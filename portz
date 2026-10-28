@@ -227,7 +227,7 @@ while IFS= read -r line; do
     if [[ -n "$pid_str" ]] && command -v lsof >/dev/null 2>&1; then
         lsof_line=$($SUDO lsof -nP -i :"$port" 2>/dev/null \
             | awk -v want="$pid_str" '$2==want && $5=="IPv4" || $2==want && $5=="IPv6" {print $1, $2; exit}')
-        [[ -n "$lsof_line" ]] && cmd_info="pid=$pid_str $(truncate "$lsof_line" 24)"
+        [[ -n "$lsof_line" ]] && cmd_info="pid=$pid_str $(trunc "$lsof_line" 24)"
     fi
     if [[ "$cmd_info" == "(unknown)" && -n "$pid_str" ]]; then
         # Resolve the real binary the PID is running (best-effort)
@@ -248,7 +248,7 @@ while IFS= read -r line; do
     elif [[ "$cmd_info" == "(unknown)" ]]; then
         # No PID parsed from ss — still show the ss users:() blob if present
         if [[ -n "$proc_info" ]]; then
-            cmd_info=$(truncate "$proc_info" 30)
+            cmd_info=$(trunc "$proc_info" 30)
         else
             cmd_info="(no owner)"
         fi

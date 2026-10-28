@@ -310,7 +310,7 @@ if [[ $HAVE_PS -eq 1 ]]; then
         [[ -z "$cmdline" ]] && cmdline="$comm"
         printf "  ${C_DIM}%7s${C_RESET} %10s ${C_CYAN}%5s%%${C_RESET}  " "$pid" "$(humansize $(kb_to_b $rss))" "$pmem"
         bar $(( p * 2 > 100 ? 100 : p * 2 )) 5
-        printf " ${C_DIM}%-16s${C_RESET} %s\n" "$comm" "$(truncate "$cmdline" 90)"
+        printf " ${C_DIM}%-16s${C_RESET} %s\n" "$comm" "$(trunc "$cmdline" 90)"
         CONSUMER_ROWS+=("${pmem} ${cmdline}")
       done <<< "$PS_OUT"
 

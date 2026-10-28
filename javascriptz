@@ -66,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     fi
     case "$1" in
         --json)        JSON_OUT=1; shift ;;
+        --no-color)   NO_COLOR=1; shift ;;
         --outdir)      OUTDIR="$2"; shift 2 ;;
         --max-scripts) MAX_SCRIPTS="$2"; shift 2 ;;
         --no-timing)   DO_TIMING=0; shift ;;
@@ -82,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$URL" ]]; then
-    printf "Usage: %s URL [--json] [--outdir DIR] [--max-scripts N] [--no-timing]\n" "$0" >&2
+    printf "Usage: %s URL [--json] [--no-color] [--outdir DIR] [--max-scripts N] [--no-timing]\n" "$0" >&2
     exit 2
 fi
 

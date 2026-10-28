@@ -68,6 +68,7 @@ case "${1:-}" in
     4|--single) MODE_ARG="4" ;;
     --ai)       AI_VERDICT=1 ;;
     --no-ai)    AI_VERDICT=0 ;;
+    --no-color) NO_COLOR=1; init_colors ;;
 esac
 
 if [[ "${JSON_OUT:-0}" != "1" ]] && declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "timingz"; fi

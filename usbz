@@ -410,7 +410,7 @@ if [[ -n "$FILTERED_DEVICES" ]]; then
     drv="${bind_entry%%|*}"
     bind="${bind_entry#*|}"
     printf "  ${C_CYAN}%-9s${C_RESET} %-11s ${C_DIM}%-30s${C_RESET} %-18s ${C_DIM}%s${C_RESET}\n" \
-      "$busdev" "$vidpid" "$(truncate "$descr" 28)" "$(truncate "$drv" 16)" "$(truncate "$bind" 80)"
+      "$busdev" "$vidpid" "$(trunc "$descr" 28)" "$(trunc "$drv" 16)" "$(trunc "$bind" 80)"
   done <<< "$FILTERED_DEVICES"
 else
   info "No devices match filter"

@@ -68,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     fi
     case "$1" in
         --json)       JSON_OUT=1; shift ;;
+        --no-color)   NO_COLOR=1; shift ;;
         --outdir)     OUTDIR="$2"; shift 2 ;;
         --resolvers)  RESOLVERS="$2"; shift 2 ;;
         --local)      LOCAL_MODE=1; shift ;;
@@ -86,7 +87,7 @@ done
 if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "dnsz" "JSON_OUT=$JSON_OUT LOCAL_MODE=$LOCAL_MODE" 2>/dev/null; fi
 
 if [[ -z "$HOST" && $LOCAL_MODE -eq 0 ]]; then
-    printf "Usage: %s [--local | HOST] [--json] [--outdir DIR] [--resolvers CSV] [--ai]\n" "$0" >&2
+    printf "Usage: %s [--local | HOST] [--json] [--no-color] [--outdir DIR] [--resolvers CSV] [--ai]\n" "$0" >&2
     exit 2
 fi
 
@@ -109,7 +110,7 @@ if [[ $LOCAL_MODE -eq 1 ]]; then
         while IFS= read -r line; do
             printf "    %s\n" "$line"
         done < /etc/resolv.conf
-        NS_COUNT=$(grep -cE '^nameserver' /etc/resolv.conf 2>/dev/null || echo 0)
+        NS_COUNT=$(grep -cE '^nameserver' /etc/resolv.conf 2>/dev/null || true); NS_COUNT=${NS_COUNT:-0}
         if (( NS_COUNT == 0 )); then
             printf "    ${C_YELLOW}!${C_RESET} no nameserver directives — relying on DHCP/network default\n"
         elif (( NS_COUNT == 1 )); then

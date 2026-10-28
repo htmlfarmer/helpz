@@ -515,6 +515,13 @@ if [[ "${1:-}" == "--path" ]]; then
     exit 0
 fi
 if [[ "${1:-}" == "--usage" ]]; then usage_report; exit 0; fi
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    echo
+    echo "Also: helpz --path   (make every tool callable from anywhere)"
+    echo "      helpz --usage  (which tools you actually run)"
+    exit 0
+fi
 if [[ "${1:-}" == "--json" ]]; then
     emit_json
     exit 0

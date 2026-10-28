@@ -866,7 +866,7 @@ if [[ -n "$HBA_FILE" && -r "$HBA_FILE" ]]; then
 fi
 HBA_OK=0 HBA_TOTAL=0
 [[ -r "$HBA_FILE" ]] && {
-    HBA_TOTAL=$(grep -cE '^[a-z]' "$HBA_FILE" 2>/dev/null || echo 0)
+    HBA_TOTAL=$(grep -cE '^[a-z]' "$HBA_FILE" 2>/dev/null || true); HBA_TOTAL=${HBA_TOTAL:-0}
     HBA_TRUST_LCL=$(grep -E '^[^#]*[[:space:]]trust[[:space:]]+(127\.|::1|localhost|samehost)' "$HBA_FILE" 2>/dev/null | wc -l)
     info "pg_hba.conf lines: ${C_BOLD}$HBA_TOTAL${C_RESET} ($HBA_TRUST_LCL trust-auth on localhost)"
 }

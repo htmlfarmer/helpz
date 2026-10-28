@@ -34,6 +34,17 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR/lib/verdict_log.sh"
 
+# Cut a string to N characters, marking it with an ellipsis. (coreutils
+# `truncate` resizes FILES — it is not a string cutter.)
+trunc() {
+    local str="$1" len="${2:-40}"
+    if (( ${#str} > len )); then
+        printf "%s…" "${str:0:$((len - 1))}"
+    else
+        printf "%s" "$str"
+    fi
+}
+
 show_help() {
     cat << 'HELPEOF'
 
@@ -378,7 +389,7 @@ audit_etc_crontab() {
         count=$((count + 1))
 
         printf "  ${C_BOLD}[line %d]${C_RESET} ${C_CYAN}%-15s${C_RESET} user=${C_MAGENTA}%-12s${C_RESET} cmd=${C_DIM}%s${C_RESET}\n" \
-            "$count" "$schedule" "$user" "$(truncate "$command" 60)"
+            "$count" "$schedule" "$user" "$(trunc "$command" 60)"
         printf "      ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
         printf "      ${C_DIM}file: /etc/crontab (line %d)${C_RESET}\n" "$count"
 
@@ -437,7 +448,7 @@ audit_cron_d() {
             count=$((count + 1))
             total_jobs=$((total_jobs + 1))
             printf "    ${C_CYAN}%-15s${C_RESET} user=${C_MAGENTA}%-12s${C_RESET} cmd=${C_DIM}%s${C_RESET}\n" \
-                "$schedule" "$user" "$(truncate "$command" 60)"
+                "$schedule" "$user" "$(trunc "$command" 60)"
             printf "        ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
             check_suspicious "$command" "$f:line-$count"
         done < "$f"
@@ -534,7 +545,7 @@ audit_user_crontabs() {
             cmd_full=$(resolve_cron_cmd "$command")
             count=$((count + 1))
             printf "    ${C_CYAN}%-15s${C_RESET} cmd=${C_DIM}%s${C_RESET}\n" \
-                "$schedule" "$(truncate "$command" 60)"
+                "$schedule" "$(trunc "$command" 60)"
             printf "      ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
             check_suspicious "$command" "$f:line-$count"
         done < "$f" 2>/dev/null
@@ -572,7 +583,7 @@ audit_anacron() {
         count=$((count + 1))
         printf "  ${C_BOLD}[job %d]${C_RESET} period=${C_MAGENTA}%s${C_RESET} delay=${C_CYAN}%s${C_RESET} id=${C_YELLOW}%s${C_RESET}\n" \
             "$count" "$period" "$delay" "$job_id"
-        printf "      ${C_DIM}cmd: %s${C_RESET}\n" "$(truncate "$command" 80)"
+        printf "      ${C_DIM}cmd: %s${C_RESET}\n" "$(trunc "$command" 80)"
         printf "      ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
         check_suspicious "$command" "/etc/anacrontab:$count"
     done < /etc/anacrontab

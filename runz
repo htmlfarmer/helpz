@@ -25,6 +25,11 @@ source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 [[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; }
 
 BYPASS=0
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    sed -n '6,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+if [[ "${1:-}" == "--no-color" ]]; then NO_COLOR=1; init_colors; shift; fi
 if [[ "${1:-}" == "--allow-changed" ]]; then BYPASS=1; shift; fi
 if [[ "${1:-}" == "--check" ]]; then
     exec "$SCRIPT_DIR/trustz" --check

@@ -334,7 +334,7 @@ fi
 # Per-CPU utilization from /proc/stat
 if [[ -r /proc/stat ]]; then
   subsec "Per-CPU utilization (since boot, total time %)"
-  TOTAL_CPUS=$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || echo 0)
+  TOTAL_CPUS=$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || true); TOTAL_CPUS=${TOTAL_CPUS:-0}
   if [[ "$TOTAL_CPUS" -gt 0 ]]; then
     printf "    ${C_DIM}%-6s %10s %10s %10s   busy%%${C_RESET}\n" "CPU" "user" "nice" "system"
     printf "    ${C_DIM}%-6s %10s %10s %10s   %s${C_RESET}\n" "----" "----------" "----------" "----------" "------"

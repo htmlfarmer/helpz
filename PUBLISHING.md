@@ -5,35 +5,34 @@
 ## One-command release (from the source suite)
 
 ```bash
-cd ~/security          # the working directory where the tools live
+cd <suite-dir>          # the working directory where the tools live
 ./publishz             # security gate → copy → sanitize → audit → docs → commit
 ./publishz --push      # ...and push to GitHub
 ```
 
 What `publishz` does, in order:
 
-1. **Security gate** — runs `secretz --code` over the source suite; aborts if
-   credential-shaped hits are found in *code* (use `--force` to override).
+1. **Security gate** — runs `secretz --code` over the source suite.
 2. **Copy** — every executable `*z` tool + `lib/*.sh` + `.helpz_log.sh`.
-   Personal tools and business-specific tools are excluded, as are backup
-   files. Anything business-specific that must ship gets its internal unit
-   names, env vars and database names rewritten to generic examples first.
+   Personal tools and business-specific tools (which carry real systemd unit
+   names and worker env vars) are excluded, as are backup files.
 3. **Sanitize** — rewrites absolute suite paths to script-relative lookups,
    replaces personal identity defaults with env-var placeholders, swaps LAN
    IPs for `127.0.0.1`, and generates `ai.json.example`.
-4. **Leak audit** — greps the publish copy for personal paths, names, and
-   private IPs; a non-zero result blocks a clean release.
+4. **Leak audit + publish gate** — greps the publish copy for personal
+   paths, names and private IPs, then runs the full credential scan against
+   the exact bytes that will reach GitHub. A non-zero result blocks release.
 5. **Docs** — regenerates README.md (this file's tool table) **from the live
    headers of every tool**, so docs can never drift from code. Add a tool,
    run `publishz`, done.
-6. **Git** — initializes the repo if needed, stages, and commits. `--push`
-   sends it to the remote named `origin`.
+6. **Git** — preserves the existing history and remote, stages, and commits.
+   `--push` sends it to the remote named `origin`.
 
 ## First-time GitHub setup
 
 ```bash
 # with the gh CLI:
-cd <suite-dir>          # the directory holding the publish copy
+cd ../helpz
 gh repo create helpz --public --source=. --push
 
 # or manual: create an empty repo on github.com, then:
@@ -53,7 +52,7 @@ The README + PUBLISHING files are *generated*, never hand-edited:
 
 ```bash
 #!/usr/bin/env bash
-. /home/USER/security/.helpz_log.sh
+. <suite-dir>/.helpz_log.sh
 # ============================================================
 # mytoolz - One-line description            <- helpz list + README
 # ------------------------------------------------------------
@@ -64,6 +63,7 @@ The README + PUBLISHING files are *generated*, never hand-edited:
 #   ./mytoolz --json ...
 # ============================================================
 # source lib/common.sh  → section/ok/warn/crit, bar(), spark(), kpi(), emit_verdict
+# source lib/chart.sh  → chart_hbars/chart_gauge/chart_donut/chart_spark/chart_heat
 ```
 
 - Support `--json`, `--no-color`, `-h|--help` (the house style).

@@ -656,7 +656,7 @@ if [[ -n "$LSPCI_K" ]]; then
   ' | head -10 | while IFS='|' read -r bdf desc drv; do
     [[ -z "$bdf" ]] && continue
     printf "  ${C_CYAN}%-10s${C_RESET} ${C_DIM}%-50s${C_RESET} %s\n" \
-      "$bdf" "$(truncate "$desc" 48)" "$(truncate "$drv" 30)"
+      "$bdf" "$(trunc "$desc" 48)" "$(trunc "$drv" 30)"
   done
 fi
 

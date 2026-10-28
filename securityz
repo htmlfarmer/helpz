@@ -363,7 +363,7 @@ else
     for ip in "${FAILED_IPS[@]}"; do
         [[ -z "$ip" ]] && continue
         # Count occurrences
-        hit_count=$(grep -cE "from[[:space:]]+${ip//./\\.}\b" "$log_file" 2>/dev/null || echo 0)
+        hit_count=$(grep -cE "from[[:space:]]+${ip//./\\.}\b" "$log_file" 2>/dev/null || true); hit_count=${hit_count:-0}
         hit_count=${hit_count:-0}
         # Enrich
         full=$(enrich_ip "$ip")

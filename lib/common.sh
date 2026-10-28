@@ -54,6 +54,12 @@ init_colors() {
 # Run color initialization initially
 init_colors
 
+# ---------- chart toolkit ----------
+# Every tool that sources common.sh also gets the text-chart helpers.
+[[ -z "${SCRIPT_DIR:-}" ]] && SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/chart.sh
+[[ -r "$SCRIPT_DIR/lib/chart.sh" ]] && source "$SCRIPT_DIR/lib/chart.sh"
+
 # ---------- live heartbeat for slow commands ----------
 # with_spin "label" cmd args...   → runs cmd (stdout stays capturable),
 # paints a braille spinner + elapsed seconds on /dev/tty while it runs.
@@ -222,29 +228,6 @@ trunc() {
     fi
 }
 
-bar() {
-    local pct=$1 width=${2:-20}
-    (( pct < 0 )) && pct=0
-    (( pct > 100 )) && pct=100
-    local filled=$(( pct * width / 100 ))
-    local empty=$(( width - filled ))
-    local color="$C_GREEN"
-    (( pct >= 60 )) && color="$C_YELLOW"
-    (( pct >= 85 )) && color="$C_RED"
-
-    # Build filled/empty strings in bash (no seq subshell fork).
-    local filled_str="" empty_str=""
-    if (( filled > 0 )); then
-        printf -v filled_str '%*s' "$filled" ''
-        filled_str=${filled_str// /█}
-    fi
-    if (( empty > 0 )); then
-        printf -v empty_str '%*s' "$empty" ''
-        empty_str=${empty_str// /░}
-    fi
-    emit "%s%s%s%s%s" "$color" "$filled_str" "$C_DIM" "$empty_str" "$C_RESET"
-}
-
 temp_color() {
     local t=$1
     if [[ -z "$t" ]] || ! [[ "$t" =~ ^[0-9]+\.?[0-9]*$ ]]; then
@@ -338,7 +321,7 @@ bar() {
     local filled_str="" empty_str=""
     if (( filled > 0 )); then
         printf -v filled_str '%*s' "$filled" ''
-        filled_str=${filled_str// /▓}
+        filled_str=${filled_str// /█}
     fi
     if (( empty > 0 )); then
         printf -v empty_str '%*s' "$empty" ''
@@ -633,6 +616,54 @@ emit_warning_one_liners() {
     done
 }
 
+# ---------- findings chart ----------
+# Every tool that logs findings through critf/warnf ends up with the same
+# two arrays. Drawing the breakdown here means all 20+ tools get a chart of
+# their own results for free, and they all look identical.
+chart_findings() {
+    chart_suppressed && return 0
+    local n_crit=0 n_warn=0
+    (( ${#CRITICAL_ISSUES[@]} )) && n_crit=${#CRITICAL_ISSUES[@]}
+    (( ${#WARN_ENTRIES[@]} )) && n_warn=${#WARN_ENTRIES[@]}
+    (( n_crit + n_warn == 0 )) && return 0
+
+    # Group by category.
+    local -A cats=()
+    local e cat
+    for e in "${CRITICAL_ISSUES[@]:-}"; do
+        [[ -z "$e" ]] && continue
+        cat="${e%%|*}"
+        cats["$cat"]=$(( ${cats[$cat]:-0} + 1 ))
+    done
+    for e in "${WARN_ENTRIES[@]:-}"; do
+        [[ -z "$e" ]] && continue
+        cat="${e%%|*}"
+        cats["$cat"]=$(( ${cats[$cat]:-0} + 1 ))
+    done
+    (( ${#cats[@]} == 0 )) && return 0
+
+    section "FINDINGS BREAKDOWN"
+    local -a pairs=()
+    for cat in "${!cats[@]}"; do pairs+=("$cat"$'\t'"${cats[$cat]}"); done
+    printf '%s\n' "${pairs[@]}" | sort -t$'\t' -k2 -gr | chart_hbars
+
+    # A severity split ring — but only when there is a critical share to show.
+    # An empty ring at 0% is just four blank lines, so say it in words instead.
+    local total=$(( n_crit + n_warn ))
+    if (( n_crit > 0 )); then
+        local pct=$(( n_crit * 100 / total ))
+        printf "\n"
+        chart_donut "$pct" "critical share"
+        printf "  %s%d critical%s  ·  %s%d warning%s  ·  %s%d total%s\n" \
+            "$C_RED" "$n_crit" "$C_RESET" "$C_YELLOW" "$n_warn" "$C_RESET" \
+            "$C_DIM" "$total" "$C_RESET"
+    else
+        printf "\n  %s%d warning%s  ·  %s%d total%s  ·  %sno critical findings%s\n" \
+            "$C_YELLOW" "$n_warn" "$C_RESET" "$C_DIM" "$total" "$C_RESET" \
+            "$C_GREEN" "$C_RESET"
+    fi
+}
+
 emit_verdict() {
     # if a run-comparison capture is still open, drain it NOW so the tee
     # coprocess can never paint bytes after the shell prompt (fd-order race)
@@ -682,6 +713,9 @@ emit_verdict() {
             exit_code=0
         fi
         printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n\n" "$elapsed" "$(date '+%H:%M:%S')"
+
+        # Findings chart — every tool that logs findings gets one.
+        chart_findings
 
         # Pointer to logs
         if (( CRITICAL > 0 )) || (( WARNINGS > 0 )); then

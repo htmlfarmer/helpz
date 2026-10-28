@@ -167,7 +167,7 @@ if has_cmd systemd-analyze; then
                 resolved=" (→$(command -v "$first_word" 2>/dev/null || echo "$first_word"))"
             fi
             printf "  ${C_BOLD}%-22s${C_RESET} ${C_CYAN}%-40s${C_RESET} ${C_DIM}%s%s${C_RESET}\n" \
-                "$uname_eff" "$(truncate "$exec_start" 38)" "$(truncate "$unit_path" 30)" "$resolved"
+                "$uname_eff" "$(trunc "$exec_start" 38)" "$(trunc "$unit_path" 30)" "$resolved"
         done
         set -e -o pipefail
     fi

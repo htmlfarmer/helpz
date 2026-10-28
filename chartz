@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# chartz - Turn any numbers into a text-mode chart
+# ----------------------------------------------------------------------------
+# The suite has a chart library (lib/chart.sh) that every *z tool uses, so a
+# bar in cpuz looks like a bar in diskz. chartz puts that library to work on
+# YOUR data: pipe it anything and get a graph back in the terminal.
+#
+# Usage:
+#   cat data.csv | chartz bars             Horizontal bars (label,value per line)
+#   cat data.csv | chartz spark            Sparkline of a single series
+#   cat data.csv | chartz gauge            One big gauge (first value = percent)
+#   cat data.csv | chartz hist             Vertical histogram (label,count pairs)
+#   cat data.csv | chartz donut            Ring gauge (first value = percent)
+#   cat data.csv | chartz heat             Heat-map strip
+#   cat data.csv | chartz rank             Ranked top-N
+#   cat data.csv | chartz timeline         Event timeline
+#
+# Options:
+#   --title "TEXT"      Section heading
+#   --top N             Keep only the N largest (bars, rank)
+#   --sort              Sort descending (bars) — default is input order
+#   --no-color          Plain output
+#   --json              Machine-readable (passes the data through as JSON)
+#
+# Input formats:
+#   bars / rank / timeline   "label<whitespace>value" per line
+#   spark / heat             whitespace-separated numbers
+#   gauge / donut            a single number (0-100)
+#   hist                     "label<whitespace>count" pairs
+#
+# Examples:
+#   df -h | awk 'NR>1{print $NF, $5"%"}' | chartz bars --title "disk usage"
+#   for i in {1..20}; do echo $((RANDOM%100)); done | chartz spark
+#   uptime | chartz gauge --title "load"
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+MODE=""; TITLE=""; TOP=0; SORT=0; JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        bars|spark|gauge|hist|donut|heat|rank|timeline) MODE="$1" ;;
+        --title)   shift; TITLE="${1:-}" ;;
+        --title=*) TITLE="${1#--title=}" ;;
+        --top)     shift; TOP="${1:-0}" ;;
+        --top=*)   TOP="${1#--top=}" ;;
+        --sort)    SORT=1 ;;
+        --json)    JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,44p' "$0"; exit 0 ;;
+        *) echo "chartz: unknown option $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+[[ -z "$MODE" ]] && { echo "chartz: pick a chart type (bars, spark, gauge, hist, donut, heat, rank, timeline)" >&2; sed -n '6,44p' "$0" >&2; exit 64; }
+
+DATA=$(cat)
+[[ -z "${DATA//[[:space:]]/}" ]] && { echo "chartz: no input data" >&2; exit 1; }
+
+# Normalise "label value" lines into TAB-separated pairs the chart library
+# expects. Whitespace of any kind separates the label from the value.
+normalise_pairs() {
+    awk '
+        {
+            line=$0
+            gsub(/^[ \t]+|[ \t]+$/, "", line)
+            if (line == "") next
+            n = split(line, f, /[ \t]+/)
+            if (n >= 2) {
+                lbl = f[1]
+                val = f[2]
+                for (i = 3; i <= n; i++) val = val " " f[i]
+                printf "%s\t%s\n", lbl, val
+            } else {
+                printf "%s\t%s\n", f[1], 0
+            }
+        }'
+}
+
+# Keep the N largest pairs.
+top_n() {
+    local n="$1"
+    (( n <= 0 )) && { cat; return 0; }
+    sort -t$'\t' -k2 -gr | head -n "$n"
+}
+
+# Strip a trailing % so percentages chart cleanly.
+strip_pct() { sed 's/%$//'; }
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"chartz","mode":"%s","title":"%s","data":[' "$MODE" "$TITLE"
+    first=1
+    while IFS=$'\t' read -r l v; do
+        [[ -z "${l:-}" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf '{"label":"%s","value":"%s"}' "${l//\"/\\\"}" "${v//\"/\\\"}"
+    done < <(printf '%s\n' "$DATA" | normalise_pairs)
+    printf ']}\n'
+    exit 0
+fi
+
+[[ -n "$TITLE" ]] && heading "$TITLE"
+
+case "$MODE" in
+    bars)
+        PAIRS=$(printf '%s\n' "$DATA" | normalise_pairs)
+        (( SORT )) && PAIRS=$(printf '%s\n' "$PAIRS" | sort -t$'\t' -k2 -gr)
+        (( TOP )) && PAIRS=$(printf '%s\n' "$PAIRS" | top_n "$TOP")
+        printf '%s\n' "$PAIRS" | strip_pct | chart_hbars
+        ;;
+    rank)
+        PAIRS=$(printf '%s\n' "$DATA" | normalise_pairs)
+        n=$(( TOP > 0 ? TOP : 10 ))
+        printf '%s\n' "$PAIRS" | chart_rank "$n"
+        ;;
+    spark)
+        nums=$(printf '%s\n' $DATA | tr -d '%,' | grep -E '^-?[0-9.]+$' | tr '\n' ' ')
+        [[ -z "$nums" ]] && { echo "  no numbers found in the input" >&2; exit 1; }
+        chart_spark $nums
+        ;;
+    heat)
+        nums=$(printf '%s\n' $DATA | tr -d '%,' | grep -E '^-?[0-9.]+$' | tr '\n' ' ')
+        [[ -z "$nums" ]] && { echo "  no numbers found in the input" >&2; exit 1; }
+        chart_heat "${TITLE:-values}" $nums
+        ;;
+    gauge|donut)
+        pct=$(printf '%s\n' $DATA | tr -d '%,' | grep -E '^-?[0-9.]+$' | head -1)
+        [[ -z "$pct" ]] && { echo "  no number found in the input" >&2; exit 1; }
+        if [[ "$MODE" == "gauge" ]]; then
+            chart_gauge "$pct" "${TITLE:-}"
+        else
+            chart_donut "$pct" "${TITLE:-}"
+        fi
+        ;;
+    hist)
+        PAIRS=$(printf '%s\n' "$DATA" | normalise_pairs)
+        args=()
+        while IFS=$'\t' read -r l v; do
+            [[ -z "${l:-}" ]] && continue
+            args+=("$l" "$(printf '%s' "$v" | strip_pct)")
+        done <<< "$PAIRS"
+        (( ${#args[@]} == 0 )) && { echo "  no data" >&2; exit 1; }
+        chart_hist "${args[@]}"
+        ;;
+    timeline)
+        printf '%s\n' "$DATA" | normalise_pairs | chart_timeline
+        ;;
+esac
+exit 0

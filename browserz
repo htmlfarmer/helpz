@@ -174,7 +174,7 @@ add_browser() {
 section "1. REALM SNAPSHOT"
 printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Host:" "$HOSTNAME_SHORT"
 printf "  ${C_DIM}%-16s${C_RESET} %s\n" "OS:" "$(uname -srm)"
-printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Window manager:" "$(echo "$XDG_CURRENT_DESKTOP${DESKTOP_SESSION:-}")"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Window manager:" "$(echo "${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}")"
 if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Distro:" "$PRETTY_NAME"
@@ -276,7 +276,7 @@ else
         # Channel placeholder (we don't have reliable channel info unless in snap)
         chan="stable"
         printf "  ${C_BOLD}%-25s${C_RESET} ${C_CYAN}%-22s${C_RESET} ${C_DIM}%-15s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
-            "$(truncate "$name" 25)" "$(truncate "$ver" 22)" "$chan" "$(truncate "$path" 60)"
+            "$(trunc "$name" 25)" "$(trunc "$ver" 22)" "$chan" "$(trunc "$path" 60)"
     done
 fi
 

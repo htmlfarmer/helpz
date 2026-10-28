@@ -209,7 +209,7 @@ if [[ -r /proc/cpuinfo ]]; then
     printf "  ${C_DIM}%-16s${C_RESET} %s\n" "CPU model:" "$cpu_model"
 fi
 if [[ -r /proc/stat ]]; then
-    cpus_online=$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || echo 0)
+    cpus_online=$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || true); cpus_online=${cpus_online:-0}
     printf "  ${C_DIM}%-16s${C_RESET} %s\n" "CPUs online:" "$cpus_online"
 fi
 total_threads=$(awk 'BEGIN{c=0} {c++} END{print c}' /proc/*/stat 2>/dev/null | tail -1 || echo 0)

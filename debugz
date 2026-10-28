@@ -354,7 +354,7 @@ if [[ -n "$PID_ARG" ]]; then
                 subsec "Top 10 open file targets"
                 ls -la /proc/$PID_ARG/fd/ 2>/dev/null | grep -E '^l' | awk '{print $NF}' \
                 | head -10 | while IFS= read -r target; do
-                    printf "  ${C_DIM}%s${C_RESET}\n" "$(truncate "$target" 80)"
+                    printf "  ${C_DIM}%s${C_RESET}\n" "$(trunc "$target" 80)"
                 done
             fi
         fi
