@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# pullz - Git pull with a rollback point and a preview of what's coming
+# ----------------------------------------------------------------------------
+# A plain "git pull" can merge half a story into your working tree, or fail
+# halfway and leave you untangling. pullz fetches first, shows you exactly
+# which commits are incoming, cuts a rollback branch before touching anything,
+# then merges fast-forward-only unless you ask for something else.
+#
+# Usage:
+#   ./pullz                  Fetch, preview, rollback-branch, fast-forward pull
+#   ./pullz --dry-run        Show what would arrive (no changes)
+#   ./pullz --rebase         Rebase local commits on top of the incoming ones
+#   ./pullz --merge          Allow a merge commit (instead of ff-only)
+#   ./pullz --autostash      Stash local changes, pull, then restore them
+#   ./pullz --no-backup      Don't cut the rollback branch
+#   ./pullz --json           Machine-readable result
+#
+# Exit codes: 0 pulled · 1 nothing to do · 2 refused
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+REPO_DIR="$PWD"; DRY=0; MODE="ff"; AUTOSTASH=0; BACKUP=1; JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)   DRY=1 ;;
+        --rebase)    MODE="rebase" ;;
+        --merge)     MODE="merge" ;;
+        --autostash) AUTOSTASH=1 ;;
+        --no-backup) BACKUP=0 ;;
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1; init_colors ;;
+        -h|--help)   sed -n '6,22p' "$0"; exit 0 ;;
+        -*) echo "pullz: unknown option $1" >&2; exit 64 ;;
+        *) REPO_DIR="$1" ;;
+    esac
+    shift
+done
+
+cd "$REPO_DIR" 2>/dev/null || { echo "pullz: no such directory: $REPO_DIR" >&2; exit 2; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "pullz: not a git repository: $REPO_DIR" >&2; exit 2; }
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+[[ "$BRANCH" == "HEAD" ]] && { echo "pullz: detached HEAD — nothing to pull into" >&2; exit 2; }
+REMOTE="origin"
+git remote get-url "$REMOTE" >/dev/null 2>&1 || { echo "pullz: no remote named 'origin'" >&2; exit 2; }
+UPSTREAM="$REMOTE/$BRANCH"
+
+# ── working tree state ─────────────────────────────────────────────────────
+DIRTY=$(git status --porcelain 2>/dev/null)
+UNTRACKED=$(printf '%s\n' "$DIRTY" | grep -c '^??' || true)
+MODIFIED=$(printf '%s\n' "$DIRTY" | grep -vc '^??' || true)
+
+STASHED=0
+if [[ -n "$DIRTY" && "$AUTOSTASH" -eq 1 ]]; then
+    git stash push -u -m "pullz autostash $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null 2>&1 && STASHED=1
+fi
+if [[ -n "$DIRTY" && "$AUTOSTASH" -ne 1 && "$DRY" -eq 0 ]]; then
+    printf "  ${C_RED}✗${C_RESET} working tree has uncommitted changes (%s modified, %s untracked)\n" "$MODIFIED" "$UNTRACKED"
+    printf "     ${C_DIM}commit or stash them first, or re-run with --autostash${C_RESET}\n"
+    printf "     ${C_DIM}git status --short${C_RESET}\n"
+    exit 2
+fi
+
+# ── fetch ──────────────────────────────────────────────────────────────────
+section "FETCH"
+if ! git fetch -q "$REMOTE" "$BRANCH" 2>/dev/null; then
+    git fetch -q "$REMOTE" 2>/dev/null || { echo "  ${C_RED}✗${C_RESET} fetch failed — check network/remote" >&2; exit 2; }
+fi
+ok "fetched $REMOTE/$BRANCH"
+
+if ! git rev-parse --verify -q "$UPSTREAM" >/dev/null 2>&1; then
+    info "no upstream branch named $UPSTREAM yet"
+    BEHIND=0; AHEAD=0; COMMITS=""
+else
+    BEHIND=$(git rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo 0)
+    AHEAD=$(git rev-list --count "$UPSTREAM..HEAD" 2>/dev/null || echo 0)
+    COMMITS=$(git log --oneline --no-decorate "HEAD..$UPSTREAM" 2>/dev/null)
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"pullz","repo":"%s","branch":"%s","behind":%s,"ahead":%s,"mode":"%s"}\n' \
+        "$REPO_DIR" "$BRANCH" "${BEHIND:-0}" "${AHEAD:-0}" "$MODE"
+    [[ "${BEHIND:-0}" -eq 0 ]] && exit 0
+    [[ "$DRY" -eq 1 ]] && exit 0
+    [[ "$MODE" == "ff" && "${AHEAD:-0}" -gt 0 ]] && exit 2
+    git pull -q --ff-only "$REMOTE" "$BRANCH" >/dev/null 2>&1 && exit 0 || exit 2
+fi
+
+# ── preview ────────────────────────────────────────────────────────────────
+section "INCOMING"
+if [[ "${BEHIND:-0}" -eq 0 ]]; then
+    ok "already up to date with $UPSTREAM"
+    [[ "$STASHED" -eq 1 ]] && { git stash pop -q 2>/dev/null && ok "restored your stashed changes"; }
+    exit 0
+fi
+info "$BEHIND commit(s) incoming, $AHEAD local commit(s) ahead"
+if [[ -n "$COMMITS" ]]; then
+    while IFS= read -r c; do [[ -n "$c" ]] && printf "  ${C_CYAN}%s${C_RESET}\n" "$c"; done <<< "$COMMITS"
+fi
+
+if [[ "$DRY" -eq 1 ]]; then
+    printf "\n  ${C_DIM}dry run — nothing changed${C_RESET}\n"
+    exit 0
+fi
+
+# ── rollback point ─────────────────────────────────────────────────────────
+if [[ "$BACKUP" -eq 1 ]]; then
+    section "ROLLBACK POINT"
+    BK="backup/$(date '+%Y%m%d-%H%M%S')"
+    if git branch "$BK" >/dev/null 2>&1; then
+        ok "cut branch '$BK' at $(git rev-parse --short HEAD)"
+        printf "  ${C_DIM}to go back: git reset --hard $BK${C_RESET}\n"
+    else
+        warn "could not create the rollback branch (branch name collision?)"
+    fi
+fi
+
+# ── merge ──────────────────────────────────────────────────────────────────
+section "PULL"
+if [[ "$MODE" == "ff" && "${AHEAD:-0}" -gt 0 ]]; then
+    printf "  ${C_YELLOW}!${C_RESET} you have %s local commit(s) and %s incoming — fast-forward is impossible.\n" "$AHEAD" "$BEHIND"
+    printf "     ${C_DIM}re-run with --rebase (linear history) or --merge (keeps both)${C_RESET}\n"
+    printf "     ${C_DIM}your work is safe on the rollback branch above${C_RESET}\n"
+    [[ "$STASHED" -eq 1 ]] && { git stash pop -q 2>/dev/null && ok "restored your stashed changes"; }
+    exit 2
+fi
+
+case "$MODE" in
+    ff)     git pull -q --ff-only "$REMOTE" "$BRANCH" ;;
+    rebase) git pull -q --rebase "$REMOTE" "$BRANCH" ;;
+    merge)  git pull -q --no-rebase "$REMOTE" "$BRANCH" ;;
+esac
+RC=$?
+
+if [[ "$RC" -eq 0 ]]; then
+    ok "pulled $BEHIND commit(s) into $BRANCH"
+    [[ "$STASHED" -eq 1 ]] && { git stash pop -q 2>/dev/null && ok "restored your stashed changes" || warn "your stashed changes had conflicts — resolve with: git stash pop"; }
+    exit 0
+fi
+printf "  ${C_RED}✗${C_RESET} pull failed (exit %s) — the rollback branch above still has your starting point\n" "$RC"
+[[ "$STASHED" -eq 1 ]] && info "your changes are still stashed (git stash list)"
+exit 2

@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# pushz - Push to GitHub with a secret/leak gate in front of it
+# ----------------------------------------------------------------------------
+# "git push" will happily ship a .env, an API key, or your personal email
+# address into a public repo. pushz runs the same checks the global secret
+# guard runs, but BEFORE anything leaves the machine — and shows you exactly
+# which commits are about to go out so you can stop it.
+#
+# Usage:
+#   ./pushz                  Push the current branch to origin (gated)
+#   ./pushz --dry-run        Show what would be pushed — nothing is sent
+#   ./pushz --branch main    Push a specific branch
+#   ./pushz --remote upstream
+#   ./pushz --force          Use --force-with-lease (still gated)
+#   ./pushz --allow-secrets  Push anyway despite findings (records why)
+#   ./pushz --json           Machine-readable result
+#
+# Exit codes: 0 pushed · 1 nothing to do · 2 blocked by the gate
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+REPO_DIR="$PWD"; BRANCH=""; REMOTE=""; DRY=0; FORCE=0; ALLOW=0; JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY=1 ;;
+        --force)   FORCE=1 ;;
+        --allow-secrets) ALLOW=1 ;;
+        --branch)  shift; BRANCH="${1:-}" ;;
+        --branch=*) BRANCH="${1#--branch=}" ;;
+        --remote)  shift; REMOTE="${1:-}" ;;
+        --remote=*) REMOTE="${1#--remote=}" ;;
+        --json)    JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,22p' "$0"; exit 0 ;;
+        -*) echo "pushz: unknown option $1" >&2; exit 64 ;;
+        *) REPO_DIR="$1" ;;
+    esac
+    shift
+done
+
+cd "$REPO_DIR" 2>/dev/null || { echo "pushz: no such directory: $REPO_DIR" >&2; exit 2; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "pushz: not a git repository: $REPO_DIR" >&2; exit 2; }
+
+# Patterns live with the guard so both use one source of truth.
+GUARD_LIB=""
+for cand in "$SCRIPT_DIR/lib/guard.sh" "$SCRIPT_DIR/../lib/guard.sh"; do
+    [[ -r "$cand" ]] && { GUARD_LIB="$cand"; break; }
+done
+if [[ -r "$GUARD_LIB" ]]; then
+    # shellcheck source=lib/guard.sh
+    source "$GUARD_LIB"
+fi
+
+SECRET_RE="${GUARD_SECRET_RE:-}"
+BLOCK_TOKENS="${GUARD_BLOCK_TOKENS:-}"
+
+BRANCH="${BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}"
+REMOTE="${REMOTE:-origin}"
+[[ "$BRANCH" == "HEAD" ]] && { echo "pushz: detached HEAD — pass --branch" >&2; exit 2; }
+
+git remote get-url "$REMOTE" >/dev/null 2>&1 || { echo "pushz: no remote named '$REMOTE'" >&2; exit 2; }
+REMOTE_URL=$(git remote get-url "$REMOTE")
+
+# ── what is about to go out? ───────────────────────────────────────────────
+UPSTREAM="$REMOTE/$BRANCH"
+git fetch -q "$REMOTE" "$BRANCH" 2>/dev/null || true
+if git rev-parse --verify -q "$UPSTREAM" >/dev/null 2>&1; then
+    AHEAD=$(git rev-list --count "$UPSTREAM..HEAD" 2>/dev/null || echo 0)
+    COMMITS=$(git log --oneline --no-decorate "$UPSTREAM..HEAD" 2>/dev/null)
+else
+    AHEAD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+    COMMITS=$(git log --oneline --no-decorate -n 20 2>/dev/null)
+fi
+
+# Content that would be published: every blob in the trees being pushed.
+PUSH_TREES=$(git rev-list "$UPSTREAM..HEAD" 2>/dev/null || git rev-list --max-count=1 HEAD)
+[[ -z "$PUSH_TREES" ]] && PUSH_TREES="HEAD"
+
+# ── the gate ───────────────────────────────────────────────────────────────
+CRIT=0; HITS=""; BADPATHS=""
+
+scan_content() {
+    [[ -z "$SECRET_RE" ]] && return 0
+    local allow="" top
+    top=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+    [[ -r "$top/.secret-guard-ignore" ]] && allow=$(cat "$top/.secret-guard-ignore")
+    HITS=$(git grep -niE -e "$SECRET_RE" $PUSH_TREES -- 2>/dev/null \
+      | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" \
+      | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]|your-' \
+      | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } \
+      | head -10)
+    [[ -n "$HITS" ]] && CRIT=1
+}
+
+scan_paths() {
+    [[ -z "$BLOCK_TOKENS" ]] && return 0
+    BADPATHS=""
+    # Use the guard's own checker when available — it knows that
+    # .example/.sample/.template files are templates, not secrets.
+    if declare -F guard_paths_check >/dev/null 2>&1; then
+        BADPATHS=$(git ls-tree -r --name-only HEAD 2>/dev/null | guard_paths_check 2>/dev/null)
+    else
+        local f t
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            for t in $BLOCK_TOKENS; do
+                [[ "$f" == *"$t"* ]] && { BADPATHS+="$f"$'\n'; break; }
+            done
+        done < <(git ls-tree -r --name-only HEAD 2>/dev/null)
+    fi
+    [[ -n "$BADPATHS" ]] && CRIT=1
+}
+
+scan_content
+scan_paths
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"pushz","repo":"%s","branch":"%s","remote":"%s","url":"%s","ahead":%s,"blocked":%s,"hits":[%s]}\n' \
+        "$REPO_DIR" "$BRANCH" "$REMOTE" "$REMOTE_URL" "${AHEAD:-0}" "$CRIT" \
+        "$(printf '%s\n' "$HITS" | sed '/^$/d' | awk '{gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0}')"
+    [[ "$CRIT" -eq 1 && "$ALLOW" -eq 0 ]] && exit 2
+    [[ "$DRY" -eq 1 ]] && exit 0
+    git push "$REMOTE" "$BRANCH" >/dev/null 2>&1 && exit 0 || exit 2
+fi
+
+section "PUSH PREFLIGHT"
+info "repo    : $REPO_DIR"
+info "remote  : $REMOTE ($REMOTE_URL)"
+info "branch  : $BRANCH"
+info "commits ahead: ${AHEAD:-0}"
+
+if [[ -n "$COMMITS" ]]; then
+    subsec "COMMITS THAT WILL GO OUT"
+    while IFS= read -r c; do [[ -n "$c" ]] && printf "  ${C_CYAN}%s${C_RESET}\n" "$c"; done <<< "$COMMITS"
+fi
+
+# ── gate verdict ───────────────────────────────────────────────────────────
+section "SECRET GATE"
+if [[ -z "$SECRET_RE" ]]; then
+    warn "guard patterns unavailable (lib/guard.sh not found) — running WITHOUT the gate"
+else
+    if [[ -n "$HITS" ]]; then
+        printf "  ${C_RED}✗${C_RESET} credential-shaped strings in the outgoing content:\n"
+        printf '%s\n' "$HITS" | sed 's/[A-Za-z0-9_-]\{16,\}/[REDACTED]/g; s/^/      /'
+    else
+        ok "no credential-shaped strings in the outgoing content"
+    fi
+    if [[ -n "$BADPATHS" ]]; then
+        printf "  ${C_RED}✗${C_RESET} private/personal paths in the tree:\n"
+        printf '%s' "$BADPATHS" | sed '/^$/d;s/^/      /'
+    else
+        ok "no private/personal paths in the tree"
+    fi
+fi
+
+if [[ "$CRIT" -eq 1 && "$ALLOW" -ne 1 ]]; then
+    printf "\n  ${C_RED}${C_BOLD}BLOCKED${C_RESET} — nothing was pushed.\n"
+    printf "  ${C_DIM}Remove the secrets, or push anyway with: ./pushz --allow-secrets${C_RESET}\n"
+    exit 2
+fi
+if [[ "$CRIT" -eq 1 && "$ALLOW" -eq 1 ]]; then
+    printf "  ${C_YELLOW}!${C_RESET} pushing anyway (--allow-secrets) — this is on the record.\n"
+fi
+
+if [[ "$DRY" -eq 1 ]]; then
+    printf "\n  ${C_DIM}dry run — nothing was pushed${C_RESET}\n"
+    exit 0
+fi
+
+section "PUSH"
+PUSH_ARGS=("$REMOTE" "$BRANCH")
+[[ "$FORCE" -eq 1 ]] && PUSH_ARGS=(--force-with-lease "$REMOTE" "$BRANCH")
+if git push "${PUSH_ARGS[@]}"; then
+    ok "pushed $BRANCH → $REMOTE"
+    printf "  ${C_DIM}%s${C_RESET}\n" "$REMOTE_URL"
+    exit 0
+else
+    printf "  ${C_RED}✗${C_RESET} push failed — nothing changed on the remote.\n"
+    exit 2
+fi

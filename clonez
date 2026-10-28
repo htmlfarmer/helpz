@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# clonez - Clone a repo safely: clean target, sane URL, then scan what landed
+# ----------------------------------------------------------------------------
+# "git clone" is where other people's code lands on your disk with your
+# privileges. clonez refuses the obvious foot-guns (cloning into a directory
+# that already has files, plain-text http:// remotes, half-finished clones)
+# and then runs the suite's own secret scanner over what arrived, so you see
+# what you just invited onto the machine.
+#
+# Usage:
+#   ./clonez <url> [dir]     Clone a repository
+#   ./clonez <url> --branch dev
+#   ./clonez <url> --depth 1
+#   ./clonez <url> --no-scan Skip the post-clone secret scan
+#   ./clonez --list <url>   List remote branches before cloning
+#   ./clonez --json         Machine-readable result
+#
+# Exit codes: 0 cloned · 1 nothing to do · 2 refused or failed
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+URL=""; DEST=""; BRANCH=""; DEPTH=""; SCAN=1; LIST=0; JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --branch)  shift; BRANCH="${1:-}" ;;
+        --branch=*) BRANCH="${1#--branch=}" ;;
+        --depth)   shift; DEPTH="${1:-}" ;;
+        --depth=*) DEPTH="${1#--depth=}" ;;
+        --no-scan) SCAN=0 ;;
+        --list)    LIST=1 ;;
+        --json)    JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,22p' "$0"; exit 0 ;;
+        -*) echo "clonez: unknown option $1" >&2; exit 64 ;;
+        *) [[ -z "$URL" ]] && URL="$1" || DEST="$1" ;;
+    esac
+    shift
+done
+
+[[ -z "$URL" ]] && { echo "clonez: need a repository URL" >&2; sed -n '6,22p' "$0" >&2; exit 64; }
+command -v git >/dev/null 2>&1 || { echo "clonez: git is not installed" >&2; exit 2; }
+
+# ── URL sanity ─────────────────────────────────────────────────────────────
+section "REMOTE"
+info "url: $URL"
+case "$URL" in
+    http://*)
+        warn "plain-text http:// — traffic and your credentials travel unencrypted"
+        warn "prefer:  ${URL/http:\/\//https:\/\/}"
+        ;;
+    git://*)
+        warn "git:// is unencrypted — prefer ssh (git@host:path) or https://"
+        ;;
+    https://*|git@*|ssh://*|file://*|/*) ok "transport looks sane (encrypted or local)" ;;
+    *) warn "unrecognised URL form — double-check it before you clone" ;;
+esac
+
+# ── list mode ──────────────────────────────────────────────────────────────
+if [[ "$LIST" -eq 1 ]]; then
+    subsec "REMOTE BRANCHES"
+    git ls-remote --heads "$URL" 2>/dev/null | awk '{print "  " $2}' | sed 's#refs/heads/##' || {
+        echo "  ${C_RED}✗${C_RESET} could not reach the remote"; exit 2; }
+    exit 0
+fi
+
+# ── destination checks ─────────────────────────────────────────────────────
+if [[ -z "$DEST" ]]; then
+    # Derive from the URL: trailing .git stripped, last path segment.
+    DEST=$(basename "$URL")
+    DEST="${DEST%.git}"
+    [[ -z "$DEST" ]] && DEST="cloned-repo"
+fi
+
+if [[ -e "$DEST" ]]; then
+    if [[ ! -d "$DEST" ]]; then
+        echo "clonez: $DEST exists and is not a directory" >&2; exit 2
+    fi
+    if [[ -n "$(ls -A "$DEST" 2>/dev/null)" ]]; then
+        if [[ -d "$DEST/.git" ]]; then
+            printf "  ${C_YELLOW}!${C_RESET} %s is already a git repository — use pullz to update it\n" "$DEST"
+            exit 1
+        fi
+        printf "  ${C_RED}✗${C_RESET} %s already exists and is not empty — refusing to clone into it\n" "$DEST"
+        printf "     ${C_DIM}pick another name, or move it aside first${C_RESET}\n"
+        exit 2
+    fi
+    ok "$DEST exists and is empty — safe to clone into"
+fi
+
+# ── clone ──────────────────────────────────────────────────────────────────
+section "CLONE"
+CLONE_ARGS=()
+[[ -n "$BRANCH" ]] && CLONE_ARGS+=(--branch "$BRANCH")
+[[ -n "$DEPTH" ]]  && CLONE_ARGS+=(--depth "$DEPTH")
+info "destination: $DEST"
+
+if ! git clone "${CLONE_ARGS[@]}" "$URL" "$DEST"; then
+    printf "  ${C_RED}✗${C_RESET} clone failed\n"
+    exit 2
+fi
+ok "cloned into $DEST"
+
+if [[ -d "$DEST/.git" ]]; then
+    local_head=$(git -C "$DEST" rev-parse --short HEAD 2>/dev/null)
+    ok "HEAD: $local_head  ($(git -C "$DEST" rev-parse --abbrev-ref HEAD 2>/dev/null))"
+    CNT=$(find "$DEST" -type f ! -path '*/.git/*' 2>/dev/null | wc -l)
+    info "$CNT file(s) landed on disk"
+fi
+
+# ── post-clone scan ────────────────────────────────────────────────────────
+if [[ "$SCAN" -eq 1 ]]; then
+    section "CONTENT SCAN"
+    SCANNER=""
+    for cand in "$SCRIPT_DIR/secretz" "$SCRIPT_DIR/../secretz"; do
+        [[ -x "$cand" ]] && { SCANNER="$cand"; break; }
+    done
+    if [[ -z "$SCANNER" ]]; then
+        warn "secretz not found — skipping the post-clone scan"
+    else
+        OUT=$("$SCANNER" --code "$DEST" --json 2>/dev/null)
+        CRIT=$(grep -oE '"critical":[0-9]+' <<< "$OUT" | cut -d: -f2); CRIT="${CRIT:-0}"
+        WRN=$(grep -oE '"warn":[0-9]+' <<< "$OUT" | cut -d: -f2); WRN="${WRN:-0}"
+        if [[ "$CRIT" -gt 0 ]]; then
+            critf "Clone" "$CRIT credential-shaped pattern(s) found in the cloned code" "review before running anything: cd $DEST && secretz --code ."
+        else
+            ok "no credential patterns in the cloned code ($WRN warning(s))"
+        fi
+    fi
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"clonez","url":"%s","dest":"%s","scanned":%s}\n' "$URL" "$DEST" "$SCAN"
+    exit 0
+fi
+
+printf "\n  ${C_DIM}next: cd %s && read the README before running anything${C_RESET}\n" "$DEST"
+exit 0
