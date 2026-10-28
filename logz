@@ -13,6 +13,7 @@
 #   ./logz                           # Interactive: choose time window
 #   ./logz --last 5min                # Last 5 minutes (shorthand)
 #   ./logz --last 30m                 # Last 30 minutes
+#   ./logz --last 1hr                 # Last 1 hour
 #   ./logz --last 2h                  # Last 2 hours
 #   ./logz --since "1 hour ago"      # Last hour
 #   ./logz --since "7 days ago"      # Last week
@@ -24,8 +25,9 @@
 #   ./logz --json                    # Machine-readable summary
 #
 # --last accepts: NUM followed by unit suffix
-#   s/sec/second(s), m/min/minute(s), h/hour(s), d/day(s), w/week(s)
-#   e.g. --last 1min, --last 10min, --last 15, --last 30min, --last 90s, --last 2h
+#   s/sec/second(s), m/min/minute(s), h/hr/hour(s), d/day(s), w/wk/week(s)
+#   e.g. --last 1min, --last 10min, --last 15, --last 30min, --last 90s,
+#        --last 1hr, --last 2h, --last 1d
 #   bare numbers default to MINUTES: --last 10  ==  --last 10min
 #
 # Interactive (when run with no args in a terminal):
@@ -50,38 +52,15 @@ HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
 SCRIPT_VERSION="1.0.0"
 
 # Convert --last VALUE into a journalctl-friendly "N unit ago" string.
-# Accepts: 5min, 30m, 2h, 90s, 1d, 1w (case-insensitive, pluralisation optional)
-parse_last() {
-  local raw="$1"
-  # Normalize: lowercase, strip 's' suffix on unit (handled by case below)
-  local v="${raw,,}"
-  # Bare number with no unit → minutes (so --last 10 just works)
-  if [[ "$v" =~ ^([0-9]+)$ ]]; then
-    echo "${v} minutes ago"
-    return 0
-  fi
-  # Extract number and unit
-  if [[ ! "$v" =~ ^([0-9]+)([a-z]+)$ ]]; then
-    echo ""
-    return 1
-  fi
-  local num="${BASH_REMATCH[1]}"
-  local unit="${BASH_REMATCH[2]}"
+# The translation lives in lib/duration.sh so every tool that takes a
+# duration understands the same spellings (1hr, 1h, 1hour, 60m ...).
+# Sourced here because the option parser runs before lib/common.sh.
+DURATION_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/duration.sh"
+# shellcheck source=lib/duration.sh
+[[ -r "$DURATION_LIB" ]] && source "$DURATION_LIB"
 
-  case "$unit" in
-    s|sec|secs|second|seconds)
-      echo "${num} seconds ago" ;;
-    m|min|mins|minute|minutes)
-      echo "${num} minutes ago" ;;
-    h|hr|hrs|hour|hours)
-      echo "${num} hours ago" ;;
-    d|day|days)
-      echo "${num} days ago" ;;
-    w|wk|wks|week|weeks)
-      echo "${num} weeks ago" ;;
-    *)
-      echo ""; return 1 ;;
-  esac
+parse_last() {
+  duration_ago "$1"
 }
 
 # Index-based parser so multi-word values (e.g. --since "7 days ago") work
@@ -93,10 +72,10 @@ while [[ $i -lt $# ]]; do
     --since=*)   SINCE="${arg#--since=}"; SINCE_SET=1 ;;
     --since)     i=$((i+1)); SINCE="${ARGS[$i]:-}"; SINCE_SET=1 ;;
     --last=*)    _pv="$(parse_last "${arg#--last=}")" || _pv=""
-                 if [[ -z "$_pv" ]]; then printf "logz: bad --last value '%s' (try: 1min 10m 15min 30min 2h 7d)\n" "${arg#--last=}" >&2; exit 64; fi
+                 if [[ -z "$_pv" ]]; then printf "logz: bad --last value '%s' (%s)\n" "${arg#--last=}" "$(duration_hint)" >&2; exit 64; fi
                  SINCE="$_pv"; SINCE_SET=1 ;;
     --last)      i=$((i+1)); _pv="$(parse_last "${ARGS[$i]:-}")" || _pv=""
-                 if [[ -z "$_pv" ]]; then printf "logz: bad --last value '%s' (try: 1min 10m 15min 30min 2h 7d)\n" "${ARGS[$i]:-}" >&2; exit 64; fi
+                 if [[ -z "$_pv" ]]; then printf "logz: bad --last value '%s' (%s)\n" "${ARGS[$i]:-}" "$(duration_hint)" >&2; exit 64; fi
                  SINCE="$_pv"; SINCE_SET=1 ;;
     --tail)      TAIL_MODE=1 ;;
     --no-color)  NO_COLOR=1 ;;
@@ -119,6 +98,7 @@ USAGE
   ./logz                           Interactive: choose time window
   ./logz --last 5min               Last 5 minutes
   ./logz --last 30m                Last 30 minutes
+  ./logz --last 1hr                Last 1 hour
   ./logz --last 2h                 Last 2 hours
   ./logz --since "1 hour ago"      Last hour
   ./logz --since "7 days ago"      Last week
@@ -129,7 +109,7 @@ USAGE
 
 OPTIONS
   --since=TIME    Journalctl time string (e.g. "2 hours ago")
-  --last=DUR      Shorthand duration (5min, 30m, 2h, 1d, 1w)
+  --last=DUR      Shorthand duration (5min, 30m, 1hr, 2h, 1d, 1w)
   --tail          Show last 50 raw error lines
   --top[=N]       Top N recurring messages (default 10)
   --no-color      Disable colors
@@ -183,7 +163,7 @@ fi
 
 # If --last was malformed, fail loud with a helpful hint
 if [[ $SINCE_SET -eq 1 && -z "$SINCE" ]]; then
-  echo "logz: --last expects a duration like 5min, 30m, 2h, 1d, 90s, 1w" >&2
+  echo "logz: --last expects a duration like 5min, 30m, 1hr, 2h, 1d, 90s, 1w" >&2
   exit 64
 fi
 

@@ -1,6 +1,6 @@
 # Publishing & maintaining helpz
 
-*Generated 2026-10-27 by `publishz`.*
+*Generated 2026-10-28 by `publishz`.*
 
 ## One-command release (from the source suite)
 
