@@ -37,14 +37,14 @@
 #   - Geo-location of every public endpoint
 #
 # Usage:
-#   ./websitez xyzo.org
-#   ./websitez https://xyzo.org
+#   ./websitez example.com
+#   ./websitez https://example.com
 #   ./websitez hivv.org --quick
-#   ./websitez xyzo.org --api-only
-#   ./websitez xyzo.org --json
-#   ./websitez xyzo.org --outdir ./reports
-#   ./websitez xyzo.org --depth deep   (quick | deep | forensic)
-#   ./websitez xyzo.org --samples 20
+#   ./websitez example.com --api-only
+#   ./websitez example.com --json
+#   ./websitez example.com --outdir ./reports
+#   ./websitez example.com --depth deep   (quick | deep | forensic)
+#   ./websitez example.com --samples 20
 #
 # Requires: curl (required). Optional but recommended: dig/host, openssl,
 # whois, jq, traceroute. Missing optional tools are skipped with a warning
@@ -115,11 +115,11 @@ OPTIONS
   -h, --help          Show this help
 
 EXAMPLES
-  ./websitez xyzo.org
+  ./websitez example.com
   ./websitez https://hivv.org --json
-  ./websitez xyzo.org --quick
-  ./websitez xyzo.org --api-only
-  ./websitez xyzo.org --depth deep --samples 20
+  ./websitez example.com --quick
+  ./websitez example.com --api-only
+  ./websitez example.com --depth deep --samples 20
 
 SECTIONS PRODUCED
   0   Realm snapshot (local IP / network)

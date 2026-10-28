@@ -9,7 +9,7 @@
 # Blocks three things:
 #   1. credential-shaped strings in what you're about to commit/push
 #   2. known personal/private PATHS sneaking in (force-added ignored files,
-#      reports, key material, trust state, xyzo/personal tools)
+#      reports, key material, trust state, business/personal tools)
 #   3. tracked files that match the blocklist (pre-push catches history)
 #
 # Bypass once:  SECRET_GUARD_OK=1 git commit ...
@@ -19,9 +19,9 @@
 GUARD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|gh[ourps]_[A-Za-z0-9]{36}|xox[bpars]-[A-Za-z0-9-]{10,}|sk-(live|test|proj)-[A-Za-z0-9_\-]{20,}|AIza[0-9A-Za-z_-]{35}|ya29\.[0-9A-Za-z_-]{25,}|eyJ[A-Za-z0-9_-]{12,}\.eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+|whsec_[A-Za-z0-9]{16,}|GOCSPX-[A-Za-z0-9_-]{16,}|hf_[A-Za-z0-9]{30,}|[a-z][a-z0-9+.-]{2,10}://[^/[:space:]:@]+:[^/[:space:]@]{6,}@|Basic[[:space:]]+["'"'"']?[A-Za-z0-9+/=]{16,}|Buffer\.from\(["'"'"'][A-Za-z0-9_.+-]{2,30}:[^"'"'"'[:space:]]{8,}["'"'"']\)|b64decode\(["'"'"'][A-Za-z0-9+/]{20,}={0,2}["'"'"']\)|(password|passwd|pwd|secret|token|api[_-]?key|apikey|client[_-]?secret|access[_-]?key)[A-Za-z0-9_-]*["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+_./=:-]{12,}'
 
 # path tokens: substring match against staged/tracked paths
-# NOTE: 'xyzo' was replaced by 'xyzoservicesz-backups' — the tool *filenames*
-# (xyzoservicesz / xyzothinthreadsz) are intentionally published, but the local
-# backup dir they write is never publishable.
+# NOTE: the backup dir token below is deliberately narrow — it blocks the
+# local backup directory a business-specific tool writes, without blocking
+# the tool names themselves.
 GUARD_BLOCK_TOKENS='-reports/ _reports/ .trustz/ ai.json .env id_rsa id_ed25519 .kdbx .pcap .pftrace .pem .key .p12 .pfx .netrc secrets. secure.csv O3.txt .helpz_history xyzoservicesz-backups .aws/ .gnupg/ .kube/config docker/config.json .git-credentials'
 
 # Template/config files are non-secret by convention: ai.json.example,
