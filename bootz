@@ -560,7 +560,7 @@ H1="Boot:         $BOOT_IDX (${RANGE_LABEL})"
 H2="Boot time:    ${TOTAL_TIME:-unknown}"
 H3="Messages:     ${TOTAL_MSG} at level ${LEVEL}"
 H4="Issues:       $TOTAL_ISSUES across categories"
-H5="Failed units: $([[ $HAVE_ANALYZE -eq 1 ]] && systemctl --no-pager --state=failed --plain 2>/dev/null | grep -c '\.service' || echo 0)"
+H5="Failed units: $([[ $HAVE_ANALYZE -eq 1 ]] && systemctl --no-pager --state=failed --plain 2>/dev/null | grep -c '\.service' || true)"
 
 widest=0
 for line in "$H1" "$H2" "$H3" "$H4" "$H5"; do

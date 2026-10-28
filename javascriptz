@@ -336,7 +336,7 @@ for u in p1 + p2 + p3:
 PYEOF
 )
 rm -f "$BODY_FILE"
-ESM_N=$(echo -n "$ESM_IMPORTS" | grep -c . || echo 0)
+ESM_N=$(echo -n "$ESM_IMPORTS" | grep -c . || true)
 if [[ -n "$ESM_IMPORTS" ]]; then
     printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Static imports:" "$ESM_N"
     echo "$ESM_IMPORTS" | sed 's/^/      ↳ /'

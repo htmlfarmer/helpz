@@ -489,7 +489,7 @@ fi
 section "8. ZOMBIES — CLEANUP OPPORTUNITIES"
 set +e
 zombies=$(ps -eo pid,ppid,stat,user,comm --sort=-pid 2>/dev/null | awk '$3 ~ /^Z/' | head -10 || true)
-zombie_count=$(printf '%s\n' "$zombies" | grep -c . || echo 0)
+zombie_count=$(printf '%s\n' "$zombies" | grep -c . || true)
 zombie_count=${zombie_count:-0}
 set -e
 if [[ "$zombie_count" -eq 0 || -z "$zombies" ]]; then

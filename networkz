@@ -1043,8 +1043,8 @@ section "LISTENING SERVICES"
 LISTEN_OUT=$(run ss -tulnp 2>/dev/null || run netstat -tulnp 2>/dev/null)
 if [[ -n "$LISTEN_OUT" ]]; then
   # Count by protocol
-  TCP_COUNT=$(printf '%s\n' "$LISTEN_OUT" | grep -cE '^tcp' 2>/dev/null || echo 0)
-  UDP_COUNT=$(printf '%s\n' "$LISTEN_OUT" | grep -cE '^udp' 2>/dev/null || echo 0)
+  TCP_COUNT=$(printf '%s\n' "$LISTEN_OUT" | grep -cE '^tcp' 2>/dev/null || true)
+  UDP_COUNT=$(printf '%s\n' "$LISTEN_OUT" | grep -cE '^udp' 2>/dev/null || true)
   TOTAL=$((TCP_COUNT + UDP_COUNT))
   info "Total listeners: ${C_BOLD}${C_CYAN}$TOTAL${C_RESET}  (TCP: ${C_BOLD}$TCP_COUNT${C_RESET}, UDP: ${C_BOLD}$UDP_COUNT${C_RESET})"
 
@@ -1068,7 +1068,7 @@ section "ACTIVE CONNECTIONS"
 
 CONN_OUT=$(run ss -tan state established 2>/dev/null || run netstat -tan 2>/dev/null | grep ESTABLISHED)
 if [[ -n "$CONN_OUT" ]]; then
-  TOTAL_CONN=$(printf '%s\n' "$CONN_OUT" | grep -cE 'ESTAB|tcp' || echo 0)
+  TOTAL_CONN=$(printf '%s\n' "$CONN_OUT" | grep -cE 'ESTAB|tcp' || true)
   info "Established: ${C_BOLD}${C_CYAN}$TOTAL_CONN${C_RESET}"
 
   subsec "Top remote peers"

@@ -471,7 +471,7 @@ elif [[ "$TYPE" == "index" ]]; then
             if [[ "$CHILD" == *.gz ]] && have gzip; then
                 CHILD=$(printf '%s' "$CHILD" | gunzip -c 2>/dev/null)
             fi
-            CCNT=$(echo "$CHILD" | grep -c '<url>' 2>/dev/null || echo 0)
+            CCNT=$(echo "$CHILD" | grep -c '<url>' 2>/dev/null || true)
             printf "    ${C_DIM}%-60s${C_RESET} %s URLs\n" "$SUB_URL" "$CCNT"
             echo "$CHILD" | grep -oE '<loc>[^<]+</loc>' | sed 's|</\?loc>||g' >> "$ALL_URLS_FILE"
         done
@@ -490,7 +490,7 @@ elif [[ "$TYPE" == "index" ]]; then
         # admin pages, backup files, internal/staging hosts, debug endpoints, etc.
         SENSITIVE_HITS=$(grep -iE '/(admin|administrator|wp-admin|wp-login|backend|manage|console|phpmyadmin|pma|mysql|sql|backup|backups|dump|\.sql(\.gz)?|\.bak|\.tar(\.gz)?|\.zip|\.git/|\.svn/|\.env|\.htpasswd|\.htaccess|staging|internal|debug|test/|dev/|private|secret|conf|/etc/)' \
             "$ALL_URLS_FILE" 2>/dev/null || true)
-        SENSITIVE_COUNT=$(echo -n "$SENSITIVE_HITS" | grep -c . 2>/dev/null || echo 0)
+        SENSITIVE_COUNT=$(echo -n "$SENSITIVE_HITS" | grep -c . 2>/dev/null || true)
         if [[ "$SENSITIVE_COUNT" -gt 0 ]]; then
             printf "    ${C_RED}✗${C_RESET} ${C_RED}%-22s${C_RESET} ${C_RED}%s sensitive URL(s) leaked via sitemap${C_RESET}\n" \
                 "Sensitive paths:" "$SENSITIVE_COUNT"

@@ -507,7 +507,7 @@ if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
                 | sed 's/\x1b\[[0-9;]*m//g' \
                 | grep -oE '[a-zA-Z0-9_@.-]+\.(service|target|mount|swap|socket|path|timer|slice|scope)' \
                 | sort -u)
-  FAILED=$(echo -n "$FAILED_LIST" | grep -c '.' || echo 0)
+  FAILED=$(echo -n "$FAILED_LIST" | grep -c '.' || true)
   if [[ -n "$FAILED_LIST" ]] && [[ "$FAILED" -gt 0 ]]; then
     crit "$FAILED failed systemd units:"
     echo "$FAILED_LIST" | head -10 | sed 's/^/    /'

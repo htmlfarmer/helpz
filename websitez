@@ -525,7 +525,7 @@ for URL in "${TARGETS[@]}"; do
                     -connect "${URL_HOST}:443" </dev/null 2>/dev/null \
                     | openssl x509 -noout -text 2>/dev/null \
                     | grep -cE '^\s*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\s*=' \
-                    || echo 0)
+                    || true)
                 SIG_ALGO=$(timeout 5 openssl s_client -servername "$URL_HOST" \
                     -connect "${URL_HOST}:443" </dev/null 2>/dev/null \
                     | openssl x509 -noout -text 2>/dev/null \

@@ -507,7 +507,7 @@ if has_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
 elif has_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
     ok "firewalld: ACTIVE"; fw_active=1
 elif has_cmd iptables; then
-    rules=$(iptables -S 2>/dev/null | grep -cE '^-A' || echo 0)
+    rules=$(iptables -S 2>/dev/null | grep -cE '^-A' || true)
     if (( rules > 0 )); then
         ok "iptables: $rules rule(s) loaded"; fw_active=1
     fi

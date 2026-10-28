@@ -247,7 +247,7 @@ JSON_FIELDS+=("\"total_devices\":$TOTAL_DEVICES")
 FILTERED_DEVICES="$ALL_DEVICES"
 if [[ -n "$FILTER_BUS" ]]; then
   FILTERED_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | grep -E "^Bus ${FILTER_BUS}[ .]" || true)
-  info "Filter: bus=${C_CYAN}${FILTER_BUS}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | grep -c '^Bus' || echo 0) match(es)"
+  info "Filter: bus=${C_CYAN}${FILTER_BUS}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | grep -c '^Bus' || true) match(es)"
 fi
 if [[ -n "$FILTER_VENDOR" ]]; then
   if [[ -n "$FILTER_BUS" ]]; then
@@ -255,7 +255,7 @@ if [[ -n "$FILTER_VENDOR" ]]; then
   else
     FILTERED_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | grep -iE "ID ${FILTER_VENDOR}:" || true)
   fi
-  info "Filter: vendor=${C_CYAN}${FILTER_VENDOR}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | grep -c '^Bus' || echo 0) match(es)"
+  info "Filter: vendor=${C_CYAN}${FILTER_VENDOR}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | grep -c '^Bus' || true) match(es)"
 fi
 
 # For speed: lsusb -v gives bInterfaceClass on devices but speed on the tree. Combine.

@@ -505,10 +505,10 @@ fi
 # ─── SECTION 8: Package manager cruft ──────────────────────────────────────
 section "PACKAGE MANAGER — UNUSED PACKAGES WEIGHING YOU DOWN"
 if has_cmd apt; then
-    auto_count=$(apt list --installed 2>/dev/null | grep -c '^.*' || echo 0)
+    auto_count=$(apt list --installed 2>/dev/null | grep -c '^.*' || true)
     # Try the autoremove hint
     if command -v apt-get >/dev/null && [[ -n "$SUDO" ]]; then
-        autoremove_count=$($SUDO apt-get -s autoremove 2>/dev/null | awk '/^The following packages will be REMOVED/{flag=1; next} /^$/ && flag {exit} flag' | wc -l | head -1 || echo 0)
+        autoremove_count=$($SUDO apt-get -s autoremove 2>/dev/null | awk '/^The following packages will be REMOVED/{flag=1; next} /^$/ && flag {exit} flag' | wc -l | head -1 || true)
         autoremove_count=${autoremove_count:-0}; [[ "$autoremove_count" =~ ^[0-9]+$ ]] || autoremove_count=0
         info "${C_BOLD}${autoremove_count}${C_RESET} packages can be auto-removed"
         if (( autoremove_count > 30 )); then

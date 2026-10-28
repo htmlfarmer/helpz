@@ -803,7 +803,7 @@ section "SERVICES & LOGS"
 if command -v systemctl >/dev/null 2>&1; then
   subsec "Failed systemd units"
   FAILED_TOTAL=$(systemctl --failed --no-pager --no-legend 2>/dev/null | wc -l)
-  PRINTER_FAILS=$(systemctl --failed --no-pager --no-legend 2>/dev/null | grep -cE "$PRINTER_UNIT_RE" 2>/dev/null || echo 0)
+  PRINTER_FAILS=$(systemctl --failed --no-pager --no-legend 2>/dev/null | grep -cE "$PRINTER_UNIT_RE" 2>/dev/null || true)
   REAL_FAILS=$(( FAILED_TOTAL - PRINTER_FAILS ))
   if (( FAILED_TOTAL > 0 )); then
     if (( REAL_FAILS > 0 )); then

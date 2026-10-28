@@ -169,7 +169,7 @@ fi
 section "NVIDIA DETAIL"
 
 if [[ $HAVE_NVIDIA -eq 1 ]]; then
-  NVIDIA_COUNT=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 0)
+  NVIDIA_COUNT=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
   if [[ "$NVIDIA_COUNT" -gt 0 ]]; then
     info "Found ${C_BOLD}${NVIDIA_COUNT}${C_RESET} NVIDIA GPU(s)"
 
@@ -287,7 +287,7 @@ if [[ $HAVE_NVIDIA -eq 1 ]] && [[ "$NVIDIA_COUNT" -gt 0 ]]; then
     done <<< "$PMON_OUT"
 
     # Warn if too many processes
-    PROC_COUNT=$(printf '%s\n' "$PMON_OUT" | tail -n +2 | grep -c . || echo 0)
+    PROC_COUNT=$(printf '%s\n' "$PMON_OUT" | tail -n +2 | grep -c . || true)
     if (( PROC_COUNT > 8 )); then
       warn "${PROC_COUNT} processes on GPU — high contention"
     fi

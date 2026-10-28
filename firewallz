@@ -243,7 +243,7 @@ fi
 # firewalld
 if has_cmd firewall-cmd; then
     if systemctl is-active --quiet firewalld 2>/dev/null; then
-        ok "firewalld: ACTIVE — $(firewall-cmd --list-all 2>/dev/null | grep -c '^  ' || echo 0) zone rules"
+        ok "firewalld: ACTIVE — $(firewall-cmd --list-all 2>/dev/null | grep -c '^  ' || true) zone rules"
     else
         warn "firewalld: installed but INACTIVE"
     fi
@@ -271,7 +271,7 @@ if has_cmd nft; then
 fi
 # iptables
 if has_cmd iptables; then
-    ipt_rule_count=$(iptables -S 2>/dev/null | grep -cE '^-A ' || echo 0)
+    ipt_rule_count=$(iptables -S 2>/dev/null | grep -cE '^-A ' || true)
     if [[ "$ipt_rule_count" -gt 0 ]]; then
         ok "iptables: ${C_BOLD}${ipt_rule_count}${C_RESET} rules loaded (IPv4)"
     else

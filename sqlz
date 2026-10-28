@@ -326,10 +326,10 @@ else
     # Get line count
     LINES=$(reader | wc -l 2>/dev/null || echo 0)
     # Count severity levels
-    ERRORS=$(reader 2>/dev/null | grep -ciE 'ERROR:' || echo 0)
-    WARNS=$(reader 2>/dev/null | grep -ciE 'WARNING:' || echo 0)
-    FATALS=$(reader 2>/dev/null | grep -ciE 'FATAL:' || echo 0)
-    PANICS=$(reader 2>/dev/null | grep -ciE 'PANIC:' || echo 0)
+    ERRORS=$(reader 2>/dev/null | grep -ciE 'ERROR:' || true)
+    WARNS=$(reader 2>/dev/null | grep -ciE 'WARNING:' || true)
+    FATALS=$(reader 2>/dev/null | grep -ciE 'FATAL:' || true)
+    PANICS=$(reader 2>/dev/null | grep -ciE 'PANIC:' || true)
 
     TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
     TOTAL_WARNINGS=$((TOTAL_WARNINGS + WARNS))
