@@ -15,7 +15,9 @@ What `publishz` does, in order:
 1. **Security gate** — runs `secretz --code` over the source suite; aborts if
    credential-shaped hits are found in *code* (use `--force` to override).
 2. **Copy** — every executable `*z` tool + `lib/*.sh` + `.helpz_log.sh`.
-   Personal tools (e.g. `spiritz`) and backup files are excluded.
+   Personal tools (e.g. `spiritz`) and backup files are excluded. Business-
+   specific tools (e.g. `xyzo*`) do ship, but their internal unit names,
+   worker env vars and database names are rewritten to generic examples.
 3. **Sanitize** — rewrites absolute suite paths to script-relative lookups,
    replaces personal identity defaults with env-var placeholders, swaps LAN
    IPs for `127.0.0.1`, and generates `ai.json.example`.
