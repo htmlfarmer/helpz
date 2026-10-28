@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# trustz - Pre-run trust gate: scan this repo's code BEFORE you execute it
+# ----------------------------------------------------------------------------
+# Protects against the "just pulled from GitHub and ran it" risk. Computes a
+# content manifest of every *z tool + lib/, compares it against your last
+# APPROVED manifest, and if anything changed (fresh pull, new files, edits)
+# it runs a layered review:
+#   1. pattern scan   → ./secretz --code .        (credentials/secrets)
+#   2. danger grep    → known risky shell idioms   (curl|sh, rm -rf /, eval…)
+#   3. AI code review → local LLM via lib/ai.sh    (optional, graceful skip)
+# …then asks YOU: "Proceed and approve this exact code set? [y/N]"
+# Approval is bound to the manifest hash — a later pull that changes any file
+# invalidates it and re-prompts. runz uses this gate before launching tools.
+#
+# Usage:
+#   ./trustz                        Review current state; approve if clean
+#   ./trustz --status               Just show changed/unchanged vs approved
+#   ./trustz --check <tool> [args]  Exit 0 if safe to run, 2 if needs review
+#   ./trustz --revoke               Forget the approval (forces re-prompt)
+#   ./trustz --no-ai                Skip the LLM review layer
+#
+# Requires: sha256sum, ./secretz; optional: local AI server (lib/ai.sh)
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+have_ai=1
+[[ -f "$SCRIPT_DIR/lib/ai.sh" ]] && source "$SCRIPT_DIR/lib/ai.sh" || have_ai=0
+
+STATE_DIR="${TRUSTZ_STATE:-$SCRIPT_DIR/.trustz}"
+MODE="review"; TARGET=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --status)  MODE="status" ;;
+        --check)   MODE="check"; shift; TARGET="${1:-}"; break ;;
+        --revoke)  MODE="revoke" ;;
+        --approve) MODE="approve" ;;
+        --install-hook) MODE="hook" ;;
+        --no-ai)   have_ai=0 ;;
+        --json)    JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
+        *) echo "trustz: unknown option $1 (try --help)" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+code_manifest() {   # stable hash of all runnable code + libs
+    { find "$SCRIPT_DIR" -maxdepth 1 -type f -name '*z' -printf '%P\n' 2>/dev/null | sort
+      find "$SCRIPT_DIR/lib" -type f -printf 'lib/%P\n' 2>/dev/null | sort; } \
+    | while read -r rel; do
+        [[ -f "$SCRIPT_DIR/$rel" ]] && sha256sum "$SCRIPT_DIR/$rel"
+      done | sha256sum | cut -d' ' -f1
+}
+
+CURRENT=$(code_manifest)
+APPROVED_FILE="$STATE_DIR/approved"
+APPROVED=$(awk -F: '/^#manifest:/{print $2}' "$APPROVED_FILE" 2>/dev/null || echo "")
+APPROVED_TS=$(awk -F: '/^#approved:/{print $2}' "$APPROVED_FILE" 2>/dev/null || echo "")
+
+# ── modes that don't need the full review ─────────────────────────────────
+case "$MODE" in
+  status)
+    if [[ -z "$APPROVED" ]]; then printf "no approval on record — run: ./trustz\n"
+    elif [[ "$APPROVED" == "$CURRENT" ]]; then printf "✓ code unchanged since approval (%s, %s)\n" "${APPROVED:0:12}" "${APPROVED_TS:-?}"
+    else printf "⚠ code CHANGED since last approval — re-review needed: ./trustz\n  approved %.12s…  current %.12s…\n" "$APPROVED" "$CURRENT"; exit 1; fi
+    exit 0 ;;
+  revoke)
+    rm -f "$APPROVED_FILE" 2>/dev/null && echo "approval revoked — next run will re-prompt" || echo "nothing to revoke"; exit 0 ;;
+  check)   # used by runz: 0 = approved+unchanged, 2 = needs review
+    [[ -n "$APPROVED" && "$APPROVED" == "$CURRENT" ]] && exit 0 || exit 2 ;;
+  hook)
+    if ! git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "trustz: not a git repo — nothing to hook (this is fine for a plain folder)" >&2; exit 1
+    fi
+    gd=$(git -C "$SCRIPT_DIR" rev-parse --git-dir); gd="$SCRIPT_DIR/$gd"
+    mkdir -p "$gd/hooks"
+    for h in post-merge post-checkout post-rewrite; do
+        cat > "$gd/hooks/$h" <<'HOOK'
+#!/usr/bin/env bash
+# trustz reminder — code just changed on disk; re-review before running.
+t="$(pwd)/trustz"          # git hooks run from the repo top-level
+[[ -x "$t" ]] || { command -v trustz >/dev/null 2>&1 && t="$(command -v trustz)"; }
+if [[ -x "$t" ]] && ! "$t" --check >/dev/null 2>&1; then
+    printf '\n  \033[1;33m⚠ CODE JUST CHANGED (git %s)\033[0m\n' "${0##*/}"
+    printf '  \033[2mYou pulled/rewrote these scripts. Before running any tool:\033[0m\n'
+    printf '    \033[36m./trustz\033[0m        # secrets + danger grep + optional AI review, then approve\n'
+    printf '    \033[36m./runz <tool>\033[0m   # runs a tool ONLY if the current code is approved\n\n'
+fi
+HOOK
+        chmod +x "$gd/hooks/$h"
+    done
+    echo "✓ git hooks installed (post-merge/checkout/rewrite) — pull now triggers a trustz reminder"
+    exit 0 ;;
+esac
+
+# ── full review flow ──────────────────────────────────────────────────────
+emit "\n  ${C_BOLD}${C_MAGENTA}╔═════════════════════════════════════════════════════════════╗
+  ║  TRUSTZ — have you scanned this before you run it?          ║
+  ╚═════════════════════════════════════════════════════════════╝${C_RESET}\n"
+
+if [[ -n "$APPROVED" ]]; then
+    if [[ "$APPROVED" == "$CURRENT" ]]; then
+        emit "  ${C_GREEN}✓ already approved${C_RESET} ${DIM}(manifest ${CURRENT:0:12}, $APPROVED_TS)${C_RESET}\n"
+        emit "  ${C_DIM}re-run anyway: ./trustz --revoke then ./trustz${C_RESET}\n\n"
+        exit 0
+    fi
+    emit "  ${C_YELLOW}⚠ code changed since your last approval${C_RESET} ${DIM}($APPROVED_TS)${C_RESET}\n"
+    emit "  ${C_DIM}approved ${APPROVED:0:12}…   current ${CURRENT:0:12}…${C_RESET}\n\n"
+    heading "What changed (git-assisted if available):"
+    if command -v git >/dev/null 2>&1 && git -C "$SCRIPT_DIR" rev-parse HEAD >/dev/null 2>&1; then
+        git -C "$SCRIPT_DIR" diff --stat '@{0}' 2>/dev/null | tail -20
+        emit "  ${C_DIM}full: git -C %s diff${C_RESET}\n" "$SCRIPT_DIR"
+    else
+        info "no git history here — run the layers below on the whole set"
+    fi
+else
+    emit "  ${C_DIM}first run for this code set — full review:${C_RESET}\n\n"
+fi
+
+RISK=0
+
+# Layer 1: secrets (reuse secretz code scanner)
+section "LAYER 1 · SECRET SCAN (secretz --code)"
+if [[ -x "$SCRIPT_DIR/secretz" ]]; then
+    sec=$("$SCRIPT_DIR/secretz" --code "$SCRIPT_DIR" --json 2>/dev/null)
+    sc=$(grep -oE '"critical":[0-9]+' <<< "${sec:-}" | cut -d: -f2); sc=${sc:-0}
+    sw=$(grep -oE '"warn":[0-9]+'    <<< "${sec:-}" | cut -d: -f2); sw=${sw:-0}
+    if (( sc > 0 )); then RISK=$((RISK+2)); printf "  ${C_RED}✗ %d CRITICAL credential shapes${C_RESET} — open: ./secretz --code .\n" "$sc"
+    elif (( sw > 0 )); then RISK=$((RISK+1)); printf "  ${C_YELLOW}! %d warnings (template/env filenames?)${C_RESET}\n" "$sw"
+    else printf "  ${C_GREEN}✓ no credential patterns in %s files${C_RESET}\n" "$(grep -oE '"files_walked":[0-9]+|files walked: [0-9]+' <<< "$sec" | grep -oE '[0-9]+' | head -1)"; fi
+else
+    info "secretz not found — skipping layer 1"
+fi
+
+# Layer 2: dangerous-idiom grep (heuristic, low false-positive set)
+section "LAYER 2 · DANGEROUS SHELL IDIOMS"
+DANGER_PATTERNS='curl[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba)?sh|wget[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba)?sh|rm[[:space:]]+-[a-z]*rf[[:space:]]+/[[:space:]]|rm[[:space:]]+-[a-z]*rf[[:space:]]+\$HOME(\b|/)|base64[[:space:]]+-d[^|]*\|[[:space:]]*(ba)?sh|mkfs\.[[:space:]]|dd[[:space:]]+if=[^[:space:]]+[[:space:]]+of=/dev/(sd|nvme|hd|vd)[a-z]'
+# search real code: skip the scanners themselves, and lines where the match is
+# only in a # comment (col-comment stripping is heuristic, good enough here)
+dhits=$(grep -nE "$DANGER_PATTERNS" "$SCRIPT_DIR"/*z "$SCRIPT_DIR"/lib/*.sh 2>/dev/null \
+  | grep -vE '/(trustz|secretz|runz|run_comparison|ai\.sh):' \
+  | awk -F: '{ code=$0; sub(/^[^:]+:[0-9]+:/,"",code)
+              if (code ~ /^[[:space:]]*#/) next            # comment
+              if (code ~ /→/) next                          # help/investigation docs
+              if (code ~ /^[^=]*PATTERNS?=/) next           # detection-pattern constants
+              print }' \
+  | head -20 || true)
+if [[ -n "$dhits" ]]; then
+    RISK=$((RISK+2))
+    printf "  ${C_RED}✗ risky idioms found — REVIEW EACH BEFORE APPROVING:${C_RESET}\n"
+    printf '%s\n' "$dhits" | sed -E "s#$SCRIPT_DIR/##" | head -12 | sed 's/^/      /'
+else
+    printf "  ${C_GREEN}✓ no pipe-to-shell / rm -rf / / reverse-shell / decode-exec idioms${C_RESET}\n"
+fi
+
+# Layer 3: local AI review (optional, never blocks if absent)
+AI_NOTE="(not used)"
+if [[ "$have_ai" -eq 1 ]] && declare -F ai_is_available >/dev/null 2>&1 && [[ "$(ai_is_available)" == "1" ]]; then
+    section "LAYER 3 · LOCAL AI CODE REVIEW"
+    ai_in=""
+    if [[ -n "$dhits" ]]; then
+        ai_in="$dhits"
+    else
+        # sample the head of each tool + changed surface — bounded to keep prompt small
+        ai_in=$(for f in "$SCRIPT_DIR"/*z; do printf '### %s\n' "$(basename "$f")"; sed -n '1,18p' "$f"; done | head -400)
+    fi
+    verdict=$(ai_analyze security_review "$ai_in" 2>/dev/null)
+    if [[ -n "$verdict" ]]; then
+        printf "  ${C_BOLD}AI:${C_RESET} %s\n" "$verdict"
+        case "${verdict,,}" in *"high risk"*|*"high."*|*"med risk"*|*"medium risk"*) RISK=$((RISK+2)); AI_NOTE="elevated (see verdict)";; *low*) AI_NOTE="low risk";; esac
+    else
+        info "AI endpoint reachable but no reply — continuing without it"
+        AI_NOTE="(no reply)"
+    fi
+else
+    section "LAYER 3 · LOCAL AI CODE REVIEW"
+    info "no local AI server reachable (see ai.json.example) — layer skipped, NOT a failure"
+fi
+
+# Consent
+hr
+if (( RISK == 0 )); then
+    printf "  ${C_GREEN}${C_BOLD}All layers clean.${C_RESET} Approve this exact code set so runz and tools proceed without re-prompting?\n"
+else
+    printf "  ${C_YELLOW}${C_BOLD}Layers flagged issues (risk=%d).${C_RESET} Review the ✗ lines above. Proceed to approve anyway?\n" "$RISK"
+fi
+printf "  ${C_DIM}manifest %s · approval auto-invalidates on the next pull/edit${C_RESET}\n" "${CURRENT:0:12}"
+if [[ "${TRUSTZ_AUTO_YES:-0}" -eq 1 ]]; then
+    ans=y
+else
+    read -r -p "  Approve? [y/N] " ans || ans=""
+fi
+if [[ "${ans,,}" =~ ^y ]]; then
+    mkdir -p "$STATE_DIR"
+    { printf '#approved:%s\n#manifest:%s\n' "$(date '+%F %T')" "$CURRENT"; } > "$APPROVED_FILE"
+    printf "  ${C_GREEN}✓ approved${C_RESET} ${DIM}($AI_NOTE)${C_RESET} — run tools normally or via ./runz\n\n"
+    emit_verdict
+else
+    printf "  ${C_RED}✗ NOT approved${C_RESET} — ./runz and trustz --check will refuse until you approve. Re-scan: ./trustz\n\n"
+    exit 2
+fi

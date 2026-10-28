@@ -1,0 +1,851 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# browserz — Installed Web Browser & Privacy Audit
+# ----------------------------------------------------------------------------
+# Studies every web browser on the system:
+#   - Installed binaries (firefox, chromium, chrome, brave, edge, opera,
+#     vivaldi, librewolf, waterfox, tor, etc.)
+#   - Versions and channels
+#   - Profile / cache disk usage
+#   - DoH (DNS-over-HTTPS) configuration
+#   - Telemetry flags
+#   - GPU acceleration posture (from prefs files)
+#   - Active sessions (process count)
+#   - Container integration (snap, flatpak)
+#
+# Visual:
+#   - Bar chart of disk usage per browser
+#   - Privacy posture gauge (green = strong, red = lots of telemetry on)
+#   - Process per-browser sparkline (you'll love this)
+#   - Donut of installed browser family types
+#   - Geographic enrichment of any remote endpoints found in profiles
+#
+# Usage:
+#   ./browserz                  Full audit
+#   ./browserz --top N          Top N browsers by disk/CPU
+#   ./browserz --json           Machine-readable
+#   ./browserz --no-color       Plain output
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+JSON_OUT=0
+NO_COLOR_FLAG=0
+TOP_N=10
+BENCH=0
+BENCH_RUNS=3
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              SHOW_HELP=1 ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
+        --bench)                BENCH=1 ;;
+        --bench-runs)           i=$((i+1)); BENCH_RUNS="${ARGS[$i]:-3}" ;;
+        --bench-runs=*)         BENCH_RUNS="${arg#--bench-runs=}" ;;
+        --ai)                   AI_VERDICT=1 ;;
+        --no-ai)                AI_VERDICT=0 ;;
+        *) echo "Unknown flag: $arg" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "browserz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+if [[ "${SHOW_HELP:-0}" -eq 1 ]]; then
+    cat << 'EOF'
+browserz — Installed Browser Audit
+
+USAGE
+  ./browserz                  Full audit + visuals
+  ./browserz --top N          Top N browsers (default 10)
+  ./browserz --json           Machine-readable
+  ./browserz --no-color       Plain output
+
+SECTIONS
+  1. Realm snapshot              System + display info
+  2. Installed browsers          Versions, channels, paths
+  3. Disk usage                  Per-browser and per-profile
+  4. Active sessions             Live process counts
+  5. DoH / DNS over HTTPS        Privacy posture
+  6. Telemetry flags             What each browser reports home
+  7. Container provenance        Snap / Flatpak / native
+  8. Privacy scorecard           Per-browser verdict
+  9. Donut chart                 Family types
+EOF
+    exit 0
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  BROWSER.SH  — Installed Browser & Privacy Audit             ║
+   ║  Versions · Profiles · DoH · Telemetry · Family Trees        ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+fi
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+# Each detected browser is stored as: family|name|bin|version|path|profileroot
+declare -a BROWSERS=()
+
+bar() {
+    local pct=$1 width=${2:-20}
+    [[ "$pct" < "0" ]] && pct=0
+    [[ "$pct" > "100" ]] && pct=100
+    local filled=$(( pct * width / 100 ))
+    [[ $filled -eq 0 && $pct -gt 0 ]] && filled=1
+    local empty=$(( width - filled ))
+    local color="$C_GREEN"
+    [[ $pct -ge 60 ]] && color="$C_YELLOW"
+    [[ $pct -ge 85 ]] && color="$C_RED"
+    printf '%s' "$color"
+    printf '█%.0s' $(seq 1 "$filled") 2>/dev/null || true
+    printf '%s' "$C_DIM"
+    printf '░%.0s' $(seq 1 "$empty") 2>/dev/null || true
+    printf '%s' "$C_RESET"
+}
+
+truncate() {
+    local s="$1" max="$2"
+    if (( ${#s} > max )); then
+        printf "%s…" "${s:0:$max-1}"
+    else
+        printf "%s" "$s"
+    fi
+}
+
+# Detection: probe each candidate browser binary.
+# Each candidate returns: "family|name|bin|ver|path"
+detect_browser() {
+    local bin="$1" family="$2" name="$3" nice="$4" check_cmd="$5"
+    if ! has_cmd "$check_cmd"; then return 0; fi
+    local ver=""
+    case "$family" in
+        firefox)
+            ver=$("$check_cmd" --version 2>/dev/null | head -1 | awk '{print $NF}' || echo "?")
+            ;;
+        chrome|chromium)
+            # chromium  + chromium-browser  + google-chrome-stable
+            ver=$("$check_cmd" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+            ;;
+        *)
+            ver=$("$check_cmd" --version 2>/dev/null | head -1 | awk '{print $NF}' || echo "?")
+            ;;
+    esac
+    local bin_path
+    bin_path=$(command -v "$check_cmd" 2>/dev/null || echo "")
+    [[ -z "$bin_path" ]] && return 0
+    echo "$family|$name|$check_cmd|$ver|$bin_path"
+}
+
+# Add a browser record to BROWSERS array
+add_browser() {
+    local family="$1" name="$2" bin="$3" ver="$4" path="$5"
+    BROWSERS+=("$family|$name|$bin|$ver|$path")
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 1: REALM SNAPSHOT
+# ───────────────────────────────────────────────────────────────────────────
+section "1. REALM SNAPSHOT"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Host:" "$HOSTNAME_SHORT"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "OS:" "$(uname -srm)"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Window manager:" "$(echo "$XDG_CURRENT_DESKTOP${DESKTOP_SESSION:-}")"
+if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Distro:" "$PRETTY_NAME"
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 2: INSTALLED BROWSERS (heavy detection)
+# ───────────────────────────────────────────────────────────────────────────
+section "2. INSTALLED BROWSERS — VERSIONS & PATHS"
+
+# Firefox-family (Mozilla + forks)
+for b in firefox firefox-esr firefox-bin; do
+    if has_cmd "$b"; then
+        v=$("$b" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+        add_browser firefox "Mozilla Firefox" "$b" "$v" "$(command -v $b)"
+    fi
+done
+for b in librewolf waterfox waterfox-g firefox-trunk tor-browser; do
+    if has_cmd "$b"; then
+        v=$("$b" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+        add_browser firefox "Mozilla fork ($b)" "$b" "$v" "$(command -v $b)"
+    fi
+done
+
+# Also check /opt for portable browsers (brave, tor, vivaldi, etc.)
+for d in /opt/*; do
+    [[ -d "$d" ]] || continue
+    base=$(basename "$d")
+    case "$base" in
+        *google*chrome*)        add_browser chrome "Google Chrome" "chrome" "?" "$d/google-chrome/google-chrome" ;;
+        *Brave*)                add_browser chrome "Brave Browser" "brave" "?" "$d/brave/brave" ;;
+        *vivaldi*)              add_browser chrome "Vivaldi" "vivaldi" "?" "$d/vivaldi/vivaldi" ;;
+        *opera*)                add_browser chrome "Opera" "opera" "?" "$d/opera/opera" ;;
+        *Microsoft*Edge*|*edge*) add_browser chrome "Microsoft Edge" "edge" "?" "$d/microsoft/microsoft-edge/microsoft-edge" ;;
+        *)
+            # Look for a launchable binary
+            b=$(find "$d" -maxdepth 2 -type f -executable 2>/dev/null | head -1 || true)
+            if [[ -n "$b" && "$b" == *"firefox"* ]]; then
+                v=$("$b" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+                add_browser firefox "Firefox portable" "$b" "$v" "$b"
+            fi
+            ;;
+    esac
+done
+
+# Chromium-family (Debian/Ubuntu + arch + flatpak)
+for b in chromium chromium-browser google-chrome google-chrome-stable brave brave-browser vivaldi opera microsoft-edge edge; do
+    if has_cmd "$b"; then
+        v=$("$b" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+        # Family name refinement
+        family="chromium"
+        case "$b" in
+            google-chrome*|chrome*|google*) family=chrome ;;
+            brave*|vivaldi*|opera*|edge*|microsoft*) family=chrome ;;
+        esac
+        add_browser "$family" "$b" "$b" "$v" "$(command -v $b)"
+    fi
+done
+
+# Snap and Flatpak
+for cmd in snap flatpak; do
+    if has_cmd "$cmd"; then
+        case "$cmd" in
+            snap)
+                set +e +o pipefail
+                snap list 2>/dev/null | awk '/chromium|firefox|brave|edge|vivaldi|opera/{print $1, $2, $3}' \
+                | while IFS= read -r line; do
+                    name=$(awk '{print $1}' <<< "$line")
+                    ver=$(awk '{print $2}' <<< "$line")
+                    rev=$(awk '{print $3}' <<< "$line")
+                    chan=$(awk '{$1=""; $2=""; $3=""; print}' <<< "$line" | xargs)
+                    echo "snap|$name|$name|$ver|/snap/$name/$rev"
+                done
+                set -e -o pipefail
+                ;;
+            flatpak)
+                set +e +o pipefail
+                flatpak list --columns=name,version,origin 2>/dev/null | awk '/chromium|firefox|brave|edge/{print $1, $2, $3}' \
+                | while IFS= read -r line; do
+                    name=$(awk '{print $1}' <<< "$line")
+                    ver=$(awk '{print $2}' <<< "$line")
+                    echo "flatpak|$name|$name|$ver|/var/lib/flatpak/..."
+                done
+                set -e -o pipefail
+                ;;
+        esac
+    fi
+done
+
+# Render
+if [[ ${#BROWSERS[@]} -eq 0 ]]; then
+    warn "No browser detected (check /opt, /usr/bin, snap, flatpak)"
+    info "Tip: install one with 'sudo apt install firefox' or 'sudo apt install chromium'"
+else
+    printf "  ${C_DIM}%-25s %-22s %-15s %s${C_RESET}\n" "BROWSER" "VERSION" "CHANNEL" "BINARY PATH"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────────────"
+    for entry in "${BROWSERS[@]}"; do
+        IFS='|' read -r family name bin ver path <<< "$entry"
+        # Channel placeholder (we don't have reliable channel info unless in snap)
+        chan="stable"
+        printf "  ${C_BOLD}%-25s${C_RESET} ${C_CYAN}%-22s${C_RESET} ${C_DIM}%-15s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+            "$(truncate "$name" 25)" "$(truncate "$ver" 22)" "$chan" "$(truncate "$path" 60)"
+    done
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 3: DISK USAGE BY BROWSER
+# ───────────────────────────────────────────────────────────────────────────
+section "3. DISK USAGE — HOW MUCH SPACE ARE BROWSERS EATING?"
+
+# Map family → profile root locations
+declare -A PROFILE_ROOTS
+PROFILE_ROOTS[firefox]="${HOME}/.mozilla ${HOME}/.cache/mozilla ${HOME}/.librewolf ${HOME}/.waterfox ${HOME}/.torbrowser"
+PROFILE_ROOTS[chrome]="${HOME}/.config/google-chrome ${HOME}/.cache/google-chrome ${HOME}/.config/BraveSoftware ${HOME}/.cache/BraveSoftware ${HOME}/.config/vivaldi ${HOME}/.cache/vivaldi ${HOME}/.config/opera ${HOME}/.config/microsoft-edge ${HOME}/.config/chromium ${HOME}/.cache/chromium"
+
+# For each detected browser compute its total disk usage
+declare -a USAGE_KB=()
+declare -a USAGE_NAMES=()
+declare -a USAGE_FAMILY=()
+
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family name bin ver path <<< "$entry"
+    # Gather all profile directories
+    roots="${PROFILE_ROOTS[$family]:-}"
+    if [[ -n "$roots" ]]; then
+        total=0
+        for r in $roots; do
+            [[ -d "$r" ]] || continue
+            # du in KiB; -s = summary; -x = stay on filesystem
+            sz=$(du -sk "$r" 2>/dev/null | awk '{print $1}')
+            [[ -z "$sz" ]] && sz=0
+            total=$(( total + sz ))
+        done
+        USAGE_KB+=("$total")
+        USAGE_NAMES+=("$name")
+        USAGE_FAMILY+=("$family")
+    fi
+done
+
+if [[ ${#USAGE_KB[@]} -eq 0 ]]; then
+    info "No profile directories found (clean machine?)"
+else
+    # Find max usage for scaling
+    max_usage=0
+    for u in "${USAGE_KB[@]}"; do
+        [[ $u -gt $max_usage ]] && max_usage=$u
+    done
+
+    subsec "Per-browser storage totals"
+    printf "  ${C_DIM}%-25s %-10s %s${C_RESET}\n" "BROWSER" "SIZE" "BAR"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    for i in "${!USAGE_KB[@]}"; do
+        kb=${USAGE_KB[$i]}
+        # humanize
+        if (( kb > 1048576 )); then
+            size=$(awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}')
+        elif (( kb > 1024 )); then
+            size=$(awk -v k="$kb" 'BEGIN{printf "%.0fM", k/1024}')
+        else
+            size="${kb}K"
+        fi
+        # bar scaled to max
+        bar_pct=0
+        if [[ $max_usage -gt 0 ]]; then
+            bar_pct=$(( kb * 100 / max_usage ))
+        fi
+        printf "  ${C_BOLD}%-25s${C_RESET} ${C_DIM}%-10s${C_RESET} " "${USAGE_NAMES[$i]}" "$size"
+        bar "$bar_pct" 50
+        printf "\n"
+    done
+
+    total_kb=0
+    for u in "${USAGE_KB[@]}"; do total_kb=$(( total_kb + u )); done
+    info "${C_BOLD}Combined browser storage:${C_RESET} $(awk -v k="$total_kb" 'BEGIN { if (k>1048576) printf "%.1fG", k/1048576; else printf "%.0fM", k/1024 }') on disk"
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 4: ACTIVE PROCESSES
+# ───────────────────────────────────────────────────────────────────────────
+section "4. ACTIVE SESSIONS — BROWSER PROCESS COUNTS"
+if has_cmd ps && has_cmd pgrep; then
+    declare -A PROC_COUNT
+    for entry in "${BROWSERS[@]}"; do
+        IFS='|' read -r family name bin ver path <<< "$entry"
+        # Match either the literal command name or "name" in process list
+        # Use the binary base name
+        bname=$(basename "$bin" 2>/dev/null)
+        [[ -z "$bname" ]] && bname="$name"
+        # Strip .Browser, .Extension suffixes
+        bname=${bname%-*}
+        count=$(pgrep -c -f "$bname" 2>/dev/null || echo 0)
+        count=${count:-0}; [[ "$count" =~ ^[0-9]+$ ]] || count=0
+        PROC_COUNT[$name]="$count"
+    done
+
+    printf "  ${C_DIM}%-25s %-12s %s${C_RESET}\n" "BROWSER" "PROCESSES" "BAR"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    max_proc=0
+    for k in "${!PROC_COUNT[@]}"; do
+        [[ ${PROC_COUNT[$k]} -gt $max_proc ]] && max_proc=${PROC_COUNT[$k]}
+    done
+    for entry in "${BROWSERS[@]}"; do
+        IFS='|' read -r family name bin ver path <<< "$entry"
+        c=${PROC_COUNT[$name]:-0}
+        pct=0
+        if [[ $max_proc -gt 0 ]]; then
+            pct=$(( c * 100 / max_proc ))
+        fi
+        color=$C_GREEN
+        [[ $c -gt 3 ]] && color=$C_YELLOW
+        [[ $c -gt 8 ]] && color=$C_RED
+        printf "  ${C_BOLD}%-25s${C_RESET} ${color}%-12s${C_RESET} " "$name" "$c"
+        bar "$pct" 50
+        printf "\n"
+    done
+
+    # Total running across all browsers
+    total_proc=0
+    for k in "${!PROC_COUNT[@]}"; do total_proc=$(( total_proc + PROC_COUNT[$k] )); done
+    if (( total_proc > 50 )); then
+        warn "$total_proc browser processes running — high RAM/CPU consumption"
+        critf "browser_process_count" "$total_proc browser processes" \
+            "Trim background tabs. Disable 'Continue running background apps when closed' in browser settings. Identify leaks via 'ps -e --sort=-pcpu | head'"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 5: DoH / DNS OVER HTTPS
+# ───────────────────────────────────────────────────────────────────────────
+section "5. DoH / DNS OVER HTTPS — ARE QUERIES ENCRYPTED?"
+
+# Check system DoH config (systemd-resolved, NetworkManager)
+doh_enabled=0
+if has_cmd resolvectl; then
+    doh_status=$(resolvectl status 2>/dev/null | grep -iE "DNSOverTLS|DoH" | head -1 || true)
+    if [[ -n "$doh_status" ]]; then
+        info "systemd-resolved: $doh_status"
+        if grep -q "yes" <<< "$doh_status"; then doh_enabled=1; fi
+    fi
+fi
+
+# Per-browser prefs
+declare -A DOH_STATE
+for d in "${HOME}/.mozilla" "${HOME}/.librewolf" "${HOME}/.waterfox" \
+         "${HOME}/.config/google-chrome" "${HOME}/.config/BraveSoftware" \
+         "${HOME}/.config/vivaldi" "${HOME}/.config/microsoft-edge" \
+         "${HOME}/.config/chromium"; do
+    [[ -d "$d" ]] || continue
+    # Firefox-style prefs: search user.js / prefs.js for network.trr
+    found_trr=""
+    while IFS= read -r pf; do
+        [[ -f "$pf" ]] || continue
+        l=$(grep -hE "network.trr|security.trr|doh.network" "$pf" 2>/dev/null || true)
+        if [[ -n "$l" ]]; then found_trr="$found_trr$l\n"; fi
+    done < <(find "$d" -maxdepth 3 -name 'user.js' -o -name 'prefs.js' 2>/dev/null || true)
+
+    # Chromium-style: secure_dns etc. — scope to Preferences files only (avoid scanning GB of cache)
+    secure_dns=$(grep -rh --include='Preferences' --include='Secure Preferences' "secure_dns" "$d" 2>/dev/null | grep -v '^#' | head -1 || true)
+
+    browser_short=$(basename "$d")
+    if [[ -n "$found_trr" || -n "$secure_dns" ]]; then
+        DOH_STATE[$browser_short]="configured"
+    else
+        DOH_STATE[$browser_short]="default (browser decides)"
+    fi
+done
+
+if [[ ${#DOH_STATE[@]} -gt 0 ]]; then
+    printf "  ${C_DIM}%-30s %s${C_RESET}\n" "BROWSER ROOT" "DoH"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    for k in "${!DOH_STATE[@]}"; do
+        state="${DOH_STATE[$k]}"
+        color=$C_YELLOW
+        [[ "$state" == "configured" ]] && color=$C_GREEN
+        printf "  ${C_BOLD}%-30s${C_RESET} ${color}%s${C_RESET}\n" "$k" "$state"
+    done
+else
+    info "No profile prefs files found (new browser installs?)"
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 6: TELEMETRY FLAGS
+# ───────────────────────────────────────────────────────────────────────────
+section "6. TELEMETRY FLAGS — WHAT IS BEING REPORTED?"
+
+# Known telemetry flags per browser family
+declare -A TELEMETRY_FLAGS=(
+    ["Mozilla Firefox"]="datareporting.healthreport.uploadEnabled|datareporting.policy.dataSubmissionEnabled|telemetry.enabled|toolkit.telemetry.unified"
+    ["LibreWolf"]="no-telemetry-pref-needed"
+    ["Google Chrome"]="metrics.reporting.enable|enrollment.enrollment_region|usage_stats|reporting"
+    ["Brave"]="brave.telemetry|reporting.telemetry|enrollment"
+    ["Chromium"]="metrics.reporting.reportMenu"
+    ["Opera"]="installer.crashreporting.enable|preferences"
+    ["Vivaldi"]="telemetry.preferences.system_stats|enable_metrics_reporting"
+    ["Microsoft Edge"]="edge.telemetry|telemetry|data_collection"
+)
+
+# Walk every browser profile for these keys
+printf "  ${C_DIM}%-25s %-15s %s${C_RESET}\n" "BROWSER" "STATE" "FLAG"
+printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────"
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family name bin ver path <<< "$entry"
+    flags="${TELEMETRY_FLAGS[$name]:-}"
+    [[ -z "$flags" ]] && flags="${TELEMETRY_FLAGS[$family]:-}"
+    if [[ -z "$flags" || "$flags" == "no-telemetry-pref-needed" ]]; then
+        printf "  ${C_BOLD}%-25s${C_RESET} ${C_GREEN}%-15s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$name" "ok" "no telemetry flag"
+        continue
+    fi
+
+    # Check each flag in profile prefs
+    IFS='|' read -ra flaglist <<< "$flags"
+    found_off=0
+    found_on=0
+    found_unset=0
+    for d in "${HOME}/.mozilla" "${HOME}/.librewolf" "${HOME}/.config/google-chrome" \
+             "${HOME}/.config/BraveSoftware" "${HOME}/.config/vivaldi" \
+             "${HOME}/.config/microsoft-edge" "${HOME}/.config/chromium"; do
+        [[ -d "$d" ]] || continue
+        set +e +o pipefail
+        for pref in "${flaglist[@]}"; do
+            v=$(grep -rh --include='Preferences' --include='Secure Preferences' --include='prefs.js' --include='user.js' "\"$pref\"" "$d" 2>/dev/null | head -1 | grep -oE '(true|false|0|1|2)' | tail -1 || true)
+            if [[ "$v" == "true" || "$v" == "1" ]]; then
+                found_on=1
+            elif [[ "$v" == "false" || "$v" == "0" ]]; then
+                found_off=1
+            else
+                found_unset=1
+            fi
+        done
+        set -e -o pipefail
+    done
+    state="ok"
+    color=$C_GREEN
+    if [[ $found_on -gt 0 ]]; then
+        state="telemetry ON"
+        color=$C_RED
+        critf "telemetry_on" "$name reports telemetry" "Edit '$HOME/<profile>/user.js' to set 'pref(\"$pref\", false);' — or see script-fix below"
+    elif [[ $found_unset -gt 0 ]]; then
+        state="default"
+        color=$C_YELLOW
+    fi
+    printf "  ${C_BOLD}%-25s${C_RESET} ${color}%-15s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+        "$name" "$state" "${flaglist[0]}"
+done
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 7: CONTAINER PROVENANCE
+# ───────────────────────────────────────────────────────────────────────────
+section "7. CONTAINER PROVENANCE — HOW WAS THIS BROWSER INSTALLED?"
+declare -A SOURCE_COUNT
+SOURCE_COUNT[native]=0
+SOURCE_COUNT[snap]=0
+SOURCE_COUNT[flatpak]=0
+SOURCE_COUNT[portable_opt]=0
+
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family name bin ver path <<< "$entry"
+    if [[ "$path" == /snap/* ]]; then
+        SOURCE_COUNT[snap]=$((${SOURCE_COUNT[snap]:-0} + 1))
+    elif [[ "$path" == /var/lib/flatpak/* ]]; then
+        SOURCE_COUNT[flatpak]=$((${SOURCE_COUNT[flatpak]:-0} + 1))
+    elif [[ "$path" == /opt/* ]]; then
+        SOURCE_COUNT[portable_opt]=$((${SOURCE_COUNT[portable_opt]:-0} + 1))
+    else
+        SOURCE_COUNT[native]=$((${SOURCE_COUNT[native]:-0} + 1))
+    fi
+done
+
+printf "  ${C_DIM}%-15s %-10s${C_RESET}\n" "SOURCE" "COUNT"
+printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+for src in native snap flatpak portable_opt; do
+    c=${SOURCE_COUNT[$src]:-0}
+    bar_pct=$(( c * 100 / 5 ))
+    [[ $c -gt 5 ]] && bar_pct=100
+    printf "  ${C_BOLD}%-15s${C_RESET} ${C_BOLD}%-10s${C_RESET} " "$src" "$c"
+    bar "$bar_pct" 30
+    printf "\n"
+done
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 8: BROWSER SECURITY POSTURE
+#           (extensions, saved-password stores, master passwords, cookie perms)
+# ───────────────────────────────────────────────────────────────────────────
+section "8. BROWSER SECURITY POSTURE — EXTENSIONS, CREDS, COOKIES"
+
+# Cache global findings for AI verdict
+_BROWSER_SEC_NOTES=""
+
+# 8a. Browser extensions — Firefox: extensions/ JSON; Chromium: Secure Preferences / Extensions
+EXT_FINDINGS=0
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family name bin ver path <<< "$entry"
+    ext_count=0
+    ext_dir=""
+    case "$family" in
+        firefox)
+            # Each profile has extensions/ subfolder; count subdirs
+            for prof in "${HOME}/.mozilla/firefox" "${HOME}/.librewolf" "${HOME}/.waterfox"; do
+                [[ -d "$prof" ]] || continue
+                while IFS= read -r pdir; do
+                    ed="$pdir/extensions"
+                    [[ -d "$ed" ]] || continue
+                    c=$(find "$ed" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+                    ext_count=$(( ext_count + c ))
+                done < <(find "$prof" -maxdepth 1 -type d -name '*.default*' 2>/dev/null)
+            done
+            ;;
+        chrome|chromium)
+            for prof in "${HOME}/.config/google-chrome" "${HOME}/.config/BraveSoftware" \
+                        "${HOME}/.config/vivaldi" "${HOME}/.config/microsoft-edge" \
+                        "${HOME}/.config/chromium"; do
+                [[ -d "$prof" ]] || continue
+                ed="$prof/Default/Extensions"
+                [[ -d "$ed" ]] || continue
+                c=$(find "$ed" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+                ext_count=$(( ext_count + c ))
+            done
+            ;;
+    esac
+
+    if (( ext_count > 0 )); then
+        # > 30 extensions is a yellow flag (attack surface)
+        if (( ext_count > 30 )); then
+            warnf "extensions_high" "$name has $ext_count extensions (high attack surface)" \
+                "Review via $name menu → Extensions. Disable anything unused."
+            _BROWSER_SEC_NOTES+="$name: $ext_count extensions (HIGH). "
+            EXT_FINDINGS=$(( EXT_FINDINGS + 1 ))
+        elif (( ext_count > 15 )); then
+            info "$name has $ext_count extensions (moderate)"
+            _BROWSER_SEC_NOTES+="$name: $ext_count extensions. "
+        else
+            info "$name has $ext_count extensions"
+        fi
+    fi
+done
+
+if [[ $EXT_FINDINGS -eq 0 ]]; then
+    info "No high-extension-count browsers detected"
+fi
+
+# 8b. Saved-password stores — these are the crown jewels
+section_pass=0
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family name bin ver path <<< "$entry"
+    case "$family" in
+        firefox)
+            # Firefox stores creds in logins.json + key4.db (NSS) + cert9.db
+            for prof in "${HOME}/.mozilla/firefox" "${HOME}/.librewolf" "${HOME}/.waterfox"; do
+                [[ -d "$prof" ]] || continue
+                while IFS= read -r pdir; do
+                    lj="$pdir/logins.json"
+                    k4="$pdir/key4.db"
+                    [[ -f "$lj" ]] || continue
+                    # Check perms on the trio
+                    bad_perm=0
+                    for f in "$lj" "$k4"; do
+                        [[ -f "$f" ]] || continue
+                        perm=$(stat -c '%a' "$f" 2>/dev/null)
+                        owner=$(stat -c '%U' "$f" 2>/dev/null)
+                        # Group/other readable is a problem (unless owned by someone else)
+                        if [[ "$perm" != "600" && "$perm" != "400" ]]; then
+                            if (( perm & 4 )); then
+                                critf "browser_cred_perms" \
+                                    "$(basename "$pdir"): $(basename "$f") mode=$perm (world-readable)" \
+                                    "chmod 600 '$f'"
+                                _BROWSER_SEC_NOTES+="$(basename "$pdir") world-readable creds. "
+                                bad_perm=1
+                                section_pass=1
+                            fi
+                        fi
+                        # Owner should match the user, not root
+                        if [[ "$owner" == "root" && "$USER" != "root" ]]; then
+                            warnf "browser_cred_owner" \
+                                "$(basename "$pdir"): $(basename "$f") owned by root (running as $USER)" \
+                                "sudo chown $USER: '$f'"
+                            bad_perm=1
+                        fi
+                    done
+                    # Detect master password: logins.json may have encrypted logins
+                    # If "encrypted" field exists & true OR logins count > 0 without "mp"
+                    if [[ -f "$lj" ]] && command -v jq >/dev/null 2>&1; then
+                        count=$(jq -r '.logins // [] | length' "$lj" 2>/dev/null || echo 0)
+                        if (( count > 0 )); then
+                            info "$name profile $(basename "$pdir") stores $count saved login(s)"
+                            _BROWSER_SEC_NOTES+="$name($(basename "$pdir")): $count saved logins. "
+                        fi
+                    fi
+                done < <(find "$prof" -maxdepth 1 -type d -name '*.default*' 2>/dev/null)
+            done
+            ;;
+        chrome|chromium)
+            # Chromium stores creds in 'Login Data' (sqlite)
+            for prof in "${HOME}/.config/google-chrome" "${HOME}/.config/BraveSoftware" \
+                        "${HOME}/.config/vivaldi" "${HOME}/.config/microsoft-edge" \
+                        "${HOME}/.config/chromium"; do
+                [[ -d "$prof" ]] || continue
+                ld="$prof/Default/Login Data"
+                # Newer profiles may use 'Login Data For Account'
+                [[ -f "$ld" ]] || ld="$prof/Default/Login Data For Account"
+                [[ -f "$ld" ]] || continue
+                perm=$(stat -c '%a' "$ld" 2>/dev/null)
+                owner=$(stat -c '%U' "$ld" 2>/dev/null)
+                if (( perm & 4 )); then
+                    critf "browser_cred_perms" \
+                        "$name Login Data mode=$perm (world-readable — saved passwords exposed)" \
+                        "chmod 600 '$ld'"
+                    _BROWSER_SEC_NOTES+="$name Login Data world-readable. "
+                    section_pass=1
+                fi
+                if [[ "$owner" == "root" && "$USER" != "root" ]]; then
+                    warnf "browser_cred_owner" \
+                        "$name Login Data owned by root" \
+                        "sudo chown $USER: '$ld'"
+                fi
+                # Try to count rows (sqlite3 may not be installed)
+                if command -v sqlite3 >/dev/null 2>&1; then
+                    cnt=$(sqlite3 "$ld" "SELECT COUNT(*) FROM logins;" 2>/dev/null || echo 0)
+                    if (( cnt > 0 )); then
+                        info "$name stores $cnt saved login(s)"
+                        _BROWSER_SEC_NOTES+="$name: $cnt saved logins. "
+                    fi
+                fi
+            done
+            ;;
+    esac
+done
+
+if [[ $section_pass -eq 0 ]]; then
+    info "No world-readable credential stores found in browser profiles"
+fi
+
+# 8c. Cookie DBs — Chrome stores encrypted; if world-readable that's a problem too
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family name bin ver path <<< "$entry"
+    case "$family" in
+        chrome|chromium)
+            for prof in "${HOME}/.config/google-chrome" "${HOME}/.config/BraveSoftware" \
+                        "${HOME}/.config/vivaldi" "${HOME}/.config/microsoft-edge" \
+                        "${HOME}/.config/chromium"; do
+                [[ -d "$prof" ]] || continue
+                cookies="$prof/Default/Cookies"
+                [[ -f "$cookies" ]] || continue
+                perm=$(stat -c '%a' "$cookies" 2>/dev/null)
+                if (( perm & 4 )); then
+                    warnf "browser_cookie_perms" \
+                        "$name Cookies DB mode=$perm (world-readable)" \
+                        "chmod 600 '$cookies'"
+                    _BROWSER_SEC_NOTES+="$name cookies world-readable. "
+                fi
+            done
+            ;;
+    esac
+done
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 9: DONUT — FAMILY TYPES
+# ───────────────────────────────────────────────────────────────────────────
+section "9. FAMILY DISTRIBUTION"
+family_w=()
+family_n=()
+for entry in "${BROWSERS[@]}"; do
+    IFS='|' read -r family _ _ _ _ <<< "$entry"
+    seen=0
+    for fi in "${!family_w[@]}"; do
+        [[ "${family_n[$fi]}" == "$family" ]] && { family_w[$fi]=$(( family_w[fi] + 1 )); seen=1; break; }
+    done
+    [[ $seen -eq 0 ]] && { family_n+=("$family"); family_w+=("1"); }
+done
+
+if [[ ${#family_n[@]} -gt 0 ]]; then
+    total_fam=${#BROWSERS[@]}
+    if [[ $total_fam -gt 0 ]]; then
+        for i in "${!family_n[@]}"; do
+            pct=$(( family_w[i] * 100 / total_fam ))
+            label="${family_n[$i]} (n=${family_w[$i]})"
+            printf "  ${C_CYAN}%-30s${C_RESET} " "$label"
+            bar "$pct" 40
+            printf " ${C_BOLD}%3d%%${C_RESET}\n" "$pct"
+        done
+    fi
+fi
+
+# ─── Verdict ───────────────────────────────────────────────────────────────
+# SECTION 10: BROWSER SPEED BENCHMARK (--bench)
+# ───────────────────────────────────────────────────────────────────────────
+bench_headless_ms() {   # $1=bin  $2=family  → prints median ms (or empty)
+    local bin="$1" family="$2" shot tmp
+    local -a t=()
+    local run t0 t1 ms rc
+    for (( run=0; run<BENCH_RUNS; run++ )); do
+        t0=$(date +%s%N)
+        case "$family" in
+            chromium|chrome)
+                timeout 25 "$bin" --headless --no-gpu --disable-gpu \
+                    --no-first-run --no-default-browser-check \
+                    --user-data-dir="$(mktemp -d)" --dump-dom about:blank >/dev/null 2>&1 ;;
+            *)  # firefox family & others
+                shot=$(mktemp -u /tmp/browserz-shot.XXXXXX.png)
+                timeout 25 "$bin" --headless --screenshot "$shot" \
+                    --window-size 1024,768 about:blank >/dev/null 2>&1
+                rm -f "$shot" ;;
+        esac
+        rc=$?
+        t1=$(date +%s%N)
+        [[ $rc -ne 0 ]] && continue
+        ms=$(( (t1 - t0) / 1000000 ))
+        t+=("$ms")
+    done
+    (( ${#t[@]} == 0 )) && { echo ""; return; }
+    printf '%s\n' "${t[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'
+}
+
+if [[ "$BENCH" -eq 1 ]]; then
+    section "10. BROWSER SPEED BENCHMARK — headless cold launch (median of ${BENCH_RUNS}×)"
+    info "${C_DIM}measures launch → first render of a blank page; lower is better${C_RESET}"
+    echo ""
+    declare -a BENCH_RESULTS=()
+    for entry in "${BROWSERS[@]}"; do
+        IFS='|' read -r family name bin ver path <<< "$entry"
+        [[ -z "$bin" ]] && continue
+        # pick a representative launchable binary per family (first found)
+        emit "  ${C_DIM}testing ${C_RESET}${C_BOLD}%s${C_RESET}${C_DIM} (%s)…${C_RESET}" "$name" "$bin"
+        med=$(bench_headless_ms "$bin" "$family")
+        if [[ -z "$med" ]]; then
+            emit "  ${C_YELLOW} headless not supported${C_RESET}\n"
+        else
+            emit "  ${C_GREEN} %sms${C_RESET}\n" "$med"
+            BENCH_RESULTS+=("$med|$name|$family")
+        fi
+    done
+    echo ""
+    if (( ${#BENCH_RESULTS[@]} > 0 )); then
+        # fastest baseline
+        fastest=$(printf '%s\n' "${BENCH_RESULTS[@]}" | awk -F'|' '{print $1}' | sort -n | head -1)
+        slowest=$(printf '%s\n' "${BENCH_RESULTS[@]}" | awk -F'|' '{print $1}' | sort -n | tail -1)
+        # bar chart (scale to slowest)
+        emit "  ${C_BOLD}${C_CYAN}Relative cold-start speed:${C_RESET}\n"
+        maxw=32
+        while IFS='|' read -r ms name fam; do
+            fill=$(( ms * maxw / slowest )); (( fill < 1 )) && fill=1
+            barstr=""
+            for (( j=0; j<fill; j++ )); do barstr+="█"; done
+            case "$ms" in
+                "$fastest") col="$C_GREEN" ;;
+                "$slowest") col="$C_RED" ;;
+                *)          col="$C_YELLOW" ;;
+            esac
+            rel=$(awk -v a="$ms" -v f="$fastest" 'BEGIN{printf "×%.1f", a/f}')
+            emit "    %-16s ${col}%s${C_RESET} %5dms ${DIM}(%s fastest)${C_RESET}\n" "$name" "$barstr" "$ms" "$rel"
+        done < <(printf '%s\n' "${BENCH_RESULTS[@]}" | sort -t'|' -k1 -n)
+        echo ""
+        emit "  ${C_BOLD}Verdict:${C_RESET} ${C_GREEN}%s is fastest${C_RESET}" \
+            "$(printf '%s\n' "${BENCH_RESULTS[@]}" | sort -t'|' -k1 -n | head -1 | cut -d'|' -f2)"
+        [[ "$fastest" != "$slowest" ]] && emit "  ${C_DIM}(${slowest}ms slower than ${fastest}ms)${C_RESET}"
+        emit "\n"
+    else
+        warn "no browser supported headless launch — nothing to benchmark"
+    fi
+fi
+
+emit_verdict
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# AI verdict (only if --ai was passed AND output is to a terminal AND AI is reachable)
+if [[ "${AI_VERDICT:-}" == "1" && -n "${_BROWSER_SEC_NOTES:-}" ]]; then
+    ai_emit_verdict "top_issue" "$_BROWSER_SEC_NOTES" 2>/dev/null || true
+fi
+
+# Pointers
+if (( CRITICAL > 0 )); then
+    printf "\n  ${C_DIM}Full critical log: ${C_RESET}${C_CYAN}%s${C_RESET}\n" "$ERROR_LOG"
+fi

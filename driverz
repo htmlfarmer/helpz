@@ -1,0 +1,902 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# driverz - Driver & firmware health auditor
+# ----------------------------------------------------------------------------
+# Walks PCI/USB hardware, checks which kernel drivers are bound, flags devices
+# with no driver (and no loadable module), mines the kernel log for failed
+# firmware loads, verifies dkms modules are built for the RUNNING kernel, and
+# prints ready-to-run Debian-family apt recommendations — with a check that
+# the recommended packages actually exist in your repositories.
+# Answers the classic "I plugged something in and why doesn't it work":
+#   ./driverz 8179          look up a device by ID or name fragment
+#   ./driverz --events      plug-event timeline from the kernel log
+#   ./driverz --watch       live: diagnose the moment something is connected
+#
+# Usage:
+#   ./driverz                       Full audit + recommendations
+#   ./driverz KEYWORD|VID:PID       Device lookup card (e.g. rtl8192, 0bda:8179)
+#   ./driverz --net                 NIC / Wi-Fi deep dive: drivers, firmware, files to edit
+#   ./driverz --events              Devices plugged in recently + faults seen
+#   ./driverz --watch               Follow udev: instant diagnosis on every plug
+#   ./driverz --pci                 PCI devices table only
+#   ./driverz --firmware            Kernel-log firmware-failure scan only
+#   ./driverz --json                Machine-readable summary
+#   ./driverz --no-color            Plain output
+#
+# Requires: lspci (pciutils); optional: lsusb, udevadm, dkms, nvidia-smi, apt-cache
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_VERSION="1.0.0"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+ONLY=""; NO_COLOR=0; JSON_OUT=0; QUERY=""; SINCE=15; EVENTS_MODE=0
+ARGS=("$@")
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pci) ONLY=pci ;;
+        --usb) ONLY=usb ;;
+        --firmware) ONLY=fw ;;
+        --dkms) ONLY=dkms ;;
+        --events) EVENTS_MODE=1 ;;
+        --net|--network) ONLY=net ;;
+        --video|--graphics) ONLY=video ;;
+        --watch) ONLY=watch ;;
+        --since=*) SINCE="${1#--since=}" ;;
+        --json) JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1 ;;
+        -h|-help|--help)
+            cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          driverz — Driver & Firmware Health Auditor           ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Answers: "which drivers do I need, which are working, which are broken,
+  and what exactly do I install to fix them?" Checks PCI devices for bound
+  kernel drivers, scans the kernel log for firmware-load failures, matches
+  dkms modules against the running kernel, inspects GPU (NVIDIA/AMD/Intel)
+  and WiFi/BT state, and emits apt package recommendations verified to
+  exist in your repos.
+
+USAGE
+  ./driverz                 Full audit + recommendations
+  ./driverz rtl8192         Lookup card for a device (name fragment or VID:PID)
+  ./driverz 0bda:8179       (same, by USB/PCI id)
+  ./driverz --net           NIC/Wi-Fi deep dive: drivers, firmware files, and the
+                            exact config files (+sudo edits) that make networking work
+  ./driverz --events        Timeline: what was plugged in recently & what failed
+  ./driverz --watch         Live udev monitor: instant verdict when you plug things in
+  ./driverz --since=60      Event window in minutes for --events/--watch history (default 15)
+  ./driverz --pci           PCI driver-binding table only
+  ./driverz --usb           USB devices missing drivers
+  ./driverz --firmware      Kernel-log firmware failure scan
+  ./driverz --dkms          dkms vs running-kernel check
+  ./driverz --json          Machine-readable summary
+  ./driverz --no-color      Plain output
+
+WHAT IT CHECKS
+  driver in use        →  lspci -nnk "Kernel driver in use"
+  module idle          →  "Kernel modules" present but nothing bound (modprobe)
+  firmware failures    →  dmesg / journalctl -k "Direct firmware load ... failed"
+  GPU stack            →  nvidia-smi / nouveau / amdgpu / i915 state
+  dkms                 →  every dkms module built for `uname -r`?
+  recommendations      →  Debian/Ubuntu firmware-* and nvidia-driver packages,
+                           existence verified with apt-cache policy
+
+PLUG-DIAGNOSIS WORKFLOW ("why doesn't it work?")
+  Plug the device in               →  ./driverz --watch        (instant verdict)
+  Already plugged, unclear         →  ./driverz --events       (recent connects + faults)
+  Know the chip?                   →  ./driverz <name or vid:pid>   (full card)
+  General audit                    →  ./driverz
+
+WARNING → INVESTIGATION COMMANDS
+  Module present but not bound     →  sudo modprobe <mod> && dmesg | tail
+  Firmware load failed             →  apt-cache search '<chipset>' ; sudo apt install firmware-*
+  NVIDIA working on nouveau only   →  sudo apt install nvidia-driver  (reboot)
+  dkms not built for this kernel   →  sudo dkms autoinstall
+  Unknown out-of-tree chip         →  search vendor site; never apt-install random .debs
+
+HELPEOF
+            exit 0 ;;
+        -*) printf 'driverz: unknown option "%s" (try --help)\n' "$1" >&2; exit 64 ;;
+        *) QUERY="$QUERY $1" ;;
+    esac
+    shift
+done
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+if declare -f run_comparison_init >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
+    run_comparison_init "driverz" "JSON_OUT=$JSON_OUT"
+fi
+
+KREL=$(uname -r)
+
+# ---------- helpers ----------
+apt_exists() { [[ "$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}')" =~ ^[0-9] ]]; }
+
+declare -A RECS=()      # pkg -> why
+add_rec() {             # add_rec package "reason chip/device"
+    local pkg="$1" why="$2"
+    [[ -z "$pkg" ]] && return 0
+    [[ -n "${RECS[$pkg]:-}" ]] && RECS[$pkg]="${RECS[$pkg]} / $why" || RECS[$pkg]="$why"
+}
+
+map_fw_file_to_pkg() {   # firmware path from kernel log -> best Debian pkg
+    local fw="$1"
+    case "$fw" in
+        iwlwifi*|iwl-*)               printf 'firmware-iwlwifi' ;;
+        amdgpu/*)                     printf 'firmware-amd-graphics' ;;
+        nvidia/*|nouveau/*)           printf 'firmware-misc-nonfree' ;;
+        i915/*)                       printf 'firmware-misc-nonfree' ;;
+        brcm/*)                       printf 'firmware-brcm80211' ;;
+        rtl_nic/*|rtlwifi/*|rtw89/*)  printf 'firmware-realtek' ;;
+        mediatek/mt76*|mt76*|BL1*|mt76*) printf 'firmware-misc-nonfree' ;;
+        qcom/*|ath10k/*|ath9k_htc*)   printf 'firmware-atheros' ;;
+        mrvl/*|libertas/*|sd8*)       printf 'firmware-libertas' ;;
+        bnx2*|bnx2x/*|netxen/*)       printf 'firmware-bnx2x' ;;
+        myri10ge*)                    printf 'firmware-myricom' ;;
+        wl12xx*|wl18xx*|ti-connectivity/*) printf 'firmware-ti-connectivity' ;;
+        dvb-*)                        printf 'firmware-dvb-saa716x' ;;
+        *)                            printf '' ;;
+    esac
+}
+
+map_pci_to_pkg() {       # vid:pid + class text -> firmware/pkg hint
+    local vidpid="$1" cls="$2"
+    case "$vidpid" in
+        8086:*) [[ "$cls" == *rless* || "$cls" == *Wireless* || "$cls" == *Bluetooth* ]] && printf 'firmware-iwlwifi' || printf '' ;;
+        10de:*) printf 'nvidia-driver' ;;
+        10ec:*) printf 'firmware-realtek' ;;
+        168c:*) printf 'firmware-atheros' ;;
+        14e4:*) printf 'firmware-brcm80211' ;;
+        14c3:*|0e8d:*) printf 'firmware-misc-nonfree' ;;
+        1ab8:*) printf 'vmware-tools? (paravirt — usually fine)' ;;
+        *) printf '' ;;
+    esac
+}
+
+# ---------- kernel log (cached, multi-fallback) ----------
+KLOG=""; KLOG_READY=0
+get_klog() {
+    if [[ $KLOG_READY -eq 1 ]]; then printf '%s' "$KLOG"; return 0; fi
+    KLOG_READY=1
+    KLOG=$(dmesg 2>/dev/null) || KLOG=""
+    if [[ -z "$KLOG" ]]; then KLOG=$(journalctl -k -b -o monotonic --no-pager -q 2>/dev/null) || true; fi
+    if [[ -z "$KLOG" ]] && command -v sudo >/dev/null 2>&1; then
+        KLOG=$(sudo -n dmesg 2>/dev/null) || true
+        [[ -z "$KLOG" ]] && KLOG=$(sudo -n journalctl -k -b -o monotonic --no-pager -q 2>/dev/null) || true
+    fi
+    printf '%s' "$KLOG"
+}
+
+# ---------- human-readable names ----------
+usb_name() {   # vid pid -> "Vendor — Product" (or empty); uses hwdata usb.ids
+    local v="$1" p="$2" ids=""
+    for ids in /usr/share/hwdata/usb.ids /usr/share/misc/usb.ids; do [[ -r "$ids" ]] && break; done
+    [[ -r "$ids" ]] || return 0
+    awk -v v="$v" -v p="$p" '
+        /^\t[^ ]/ { curv=substr($0,2,4); vn=substr($0,7); sub(/^ +/,"",vn); next }
+        /^\t\t[^ ]/ { if (curv==v && substr($0,3,4)==p) { nm=substr($0,8); sub(/^ +/,"",nm); print vn " — " nm; exit } }
+    ' "$ids"
+}
+fmt_age() {   # seconds -> human
+    local s="$1"
+    [[ "$s" =~ ^-?[0-9]+$ ]] || { printf '?'; return; }
+    (( s < 0 )) && { printf 'now'; return; }
+    if (( s < 60 )); then printf '%ds' "$s"; elif (( s < 3600 )); then printf '%dm' "$((s/60))"; else printf '%dh%02dm' "$((s/3600))" "$((s/60%60))"; fi
+}
+
+# ---------- interface driver collection (the driver that really matters) ----------
+iface_drivers() {   # $1 = usb device dir path with trailing slash
+    local i out=""
+    for i in "$1"*":1."*/driver; do
+        [[ -e "$i" ]] && out="$out $(basename "$(readlink -f "$i")")"
+    done
+    printf '%s' "$(tr ' ' '\n' <<< "$out" | grep -v '^$' | sort -u | tr '\n' ' ')"
+}
+
+# ---------- per-USB-port quick diagnosis ----------
+diag_port() {   # $1 = sysfs port dir name like 1-4 or 1-4.2
+    local port="$1" d="/sys/bus/usb/devices/$1"
+    if [[ ! -d "$d" ]]; then
+        printf "  ${C_DIM}· ${port}: gone (unplugged, or enumeration failed)${C_RESET}\n"
+        return 0
+    fi
+    local uv up prod drv nm log
+    uv=$(cat "$d/idVendor" 2>/dev/null); up=$(cat "$d/idProduct" 2>/dev/null)
+    prod=$(cat "$d/product" 2>/dev/null)
+    drv=$(iface_drivers "$d"); [[ -z "$drv" && -e "$d/driver" ]] && drv=$(basename "$(readlink -f "$d/driver")")
+    [[ "$drv" == "usb" ]] && drv=""
+    nm=$(usb_name "$uv" "$up"); [[ -z "$nm" && -n "$prod" ]] && nm="$prod"
+    if [[ -n "$drv" ]]; then
+        printf "  ${C_GREEN}✓${C_RESET} %-6s [%s:%s] %s → interface driver(s) ${C_BOLD}%s${C_RESET} bound\n" "$port" "$uv" "$up" "${nm:-unknown}" "$drv"
+    else
+        printf "  ${C_RED}✗${C_RESET} %-6s [%s:%s] %s → ${C_RED}no driver bound${C_RESET} — lookup: ./driverz %s:%s\n" "$port" "$uv" "$up" "${nm:-unknown}" "$uv" "$up"
+        local rec; rec=$(map_pci_to_pkg "$uv:$up" "wireless")
+        if [[ -n "$rec" ]] && apt_exists "$rec"; then
+            printf "      ${C_GREEN}likely fix: sudo apt install %s${C_RESET}\n" "$rec"
+            add_rec "$rec" "unclaimed [${uv}:${up}] ${nm}"
+        fi
+    fi
+    log=$(get_klog)
+    if [[ -n "$log" ]]; then
+        grep -F "usb $port" <<< "$log" | grep -iE 'error|fail|firmware|not accepting|reset' | tail -3 | sed 's/^/      ${C_DIM}/;s/$/${C_RESET}/' | sed "s/\${C_DIM}/$(printf '\033[2m')/g;s/\${C_RESET}/$(printf '\033[0m')/g"
+    fi
+    return 0
+}
+
+# ---------- events timeline ----------
+EVENT_N=0; EVENT_FAULTS=0
+section_events() {
+    section "RECENT PLUG EVENTS (USB, last ${SINCE} min)"
+    local log; log=$(get_klog)
+    if [[ -z "$log" ]]; then
+        info "kernel log unreadable for this user — try: sudo ./driverz --events"
+        add_json_field plug_events "-1" 1
+        add_json_field plug_fault_lines "-1" 1
+        return 0
+    fi
+    local up rows
+    up=$(awk '{print int($1)}' /proc/uptime)
+    rows=$(awk -v up="$up" -v win="$(( SINCE * 60 ))" '
+        {
+            line=$0; ts=""; body=line
+            if (match(line, /^\[[ ]*[0-9]+\.[0-9]+\]/)) { ts=substr(line,2); sub(/\].*/,"",ts); body=line; sub(/^\[[^]]*\] /,"",body) }
+            if (body !~ /usb [0-9]+(-[0-9.]+)*:/) next
+            port=body; sub(/.*usb /,"",port); sub(/:.*/,"",port)
+            gsub(/\t/," ",body)
+            age = (ts=="") ? -1 : int(up - ts)
+            if (ts!="" && age>win) next
+            if (!(port in seen)) { seen[port]=1; order[++n]=port }
+            if (age>=0 && !(port in firstage)) firstage[port]=age
+            if (body ~ /idVendor=[0-9a-f]+, idProduct=[0-9a-f]+/) {
+                v=body; sub(/.*idVendor=/,"",v); vp=body; sub(/.*idProduct=/,"",vp); vp2=vp; sub(/,.*/,"",vp2)
+                sub(/,.*/,"",v); vidpid[port]=v ":" vp2
+            }
+            if (body ~ /: Product:/) { p2=body; sub(/.*Product: /,"",p2); prod[port]=p2 }
+            if (body ~ /USB disconnect/) gone[port]=1
+            if (body ~ /(error|fail|cannot|unable|not accepting|over-?current|timeout)/i) { flt[port]++; if (!(port in errtxt)) errtxt[port]=substr(body,1,88) }
+        }
+        END { for (i=1;i<=n;i++) { p3=order[i]; printf "%s\t%s\t%s\t%s\t%d\t%d\t%s\n", (p3 in firstage? firstage[p3] : -1), p3, vidpid[p3], prod[p3], flt[p3]+0, gone[p3]+0, errtxt[p3] } }
+    ' <<< "$log" | sort -t$'\t' -k1,1n)
+    if [[ -z "$rows" ]]; then
+        ok "no USB connect events in the last ${SINCE} minutes"
+        return 0
+    fi
+    printf "  ${C_DIM}%-8s %-8s %-13s %-24s %s${C_RESET}\n" "when" "port" "id" "device" "status"
+    local age port vidpid2 prod flts gonn errtxt drv state
+    while IFS=$'\t' read -r age port vidpid2 prod flts gonn errtxt; do
+        [[ -z "$port" ]] && continue
+        EVENT_N=$((EVENT_N+1))
+        (( flts > 0 )) && EVENT_FAULTS=$((EVENT_FAULTS+flts))
+        drv=""; [[ -e "/sys/bus/usb/devices/$port/driver" ]] && drv=$(basename "$(readlink -f "/sys/bus/usb/devices/$port/driver")")
+        local nm
+        nm=$(usb_name "${vidpid2%%:*}" "${vidpid2##*:}"); [[ -z "$nm" && -n "$prod" ]] && nm="$prod"
+        if [[ $gonn -eq 1 ]]; then state="${C_DIM}removed (plugged out)${C_RESET}"
+        elif [[ -n "$drv" ]]; then state="${C_GREEN}✓ bound $drv${C_RESET}"
+        elif [[ -d "/sys/bus/usb/devices/$port" ]]; then state="${C_RED}✗ no driver${C_RESET}"
+        else state="${C_YELLOW}? enumeration failed / replaced${C_RESET}"; fi
+        printf "  %-8s %-8s %-13s %-24s %b" "$(fmt_age "$age")" "$port" "${vidpid2:-?}" "${nm:0:24}" "$state"
+        if [[ $flts -gt 0 ]]; then
+            printf "  ${C_RED}(%d fault-log lines)${C_RESET}\n" "$flts"
+            [[ -n "$errtxt" ]] && printf "      ${C_DIM}↳ %s${C_RESET}\n" "$errtxt"
+            if [[ "$errtxt" == *firmware*failed* ]]; then
+                local fw pkg2
+                fw=$(grep -oE 'for [^ ]+ failed' <<< "$errtxt" | sed -E 's/for (.*) failed/\1/' | head -1)
+                pkg2=$(map_fw_file_to_pkg "$fw")
+                [[ -n "$pkg2" ]] && { printf "      ${C_GREEN}→ sudo apt install %s${C_RESET}\n" "$pkg2"; add_rec "$pkg2" "firmware $fw (event)"; }
+            fi
+        else
+            printf "\n"
+        fi
+    done <<< "$rows"
+    info "$EVENT_N device event(s), $EVENT_FAULTS fault line(s) in window"
+    add_json_field plug_events "$EVENT_N" 1
+    add_json_field plug_fault_lines "$EVENT_FAULTS" 1
+}
+
+
+section_video() {
+    section "VIDEO / DISPLAY STACK"
+    local vgpus
+    vgpus=$(awk -F'\t' '$5 ~ /VGA|3D|Display/ {print}' <<< "$PCI_TSV")
+    if [[ -z "$vgpus" ]]; then info "no display adapter in PCI table"; return; fi
+    local slot vid drv mods name
+    while IFS=$'\t' read -r slot vid drv mods name; do
+        subsec "${name:0:60} [$vid] @ $slot"
+        if [[ -n "$drv" ]]; then
+            ok "kernel driver: $drv"
+        else
+            critf "DriverMissing" "GPU $vid has NO driver bound" "modules: ${mods:-none} → sudo modprobe ${mods%%,*} or see playbook"
+        fi
+        chip_playbook "${drv:-${mods%%,*}}"
+    done <<< "$vgpus"
+
+    subsec "display connectors (sysfs — no X needed)"
+    local c found=0
+    for c in /sys/class/drm/card*-*/status; do
+        [[ -r "$c" ]] || continue
+        [[ "$(cat "$c")" == "connected" ]] || continue
+        found=1
+        local nm=${c#/sys/class/drm/}; nm=${nm%/status}
+        printf "  ${C_GREEN}✓${C_RESET} %-36s connected  ${C_DIM}(EDID: %s)${C_RESET}\n" "$nm" "$([[ -e "${c%/status}/edid" ]] && echo yes || echo no)"
+    done
+    (( found == 0 )) && info "no connected displays (headless?)"
+
+    subsec "render nodes & GL"
+    for c in /dev/dri/card* /dev/dri/renderD*; do
+        [[ -e "$c" ]] && printf "  ${C_DIM}·${C_RESET} %s  %s\n" "$c" "$(stat -c '%A %U:%G' "$c")"
+    done
+    if command -v glxinfo >/dev/null 2>&1; then
+        glxinfo -B 2>/dev/null | grep -iE '^renderer|^vendor|version: opengl' | sed 's/^/  /'
+    else
+        info "glxinfo missing — sudo apt install mesa-utils (proves 3D really works)"
+    fi
+    add_json_field video_cards "$(awk -F'\t' '$5 ~ /VGA|3D|Display/' <<< "$PCI_TSV" | wc -l)" 1
+}
+
+# ---------- lookup card ----------
+cmd_lookup() {
+    local q="$1" ql
+    ql="${q,,}"
+    section "DEVICE LOOKUP — \"$q\""
+    local found=0 line
+    while IFS=$'\t' read -r slot vidd pidv drv mods name; do
+        line="$vidd:$pidv $name"
+        if [[ "${line,,}" == *"$ql"* ]]; then
+            found=1
+            subsec "PCI $slot — ${name:0:60}"
+            if [[ -n "$drv" ]]; then ok "driver bound: $drv"
+            else
+                warn "no driver bound"
+                [[ -n "$mods" ]] && info "loadable module available: sudo modprobe ${mods%%,*}"
+                local rec; rec=$(map_pci_to_pkg "$vidd:$pidv" "$name")
+                [[ -n "$rec" ]] && { printf "  ${C_GREEN}likely package: sudo apt install %s${C_RESET}\n" "$rec"; add_rec "$rec" "lookup $q"; }
+            fi
+        fi
+    done <<< "$PCI_TSV"
+    local d uv up2 prod2 mfr2 drv2 port2
+    for d in /sys/bus/usb/devices/*/; do
+        [[ -e "$d/idVendor" ]] || continue
+        uv=$(cat "$d/idVendor" 2>/dev/null); up2=$(cat "$d/idProduct" 2>/dev/null)
+        prod2=$(cat "$d/product" 2>/dev/null); mfr2=$(cat "$d/manufacturer" 2>/dev/null)
+        drv2=$(iface_drivers "$d"); [[ -z "$drv2" && -e "$d/driver" ]] && drv2=$(basename "$(readlink -f "$d/driver")")
+        [[ "$drv2" == "usb" ]] && drv2=""
+        port2=${d%/}; port2=${port2##*/}
+        line="$uv:$up2 $mfr2 $prod2 $drv2"
+        if [[ "${line,,}" == *"$ql"* ]]; then
+            found=1
+            subsec "USB $port2 — ${mfr2:-?} ${prod2:-?} [$uv:$up2]"
+            if [[ -n "$drv2" ]]; then ok "interface driver(s) bound: $drv2"
+            else
+                warn "NO driver bound — this device cannot work"
+                local rec2; rec2=$(map_pci_to_pkg "$uv:$up2" "wireless")
+                [[ -n "$rec2" ]] && { printf "  ${C_GREEN}likely package: sudo apt install %s${C_RESET}\n" "$rec2"; add_rec "$rec2" "lookup $q"; }
+            fi
+        fi
+    done
+    local log; log=$(get_klog)
+    if [[ $found -eq 1 && -n "$log" ]]; then
+        subsec "recent kernel log mentions"
+        grep -iE "$q" <<< "$log" | tail -8 | sed 's/^/      /' || true
+    fi
+    if command -v dkms >/dev/null 2>&1; then
+        dkms status 2>/dev/null | grep -iE "$q" | sed 's/^/    dkms: /' || true
+    fi
+    if [[ $found -eq 0 ]]; then
+        warn "'$q' not among currently present hardware"
+        [[ -n "$log" ]] && { grep -iE "$q" <<< "$log" | tail -6 | sed 's/^/      ${C_DIM}log:/;s/$/${C_RESET}/'; }
+        info "was it plugged in earlier?  ./driverz --events --since=$(( SINCE * 4 ))"
+        local srch
+        srch=$(apt-cache search "$q" 2>/dev/null | grep -iE 'firmware|driver|dkms|module' | head -6)
+        [[ -n "$srch" ]] && { printf "  ${C_DIM}related packages in your repos:${C_RESET}\n"; printf '%s\n' "$srch" | sed 's/^/    /'; }
+        add_json_field lookup "not-found"
+    else
+        add_json_field lookup "found"
+    fi
+}
+
+# ---------- live watch ----------
+cmd_watch() {
+    command -v udevadm >/dev/null 2>&1 || { critf "Tools" "udevadm missing — cannot follow plug events" "sudo apt install udev"; return 1; }
+    section "WATCH — plug something in now (Ctrl+C to stop)"
+    info "reacting to USB device add/remove events…"
+    trap 'printf "\n  ${C_DIM}[watch stopped]${C_RESET}\n"; exit 0' INT TERM
+    udevadm monitor --udev 2>/dev/null | while IFS= read -r line; do
+        case "$line" in "UDEV "*) ;; *) continue ;; esac
+        local_act=$(awk '{print $4}' <<< "$line")   # /devices/... path
+        local_sub=$(awk '{print $NF}' <<< "$line")  # (subsystem)
+        local_evt=$(awk '{print $3}' <<< "$line")
+        case "$local_sub" in "(usb_device)") ;; *) continue ;; esac
+        port=$(grep -oE '/usb[0-9]+/[0-9]+-[0-9.]+' <<< "$local_act" | head -1 | sed -E 's#/usb[0-9]+/##')
+        [[ -z "$port" ]] && continue
+        case "$local_evt" in
+            add)    printf "  ${C_BOLD}%s %s detected${C_RESET}\n" "$(date '+%H:%M:%S')" "$port"; sleep 2; diag_port "$port" ;;
+            remove) printf "  ${C_DIM}%s %s removed${C_RESET}\n" "$(date '+%H:%M:%S')" "$port" ;;
+        esac
+    done
+}
+
+# ---------- PCI table ----------
+pci_scan() {
+    command -v lspci >/dev/null 2>&1 || { critf "Tools" "lspci missing (apt install pciutils)" "sudo apt install pciutils"; return 1; }
+    lspci -nnk | awk '
+        /^[0-9a-fA-F]{2,4}:[0-9a-fA-F]{2}\.[0-9]/ {
+            if (slot != "") flush()
+            slot=$1; name=$0; drv=""; mods=""
+            sub(/^[^ ]+ /,"",name)
+            next
+        }
+        /[Kk]ernel driver in use:/ { sub(/.*: /,""); drv=$0; next }
+        /[Kk]ernel modules:/       { sub(/.*: /,""); mods=$0; next }
+        END { if (slot != "") flush() }
+        function flush(   vid) {
+            vid="?"
+            if (match(name, /\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]/)) vid=substr(name,RSTART+1,RLENGTH-2)
+            print slot "\t" vid "\t" drv "\t" mods "\t" name
+        }'
+}
+
+PCI_TSV=$(pci_scan) || true
+INTEREST='VGA|3D|Display controller|Ethernet|Network controller|Audio device|USB controller|SATA|Non-Volatile|NVMe|Bluetooth|Wireless|Serial controller of|MMC|Co-processor'
+
+n_ok=0; n_unbound=0; n_missing=0
+
+section_pci() {
+    section "PCI DRIVER BINDING"
+    [[ -z "$PCI_TSV" ]] && { info "no pci data (pciutils not installed?)"; return 0; }
+    printf "  ${C_DIM}%-10s %-12s %-16s %-22s %s${C_RESET}\n" "slot" "vendor:dev" "driver" "modules" "device"
+    while IFS=$'\t' read -r slot vid drv mods name; do
+        [[ "$name" =~ $INTEREST ]] || continue
+        local dshort="${name:0:46}"
+        if [[ -n "$drv" ]]; then
+            n_ok=$((n_ok+1))
+            printf "  ${C_GREEN}✓${C_RESET} %-10s %-12s ${C_BOLD}%-16s${C_RESET} %-22s %s\n" "$slot" "$vid" "$drv" "${mods:-—}" "$dshort"
+        elif [[ -n "$mods" ]]; then
+            n_unbound=$((n_unbound+1))
+            printf "  ${C_YELLOW}!${C_RESET} %-10s %-12s ${C_YELLOW}%-16s${C_RESET} %-22s %s  → module idle: sudo modprobe %s\n" \
+                "$slot" "$vid" "NOT BOUND" "$mods" "$dshort" "${mods%%,*}"
+            warnf "DriverUnbound" "$dshort ($vid): module $mods available but not bound" "sudo modprobe ${mods%%,*}; check: dmesg | tail"
+        else
+            n_missing=$((n_missing+1))
+            printf "  ${C_RED}✗${C_RESET} %-10s %-12s ${C_RED}%-16s${C_RESET} %-22s %s\n" "$slot" "$vid" "NO DRIVER" "none" "$dshort"
+            local pkg; pkg=$(map_pci_to_pkg "$vid" "$name")
+            if [[ -n "$pkg" ]]; then
+                critf "DriverMissing" "$dshort ($vid) has no kernel driver" "apt install $pkg (see RECOMMENDATIONS)"
+                add_rec "$pkg" "$dshort"
+            else
+                critf "DriverMissing" "$dshort ($vid) has no kernel driver and no known package" "identify: lspci -n -s $slot; search apt-cache search firmware"
+            fi
+        fi
+    done <<< "$PCI_TSV"
+    info "bound: $n_ok · module-idle: $n_unbound · missing: $n_missing"
+    add_json_field pci_bound "$n_ok" 1
+    add_json_field pci_unbound "$n_unbound" 1
+    add_json_field pci_missing "$n_missing" 1
+}
+
+section_firmware() {
+    section "FIRMWARE LOAD FAILURES (kernel log)"
+    local klog=""
+    klog=$(get_klog)
+    if [[ -z "$klog" ]]; then
+        info "kernel log not readable without sudo — firmware-failure scan skipped"
+        return 0
+    fi
+    local fails n=0
+    fails=$(grep -ioE 'Direct firmware load for [^ ]+ failed|failed to load firmware "?[^ "]+"|firmware: file [^ ]+ not found' <<< "$klog" | sort -u)
+    if [[ -z "$fails" ]]; then
+        ok "no firmware-load failures in this boot's kernel log"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        n=$((n+1))
+        local fw pkg
+        fw=$(sed -E 's/.*[Ff]or +"?([^ "]+)"? (failed|not found).*/\1/; t; s/.*file ([^ ]+) not found.*/\1/' <<< "$line")
+        pkg=$(map_fw_file_to_pkg "${fw# }")
+        if [[ -n "$pkg" ]]; then
+            warnf "Firmware" "missing firmware: $fw" "sudo apt install $pkg"
+            printf "  ${C_YELLOW}!${C_RESET} %s → ${C_BOLD}apt install %s${C_RESET}\n" "$fw" "$pkg"
+            add_rec "$pkg" "firmware $fw"
+        else
+            warnf "Firmware" "missing firmware: $fw (no known package — check apt-cache search)" "?"
+            printf "  ${C_YELLOW}!${C_RESET} %s → ${C_DIM}(search: apt-cache search %s)${C_RESET}\n" "$fw" "${fw%%/*}"
+        fi
+    done <<< "$fails"
+    info "$n distinct firmware failure(s) this boot"
+    add_json_field firmware_failures "$n" 1
+}
+
+section_gpu() {
+    section "GPU STACK"
+    local has_nvidia_pci=0
+    grep -qE "VGA|3D" <<< "$PCI_TSV" && grep -q "10de:" <<< "$PCI_TSV" && has_nvidia_pci=1
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if nvidia-smi -L >/dev/null 2>&1; then
+            ok "NVIDIA proprietary driver working: $(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>/dev/null | head -1)"
+        elif [[ $has_nvidia_pci -eq 1 ]]; then
+            critf "GPU" "nvidia-smi present but failing — driver/kernel mismatch after an update?" "sudo apt install --reinstall nvidia-driver; sudo dkms autoinstall"
+            add_rec "nvidia-driver" "nvidia-smi broken"
+        fi
+    elif [[ $has_nvidia_pci -eq 1 ]]; then
+        local drv
+        drv=$(awk -F'\t' '/10de:/ && /VGA|3D/ {print $3; exit}' <<< "$PCI_TSV")
+        if [[ "$drv" == "nouveau" ]]; then
+            warnf "GPU" "NVIDIA GPU running on nouveau (open source) — limited perf/power" "sudo apt install nvidia-driver (see RECOMMENDATIONS)"
+            add_rec "nvidia-driver" "GPU on nouveau"
+            [[ "$(apt-cache policy nvidia-detect 2>/dev/null | awk '/Candidate:/{print $2}')" =~ ^[0-9] ]] && info "tip: install nvidia-detect to pick the exact driver version"
+        elif [[ -z "$drv" ]]; then
+            critf "GPU" "NVIDIA GPU with no driver at all" "sudo apt install nvidia-driver or firmware-misc-nonfree"
+        fi
+    else
+        local adrv idrv
+        adrv=$(awk -F'\t' '/amdgpu/ && /VGA|3D/ {print $3; exit}' <<< "$PCI_TSV")
+        idrv=$(awk -F'\t' '/8086:/ && /VGA|3D/ {print $3; exit}' <<< "$PCI_TSV")
+        [[ -n "$adrv" ]] && ok "AMD GPU bound to $adrv"
+        [[ -n "$idrv" ]] && ok "Intel GPU bound to $idrv (DSC/DMC firmware: firmware-misc-nonfree if dmesg complains)"
+        [[ -z "$adrv$idrv" ]] && info "no discrete/known GPU in PCI table"
+    fi
+}
+
+section_dkms() {
+    section "DKMS vs RUNNING KERNEL ($KREL)"
+    command -v dkms >/dev/null 2>&1 || { info "dkms not installed — skipping"; return 0; }
+    local st
+    st=$(dkms status 2>/dev/null)
+    if [[ -z "$st" ]]; then
+        info "no dkms modules registered"
+        return 0
+    fi
+    declare -A DKMS_OK=()
+    local seen="" m line
+    while IFS= read -r line; do
+        [[ "$line" != *", "* && "$line" != *"/"* ]] && continue
+        m="${line%%,*}"
+        [[ -z "$m" ]] && continue
+        seen="$seen $m"
+        [[ "$line" == *"$KREL"* ]] && DKMS_OK["$m"]=1
+    done <<< "$st"
+    local bad=0
+    for m in $(printf '%s\n' $seen | sort -u); do
+        if [[ -n "${DKMS_OK[$m]:-}" ]]; then
+            ok "$m built for running kernel $KREL"
+        else
+            warnf "Dkms" "$m is registered but has no module for the running kernel $KREL" "sudo dkms autoinstall   (or: sudo dkms install '$m')"
+            bad=$((bad+1))
+        fi
+    done
+    (( bad > 0 )) && info "fix all: sudo dkms autoinstall"
+    add_json_field dkms_stale "$bad" 1
+}
+
+section_usb() {
+    section "USB DEVICES WITHOUT DRIVERS"
+    local count=0
+    local d
+    for d in /sys/bus/usb/devices/*/; do
+        [[ -e "$d/idVendor" ]] || continue
+        [[ -e "$d/bDeviceClass" ]] || continue
+        local cls vid pid drv
+        cls=$(cat "$d/bDeviceClass" 2>/dev/null | tr 'a-f' 'A-F')
+        vid=$(cat "$d/idVendor" 2>/dev/null); pid=$(cat "$d/idProduct" 2>/dev/null)
+        drv=""
+        drv=$(iface_drivers "$d"); [[ -z "$drv" && -e "$d/driver" ]] && drv=$(basename "$(readlink -f "$d/driver")")
+        [[ "$drv" == "usb" ]] && drv=""
+        [[ "$cls" == "09" || "$cls" == "00" || "$cls" == "EF" ]] && continue   # hubs/composite: normal
+        if [[ -z "$drv" ]]; then
+            count=$((count+1))
+            local nm2; nm2=$(usb_name "${vid#0x}" "${pid#0x}")
+            [[ -z "$nm2" ]] && nm2="$(cat "$d/manufacturer" 2>/dev/null || echo '?') $(cat "$d/product" 2>/dev/null || echo '?')"
+            warnf "USB" "unclaimed USB device ${vid}:${pid} — ${nm2}" "./driverz ${vid#0x}:${pid#0x}   (device card + fix)"
+            printf "  ${C_RED}✗${C_RESET} unclaimed: %s:%s  %s  → ./driverz %s:%s\n" "${vid#0x}" "${pid#0x}" "$nm2" "${vid#0x}" "${pid#0x}"
+        fi
+    done
+    (( count == 0 )) && ok "all non-hub USB devices are claimed by a driver"
+    add_json_field usb_unclaimed "$count" 1
+}
+
+section_recs() {
+    section "RECOMMENDATIONS"
+    local any=0 p
+    for p in $(printf '%s\n' "${!RECS[@]}" | sort); do
+        any=1
+        if apt_exists "$p"; then
+            printf "  ${C_GREEN}sudo apt install %s${C_RESET}   ${C_DIM}← %s${C_RESET}\n" "$p" "${RECS[$p]}"
+        else
+            printf "  ${C_YELLOW}? %s${C_RESET}  ${C_DIM}(%s — not in your repos; vendor out-of-tree driver needed)${C_RESET}\n" "$p" "${RECS[$p]}"
+            if [[ "$p" == nvidia-driver* ]]; then
+                local alt
+                for alt in nvidia-driver nvidia-headless-535 nvidia-detect; do
+                    apt_exists "$alt" && printf "    ${C_DIM}try instead: sudo apt install %s && sudo nvidia-detect${C_RESET}\n" "$alt" && break
+                done
+            fi
+        fi
+    done
+    [[ $any -eq 0 ]] && ok "no driver/firmware packages to install — hardware looks complete"
+    add_json_field recommended_packages "$(printf '%s\n' "${!RECS[@]}" | tr '\n' ' ')"
+}
+
+
+# ---------- NIC / wireless deep dive ----------
+chip_playbook() {   # $1 module name -> detailed remediation lines (stdout)
+    local mod="$1"
+    case "$mod" in
+        iwlwifi|iwlmvm|iwl*)  cat <<'PB'
+      chipset: Intel Wireless (iwlwifi)
+        firmware pkg:  sudo apt install firmware-iwlwifi
+        firmware dir:  /lib/firmware (files: iwlwifi-*.ucode)
+        verify log:    sudo dmesg | grep -i iwlwifi
+        reload:        sudo modprobe -r iwlmvm iwlwifi && sudo modprobe iwlwifi
+        random disconnects / low signal?  Wi-Fi power saving is the usual culprit:
+          sudo tee /etc/modprobe.d/iwlwifi-power.conf <<'MODE'
+          options iwlwifi power_save=0 d0haddrx=0
+          MODE
+          (then reboot)  and:
+          sudo tee /etc/NetworkManager/conf.d/wifi-powersave-off.conf <<'NM'
+          [connection]
+          wifi.powersave = 2
+          NM
+        5GHz drops with old APs?  try:  sudo tee /etc/modprobe.d/iwlwifi-11n.conf
+          options iwlwifi 11n_disable=8        (AGG TX workaround)
+        current param values:  bparm f in /sys/module/iwlwifi/parameters/*; cat $f
+PB
+        ;;
+        rt*|rtl*|r8169|r81*|rtw*) cat <<'PB'
+      chipset: Realtek (rtlwifi/rtw89/r8169 family)
+        firmware pkgs:  sudo apt install firmware-realtek firmware-misc-nonfree
+        firmware dirs:  /lib/firmware/rtlwifi/ and /lib/firmware/rtl_nic/
+        verify log:     sudo dmesg | grep -iE 'rtl|r8169'
+        r8169 link flaps on some boards:
+          sudo tee /etc/modprobe.d/r8169.conf <<'MODE'
+          options r8169 aspm=0
+          MODE
+        USB Wi-Fi dongles (rtl8812au / 8821au / 88x2bu): NOT in Debian repos —
+        need an out-of-tree dkms driver. You already have dkms; you need headers:
+          sudo apt install linux-headers-amd64   (kernelz fix can do this)
+          sudo dkms autoinstall                  (rebuild for the running kernel)
+          then check:  dkms status | grep $(uname -r)
+PB
+        ;;
+        ath*|ath9k|ath10k) cat <<'PB'
+      chipset: Qualcomm/Atheros
+        ath9k: works in-kernel, firmware often unnecessary
+        ath10k/ath11k:  sudo apt install firmware-atheros
+        firmware dir:   /lib/firmware/ath10k/ (per-board subdirs!)
+        missing board-2.bin?  dmesg will name the exact path needed:
+          sudo dmesg | grep -iE 'ath1|firmware'
+PB
+        ;;
+        b43|bcma) cat <<'PB'
+      chipset: Broadcom (b43 open driver)
+        sudo apt install firmware-b43-installer    (it downloads+cuts the blob)
+        if it fails: sudo apt install b43-fwcutter, then grab firmware from
+        Broadcom and: sudo b43-fwcutter -w /lib/firmware linux-wlan*.tgz
+        AP mode needs correct txpower; check: sudo dmesg | grep b43
+PB
+        ;;
+        mt76*|m769*) cat <<'PB'
+      chipset: MediaTek (mt76)
+        sudo apt install firmware-misc-nonfree
+        firmware: /lib/firmware/mediatek/mt76*/  (check dmesg for exact file)
+PB
+        ;;
+        btusb|bluetooth) cat <<'PB'
+      chipset: Bluetooth
+        firmware usually firmware-misc-nonfree / firmware-atheros (per chip)
+        stack files: /etc/bluetooth/main.conf ; rfkill list bluetooth
+PB
+        ;;
+        nvidia) cat <<'PB'
+      chipset: NVIDIA proprietary
+        alive check:   nvidia-smi   (died after a kernelz upgrade? driver module stale)
+        rebuild:       sudo dkms autoinstall && reboot
+        init lag fix:  sudo systemctl enable --now nvidia-persistenced
+        verify GL:     glxinfo -B | grep -i renderer   (apt install mesa-utils)
+        PRIME laptop:  __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia <app>
+        black screen:  GRUB edit (press e at boot) → add nomodeset to linux line (rescue only)
+PB
+        ;;
+        nouveau) cat <<'PB'
+      chipset: NVIDIA on open-source nouveau — no HDMI audio, weak 3D on recent cards
+        switch:        sudo apt install nvidia-driver && sudo reboot
+        if apt has none: sudo apt install nvidia-detect && nvidia-detect  (names the right package)
+PB
+        ;;
+        amdgpu) cat <<'PB'
+      chipset: AMD Radeon
+        firmware:      pkg firmware-amd-graphics → /lib/firmware/amdgpu/ ; sudo dmesg | grep amdgpu
+        video accel:   apt install vainfo && vainfo | grep -i va
+        verify GL:     glxinfo -B
+PB
+        ;;
+        i915|xe) cat <<'PB'
+      chipset: Intel graphics
+        GuC/DMC blobs: pkg firmware-misc-nonfree → /lib/firmware/i915/ (dmesg names exact file)
+        enable GuC:    /etc/default/grub → GRUB_CMDLINE_LINUX_DEFAULT add i915.enable_guc=3 ; sudo update-grub
+        video accel:   apt install intel-media-va-driver-non-free ; check: vainfo
+        brightness:    if broken: kernel param i915.enable_dpcd_backlight=1 (same GRUB file)
+PB
+        ;;
+        snd_hda_intel|snd_sof_pci*|snd*) cat <<'PB'
+      chipset: Intel/HD/SoF audio — for sound issues run: ./soundz (deep mixer/route audit)
+        SoF firmware:  sudo apt install firmware-sof-signed
+        quick check:   dmesg | grep -iE 'snd|hda|sof' ; amixer -M sget Master 0%
+PB
+        ;;
+        cdc_ether|rndis*|qmi*|wwan) cat <<'PB'
+      chipset: USB cellular / tethering
+        use ModemManager (apt install modemmanager) or ndisc6 for pure IPv6 tether
+        quick manual test:  sudo dhclient -v <iface>
+PB
+        ;;
+        *)  printf '      chipset: %s — generic checks:\n' "$mod"
+            printf '        sudo modinfo -F firmware %s   (lists firmware files it needs)\n' "$mod"
+            printf '        ls /lib/firmware/ | grep -iE "%s|rtl|iwl|fw" \n' "${mod:0:4}"
+            printf '        sudo dmesg | grep -iE "%s|firmware"
+' "$mod" ;;
+    esac
+}
+
+iface_firmware_status() {   # $1 module -> "OK" or lists missing files
+    local mod="$1" fwfiles missing="" fw
+    fwfiles=$(modinfo -F firmware "$mod" 2>/dev/null) || return 0
+    [[ -z "$fwfiles" ]] && { printf ''; return 0; }
+    for fw in $fwfiles; do
+        if [[ ! -e "/lib/firmware/$fw" && ! -e "/lib/firmware/updates/$fw" ]]; then
+            missing="$missing $fw"
+        fi
+    done
+    printf '%s' "$missing"
+}
+
+section_net() {
+    section "NIC & WIRELESS — drivers, firmware, and the files that matter"
+    local ifaces ifc any=0
+    any=0
+    for ifc in /sys/class/net/*; do
+        ifc=${ifc##*/}
+        [[ "$ifc" == "lo" ]] && continue
+        any=1
+        local devlink mod driver oper carrier mac mtu ipv4
+        devlink=$(readlink -f "/sys/class/net/$ifc/device" 2>/dev/null) || devlink=""
+        mod=""; driver=""
+        if [[ -n "$devlink" && -e "$devlink/driver" ]]; then
+            driver=$(basename "$(readlink -f "$devlink/driver")")
+            mod="$driver"
+        elif [[ -e "/sys/class/net/$ifc/device/driver" ]]; then
+            driver=$(basename "$(readlink -f "/sys/class/net/$ifc/device/driver")")
+            mod="$driver"
+        fi
+        # virtual interfaces (bridges, docker0, veth) — note and skip deep dive
+        if [[ -z "$devlink" ]]; then
+            printf "  ${C_DIM}· %-12s virtual (no physical device) — driver n/a${C_RESET}\n" "$ifc"
+            continue
+        fi
+        oper=$(cat "/sys/class/net/$ifc/operstate" 2>/dev/null || echo ?)
+        carrier=$(cat "/sys/class/net/$ifc/carrier" 2>/dev/null || echo ?)
+        mac=$(cat "/sys/class/net/$ifc/address" 2>/dev/null || echo ?)
+        mtu=$(cat "/sys/class/net/$ifc/mtu" 2>/dev/null || echo ?)
+        ipv4=$(ip -4 addr show "$ifc" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}')
+        local kind="wired"
+        [[ -e "/sys/class/net/$ifc/wireless" || -e "/sys/class/net/$ifc/device/ieee80211" ]] && kind="WIFI"
+        [[ "$devlink" == */usb*/* ]] && kind="USB $kind"
+        local fwc="$C_GREEN" drvstate
+        local fwmiss; fwmiss=$(iface_firmware_status "$mod")
+        [[ -n "$fwmiss" ]] && fwc="$C_RED"
+        printf "\n  ${C_BOLD}%s${C_RESET} (%s)  ${C_DIM}driver:${C_RESET} ${C_BOLD}%s${C_RESET}  ${C_DIM}state:${C_RESET} %s carrier=%s  mtu=%s\n" \
+            "$ifc" "$kind" "${mod:-NONE!}" "$oper" "$carrier" "$mtu"
+        printf "  ${C_DIM}mac:%s  ip:%s  sysfs:/sys/class/net/%s${C_RESET}\n" "$mac" "${ipv4:-none}" "$ifc"
+        if [[ -z "$mod" ]]; then
+            critf "NetDriver" "$ifc has NO kernel driver bound — it can never work" "./driverz ${ifc}: identify chip: readlink -f /sys/class/net/$ifc/device; lspci -nnk | grep -A3 <slot>"
+        fi
+        if [[ -n "$fwmiss" ]]; then
+            critf "NetFirmware" "$mod requires firmware NOT present:$fwmiss" "sudo apt install $(fw_to_pkg "${fwmiss#* }" || true) ; files live in /lib/firmware — exact list: modinfo -F firmware $mod"
+            printf "  ${C_RED}✗ firmware MISSING for %s:%s${C_RESET}\n" "$mod" "$fwmiss"
+            printf "    ${C_DIM}each missing file goes in:${C_RESET} /lib/firmware/<path as listed by: modinfo -F firmware %s>\n" "$mod"
+        else
+            ok "firmware files for $mod all present in /lib/firmware"
+        fi
+        [[ "$kind" == *WIFI* ]] && {
+            if command -v rfkill >/dev/null 2>&1; then
+                local rfs; rfs=$(rfkill list wifi 2>/dev/null)
+                if grep -q "Soft blocked: yes\|Hard blocked: yes" <<< "$rfs"; then
+                    warnf "RFKill" "$ifc: radio blocked — WiFi cannot turn on no matter what you configure" "rfkill unblock wifi  (hard-block = physical switch/BIOS/fn-key)"
+                fi
+            fi
+            if command -v nmcli >/dev/null 2>&1; then
+                local nmst
+                nmst=$(nmcli -t -f DEVICE,STATE,CONNECTION device status 2>/dev/null | awk -F: -v i="$ifc" '$1==i{print $2}')
+                case "$nmst" in
+                    unmanaged) warnf "NMUnmanaged" "$ifc is 'unmanaged' for NetworkManager — it will never connect until fixed" "sudo nmcli device set $ifc managed yes; check /etc/NetworkManager/NetworkManager.conf [keyfile] unmanaged-devices= and /run/NetworkManager/system-connections/" ;;
+                    connected|"") : ;;
+                    *) info "NetworkManager state: $nmst" ;;
+                esac
+            fi
+            if command -v iw >/dev/null 2>&1; then
+                local ps; ps=$(iw dev "$ifc" get power_save 2>/dev/null | awk '/Power save/{print tolower($NF)}')
+                [[ "$ps" == "on" ]] && warnf "WiFiPowerSave" "$ifc Wi-Fi power save is ON — a classic cause of lag, drops, and slow DNS on iwlwifi/rtl" "see playbook below (persist off via /etc/NetworkManager/conf.d/)"
+                info "scan test (needs radio): sudo iw dev $ifc scan | head"
+            fi
+        }
+        if [[ "$kind" == "wired" && "$oper" != "up" ]]; then
+            warnf "LinkDown" "$ifc cable/driver link is DOWN (carrier=$carrier)" "physical: cable/switch port; software: sudo ip link set $ifc up ; then sudo dhclient -v $ifc"
+        fi
+        if command -v ethtool >/dev/null 2>&1 && [[ "$kind" != *WIFI* ]]; then
+            ethtool "$ifc" 2>/dev/null | grep -E "Speed|Duplex|Link detected|Auto-negotiation" | sed 's/^/      /'
+        fi
+        [[ -n "$mod" ]] && { subsec "playbook for $mod"; chip_playbook "$mod"; }
+    done
+    [[ $any -eq 0 ]] && { warn "no non-loopback interfaces found at all"; return; }
+
+    subsec "DNS — the last mile"
+    if [[ -L /etc/resolv.conf ]]; then
+        info "/etc/resolv.conf is a symlink → $(readlink -f /etc/resolv.conf)"
+        printf "  ${C_DIM}edit the OWNER instead (e.g. /etc/systemd/resolved.conf: DNS=1.1.1.1 8.8.8.8, then sudo systemctl restart systemd-resolved)${C_RESET}\n"
+    else
+        grep -qE '^nameserver' /etc/resolv.conf 2>/dev/null && ok "/etc/resolv.conf has nameservers: $(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf)" \
+            || { critf "DNS" "/etc/resolv.conf has no nameserver" "echo 'nameserver 1.1.1.1' | sudo tee -a /etc/resolv.conf  (or start systemd-resolved)"; }
+    fi
+    grep -qiE '^hosts:[[:space:]]*files' /etc/nsswitch.conf 2>/dev/null && ok "/etc/nsswitch.conf hosts order looks sane" \
+        || warnf "NSS" "/etc/nsswitch.conf hosts line unusual" "typical: hosts: files dns myhostname"
+
+    subsec "where network config LIVES on this box"
+    [[ -f /etc/network/interfaces ]] && printf "  ${C_CYAN}/etc/network/interfaces${C_RESET} exists — ifupdown templates:\n      iface eth0 inet dhcp        (wired)\n      iface wlan0 inet dhcp\n          wpa-ssid \"YourNet\"\n          wpa-psk  \"YourPass\"\n"
+    [[ -d /etc/NetworkManager/system-connections ]] && printf "  ${C_CYAN}/etc/NetworkManager/system-connections/*.nmconnection${C_RESET} — WiFi profiles (root-only). CLI way: nmcli dev wifi connect \"SSID\" password \"…\"\n"
+    [[ -d /etc/systemd/network ]] && printf "  ${C_CYAN}/etc/systemd/network/*.network${C_RESET} — systemd-networkd: [Match] Name=wlan0 / [Network] DHCP=yes\n"
+    printf "  ${C_CYAN}/etc/modprobe.d/*.conf${C_RESET} — module options (power_save etc.)  ${C_CYAN}/etc/udev/rules.d/70-persistent-net.rules${C_RESET} — NIC naming\n"
+    add_json_field net_interfaces "$any" 1
+}
+
+
+# ---------- run ----------
+if [[ "$JSON_OUT" -eq 1 ]]; then exec 5>&1 >/dev/null; fi
+emit "\n  ${C_BOLD}${C_CYAN}╔═══════════════════════════════════════════════════════════════╗
+  ║  DRIVERZ — driver & firmware health auditor                   ║
+  ╚═══════════════════════════════════════════════════════════════╝${C_RESET}\n"
+emit "  ${C_DIM}v%s · %s · %s${C_RESET}\n" "$SCRIPT_VERSION" "$TIMESTAMP" "$HOSTNAME_SHORT"
+
+if [[ -n "$ONLY" && "$ONLY" != "watch" ]]; then
+    case "$ONLY" in
+        pci)  section_pci ;;
+        usb)  section_usb ;;
+        fw)   section_firmware ;;
+        net)  section_net
+              section_recs ;;
+        video) section_video
+               section_recs ;;
+        dkms) section_dkms ;;
+    esac
+elif [[ "$ONLY" == "watch" ]]; then
+    cmd_watch
+elif [[ -n "$QUERY" ]]; then
+    cmd_lookup "${QUERY# }"
+    section_recs
+elif [[ "$EVENTS_MODE" -eq 1 ]]; then
+    section_events
+    section_recs
+else
+    section_pci
+    section_firmware
+    section_events
+    section_gpu
+    section_dkms
+    section_usb
+    section_net
+    section_recs
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then exec 1>&5 5>&-; fi
+if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
+    run_comparison_finalize 2>/dev/null || true
+fi
+emit_verdict

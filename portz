@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# portz — Listening Services & Exposure Auditor
+# ----------------------------------------------------------------------------
+# Audits all listening TCP and UDP sockets, categorizes risk by interface
+# binding (localhost vs wildcard 0.0.0.0/::), identifies service owners,
+# and checks for Docker firewall/UFW bypass vulnerabilities.
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+[[ -f "$SCRIPT_DIR/lib/common.sh" ]] && source "$SCRIPT_DIR/lib/common.sh"
+
+SCRIPT_VERSION="1.0.0"
+
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          portz — Listening Services & Exposure Audit          ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Audits all listening TCP/UDP network sockets on the host.
+  Identifies binding scope (Loopback vs Wildcard 0.0.0.0 / ::),
+  flags exposed high-risk databases and management services,
+  and inspects Docker container port publishing to detect UFW bypasses.
+
+USAGE
+  ./portz                          Full port exposure audit
+  ./portz --quick                  Quick socket audit without deep process inspection
+  ./portz --json                   Machine-readable JSON output
+  ./portz --watch 5                Continuously monitor open ports every 5s
+  ./portz --no-color               Disable ANSI color codes
+
+OPTIONS
+  --quick       Skip deep process ownership resolution
+  --json        Output machine-readable JSON
+  --watch[=SEC] Auto-refresh display (default: 3 seconds)
+  --no-color    Disable colored output
+  -h, --help    Show this help message
+
+RISK HIGHLIGHTS
+  CRITICAL: Databases (PostgreSQL 5432, Redis 6379, MySQL 3306, Mongo 27017) on 0.0.0.0/::
+  CRITICAL: Docker ports published directly to host when UFW is expected to guard them
+  WARNING:  Unencrypted dev/management servers (HTTP 8080/8000, Telnet, VNC)
+  INFO:     Properly bound local services (127.0.0.1) or standard public web (80/443)
+
+INVESTIGATION COMMANDS
+  ss -tulpn                           List all listening sockets with PIDs
+  sudo lsof -i -P -n | grep LISTEN    Alternative listener inspection
+  sudo iptables -L DOCKER -n -v       View Docker port forwarding rules
+  docker ps --format "table {{.Names}}\t{{.Ports}}"
+                                      View active container port mappings
+
+HELPEOF
+    exit 0
+}
+
+# ---------- Helpers ----------
+# truncate(): keep a string to max chars, appending an ellipsis when clipped.
+truncate() {
+    local s="$1" max="$2"
+    if (( ${#s} > max )); then
+        printf "%s…" "${s:0:$max-1}"
+    else
+        printf "%s" "$s"
+    fi
+}
+
+# ---------- Parse Arguments ----------
+QUICK=0
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        --quick)     QUICK=1 ;;
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1 ;;
+        --watch=*)   WATCH_INTERVAL="${arg#--watch=}" ;;
+        --watch|-w)  i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-3}" ;;
+        -h|--help)   show_help ;;
+        --ai)        AI_VERDICT=1 ;;
+        --no-ai)     AI_VERDICT=0 ;;
+        *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+init_colors
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_init "portz"
+fi
+
+# If JSON mode is enabled, suppress all intermediate stdout
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 3>&1
+    exec 1>/dev/null
+fi
+
+# Privilege detection
+SUDO=""
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+fi
+
+# ---------- Banner ----------
+if [[ "$JSON_OUT" -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  PORTS.SH — Listening Services & Exposure Audit             ║
+   ║  Bind Scope · Process Owners · Docker Bypass · Risk          ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+heading "LISTENING PORTS & EXPOSURE AUDITOR"
+info "Host: $HOSTNAME_SHORT | Timestamp: $TIMESTAMP"
+[[ -z "$SUDO" && $EUID -ne 0 ]] && info "Note: Run with sudo to resolve process names and PIDs for all services"
+
+# ---------- Collect Sockets ----------
+section "SOCKET AUDIT"
+
+TOTAL_LISTENERS=0
+WILDCARD_LISTENERS=0
+LOOPBACK_LISTENERS=0
+DOCKER_MAPPINGS=0
+RISK_CRITICAL=0
+RISK_HIGH=0
+RISK_MEDIUM=0
+RISK_LOW=0
+
+# Check tool availability
+if command -v ss >/dev/null 2>&1; then
+    CMD_OUT=$($SUDO ss -tulpnH 2>/dev/null || ss -tulpnH 2>/dev/null || true)
+elif command -v netstat >/dev/null 2>&1; then
+    CMD_OUT=$($SUDO netstat -tulpen 2>/dev/null || netstat -tulpen 2>/dev/null || true)
+else
+    critf "missing_tool" "Neither 'ss' nor 'netstat' found in PATH" \
+        "Install iproute2 (ss) or net-tools (netstat): 'sudo apt install iproute2 net-tools'"
+    emit_verdict
+fi
+
+# Header for console table
+emit "\n  ${C_BOLD}%-5s %-25s %-7s %-20s %-32s %s${C_RESET}\n" "PROTO" "LOCAL ADDRESS" "PORT" "SERVICE / PROCESS" "COMMAND (PID + abs path)" "RISK ASSESSMENT"
+emit "  %s\n" "─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Format parsing from ss output:
+    proto=$(awk '{print $1}' <<< "$line")
+    local_addr=$(awk '{print $5}' <<< "$line")
+    proc_info=$(awk '{$1=$2=$3=$4=$5=$6=""; print $0}' <<< "$line" | sed -e 's/^[[:space:]]*//')
+
+    [[ -z "$local_addr" ]] && continue
+
+    # Extract IP and Port (handles IPv4 and [IPv6])
+    if [[ "$local_addr" =~ :([0-9]+)$ ]]; then
+        port="${BASH_REMATCH[1]}"
+        ip="${local_addr%:*$port}"
+        ip="${ip//\[/}"
+        ip="${ip//\]/}"
+    else
+        continue
+    fi
+
+    TOTAL_LISTENERS=$((TOTAL_LISTENERS + 1))
+
+    # Evaluate exposure scope
+    is_wildcard=0
+    is_loopback=0
+    if [[ "$ip" == "*" || "$ip" == "0.0.0.0" || "$ip" == "::" || "$ip" == "" ]]; then
+        is_wildcard=1
+        WILDCARD_LISTENERS=$((WILDCARD_LISTENERS + 1))
+        scope="WILDCARD"
+        scope_color="$C_YELLOW"
+    elif [[ "$ip" == "127.0.0.1" || "$ip" == "::1" ]]; then
+        is_loopback=1
+        LOOPBACK_LISTENERS=$((LOOPBACK_LISTENERS + 1))
+        scope="LOOPBACK"
+        scope_color="$C_GREEN"
+    else
+        scope="INTERFACE ($ip)"
+        scope_color="$C_CYAN"
+    fi
+
+    # Clean process info
+    pname="unknown"
+    pid_str=""
+    if [[ "$proc_info" =~ users:\(\(\"([^\"]+)\" ]]; then
+        pname="${BASH_REMATCH[1]}"
+        # Pull the PID as well so we can resolve /proc/PID/exe for the absolute path
+        if [[ "$proc_info" =~ pid=([0-9]+) ]]; then pid_str="${BASH_REMATCH[1]}"; fi
+    elif [[ "$proc_info" =~ pid=([0-9]+) ]]; then
+        pname="pid:${BASH_REMATCH[1]}"
+        pid_str="${BASH_REMATCH[1]}"
+    fi
+
+    # COMMAND column: prefer lsof (gives PID + cmd with absolute path);
+    # fall back to /proc/PID/{cmdline,exe} or to the ss users:() blob.
+    cmd_info="(unknown)"
+    if [[ -n "$pid_str" ]] && command -v lsof >/dev/null 2>&1; then
+        lsof_line=$($SUDO lsof -nP -i :"$port" 2>/dev/null \
+            | awk -v want="$pid_str" '$2==want && $5=="IPv4" || $2==want && $5=="IPv6" {print $1, $2; exit}')
+        [[ -n "$lsof_line" ]] && cmd_info="pid=$pid_str $(truncate "$lsof_line" 24)"
+    fi
+    if [[ "$cmd_info" == "(unknown)" && -n "$pid_str" ]]; then
+        # Resolve the real binary the PID is running (best-effort)
+        abs_exe=""
+        if [[ -r "/proc/$pid_str/exe" ]]; then
+            abs_exe=$(readlink -f "/proc/$pid_str/exe" 2>/dev/null || true)
+        fi
+        if [[ -n "$abs_exe" ]]; then
+            cmd_info="pid=$pid_str $abs_exe"
+        else
+            cmdline=$(tr '\0' ' ' < "/proc/$pid_str/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//')
+            if [[ -n "$cmdline" ]]; then
+                cmd_info="pid=$pid_str ${cmdline:0:20}"
+            else
+                cmd_info="pid=$pid_str $pname"
+            fi
+        fi
+    elif [[ "$cmd_info" == "(unknown)" ]]; then
+        # No PID parsed from ss — still show the ss users:() blob if present
+        if [[ -n "$proc_info" ]]; then
+            cmd_info=$(truncate "$proc_info" 30)
+        else
+            cmd_info="(no owner)"
+        fi
+    fi
+
+    # Risk evaluation
+    risk_label=""
+    risk_color="$C_DIM"
+
+    if [[ "$is_wildcard" -eq 1 ]]; then
+        case "$port" in
+            5432) # PostgreSQL
+                risk_label="CRITICAL: PostgreSQL DB exposed publicly"
+                risk_color="$C_RED"
+                critf "postgres_exposed" "PostgreSQL (port 5432) listening on wildcard $ip" \
+                    "Bind to localhost in postgresql.conf and restart: 'sudo systemctl restart postgresql'"
+                ;;
+            3306|33060) # MySQL/MariaDB
+                risk_label="CRITICAL: MySQL DB exposed publicly"
+                risk_color="$C_RED"
+                critf "mysql_exposed" "MySQL (port $port) listening on wildcard $ip" \
+                    "Add 'bind-address = 127.0.0.1' to mysqld.cnf and restart mysql"
+                ;;
+            6379) # Redis
+                risk_label="CRITICAL: Redis exposed without auth barrier"
+                risk_color="$C_RED"
+                critf "redis_exposed" "Redis (port 6379) listening on wildcard $ip" \
+                    "Bind to 127.0.0.1 in redis.conf, set requirepass, restart redis"
+                ;;
+            27017) # MongoDB
+                risk_label="CRITICAL: MongoDB exposed publicly"
+                risk_color="$C_RED"
+                critf "mongodb_exposed" "MongoDB (port 27017) listening on wildcard $ip" \
+                    "Add 'bindIp: 127.0.0.1' to mongod.conf, enable auth, restart mongod"
+                ;;
+            11211) # Memcached
+                risk_label="CRITICAL: Memcached exposed (amplification risk)"
+                risk_color="$C_RED"
+                critf "memcached_exposed" "Memcached (port 11211) listening on wildcard $ip" \
+                    "Bind to 127.0.0.1 ('-l 127.0.0.1') and disable UDP ('-U 0') in memcached.conf"
+                ;;
+            3389) # RDP
+                risk_label="CRITICAL: RDP exposed (brute-force / BlueKeep risk)"
+                risk_color="$C_RED"
+                critf "rdp_exposed" "RDP (port 3389) listening on wildcard $ip" \
+                    "Restrict with firewall (only allow trusted IPs) or disable: 'sudo systemctl disable --now xrdp'"
+                ;;
+            445|139) # SMB / NetBIOS
+                risk_label="CRITICAL: SMB exposed (ransomware spread vector)"
+                risk_color="$C_RED"
+                critf "smb_exposed" "SMB (port $port) listening on wildcard $ip" \
+                    "Bind to internal interface only. Public SMB = EternalBlue / ransomware."
+                ;;
+            9200|9300) # Elasticsearch
+                risk_label="CRITICAL: Elasticsearch exposed (often no auth)"
+                risk_color="$C_RED"
+                critf "es_exposed" "Elasticsearch (port $port) listening on wildcard $ip" \
+                    "Bind to internal IP, enable xpack security + auth."
+                ;;
+            5601) # Kibana
+                risk_label="WARNING: Kibana exposed (data exfil risk)"
+                risk_color="$C_YELLOW"
+                warnf "kibana_exposed" "Kibana (port 5601) listening on wildcard $ip" \
+                    "Bind to localhost + SSH tunnel or set server.basePath behind reverse proxy."
+                ;;
+            8888) # Jupyter Notebook
+                risk_label="CRITICAL: Jupyter exposed (RCE if no token)"
+                risk_color="$C_RED"
+                critf "jupyter_exposed" "Jupyter (port 8888) listening on wildcard $ip" \
+                    "If no token/auth, this is unauthenticated RCE. Bind to localhost."
+                ;;
+            2379|2380) # etcd
+                risk_label="CRITICAL: etcd exposed (k8s secret disclosure)"
+                risk_color="$C_RED"
+                critf "etcd_exposed" "etcd (port $port) listening on wildcard $ip" \
+                    "Bind to internal IP + enable TLS + auth. K8s secrets readable if exposed."
+                ;;
+            6443) # Kubernetes API
+                risk_label="CRITICAL: K8s API exposed"
+                risk_color="$C_RED"
+                critf "k8s_api_exposed" "K8s API (port 6443) listening on wildcard $ip" \
+                    "API server should be reachable from control-plane only."
+                ;;
+            10250|10255) # Kubelet
+                risk_label="CRITICAL: Kubelet exposed (anon RCE)"
+                risk_color="$C_RED"
+                critf "kubelet_exposed" "Kubelet (port $port) listening on wildcard $ip" \
+                    "Set --anonymous-auth=false on kubelet. Anonymous access = RCE."
+                ;;
+            5984) # CouchDB
+                risk_label="WARNING: CouchDB exposed"
+                risk_color="$C_YELLOW"
+                warnf "couchdb_exposed" "CouchDB (port 5984) listening on wildcard $ip" \
+                    "Bind to localhost + enable admin auth."
+                ;;
+            25) # SMTP
+                risk_label="WARNING: SMTP exposed (open-relay risk)"
+                risk_color="$C_YELLOW"
+                warnf "smtp_exposed" "SMTP (port 25) listening on wildcard $ip" \
+                    "Verify relay policy; restrict to your network or use MSA on 587."
+                ;;
+            53) # DNS
+                risk_label="WARNING: DNS exposed (amplification risk)"
+                risk_color="$C_YELLOW"
+                warnf "dns_exposed" "DNS (port 53) listening on wildcard $ip" \
+                    "Rate-limit / restrict recursion. Open resolver = DDoS amplifier."
+                ;;
+            123) # NTP
+                risk_label="WARNING: NTP exposed (amplification risk)"
+                risk_color="$C_YELLOW"
+                warnf "ntp_exposed" "NTP (port 123) listening on wildcard $ip" \
+                    "Restrict 'restrict default kod nomodify notrap nopeer noquery' in ntp.conf."
+                ;;
+            161|162) # SNMP
+                risk_label="WARNING: SNMP exposed (community string leak)"
+                risk_color="$C_YELLOW"
+                warnf "snmp_exposed" "SNMP (port $port) listening on wildcard $ip" \
+                    "Default community 'public' = full device disclosure. Use SNMPv3."
+                ;;
+            23) # Telnet
+                risk_label="CRITICAL: Unencrypted Telnet service"
+                risk_color="$C_RED"
+                critf "telnet_exposed" "Telnet (port 23) listening on wildcard $ip" \
+                    "Disable telnetd: 'sudo systemctl disable --now telnet.socket' — use SSH instead"
+                ;;
+            22) # SSH
+                risk_label="Standard remote administration"
+                risk_color="$C_CYAN"
+                ;;
+            80|443) # Web
+                risk_label="Standard web server"
+                risk_color="$C_GREEN"
+                ;;
+            8080|8000|8888|3000|5000) # Development servers
+                risk_label="WARNING: Dev/internal web server on wildcard"
+                risk_color="$C_YELLOW"
+                warnf "dev_server_exposed" "Dev/App server on port $port listening on wildcard $ip ($pname)" \
+                    "Bind to 127.0.0.1 in dev config, or restrict with 'sudo ufw deny $port'"
+                ;;
+            *)
+                risk_label="Exposed on all network interfaces"
+                risk_color="$C_YELLOW"
+                ;;
+        esac
+    else
+        risk_label="Isolated to loopback/local"
+        risk_color="$C_GREEN"
+    fi
+
+    emit "  %-5s ${scope_color}%-25s${C_RESET} %-7s %-20s ${C_CYAN}%-32s${C_RESET} ${risk_color}%s${C_RESET}\n" \
+        "$proto" "$ip" "$port" "$pname" "$cmd_info" "$risk_label"
+
+    # Bucket exposure for chart
+    if [[ "$is_loopback" -eq 1 ]]; then
+        RISK_LOW=$((RISK_LOW + 1))
+    elif [[ "$risk_label" == CRITICAL* ]]; then
+        RISK_CRITICAL=$((RISK_CRITICAL + 1))
+    elif [[ "$risk_label" == WARNING* ]]; then
+        RISK_HIGH=$((RISK_HIGH + 1))
+    elif [[ "$port" == "22" ]]; then
+        RISK_MEDIUM=$((RISK_MEDIUM + 1))
+    else
+        RISK_LOW=$((RISK_LOW + 1))
+    fi
+
+done <<< "$CMD_OUT"
+
+emit "  %s\n" "─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+info "Total active listeners: $TOTAL_LISTENERS (Wildcard/Exposed: $WILDCARD_LISTENERS, Local/Loopback: $LOOPBACK_LISTENERS)"
+
+# ---------- Risk Distribution Chart ----------
+if [[ "$JSON_OUT" -eq 0 ]]; then
+    subsec "Exposure risk distribution"
+    R_TOTAL=$(( RISK_CRITICAL + RISK_HIGH + RISK_MEDIUM + RISK_LOW ))
+    if (( R_TOTAL > 0 )); then
+        R_PALETTE=("$C_RED" "$C_YELLOW" "$C_CYAN" "$C_GREEN")
+        R_LABELS=("Critical" "High" "Medium" "Low")
+        R_COUNTS=("$RISK_CRITICAL" "$RISK_HIGH" "$RISK_MEDIUM" "$RISK_LOW")
+        printf "${C_BOLD}Exposure by severity (total=%d):${C_RESET}\n" "$R_TOTAL"
+        for ri in 0 1 2 3; do
+            cnt=${R_COUNTS[$ri]}
+            (( cnt == 0 )) && continue
+            pct=$(( cnt * 100 / R_TOTAL ))
+            arc_len=$(( cnt * 20 / R_TOTAL ))
+            (( arc_len == 0 )) && arc_len=1
+            bar_s=""
+            for (( j=0; j<arc_len; j++ )); do bar_s+="█"; done
+            col="${R_PALETTE[$ri]}"
+            printf "  ${col}%-10s${C_RESET} ${col}%-20s${C_RESET} ${C_BOLD}%3d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+                "${R_LABELS[$ri]}" "$bar_s" "$cnt" "$pct"
+        done
+    fi
+fi
+
+# ---------- Docker & Firewall Bypass Check ----------
+section "DOCKER & FIREWALL BYPASS INSPECTION"
+
+DOCKER_ACTIVE=0
+DOCKER_UFW_VULN=0
+
+if [[ "${QUICK:-0}" -eq 1 ]]; then
+    subsec "Docker / UFW-bypass audit skipped (--quick — key ports only)"
+elif command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1 || sudo -n docker info >/dev/null 2>&1; then
+        DOCKER_ACTIVE=1
+        info "Docker daemon is active"
+
+        # Check published ports
+        DOCKER_PS=$($SUDO docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null || docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null || true)
+        if [[ -n "$DOCKER_PS" ]]; then
+            subsec "Active Docker Container Port Mappings"
+            while IFS='|' read -r cname cports; do
+                [[ -z "$cname" || -z "$cports" ]] && continue
+                DOCKER_MAPPINGS=$((DOCKER_MAPPINGS + 1))
+                if [[ "$cports" =~ 0\.0\.0\.0:([0-9]+) || "$cports" =~ :::([0-9]+) ]]; then
+                    warnf "docker_published_wildcard" "Container '$cname' publishes port(s) to 0.0.0.0/:: : $cports" \
+                        "Edit compose ports to '127.0.0.1:HOST:CONTAINER' or place behind reverse proxy with TLS auth"
+                else
+                    info "Container '$cname': $cports"
+                fi
+            done <<< "$DOCKER_PS"
+        else
+            ok "No Docker containers currently publish host ports"
+        fi
+
+        # Check for UFW Docker bypass vulnerability
+        UFW_ACTIVE=0
+        if command -v ufw >/dev/null 2>&1; then
+            if $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
+                UFW_ACTIVE=1
+            fi
+        fi
+
+        if [[ "$UFW_ACTIVE" -eq 1 ]]; then
+            # Verify if DOCKER-USER chain exists and has filtering rules
+            DOCKER_USER_RULES=$($SUDO iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N' | wc -l || true)
+            if [[ "$DOCKER_USER_RULES" -le 1 ]]; then
+                DOCKER_UFW_VULN=1
+                critf "docker_ufw_bypass" "Docker + UFW Bypass detected! Docker modifies iptables PREROUTING directly, bypassing UFW rules for published ports." \
+                    "Bind to loopback in compose ('127.0.0.1:8080:80') or add DROP rule to DOCKER-USER iptables chain"
+                info "Fix: Restrict bindings to 127.0.0.1 (e.g. -p 127.0.0.1:8080:80) or configure the DOCKER-USER iptables chain"
+            else
+                ok "DOCKER-USER chain has custom filtering rules ($DOCKER_USER_RULES rules configured)"
+            fi
+        else
+            info "UFW is inactive or not used as primary firewall"
+        fi
+    else
+        info "Docker installed but daemon is stopped or unprivileged"
+    fi
+else
+    info "Docker not installed"
+fi
+
+# ---------- Recommendations ----------
+section "RECOMMENDATIONS"
+if (( CRITICAL > 0 )); then
+    emit "  ${C_RED}• Bind sensitive database servers (PostgreSQL, MySQL, Redis) to 127.0.0.1 in their conf files${C_RESET}\n"
+fi
+if [[ "$DOCKER_UFW_VULN" -eq 1 ]]; then
+    emit "  ${C_YELLOW}• Guard Docker ports: explicitly specify 127.0.0.1 in docker-compose.yml ports (e.g., '127.0.0.1:8080:80')${C_RESET}\n"
+fi
+if (( WILDCARD_LISTENERS > 5 )); then
+    emit "  ${C_YELLOW}• Review all wildcard listeners: disable unnecessary background services with 'sudo systemctl disable --now <service>'${C_RESET}\n"
+fi
+emit "  ${C_DIM}• Re-check socket activity periodically: ./portz --watch 5${C_RESET}\n"
+
+# JSON fields
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+fi
+
+add_json_field "total_listeners" "$TOTAL_LISTENERS" 1
+add_json_field "wildcard_listeners" "$WILDCARD_LISTENERS" 1
+add_json_field "loopback_listeners" "$LOOPBACK_LISTENERS" 1
+add_json_field "docker_active" "$DOCKER_ACTIVE" 1
+add_json_field "docker_published_containers" "$DOCKER_MAPPINGS" 1
+add_json_field "docker_ufw_bypass_vulnerable" "$DOCKER_UFW_VULN" 1
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_finalize
+fi
+
+emit_verdict
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "portz complete: listeners=$TOTAL_LISTENERS wildcard=$WILDCARD_LISTENERS docker=$DOCKER_ACTIVE quick=$QUICK" 2>/dev/null || true
+fi

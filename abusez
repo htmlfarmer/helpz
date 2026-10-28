@@ -1,0 +1,1309 @@
+#!/bin/bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+# abusez - SSH forensic / abuse-pattern report
+# ==========================================
+# SSH Forensic Report: Global Calibration Edition
+# Fixed: Global Timeframe Math & Campaign Density
+# ==========================================
+
+# ─── Help ────────────────────────────────────────────────────────────────────
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          abusez — SSH Forensic Abuse Reporter                 ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Analyzes SSH brute-force attack logs and generates forensic dossiers
+  on the top 30 attacker IPs. For each attacker, it:
+  - Counts attempts, rate, duration, and peak attack hours
+  - Queries WHOIS for abuse contacts and organization info
+  - Checks reverse DNS, latency, and SSH banner
+  - Analyzes attack patterns (robotic vs human cadence)
+  - Generates pre-formatted abuse complaint emails
+  - Cross-references AbuseIPDB for prior reports
+
+USAGE
+  ./abusez                  Generate SSH abuse reports (needs sudo for logs)
+  sudo ./abusez             Full access to SSH journal logs
+  ./abusez --ip <IP>        Search logs for a specific attacker IP
+  ./abusez --time <DATE>    Search logs for a specific date (MM/DD/YYYY)
+
+OPTIONS
+  -h, --help           Show this help message and exit
+  --ip <IP>            Filter logs to show only attacks from specific IP
+  --time <DATE>        Filter logs to show only attacks on specific date (MM/DD/YYYY)
+
+EXAMPLES
+  ./abusez --ip 192.168.1.1      Show all attacks from 192.168.1.1
+  ./abusez --time 6/10/2016      Show all attacks on June 10, 2016
+  ./abusez --ip 10.0.0.5 --time 3/15/2024   Attacks from IP on specific date
+
+OUTPUT FILES
+  ssh_abuse_report.txt         Main report with all attacker dossiers
+  <IP>.txt                     Filtered report when using --ip (e.g., 192_168_1_1.txt)
+  attacks_MM_DD_YYYY.txt       Filtered report when using --time only
+  /tmp/abuse_stats.tsv         Per-IP statistics (TSV)
+  /tmp/abuse_samples.tsv       Attack timestamp samples
+  /tmp/abuse_globals.txt       Global attack rate statistics
+
+FEATURES
+  --ip flag also performs:
+    - Reverse DNS lookup for the attacker
+    - Domain analysis to find related attackers from same network
+    - WHOIS information lookup
+    - Saves detailed report to IP-named file (e.g., 192_168_1_1.txt)
+
+ALTERNATIVE COMMANDS
+  last                             Show recent successful logins
+  lastb                            Show recent failed logins (needs root)
+  sudo faillog -a                  Failed login counts per user
+  grep "Failed password" /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn
+                                   Top attacking IPs from auth.log
+  geoiplookup <IP>                 Geolocate an IP (needs geoip-bin)
+  whois <IP>                       Full WHOIS record for an IP
+  dig -x <IP> +short              Reverse DNS lookup
+  curl https://ipinfo.io/<IP>/json  IP geolocation via API
+  sudo journalctl -u ssh --no-pager | grep "Failed password" | wc -l
+                                   Total failed SSH attempts
+
+WARNING → INVESTIGATION COMMANDS
+  High attack rate detected        →  sudo journalctl -u ssh -n 10000 | grep "Failed" | awk '{print $NF}' | sort | uniq -c | sort -rn | head
+  Specific IP attacking            →  sudo grep "<IP>" /var/log/auth.log | tail -20
+  Want to block an IP              →  sudo ufw deny from <IP>  or  sudo iptables -A INPUT -s <IP> -j DROP
+  Check if IP is known bad         →  curl -s https://www.abuseipdb.com/check/<IP>
+  Find attacker's organization     →  whois <IP> | grep -i 'org\|org-name\|organization'
+  Find abuse contact               →  whois <IP> | grep -i 'abuse'
+  Check SSH login success from IP  →  grep "<IP>" /var/log/auth.log | grep -i "accepted\|session opened"
+  See what usernames were tried    →  grep "Failed password" /var/log/auth.log | grep "<IP>" | awk '{for(i=1;i<=NF;i++) if($i=="for") print $(i+1)}' | sort | uniq -c | sort -rn
+  ─────────────────────────────────────────────────────────────────────────────────
+  FIND THE ATTACKER ON YOUR NETWORK (include VICTIM and TIME details):
+  ─────────────────────────────────────────────────────────────────────────────────
+  Search logs with victim IP       →  grep "<ATTACKER_IP>" /var/log/auth.log | grep "ashys.org\|<YOUR_IP>" | head -20
+  Search with timestamp window     →  sudo journalctl --since "Apr 8 11:00" --until "Apr 8 12:00" | grep "<ATTACKER_IP>"
+  Search all logs for attacker     →  grep -r "<ATTACKER_IP>" /var/log/ 2>/dev/null | grep -v "whois\|abuseipdb"
+  Search all logs for victim       →  grep -r "ashys.org\|<YOUR_IP>" /var/log/ 2>/dev/null | grep "<ATTACKER_IP>"
+  Find via SSH banner/username     →  grep "sshd.*<ATTACKER_IP>" /var/log/auth.log /var/log/secure 2>/dev/null | tail -20
+  See who logged in FROM attacker  →  last | grep "<ATTACKER_IP>"  ;  who | grep "<ATTACKER_IP>"
+  Check if attacker succeeded      →  grep "<ATTACKER_IP>" /var/log/auth.log | grep -i "accepted\|session opened\|break-in"
+  See victim's failed logins       →  grep "Failed password.*<ATTACKER_IP>" /var/log/auth.log | tail -20
+  Get victim's IP if unknown       →  hostname -I | awk '{print $1}'  OR  curl -s https://ipinfo.io/ip
+
+HELPEOF
+    exit 0
+}
+
+# ─── Parse Arguments ─────────────────────────────────────────────────────────
+FILTER_IP=""
+FILTER_DATE=""
+AI_VERDICT=0
+THREAT_CONTEXT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            ;;
+        --ip)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --ip requires an IP address argument"
+                exit 1
+            fi
+            FILTER_IP="$2"
+            shift 2
+            ;;
+        --time)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --time requires a date argument (MM/DD/YYYY)"
+                exit 1
+            fi
+            FILTER_DATE="$2"
+            shift 2
+            ;;
+        --ai)
+            AI_VERDICT=1
+            shift
+            ;;
+        --no-ai)
+            AI_VERDICT=0
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+export TZ=America/Los_Angeles
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "abusez" "JSON_OUT=$JSON_OUT QUICK=$QUICK" 2>/dev/null; fi
+
+# ---------- Colors ----------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  RESET="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
+  RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
+  BLUE="\033[34m"; MAGENTA="\033[35m"; CYAN="\033[36m"
+else
+  RESET=""; BOLD=""; DIM=""
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""
+fi
+
+MY_IP=$(curl -s --connect-timeout 3 --max-time 5 https://ipinfo.io/ip 2>/dev/null || echo "")
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+MY_NAME="${ABUSE_NAME:-Your Name}"
+MY_EMAIL="${ABUSE_EMAIL:-you@example.com}"
+MY_LOCATION="${ABUSE_LOCATION:-Your City, Your Country}"
+MY_OS=$(lsb_release -ds 2>/dev/null || echo "Linux/Debian System")
+CONTACT_INFO="${ABUSE_PHONE:-773-321-8181}"
+DATE_STR=$(date +%Y%m%d)
+EMAIL_FILE="ssh_abuse_report.txt"
+
+# Secure temporary directory with automatic cleanup on exit
+TMP_DIR=$(mktemp -d "/tmp/abuse_XXXXXX")
+STATS_TSV="$TMP_DIR/abuse_stats.tsv"
+SAMPLES_TSV="$TMP_DIR/abuse_samples.tsv"
+GLOBALS_TXT="$TMP_DIR/abuse_globals.txt"
+# Confine persistent reports to the suite directory per project security policy
+REPORTS_DIR="${SCRIPT_DIR}/abusez-reports"
+
+LOG_TEMP=$(mktemp -p "$TMP_DIR")
+FILTERED_LOG=""
+
+cleanup_abuse() {
+    rm -rf "$TMP_DIR"
+    [[ -n "${FILTERED_LOG:-}" ]] && rm -f "$FILTERED_LOG"
+}
+trap cleanup_abuse EXIT
+
+# Privilege detection
+SUDO=""
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+elif command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]; then
+    if sudo -v 2>/dev/null; then
+        SUDO="sudo"
+    fi
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${BOLD}${MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  ABUSE.SH — SSH Forensic Abuse Reporter                       ║
+   ║  Top Attackers · WHOIS · Abuse Contacts                       ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${RESET}\n"
+    printf "${DIM}  v${SCRIPT_VERSION} — %s on %s${RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+printf "${MAGENTA}${BOLD}Calculating the Global Pressure on the sanctuary, %s...${RESET}\n\n" "${MY_NAME%% *}"
+
+# Collect SSH logs from systemd journal or auth.log fallback
+if command -v journalctl >/dev/null 2>&1 && $SUDO journalctl -u ssh -n 100000 --no-pager 2>&1 | grep -E "Failed password|Invalid user" > "$LOG_TEMP"; then
+    printf "  ${GREEN}${BOLD}✓${RESET} ${GREEN}SSH logs collected successfully via journalctl${RESET}\n"
+    TOTAL_ATTEMPTS=$(wc -l < "$LOG_TEMP")
+    if [ "$TOTAL_ATTEMPTS" -eq 0 ]; then
+        printf "  ${YELLOW}!${RESET} ${YELLOW}No SSH attacks found in logs${RESET}\n"
+    fi
+elif [[ -r /var/log/auth.log ]] && grep -E "Failed password|Invalid user" /var/log/auth.log > "$LOG_TEMP" 2>/dev/null; then
+    printf "  ${GREEN}${BOLD}✓${RESET} ${GREEN}SSH logs collected successfully from /var/log/auth.log${RESET}\n"
+    TOTAL_ATTEMPTS=$(wc -l < "$LOG_TEMP")
+else
+    printf "  ${RED}✗${RESET} ${RED}Could not read SSH logs${RESET}\n"
+    printf "  ${DIM}Creating empty log file to continue...${RESET}\n"
+    : > "$LOG_TEMP"
+    TOTAL_ATTEMPTS=0
+fi
+
+# ─── Apply Filters ───────────────────────────────────────────────────────────
+FILTER_REPORT_FILE=""
+DOMAIN_NAME=""
+DOMAIN_IPS=""
+
+if [[ -n "$FILTER_IP" ]] || [[ -n "$FILTER_DATE" ]]; then
+    FILTER_TEMP=$(mktemp)
+    FILTERED_COUNT=0
+
+    if [[ -n "$FILTER_IP" ]]; then
+        printf "\n${CYAN}${BOLD}Filtering logs for IP: ${FILTER_IP}${RESET}\n"
+        grep -F "$FILTER_IP" "$LOG_TEMP" > "$FILTER_TEMP" || true
+        FILTERED_COUNT=$(wc -l < "$FILTER_TEMP")
+        mv "$FILTER_TEMP" "$LOG_TEMP"
+
+        # Set report filename based on IP (replace dots with underscores)
+        FILTER_REPORT_FILE="${FILTER_IP//./_}.txt"
+
+        # ─── DNS Reverse Lookup ───────────────────────────────────────────
+        printf "\n${MAGENTA}${BOLD}Performing DNS reverse lookup for ${FILTER_IP}...${RESET}\n"
+        RDNS_RESULT=$(timeout 5 dig -x "$FILTER_IP" +short +time=2 +tries=1 2>/dev/null | sed 's/\.$//')
+
+        if [[ -n "$RDNS_RESULT" ]]; then
+            printf "  ${GREEN}${BOLD}✓${RESET} ${GREEN}Reverse DNS: ${RDNS_RESULT}${RESET}\n"
+            DOMAIN_NAME=$(echo "$RDNS_RESULT" | awk -F'.' '{print $(NF-1)"."$NF}')
+
+            # ─── Search for other IPs from same domain ────────────────────
+            printf "\n${MAGENTA}${BOLD}Searching for other attackers from domain: ${DOMAIN_NAME}...${RESET}\n"
+
+            # Check top 30 attackers to avoid unbounded sequential DNS lookups
+            ALL_IPS=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; break}}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -30 | awk '{print $2}')
+
+            # Check each IP's reverse DNS for same domain
+            DOMAIN_ATTACKERS=""
+            DOMAIN_ATTACK_COUNT=0
+
+            while IFS= read -r ip; do
+                if [[ -n "$ip" ]] && [[ "$ip" != "$FILTER_IP" ]]; then
+                    ip_rdns=$(timeout 3 dig -x "$ip" +short +time=2 +tries=1 2>/dev/null | sed 's/\.$//')
+                    if [[ "$ip_rdns" == *"$DOMAIN_NAME"* ]]; then
+                        ip_attempts=$(grep -cF "$ip" "$LOG_TEMP" 2>/dev/null || echo "0")
+                        DOMAIN_ATTACKERS="${DOMAIN_ATTACKERS}\n  ${ip} - ${ip_rdns} (${ip_attempts} attempts)"
+                        DOMAIN_ATTACK_COUNT=$((DOMAIN_ATTACK_COUNT + 1))
+                    fi
+                fi
+            done <<< "$ALL_IPS"
+
+            if [[ $DOMAIN_ATTACK_COUNT -gt 0 ]]; then
+                printf "  ${YELLOW}${BOLD}⚠ Found ${DOMAIN_ATTACK_COUNT} other attacker(s) from ${DOMAIN_NAME}:${RESET}\n"
+                echo -e "$DOMAIN_ATTACKERS"
+            else
+                printf "  ${GREEN}✓ No other attackers found from ${DOMAIN_NAME}${RESET}\n"
+            fi
+        else
+            printf "  ${YELLOW}!${RESET} ${YELLOW}No reverse DNS found for ${FILTER_IP}${RESET}\n"
+            DOMAIN_NAME="unknown"
+        fi
+    fi
+
+    if [[ -n "$FILTER_DATE" ]]; then
+        # Convert MM/DD/YYYY to journalctl format (Mon DD)
+        FILTER_MONTH=$(echo "$FILTER_DATE" | cut -d'/' -f1 | sed 's/^0//')
+        FILTER_DAY=$(echo "$FILTER_DATE" | cut -d'/' -f2 | sed 's/^0//')
+        FILTER_YEAR=$(echo "$FILTER_DATE" | cut -d'/' -f3)
+
+        # Map month number to abbreviation
+        case "$FILTER_MONTH" in
+            1)  MONTH_ABBR="Jan" ;;
+            2)  MONTH_ABBR="Feb" ;;
+            3)  MONTH_ABBR="Mar" ;;
+            4)  MONTH_ABBR="Apr" ;;
+            5)  MONTH_ABBR="May" ;;
+            6)  MONTH_ABBR="Jun" ;;
+            7)  MONTH_ABBR="Jul" ;;
+            8)  MONTH_ABBR="Aug" ;;
+            9)  MONTH_ABBR="Sep" ;;
+            10) MONTH_ABBR="Oct" ;;
+            11) MONTH_ABBR="Nov" ;;
+            12) MONTH_ABBR="Dec" ;;
+            *)  echo "Invalid month: $FILTER_MONTH"; exit 1 ;;
+        esac
+
+        printf "\n${CYAN}${BOLD}Filtering logs for date: ${FILTER_DATE} (${MONTH_ABBR} ${FILTER_DAY})${RESET}\n"
+        grep -E "^${MONTH_ABBR} +${FILTER_DAY} " "$LOG_TEMP" > "$FILTER_TEMP" || true
+        FILTERED_COUNT=$(wc -l < "$FILTER_TEMP")
+        mv "$FILTER_TEMP" "$LOG_TEMP"
+
+        # If no IP filter, set report filename based on date
+        if [[ -z "$FILTER_REPORT_FILE" ]]; then
+            FILTER_REPORT_FILE="attacks_${FILTER_MONTH}_${FILTER_DAY}_${FILTER_YEAR}.txt"
+        fi
+    fi
+
+    TOTAL_ATTEMPTS=$(wc -l < "$LOG_TEMP")
+    printf "  ${GREEN}${BOLD}✓${RESET} ${GREEN}Filtered to ${TOTAL_ATTEMPTS} matching log entries${RESET}\n"
+
+    if [ "$TOTAL_ATTEMPTS" -eq 0 ]; then
+        printf "  ${YELLOW}!${RESET} ${YELLOW}No matching attacks found for the specified filter${RESET}\n"
+        printf "  ${DIM}Try a different IP or date range${RESET}\n"
+        rm "$LOG_TEMP"
+        exit 0
+    fi
+fi
+
+# --- GLOBAL TIMEFRAME CALCULATION ---
+if [ "$TOTAL_ATTEMPTS" -gt 0 ]; then
+    FIRST_LOG_TS=$(head -n 1 "$LOG_TEMP" | awk '{print $1" "$2" "$3}')
+    LAST_LOG_TS=$(tail -n 1 "$LOG_TEMP" | awk '{print $1" "$2" "$3}')
+    F_SEC=$(date -d "$FIRST_LOG_TS 2026" +%s 2>/dev/null || echo "0")
+    L_SEC=$(date -d "$LAST_LOG_TS 2026" +%s 2>/dev/null || echo "0")
+    DIFF_SECS=$((L_SEC - F_SEC))
+    [ $DIFF_SECS -lt 3600 ] && DIFF_SECS=3600
+else
+    FIRST_LOG_TS="No data"
+    LAST_LOG_TS="No data"
+    DIFF_SECS=3600
+fi
+
+TOTAL_HOURS=$(echo "scale=2; $DIFF_SECS / 3600" | bc)
+GLOBAL_ATTACKS_PER_HOUR=$(echo "scale=2; $TOTAL_ATTEMPTS / $TOTAL_HOURS" | bc)
+HIGH_RATE=$(echo "$GLOBAL_ATTACKS_PER_HOUR > 10000" | bc)
+MED_RATE=$(echo "$GLOBAL_ATTACKS_PER_HOUR > 100" | bc)
+if [ "$HIGH_RATE" -eq 1 ]; then
+    GLOBAL_RATE_DISPLAY=$(echo "scale=2; $TOTAL_ATTEMPTS / $DIFF_SECS" | bc)"/sec"
+elif [ "$MED_RATE" -eq 1 ]; then
+    GLOBAL_RATE_DISPLAY=$(echo "scale=2; $TOTAL_ATTEMPTS / ($TOTAL_HOURS * 60)" | bc)"/min"
+else
+    GLOBAL_RATE_DISPLAY="${GLOBAL_ATTACKS_PER_HOUR}/hr"
+fi
+
+# ─── Bar Chart: top attacker IPs by attempt count ──────────────────────────
+if [ "$TOTAL_ATTEMPTS" -gt 0 ]; then
+    TOP_ROWS=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; break}}' "$LOG_TEMP" \
+        | sort | uniq -c | sort -rn | head -10)
+    if [ -n "$TOP_ROWS" ]; then
+        CHART_MAX=$(printf '%s\n' "$TOP_ROWS" | awk 'NR==1{print $1}')
+        CHART_SUM=$(printf '%s\n' "$TOP_ROWS" | awk '{s+=$1} END {print s+0}')
+        printf "\n  ${BOLD}${CYAN}Top 10 attackers by attempts (shown=%s of %s):${RESET}\n" \
+            "$CHART_SUM" "$TOTAL_ATTEMPTS"
+        while read -r cnt ip; do
+            [ -z "$ip" ] && continue
+            pct=$(( cnt * 100 / (CHART_MAX > 0 ? CHART_MAX : 1) ))
+            color="$GREEN"; [ "$pct" -ge 60 ] && color="$YELLOW"; [ "$pct" -ge 85 ] && color="$RED"
+            filled=$(( pct * 40 / 100 ))
+            [ "$filled" -eq 0 ] && [ "$cnt" -gt 0 ] && filled=1
+            bar=""
+            for (( j=0; j<filled; j++ )); do bar+="█"; done
+            for (( j=filled; j<40; j++ )); do bar+=" "; done
+            printf "    %-18s ${color}%s${RESET} %d\n" "$ip" "$bar" "$cnt"
+        done <<< "$TOP_ROWS"
+        printf "\n"
+    fi
+fi
+
+{
+    echo "=== SSH MULTI-IP FORENSIC DOSSIER ($MY_NAME) - $DATE_STR ==="
+    echo "Report Origin: $MY_LOCATION | System: $MY_OS"
+    echo "Global Campaign Context:"
+    echo " - Total Logged Attempts: $TOTAL_ATTEMPTS"
+    echo " - Observation Window: $TOTAL_HOURS hours"
+    echo " - Global Pressure: $GLOBAL_RATE_DISPLAY"
+    echo "----------------------------------------------------------"
+} > "$EMAIL_FILE"
+
+# ============================================================================
+# Speed: pre-fetch all per-IP network lookups in parallel.
+#
+# Previously awk did 7 sequential `cmd | getline` per IP inside its END block,
+# which serialised 30 IPs × ~13s of network calls = ~6.5 minutes. We now
+# extract the top-30 IP list, fire all 7 lookups per IP in a single
+# backgrounded subshell, and write results to /tmp/.abusez_lookup.$$ so
+# awk reads from disk instead of doing the network itself.
+#
+# Layout: ip<TAB>emails<TAB>rdns<TAB>latency<TAB>ssh_banner<TAB>org<TAB>abuse_c<TAB>tz
+# ============================================================================
+TOP_IPS_FILE=$(mktemp -p "$TMP_DIR")
+LOOKUP_FILE=$(mktemp -p "$TMP_DIR")
+trap 'rm -f "$TOP_IPS_FILE" "$LOOKUP_FILE"' EXIT
+
+# Build the top-30 IP list once
+awk -v log="$LOG_TEMP" '
+    {
+        match($0, /from ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/, m)
+        if (m[1] != "") count[m[1]]++
+    }
+    END {
+        n = asorti(count, sorted, "@val_num_desc")
+        for (i = 1; i <= n && i <= 30; i++) print sorted[i]
+    }
+' "$LOG_TEMP" > "$TOP_IPS_FILE"
+
+# Fire all per-IP lookups in parallel. 30 IPs × 7 fields, all at once.
+# Each IP gets one ( ip ) & job that writes its 7 fields into the lookup file
+# under a single flock-guarded append.
+(
+    flock 9
+    fetch_ip() {
+        local ip="$1"
+        local emails rdns latency ssh_banner org abuse_c tz
+        # Cache whois once per IP (was being called 3x before).
+        local whois_out
+        whois_out=$(timeout 5 whois "$ip" 2>/dev/null)
+        emails=$(printf '%s' "$whois_out" \
+            | grep -Eio "[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}" \
+            | sort -u | paste -sd, - | sed 's/,/, /g')
+        [[ -z "$emails" ]] && emails="none"
+        org=$(printf '%s' "$whois_out" \
+            | grep -Ei "^(org-name|organization|descr)" | head -1 | sed 's/^[^:]*:[[:space:]]*//')
+        abuse_c=$(printf '%s' "$whois_out" \
+            | grep -Ei "^(abuse-mailbox|abuse-c|% Abuse contact)" | head -1 | sed 's/^[^:]*:[[:space:]]*//')
+        rdns=$(timeout 3 dig +short +time=2 +tries=1 -x "$ip" 2>/dev/null | head -1 | sed 's/\.$//')
+        [[ -z "$rdns" ]] && rdns="(no PTR)"
+        latency=$(timeout 2 ping -c 1 -W 1 "$ip" 2>&1 | grep -oE 'time=[0-9.]+' | cut -d= -f2)
+        [[ -z "$latency" ]] && latency="timeout"
+        # NOTE: removed nc banner-grab to attacker :22 — that discloses our
+        # IP to the very attacker we are reporting. Pure passive lookups only.
+        ssh_banner="(not probed — passive-only)"
+        tz=$(timeout 5 curl -s "https://ipinfo.io/${ip}/json" 2>/dev/null \
+            | grep -oE '"timezone":[[:space:]]*"[^"]+"' | cut -d'"' -f4)
+        [[ -z "$tz" ]] && tz="unknown"
+        # Tab-separated, single line per IP. awk will read this file directly.
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$ip" "$emails" "$rdns" "$latency" "$ssh_banner" "$org" "$abuse_c" "$tz" \
+            >> "$LOOKUP_FILE"
+    }
+    export -f fetch_ip
+    export LOOKUP_FILE
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        ( fetch_ip "$ip" ) &
+    done < "$TOP_IPS_FILE"
+    wait
+) 9>"$TMP_DIR/.abusez_lookup.lock"
+
+if [[ -s "$LOOKUP_FILE" ]]; then
+    printf ">>> Pre-fetched per-IP lookups in parallel for %d IPs\n" \
+        "$(wc -l < "$LOOKUP_FILE" | tr -d ' ')"
+fi
+
+# The Analyzer
+awk -v email="$EMAIL_FILE" -v my_ip="$MY_IP" -v my_gmail="$MY_EMAIL" -v my_name="$MY_NAME" -v contact="$CONTACT_INFO" -v loc="$MY_LOCATION" -v os="$MY_OS" -v global_avg="$GLOBAL_RATE_DISPLAY" -v lookup="$LOOKUP_FILE" '
+BEGIN {
+    # Load pre-fetched per-IP lookups (see /tmp/.abusez_lookup.*).
+    # Format: ip<TAB>emails<TAB>rdns<TAB>latency<TAB>ssh_banner<TAB>org<TAB>abuse_c<TAB>tz
+    while ((getline line < lookup) > 0) {
+        n = split(line, parts, "\t")
+        if (n >= 8) {
+            ip = parts[1]
+            L_email[ip]    = parts[2]
+            L_rdns[ip]     = parts[3]
+            L_latency[ip]  = parts[4]
+            L_banner[ip]   = parts[5]
+            L_org[ip]      = parts[6]
+            L_abuse[ip]    = parts[7]
+            L_tz[ip]       = parts[8]
+        }
+    }
+    close(lookup)
+}
+{
+    match($0, /for (invalid user )?([^ ]+) from ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/, arr)
+    if(arr[2]!="" && arr[3]!="") {
+        ip=arr[3]; user=arr[2]; count[ip]++
+        ts_pure = $1 " " $2 " " $3
+        users_per_ip[ip] = users_per_ip[ip] " " user
+        if (!seen_user[ip, user]++) {
+            unique_users_per_ip[ip] = unique_users_per_ip[ip] " " user
+        }
+        user_count_per_ip[ip, user]++
+        if(first[ip]=="") first[ip]=ts_pure
+        last[ip]=ts_pure
+        
+        # Parse hour from timestamp (format: "Apr  8 11:22:41")
+        split(ts_pure, ts_parts, " ")
+        time_part = ts_parts[3]
+        split(time_part, time_parts, ":")
+        hour = time_parts[1]
+        hour_count[ip, hour]++
+        global_hour_count[hour]++
+        
+        # Capture all timestamps for interval analysis
+        ts_full[ip, count[ip]] = ts_pure
+        
+        logs[ip] = logs[ip] "\n    " ts_pure " PST | Target: " user
+        
+        # Track intervals between attacks
+        if(prev_ts[ip]!="") {
+            cmd = "date -d \"" ts_pure " 2026\" +%s 2>/dev/null"
+            cmd | getline cur_sec; close(cmd)
+            cmd = "date -d \"" prev_ts[ip] " 2026\" +%s 2>/dev/null"
+            cmd | getline prev_sec; close(cmd)
+            interval = cur_sec - prev_sec
+            intervals[ip] = intervals[ip] " " interval
+            interval_sum[ip] += interval
+            if(interval < min_interval[ip] || min_interval[ip]=="") min_interval[ip] = interval
+            if(interval > max_interval[ip]) max_interval[ip] = interval
+        }
+        prev_ts[ip] = ts_pure
+    }
+}
+END {
+    PROCINFO["sorted_in"]="@val_num_desc"
+    n=0
+    total_ips = 0
+    for(ip in count) total_ips++
+    
+    print ">>> Parsed " total_ips " unique attacker IPs, analyzing top 30..."
+    print ">>> Starting attacker analysis... (progress shown below)"
+    fflush()
+    
+    for(ip in count) {
+        n++; if(n>30) break
+        
+        print ""
+        print "═══════════════════════════════════════════════════════════"
+        print ">>> [" n "/30] Processing " ip " (" count[ip] " attempts)..."
+        print "═══════════════════════════════════════════════════════════"
+        fflush()
+
+        # Calculate Specific IP Duration (inline, faster)
+        split(first[ip], dt, " ")
+        split(last[ip], dt2, " ")
+        f_sec = mktime(dt[3] " " dt[2] " " dt[1] " " dt[4] " 00 00")
+        l_sec = mktime(dt2[3] " " dt2[2] " " dt2[1] " " dt2[4] " 00 00")
+        ip_diff = l_sec - f_sec
+        if(ip_diff <= 0) ip_diff = 60
+        else if(ip_diff < 60) ip_diff = 60
+        ip_attacks_per_hour = (count[ip] / ip_diff) * 3600
+        ip_attacks_per_sec = (count[ip] / ip_diff)
+        ip_attacks_per_min = (count[ip] / ip_diff) * 60
+        
+        if (ip_attacks_per_hour > 10000) {
+            rate_display = sprintf("%.1f/sec", ip_attacks_per_sec)
+        } else if (ip_attacks_per_hour > 100) {
+            rate_display = sprintf("%.1f/min", ip_attacks_per_min)
+        } else {
+            rate_display = sprintf("%.1f/hr", ip_attacks_per_hour)
+        }
+
+        print "    [1/6] WHOIS emails (pre-fetched)..."
+        fflush()
+        current_emails = L_email[ip]
+        if (current_emails == "") current_emails = "(no data)"
+        print "    [1/6] Done - emails found: " current_emails
+        fflush()
+
+        print "    [2/6] RDNS (pre-fetched)..."
+        fflush()
+        rdns = L_rdns[ip]
+        if (rdns == "") rdns = "(no PTR)"
+        print "    [2/6] Done - RDNS: " rdns
+        fflush()
+
+        print "    [3/6] Latency (pre-fetched)..."
+        fflush()
+        latency = L_latency[ip]
+        if (latency == "") latency = "timeout"
+        print "    [3/6] Done - latency: " latency " ms"
+        fflush()
+
+        print "    [4/6] SSH banner (passive, not probed)..."
+        fflush()
+        ssh_banner = L_banner[ip]
+        if (ssh_banner == "") ssh_banner = "(not probed — passive-only)"
+        print "    [4/6] Done - server: " ssh_banner
+        fflush()
+
+        print "    [5/6] Org/abuse contact (pre-fetched)..."
+        fflush()
+        org = L_org[ip]
+        abuse_c = L_abuse[ip]
+        print "    [5/6] Done - org: " org
+        fflush()
+
+        print "    [6/6] AbuseIPDB reference..."
+        fflush()
+        print "    [6/6] Done - https://www.abuseipdb.com/check/" ip
+        fflush()
+
+        print "    [7/7] Timezone (pre-fetched)..."
+        fflush()
+        attacker_tz = L_tz[ip]
+        if (attacker_tz == "") attacker_tz = "unknown"
+        print "    [7/7] Done - timezone: " attacker_tz
+        fflush()
+
+        print "    [8/8] Analyzing attack patterns..."
+        fflush()
+
+        # Analyze username patterns for this IP
+        split(users_per_ip[ip], user_arr, " ")
+        delete seen_user
+        uniq_users = 0
+        for(k in user_arr) {
+            u = user_arr[k]
+            if(u!="" && !seen_user[u]++) uniq_users++
+            user_count[u]++
+        }
+
+        # Analyze intervals
+        split(intervals[ip], int_arr, " ")
+        delete seen_int
+        int_count = 0
+        avg_bucket_sum = 0
+        delete buckets
+        for(k in int_arr) {
+            v = int_arr[k]+0
+            if(v>0 && v<300) {
+                int_bucket = int(v/10)*10
+                buckets[int_bucket]++
+                int_count++
+            }
+        }
+        if(int_count > 0) {
+            for(b in buckets) avg_bucket_sum += buckets[b]*b
+            avg_interval = avg_bucket_sum / int_count
+        }
+        regularity = "variable"
+        if(count[ip] > 5) {
+            if(min_interval[ip]!="" && max_interval[ip]!="" && min_interval[ip]+0 > 0) {
+                ratio = (max_interval[ip]+0) / (min_interval[ip]+0)
+                if(ratio < 1.5) regularity = "ROBOT (very regular)"
+                else if(ratio < 3) regularity = "AUTOMATED (fairly regular)"
+                else regularity = "HUMAN/TOOL (irregular)"
+            }
+        }
+        
+        # Find peak attack hour for this IP
+        peak_hour = -1
+        peak_count = 0
+        for (h = 0; h < 24; h++) {
+            if (hour_count[ip, h] > peak_count) {
+                peak_count = hour_count[ip, h]
+                peak_hour = h
+            }
+        }
+        
+        # Find top username for this IP
+        top_user = ""
+        top_count = 0
+        for (key in user_count_per_ip) {
+            split(key, parts, SUBSEP)
+            if (parts[1] == ip) {
+                u = parts[2]
+                c = user_count_per_ip[key]
+                if (c > top_count) {
+                    top_count = c
+                    top_user = u
+                }
+            }
+        }
+        
+        # Format duration as hr:min:sec
+        dur_hr = int(ip_diff / 3600)
+        dur_min = int((ip_diff % 3600) / 60)
+        dur_sec = ip_diff % 60
+        dur_formatted = dur_hr "h " dur_min "m " dur_sec "s"
+
+        print ""
+        print "═══════════════════════════════════════════════════════════"
+        print " [" n "/30] ATTACKER: " ip
+        print "═══════════════════════════════════════════════════════════"
+        print "  Attempts: " count[ip] " | Rate: " rate_display " | Duration: " dur_formatted
+        print "  Timeframe: " first[ip] " → " last[ip] " PST"
+        print "---"
+        if (current_emails != "") print "  WHOIS EMAILS: " current_emails
+        else print "  WHOIS EMAILS: none"
+        if (abuse_c != "") print "  ABUSE CONTACT: " abuse_c
+        else print "  ABUSE CONTACT: none"
+        if (rdns != "") print "  RDNS: " rdns
+        else print "  RDNS: none"
+        print "  Latency: " latency " ms"
+        if (ssh_banner != "") print "  Attacker SSH: " ssh_banner
+        else print "  Attacker SSH: unknown"
+        if (org != "") print "  Org: " org
+        else print "  Org: unknown"
+        if (abuse_c != "") print "  Abuse-C: " abuse_c
+        else print "  Abuse-C: none"
+        print "  AbuseIPDB: https://www.abuseipdb.com/check/" ip
+        print "  Attacker Timezone: " attacker_tz
+        print "---"
+        print "  [PATTERNS]"
+        print "  Usernames tried: " uniq_users " unique -" substr(unique_users_per_ip[ip],2,60)
+        print "  Username attempts:"
+        for (key in user_count_per_ip) {
+            split(key, parts, SUBSEP)
+            if (parts[1] == ip) {
+                u = parts[2]
+                c = user_count_per_ip[key]
+                printf "    %-20s %d attempts\n", u, c
+            }
+        }
+        print "  Attack cadence: " regularity
+        if(int_count > 0) {
+            print "  Interval stats: min=" min_interval[ip]+0 "s, max=" max_interval[ip]+0 "s, avg=" avg_interval "s"
+            printf "  Interval distribution: "
+            for(b=0; b<=200; b+=20) {
+                if(buckets[b]>0) printf "%ds:%d ", b, buckets[b]
+            }
+            print ""
+        }
+        if (peak_hour >= 0) {
+            print "  Peak attack hour: " peak_hour ":00-" peak_hour ":59 PST with " peak_count " attempts"
+        }
+        print "---"
+        print "  [RECOMMENDATIONS FOR ISP/NETWORK ADMINS - FIND THE ATTACKER]"
+        print "  ATTACKER SERVER: " ssh_banner
+        print "  SEARCH YOUR FIREWALL/NETWORK LOGS FOR:"
+        print "  "
+        print "  1. SOURCE IP " ip " making SSH CONNECTIONS to ashys.org port 22"
+        print "  2. TIME WINDOW: " first[ip] " to " last[ip] " PST"
+        print "  3. PEAK HOUR: " peak_hour ":00 PST approx " peak_count " connections"
+        print "  4. USERNAMES TRIED: " uniq_users " unique -" substr(unique_users_per_ip[ip],2,60)
+        print "  "
+        print "  QUICK SEARCH COMMANDS:"
+        print "  grep -r " ip " /var/log/* 2>/dev/null"
+        print "  grep " ip " /var/log/messages /var/log/secure 2>/dev/null"
+        print "  "
+        print "  FIREWALL: grep " ip " /var/log/iptables* /var/log/pf* /var/log/cisco* 2>/dev/null"
+        print "  NETFLOW:  nfdump -r *.nfcap* src " ip " 2>/dev/null | head -20"
+        print "  TCPDUMP:  tcpdump -r /var/log/tcpdump* host " ip " 2>/dev/null | head -20"
+        print "  DHCP:     grep -r " ip " /var/lib/dhcp* /var/log/dhcp* 2>/dev/null"
+        print "  RADIUS:   grep " ip " /var/log/radius* /var/log/aaa* 2>/dev/null"
+        print "  SQUID:    grep " ip " /var/log/squid* /var/log/nginx/access* 2>/dev/null"
+        print "  SYSTEMD:  journalctl --since " first[ip] " | grep " ip " 2>/dev/null | head -20"
+        print ">>> Done with " ip ", moving to next..."
+        fflush()
+
+        print "To: " current_emails >> email
+        print "From: " my_gmail >> email
+        print "Subject: SSH Brute Force FROM YOUR IP: " ip " (" count[ip] " attempts) - Please Investigate" >> email
+        print "" >> email
+        print "========================================" >> email
+        print "Hello!" >> email
+        print "========================================" >> email
+        print "" >> email
+        print "My name is " my_name ", and I am from " loc "." >> email
+        print "" >> email
+        print "I have been seeing a lot of attacks from your IP address " ip "." >> email
+        if (rdns != "") print "Your hostname (reverse DNS) is: " rdns >> email
+        print "I am reaching out because I noticed there were " count[ip] " attempts between" >> email
+        print first[ip] " and " last[ip] " PST targeting my server at ashys.org." >> email
+        print "" >> email
+        print "Others have also seen attacks from your IP address." >> email
+        print "Here is a link to see what others are saying about attacks from your IP:" >> email
+        print "https://www.abuseipdb.com/check/" ip >> email
+        print "" >> email
+        print "I understand this may be coming from one of your customers, or possibly from" >> email
+        print "malware on a compromised machine within your network." >> email
+        print "" >> email
+        
+        print "========================================" >> email
+        print "RECOMMENDATIONS FOR ISP/NETWORK ADMINS" >> email
+        print "========================================" >> email
+        print "" >> email
+        print "Our server received SSH brute-force attacks FROM your IP address." >> email
+        print "Our analysis suggests the attacking server is: " ssh_banner >> email
+        print "" >> email
+        print "We have studied our logs and believe the BEST TIMEFRAME to find this" >> email
+        print "attacker in your logs is between " first[ip] " and " last[ip] " PST." >> email
+        print "The PEAK activity was around " peak_hour ":00 PST with approximately " peak_count " connections." >> email
+        print "" >> email
+        print "========================================" >> email
+        print "SEARCH CRITERIA - include ALL of these:" >> email
+        print "========================================" >> email
+        print "  Source IP - attacker:   " ip >> email
+        if (rdns != "") print "  Hostname (RDNS):       " rdns >> email
+        print "  Victim:               ashys.org (IP: " my_ip ")" >> email
+        print "  Port:                   22 SSH" >> email
+        print "  Time Window:            " first[ip] " to " last[ip] " PST" >> email
+        print "  Attacker Timezone:     " attacker_tz " (peak hour is " peak_hour ":00 in this timezone)" >> email
+        print "  Peak Hour:              " peak_hour ":00 PST - approximately " peak_count " connections" >> email
+        print "  Usernames Tried (with counts):" >> email
+        for (key in user_count_per_ip) {
+            split(key, parts, SUBSEP)
+            if (parts[1] == ip) {
+                u = parts[2]
+                c = user_count_per_ip[key]
+                printf "    %-20s %d attempts\n", u, c >> email
+            }
+        }
+        print "" >> email
+        print "========================================" >> email
+        print "HOW TO FIND THE ATTACKER:" >> email
+        print "========================================" >> email
+        print "" >> email
+        print "1. FIND THE LOGIN USERNAME WHO ATTACKED:" >> email
+        print "   last | grep \"" ip "\" 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: The login username and terminal of the attacker" >> email
+        print "" >> email
+        print "   who | grep \"" ip "\" 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: Currently logged in users from this IP" >> email
+        print "" >> email
+        print "   lastlog | grep \"" ip "\" 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: Last login time and source IP for all users" >> email
+        print "" >> email
+        print "   grep " ip " /var/log/secure /var/log/auth.log 2>/dev/null | grep -iE \"accepted|session|logged\" | head -20" >> email
+        print "   WHAT IT SHOWS: Successful SSH logins from this IP with usernames" >> email
+        print "" >> email
+        print "2. SYSTEM LOGS - Shows WHO logged in from this IP:" >> email
+        print "   grep \"" ip "\" /var/log/secure /var/log/messages /var/log/auth.log 2>/dev/null" >> email
+        print "   journalctl --since \"" first[ip] "\" | grep \"" ip "\" 2>/dev/null | head -20" >> email
+        print "   grep \"" ip "\" /var/log/auth.log | grep \"ashys.org\|" my_ip "\" 2>/dev/null | head -20" >> email
+        print "   WHAT IT SHOWS: The username and hostname of the person who ran the attack" >> email
+        print "" >> email
+        print "3. FIREWALL LOGS - Shows the ATTACK in progress:" >> email
+        print "   grep \"" ip "\" /var/log/iptables* /var/log/pf* /var/log/cisco* /var/log/firewall* 2>/dev/null" >> email
+        print "   grep \"" ip ".*ashys.org\|" ip ".*" my_ip "\" /var/log/iptables* /var/log/kern* 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: Timestamps and session details of the attack connections" >> email
+        print "" >> email
+        print "4. NETFLOW/SFLOW - Shows connection PATTERNS:" >> email
+        print "   nfdump -r *.nfcap* src " ip " 2>/dev/null | head -20" >> email
+        print "   nfdump -r *.nfcap* dst ashys.org 2>/dev/null | head -20" >> email
+        print "   nfdump -r *.nfcap* src " ip " dst " my_ip " 2>/dev/null | head -20" >> email
+        print "   WHAT IT SHOWS: Bandwidth used, session duration, and attack frequency" >> email
+        print "" >> email
+        print "5. DHCP LEASES - IDENTIFIES THE CUSTOMER ACCOUNT:" >> email
+        print "   grep -r \"" ip "\" /var/lib/dhcp* /var/db/dhcp* /var/log/dhcp* 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: Customer name, MAC address, and account billing info" >> email
+        print "" >> email
+        print "6. RADIUS/AAA - Shows WHO authenticated:" >> email
+        print "   grep \"" ip "\" /var/log/radius* /var/log/aaa* /var/log/radacct* 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: Customer credentials used and session start/stop times" >> email
+        print "" >> email
+        print "7. PROXY/GATEWAY - Shows browsing activity:" >> email
+        print "   grep \"" ip "\" /var/log/squid* /var/log/privoxy* /var/log/nginx/access* 2>/dev/null" >> email
+        print "   WHAT IT SHOWS: If this was a proxy relay, shows the original attacker IP" >> email
+        print "" >> email
+        print "8. ALL LOGS - Quick search to find any mention:" >> email
+        print "   grep -r \"" ip "\" /var/log/ 2>/dev/null | head-50" >> email
+        print "   grep -r \"ashys.org\" /var/log/ 2>/dev/null | head-50" >> email
+        print "   grep -r \"" ip "\".*ashys.org\|ashys.org.*" ip " /var/log/ 2>/dev/null | head-20" >> email
+        print "   WHAT IT SHOWS: Any log entry mentioning this IP or our server" >> email
+        print "" >> email
+        print "========================================" >> email
+        print "The customer using this IP should be identifiable via DHCP" >> email
+        print "lease logs, RADIUS accounting, or PPP/session logs." >> email
+        print "========================================" >> email
+        print "" >> email
+        print "Please try running these commands on your system to help us identify" >> email
+        print "the specific customer responsible for these attacks. Thank you!" >> email
+        print "" >> email
+        
+        # ── Consolidated Attack Summary ──
+        print "========================================" >> email
+        print "ATTACK SUMMARY (" count[ip] " total attempts)" >> email
+        print "========================================" >> email
+        print "" >> email
+        print "Timeframe: " first[ip] " to " last[ip] " PST" >> email
+        print "Duration:  " dur_formatted >> email
+        print "Rate:      " rate_display >> email
+        print "Cadence:   " regularity >> email
+        if (peak_hour >= 0) {
+            print "Peak hour: " peak_hour ":00-" peak_hour ":59 PST (" peak_count " attempts)" >> email
+        }
+        print "" >> email
+
+        # Per-hour histogram (compact)
+        print "Attacks by hour (PST):" >> email
+        for (h = 0; h < 24; h++) {
+            hc = hour_count[ip, h]+0
+            if (hc > 0) {
+                bar = ""
+                bar_scale = 1
+                if (hc > 40) bar_scale = int(hc / 40) + 1
+                for (b = 0; b < int(hc / bar_scale); b++) bar = bar "#"
+                printf "  %02d:00  %5d  %s\n", h, hc, bar >> email
+            }
+        }
+        print "" >> email
+
+        # Sample of attacks (up to 20, spread across timeframe)
+        print "Sample attacks (up to 20):" >> email
+        sample_count = 0
+        sample_total = count[ip]
+        if (sample_total <= 20) {
+            split(logs[ip], log_lines, "\n")
+            for (li in log_lines) {
+                if (log_lines[li] != "" && log_lines[li] !~ /^$/) {
+                    print "  " log_lines[li] >> email
+                    sample_count++
+                }
+            }
+        } else {
+            split(logs[ip], log_lines, "\n")
+            total_lines = 0
+            for (li in log_lines) {
+                if (log_lines[li] != "" && log_lines[li] !~ /^$/) {
+                    total_lines++
+                    non_empty[total_lines] = log_lines[li]
+                }
+            }
+            for (li = 1; li <= 5 && li <= total_lines; li++) {
+                print "  " non_empty[li] >> email
+                sample_count++
+            }
+            print "  ... (" sample_total - 20 " more entries) ..." >> email
+            start_last = total_lines - 14
+            if (start_last < 6) start_last = 6
+            for (li = start_last; li <= total_lines; li++) {
+                print "  " non_empty[li] >> email
+                sample_count++
+            }
+        }
+        print "" >> email
+
+        # ── Other Reports / AbuseIPDB ──
+        print "========================================" >> email
+        print "OTHER REPORTS OF THIS ATTACKER" >> email
+        print "========================================" >> email
+        print "" >> email
+        print "Other users have also reported attacks from your IP (" ip ")." >> email
+        print "You can view all public reports and the abuse confidence score here:" >> email
+        print "" >> email
+        print "  https://www.abuseipdb.com/check/" ip >> email
+        print "" >> email
+        print "The attacking server is in timezone: " attacker_tz >> email
+        print "Peak attack time in their local timezone: " peak_hour ":00" >> email
+        print "" >> email
+
+        # ── Related IPs ──
+        print "========================================" >> email
+        print "OTHER IPs THIS ATTACKER MAY HAVE USED" >> email
+        print "========================================" >> email
+        print "" >> email
+        print "Based on shared usernames and timing patterns, this attacker may have" >> email
+        print "also used the following IPs. Consider investigating these as well:" >> email
+        print "" >> email
+        found_related = 0
+        for (other_ip in count) {
+            if (other_ip == ip) continue
+            shared_users = 0
+            split(unique_users_per_ip[ip], u1, " ")
+            split(unique_users_per_ip[other_ip], u2, " ")
+            for (a in u1) {
+                for (b in u2) {
+                    if (u1[a] == u2[b] && u1[a] != "") shared_users++
+                }
+            }
+            if (shared_users >= 2) {
+                print "  " other_ip " -- " count[other_ip] " attempts, " shared_users " shared usernames" >> email
+                print "    Timeframe: " first[other_ip] " to " last[other_ip] " PST" >> email
+                print "    AbuseIPDB: https://www.abuseipdb.com/check/" other_ip >> email
+                print "" >> email
+                found_related++
+            }
+            if (found_related >= 5) break
+        }
+        if (found_related == 0) print "  No correlated IPs found for this attacker." >> email
+        print "" >> email
+
+        # ── Sign-off ──
+        print "Please investigate and take appropriate action." >> email
+        print "" >> email
+        print "========================================" >> email
+        print "Best regards," >> email
+        print my_name >> email
+        print "" >> email
+        print "PS: I am happy to work together to help find and stop this attacker." >> email
+        print "Please reach out if you need any additional information." >> email
+        print "" >> email
+        print "Contact:" >> email
+        print "  Email:  " my_gmail >> email
+        print "  Phone:  " contact >> email
+        print "" >> email
+        print "========================================" >> email
+        print "END OF DOSSIER FOR " ip >> email
+        print "========================================" >> email
+        print "----------------------------------------------------------" >> email
+        fflush(email)
+        fflush()
+    }
+    
+    # Find correlated IPs (same usernames, overlapping time, similar cadence)
+    print ""
+    print "═══════════════════════════════════════════════════════════"
+    print " [POSSIBLY RELATED ATTACKERS]"
+    print "═══════════════════════════════════════════════════════════"
+    for (ip1 in count) {
+        for (ip2 in count) {
+            if (ip1 >= ip2) continue
+            shared_users = 0
+            split(unique_users_per_ip[ip1], u1, " ")
+            split(unique_users_per_ip[ip2], u2, " ")
+            for (a in u1) {
+                for (b in u2) {
+                    if (u1[a] == u2[b] && u1[a] != "") shared_users++
+                }
+            }
+            if (shared_users >= 2 && count[ip1] >= 10 && count[ip2] >= 10) {
+                related[ip1,ip2] = shared_users
+            }
+        }
+    }
+    rel_count = 0
+    for (k in related) {
+        split(k, parts, SUBSEP)
+        ip1 = parts[1]; ip2 = parts[2]
+        shared = related[k]
+        print "  " ip1 " " count[ip1] " attempts <--> " ip2 " " count[ip2] " attempts"
+        print "    Shared usernames: " shared " | Same attacker likely used both IPs"
+        rel_count++
+        if (rel_count >= 5) break
+    }
+    if (rel_count == 0) print "  No correlated IPs found"
+    fflush()
+    
+    # Global peak hour analysis
+    print ""
+    print "═══════════════════════════════════════════════════════════"
+    print " [GLOBAL PEAK ATTACK TIME ANALYSIS]"
+    print "═══════════════════════════════════════════════════════════"
+    global_peak_hour = -1
+    global_peak_count = 0
+    for (h = 0; h < 24; h++) {
+        if (global_hour_count[h] > global_peak_count) {
+            global_peak_count = global_hour_count[h]
+            global_peak_hour = h
+        }
+    }
+    print "  Peak attack hour for all attackers: " global_peak_hour ":00 to " global_peak_hour ":59 PST"
+    print "  Attacks during this hour: " global_peak_count
+    print "  "
+    print "  Hour-by-hour distribution:"
+    for (h = 0; h < 24; h++) {
+        c = global_hour_count[h]+0
+        if (c > 0) {
+            bar = ""
+            bar_max = 40
+            attacks_per_bar = 1
+            if (c > bar_max) attacks_per_bar = int(c / bar_max)
+            for (i = 0; i < int(c / attacks_per_bar); i++) bar = bar "="
+            printf "  %02d:00 | %4d | %s\n", h, c, bar
+        }
+    }
+    fflush()
+}' "$LOG_TEMP"
+
+rm "$LOG_TEMP"
+
+# ==========================================
+# HTTP ATTACK ANALYSIS
+# ==========================================
+printf "${MAGENTA}${BOLD}Analyzing HTTP attack patterns...${RESET}\n"
+
+HTTP_LOG_TEMP=$(mktemp)
+sudo journalctl -u apache2 -n 100000 --no-pager > "$HTTP_LOG_TEMP" 2>/dev/null || true
+
+HTTP_ABUSE_FILE="http_abuse_report.txt"
+{
+    echo "=== HTTP ATTACK FORENSIC REPORT - $DATE_STR ==="
+    echo "Report Origin: $MY_LOCATION | System: $MY_OS"
+    echo "----------------------------------------------------------"
+} > "$HTTP_ABUSE_FILE"
+
+SENSITIVE_PATHS="/admin|.env|wp-admin|phpmyadmin|/config|backup|.sql|.git|/.htaccess|/wp-login|xmlrpc|wp-config"
+SQL_INJECTION_PATTERN="'.*(OR|UNION|SELECT|INSERT|DROP|DELETE|UPDATE).*"
+XSS_PATTERN="<script|javascript:|onerror=|onload="
+PATH_TRAV_PATTERN="../|..%2F|%2e%2e"
+SCAN_PATTERNS="nikto|sqlmap|dirbuster|gobuster|metasploit|burp|nmap|masscan|wget|curl"
+
+awk -v http_abuse="$HTTP_ABUSE_FILE" -v my_gmail="$MY_EMAIL" -v loc="$MY_LOCATION" '
+{
+    ip = ""
+    path = ""
+    status = ""
+    
+    # Apache Combined Log Format: IP - - [timestamp] "METHOD PATH PROTOCOL" STATUS ...
+    ip = ""
+    method = ""
+    path = ""
+    
+    # Try to extract IP - look for first field that looks like an IP
+    for (i = 1; i <= NF && i <= 5; i++) {
+        if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            ip = $i
+            break
+        }
+    }
+    
+    # Try to extract method and path from quoted section
+    for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[A-Z]+$/ && i+1 <= NF) {
+            method = $i
+            path = $(i+1)
+            break
+        }
+    }
+    
+    if (ip == "" || ip == "--" || ip == "-") next
+    
+    count[ip]++
+    
+    # Detect attack types
+    if (path ~ /\/admin|\.env|wp-admin|phpmyadmin|\/config|backup|\.sql|\.git|\/\.htaccess|wp-login|xmlrpc|wp-config/) {
+        sensitive_hits[ip]++
+        sensitive_paths[ip] = sensitive_paths[ip] " " path
+    }
+    if (path ~ /\047.*(OR|UNION|SELECT|INSERT|DROP|DELETE|UPDATE)/i) {
+        sqli_hits[ip]++
+    }
+    if (path ~ /<script|javascript:|onerror=|onload=/i) {
+        xss_hits[ip]++
+    }
+    if (path ~ /\.\.\/|\.\.%2F|%2e%2e/) {
+        traversal_hits[ip]++
+    }
+    if (toupper($0) ~ /NIKTO|SQLMAP|DIRBUSTER|GOBUSTER|METASPLOIT|BURP|NMAP/) {
+        scanner_hits[ip]++
+    }
+    if ($NF ~ /404|403/) {
+        error_hits[ip]++
+        error_paths[ip] = error_paths[ip] " " path
+    }
+    
+    # Track user agents
+    if (match($0, /"([^"]*)"$/, ua_arr)) {
+        ua = ua_arr[1]
+        ua_count[ip, ua]++
+    }
+}
+END {
+    PROCINFO["sorted_in"] = "@val_num_desc"
+    n = 0
+    for (ip in count) {
+        n++
+        total = count[ip]
+        sen = sensitive_hits[ip] + 0
+        sqli = sqli_hits[ip] + 0
+        xss = xss_hits[ip] + 0
+        trav = traversal_hits[ip] + 0
+        scan = scanner_hits[ip] + 0
+        err = error_hits[ip] + 0
+        
+        print "\n[HTTP] Attacker: " ip " | Total Requests: " total
+        print "  -> Sensitive Paths: " sen " | SQLi: " sqli " | XSS: " xss " | Traversal: " trav " | Scanner: " scan " | 404/403: " err
+        
+        print "\n--- HTTP ATTACK DETAILS FOR " ip " ---" >> http_abuse
+        print "Total Requests: " total >> http_abuse
+        print "Sensitive Path Hits: " sen >> http_abuse
+        print "SQL Injection Attempts: " sqli >> http_abuse
+        print "XSS Attempts: " xss >> http_abuse
+        print "Path Traversal Attempts: " trav >> http_abuse
+        print "Scanner/Bot Signatures: " scan >> http_abuse
+        print "404/403 Errors: " err >> http_abuse
+        
+        if (sensitive_paths[ip] != "") {
+            print "\nSensitive Paths Queried:" >> http_abuse
+            print sensitive_paths[ip] | "sort -u >> " http_abuse
+        }
+        if (error_paths[ip] != "") {
+            print "\n404/403 Paths Queried:" >> http_abuse
+            print error_paths[ip] | "sort -u >> " http_abuse
+        }
+        
+        print "\nTop User Agents:" >> http_abuse
+        for (key in ua_count) {
+            split(key, parts, SUBSEP)
+            if (parts[1] == ip) {
+                print "  " ua_count[key] "x: " parts[2] >> http_abuse
+            }
+        }
+        
+        print "\nWHOIS Info:" >> http_abuse
+        if (ip != "" && ip != "--" && ip != "-") {
+            whois_cmd = "whois " ip " | grep -Ei \"org-name|organization|abuse-c\" | head -5 >> " http_abuse
+            system(whois_cmd)
+        } else {
+            print "  IP not available" >> http_abuse
+        }
+        print "----------------------------------------------------------" >> http_abuse
+        fflush(http_abuse)
+    }
+    print "\nTotal unique HTTP attackers analyzed: " n >> http_abuse
+}' "$HTTP_LOG_TEMP"
+
+rm "$HTTP_LOG_TEMP"
+
+# ==========================================
+# STAGE 3: Render per-abuse-contact reports
+# ==========================================
+# Note: this stage requires the awk pipeline to have produced structured TSV
+# inputs (STATS_TSV, SAMPLES_TSV, GLOBALS_TXT). The awk refactor is out of
+# scope for this spec — when those inputs don't exist yet, we skip Stage 3
+# gracefully rather than failing the whole script.
+if command -v python3 >/dev/null 2>&1 \
+   && [ -s "$STATS_TSV" ] && [ -s "$SAMPLES_TSV" ] && [ -s "$GLOBALS_TXT" ]; then
+    mkdir -p "$REPORTS_DIR"
+    if [[ -f "$(dirname "$0")/render_reports.py" ]]; then
+    python3 "$(dirname "$0")/render_reports.py" \
+        --stats-tsv "$STATS_TSV" \
+        --samples-tsv "$SAMPLES_TSV" \
+        --globals "$GLOBALS_TXT" \
+        --outdir "$REPORTS_DIR" \
+        --legacy-combined "$EMAIL_FILE" || \
+        echo "WARN: render_reports.py failed; legacy file only." >&2
+    fi
+    rm -f "$STATS_TSV" "$SAMPLES_TSV" "$GLOBALS_TXT"
+    if [ -f "$REPORTS_DIR/INDEX.txt" ]; then
+        echo "The Per-Bucket Dossier is in: $REPORTS_DIR/"
+        echo "  See $REPORTS_DIR/INDEX.txt for the manifest."
+    fi
+elif ! command -v python3 >/dev/null 2>&1; then
+    echo "WARN: python3 not found; skipping per-bucket rendering." >&2
+fi
+
+printf "${GREEN}${BOLD}✓${RESET} ${GREEN}HTTP Attack Report complete:${RESET} ${CYAN}%s${RESET}\n" "$HTTP_ABUSE_FILE"
+printf "${GREEN}${BOLD}✓${RESET} ${GREEN}The Global-Calibrated Dossier is complete:${RESET} ${CYAN}%s${RESET}\n" "$EMAIL_FILE"
+
+# ─── Save Filtered Report ────────────────────────────────────────────────────
+if [[ -n "$FILTER_REPORT_FILE" ]]; then
+    # Create a comprehensive filtered report
+    {
+        echo "============================================================"
+        echo "  SSH ATTACK FORENSIC REPORT - FILTERED"
+        echo "  Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "============================================================"
+        echo ""
+
+        if [[ -n "$FILTER_IP" ]]; then
+            echo "TARGET IP: $FILTER_IP"
+            echo "DOMAIN: $DOMAIN_NAME"
+            echo ""
+
+            # Include domain attacker info if found
+            if [[ -n "$DOMAIN_ATTACKERS" ]]; then
+                echo "============================================================"
+                echo "  OTHER ATTACKERS FROM SAME DOMAIN: $DOMAIN_NAME"
+                echo "============================================================"
+                echo -e "$DOMAIN_ATTACKERS"
+                echo ""
+            fi
+
+            echo "============================================================"
+            echo "  WHOIS INFORMATION"
+            echo "============================================================"
+            timeout 5 whois "$FILTER_IP" 2>/dev/null | grep -Ei "org-name|organization|abuse-c|abuse-mailbox|netname|country|descr" | head -20
+            echo ""
+
+            echo "============================================================"
+            echo "  REVERSE DNS LOOKUP"
+            echo "============================================================"
+            echo "  $FILTER_IP -> $RDNS_RESULT"
+            echo ""
+
+            echo "============================================================"
+            echo "  ATTACK LOG ENTRIES"
+            echo "============================================================"
+        fi
+
+        if [[ -n "$FILTER_DATE" ]]; then
+            echo "FILTERED DATE: $FILTER_DATE"
+            echo ""
+        fi
+
+        echo "Total matching entries: $TOTAL_ATTEMPTS"
+        echo ""
+        cat "$LOG_TEMP" | head -500
+
+        if [[ $TOTAL_ATTEMPTS -gt 500 ]]; then
+            echo ""
+            echo "... (showing first 500 of $TOTAL_ATTEMPTS entries)"
+        fi
+
+    } > "$FILTER_REPORT_FILE"
+
+    printf "\n${GREEN}${BOLD}✓${RESET} ${GREEN}Filtered report saved to: ${CYAN}${FILTER_REPORT_FILE}${RESET}\n"
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in) ----------
+if [[ "$AI_VERDICT" == "1" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+    ai_emit_verdict "top_issue" "${THREAT_CONTEXT:-SSH forensic scan complete. filter_ip=${FILTER_IP:-none} filter_date=${FILTER_DATE:-none}}" 2>/dev/null || true
+fi

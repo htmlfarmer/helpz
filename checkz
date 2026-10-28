@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# checkz - Live security log monitor (tail -f for the journal)
+# ----------------------------------------------------------------------------
+# Streams journalctl -f and color-codes ERROR/WARNING/LOGIN events in real-time.
+# Identifies valid vs invalid login targets to flag credential-stuffing attempts.
+#
+# Usage:
+#   ./checkz                       # tail all journal
+#   NO_COLOR=1 ./checkz            # plain output
+#   sudo journalctl -u ssh -f | ./checkz   # pipe any journalctl -f stream
+#
+# Press Ctrl+C to stop.
+# ============================================================================
+
+set -u
+shopt -s nocasematch
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+
+# ─── Help ────────────────────────────────────────────────────────────────────
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          checkz — Live Security Log Monitor                   ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Streams journalctl -f and color-codes ERROR/WARNING/LOGIN events
+  in real-time. Identifies valid vs invalid login targets to flag
+  credential-stuffing attempts. Runs until Ctrl+C is pressed.
+
+USAGE
+  ./checkz                              Tail all journal events
+  NO_COLOR=1 ./checkz                   Plain output (no colors)
+  sudo journalctl -u ssh -f | ./checkz  Pipe any journal stream
+
+OPTIONS
+  -h, --help    Show this help message and exit
+
+HIGHLIGHTS
+  [ERROR]     Critical/error/fail patterns (red)
+  [WARNING]   Warning patterns (yellow)
+  [LOGIN]     Failed/suspicious login patterns (cyan)
+              Invalid usernames shown in magenta
+              Real usernames shown in yellow
+  Everything else printed dimmed
+
+ALTERNATIVE COMMANDS
+  journalctl -f                          Follow journal (no color-coding)
+  journalctl -f -p err                   Follow only error-priority events
+  tail -f /var/log/auth.log              Watch auth log directly
+  tail -f /var/log/syslog                Watch syslog directly
+  watch -n2 'journalctl -p err --since "1 min ago"'  Poll errors
+  sudo faillog -a                        Show failed login counts
+  lastb | head -20                       Recent bad login attempts
+
+WARNING → INVESTIGATION COMMANDS
+  [LOGIN] Invalid user attempts  →  grep "invalid user" /var/log/auth.log | awk '{print $NF}' | sort | uniq -c | sort -rn
+  [LOGIN] Real user targeted     →  last <username>  and  grep <username> /var/log/auth.log
+  [ERROR] Segfaults              →  sudo dmesg | grep -i segfault
+  [ERROR] Service crashes        →  systemctl --failed  and  journalctl -u <service> --since "1 hour ago"
+  Repeated [LOGIN] from one IP   →  grep "Failed password" /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn
+  SSH brute force pattern        →  sudo faillock --dir /var/run/faillock
+
+HELPEOF
+    exit 0
+}
+
+NO_COLOR_FLAG=0
+AI_VERDICT=0
+REPORT_FILE=""
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) show_help ;;
+        --no-color) NO_COLOR_FLAG=1 ;;
+        --ai) AI_VERDICT=1 ;;
+    esac
+done
+
+# ---------- Colors ----------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ $NO_COLOR_FLAG -eq 0 ]]; then
+  RESET="\033[0m"
+  BOLD="\033[1m"
+  DIM="\033[2m"
+  RED="\033[31m"
+  GREEN="\033[32m"
+  YELLOW="\033[33m"
+  BLUE="\033[34m"
+  MAGENTA="\033[35m"
+  CYAN="\033[36m"
+else
+  RESET=""; BOLD=""; DIM=""
+  RED=""; GREEN=""; YELLOW=""; BLUE=""
+  MAGENTA=""; CYAN=""
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${BOLD}${MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  CHECK.SH — Live Security Log Monitor                         ║
+   ║  journalctl -f · Color-coded Severity                         ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${RESET}\n"
+    printf "${DIM}  v${SCRIPT_VERSION} — %s on %s${RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+printf "${BOLD}Highlights:${RESET}\n"
+printf "  ${RED}[ERROR]${RESET}   - critical/error/fail patterns\n"
+printf "  ${YELLOW}[WARNING]${RESET} - warning patterns\n"
+printf "  ${CYAN}[LOGIN]${RESET}   - failed/suspicious login patterns (invalid user in ${MAGENTA}magenta${RESET})\n"
+printf "  ${DIM}Everything else printed dimmed${RESET}\n"
+echo
+printf "${DIM}Press Ctrl+C to stop.${RESET}\n"
+echo
+
+extract_login_user() {
+    local line="$1"
+
+    # sshd: "Failed password for invalid user admin from ..."
+    if [[ $line =~ Failed[[:space:]]+password[[:space:]]+for[[:space:]]+invalid[[:space:]]+user[[:space:]]+([^[:space:]]+) ]]; then
+        printf "%s" "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # sshd: "Failed password for root from ..."
+    if [[ $line =~ Failed[[:space:]]+password[[:space:]]+for[[:space:]]+([^[:space:]]+) ]]; then
+        printf "%s" "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # pam/sudo often include: "user=<name>"
+    if [[ $line =~ user=([^[:space:]]+) ]]; then
+        printf "%s" "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+is_login_event() {
+    local line="$1"
+    [[ $line =~ failed[[:space:]]password|invalid[[:space:]]user|authentication[[:space:]]failure|failed[[:space:]]login|login[[:space:]]failed|bad[[:space:]]password|sudo:.*incorrect[[:space:]]password|pam_unix\(.*\):[[:space:]]authentication[[:space:]]failure ]]
+}
+
+is_error_event() {
+    local line="$1"
+    [[ $line =~ (^|[^a-z])error([^a-z]|$)|(^|[^a-z])critical([^a-z]|$)|(^|[^a-z])fatal([^a-z]|$)|(^|[^a-z])panic([^a-z]|$)|segfault|failed ]]
+}
+
+is_warning_event() {
+    local line="$1"
+    [[ $line =~ (^|[^a-z])warn(ing)?([^a-z]|$) ]]
+}
+
+verify_login_target() {
+    local user="$1"
+    if getent passwd "$user" >/dev/null 2>&1; then
+        printf "${YELLOW}[REAL-USER-TARGET: %s]${RESET}" "$user"
+    else
+        printf "${MAGENTA}${BOLD}[INVALID-USER: %s]${RESET}" "$user"
+    fi
+}
+
+process_line() {
+    local line="$1"
+    if is_login_event "$line"; then
+        detail="${CYAN}[LOGIN-ATTEMPT]${RESET}"
+        if user="$(extract_login_user "$line")"; then
+            detail="$(verify_login_target "$user")"
+        fi
+        printf "${CYAN}${BOLD}[LOGIN]${RESET} %b %s\n" "$detail" "$line"
+    elif is_error_event "$line"; then
+        printf "${RED}${BOLD}[ERROR]${RESET} ${RED}%s${RESET}\n" "$line"
+    elif is_warning_event "$line"; then
+        printf "${YELLOW}[WARNING]${RESET} %s\n" "$line"
+    else
+        printf "${DIM}%s${RESET}\n" "$line"
+    fi
+}
+
+# ---------- Counters (for AI summary at exit) ----------
+_CNT_ERROR=0
+_CNT_WARN=0
+_CNT_LOGIN=0
+_LAST_LINES=""
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "$AI_VERDICT" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Trap Ctrl+C → AI verdict + exit summary
+_checkz_exit() {
+    if [[ "$AI_VERDICT" == "1" ]] && [[ -n "$_LAST_LINES" ]]; then
+        ai_emit_verdict "severity_check" "$_LAST_LINES" 2>/dev/null || true
+    fi
+    printf "\n${DIM}[exited after %d errors, %d warnings, %d logins]${RESET}\n\n" \
+        "$_CNT_ERROR" "$_CNT_WARN" "$_CNT_LOGIN" 2>/dev/null || true
+}
+trap _checkz_exit INT TERM
+
+if [[ -t 0 ]]; then
+    # Interactive: tail live journalctl
+    journalctl -f -q -o short-iso --no-pager 2>/dev/null | while IFS= read -r line; do
+        process_line "$line"
+        # Track counters for exit summary
+        if is_login_event "$line"; then _CNT_LOGIN=$((_CNT_LOGIN + 1)); fi
+        if is_error_event "$line"; then _CNT_ERROR=$((_CNT_ERROR + 1)); fi
+        if is_warning_event "$line"; then _CNT_WARN=$((_CNT_WARN + 1)); fi
+        # Keep last ~1KB for AI context
+        _LAST_LINES="${_LAST_LINES: -1024}"$'\n'"$line"
+    done
+else
+    # Piped input: read from stdin directly
+    while IFS= read -r line; do
+        process_line "$line"
+        if is_login_event "$line"; then _CNT_LOGIN=$((_CNT_LOGIN + 1)); fi
+        if is_error_event "$line"; then _CNT_ERROR=$((_CNT_ERROR + 1)); fi
+        if is_warning_event "$line"; then _CNT_WARN=$((_CNT_WARN + 1)); fi
+        _LAST_LINES="${_LAST_LINES: -1024}"$'\n'"$line"
+    done
+fi
+
+# Run exit summary if we reach this point cleanly (e.g. EOF on stdin)
+_checkz_exit

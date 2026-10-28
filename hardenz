@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# hardenz — Automated System & Kernel Hardening Remediation Tool
+# ----------------------------------------------------------------------------
+# Evaluates system security parameters and safely applies CIS-aligned
+# kernel sysctl hardening, restrictive system file permissions, and core dump
+# protections. Defaults to safe --dry-run mode unless --apply is passed.
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_VERSION="1.0.0"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+[[ -f "$SCRIPT_DIR/lib/common.sh" ]] && source "$SCRIPT_DIR/lib/common.sh"
+
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║       hardenz — System & Kernel Hardening Remediation          ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Automated companion to security.sh. Evaluates system hardening state
+  and can apply CIS-recommended kernel sysctl configurations, restrictive
+  file permissions on credentials databases, and core dump protections.
+  Always defaults to --dry-run unless --apply is explicitly specified.
+
+USAGE
+  ./hardenz                         Preview hardening actions (dry-run)
+  sudo ./hardenz --apply            Apply recommended hardening settings
+  ./hardenz --json                  Machine-readable JSON preview/result
+  ./hardenz --no-color              Plain text output
+
+OPTIONS
+  --apply       Execute remediation actions (requires root/sudo)
+  --dry-run     Inspect current state and print planned actions without modifying (default)
+  --json        Output machine-readable JSON
+  --no-color    Disable colored terminal output
+  -h, --help    Show this help message
+
+REMEDIATIONS APPLIED (with --apply)
+  1. Kernel sysctl (/etc/sysctl.d/99-security-hardening.conf):
+     - ASLR enabled (kernel.randomize_va_space = 2)
+     - SYN flood defense (net.ipv4.tcp_syncookies = 1)
+     - Dmesg restricted to root (kernel.dmesg_restrict = 1)
+     - Kernel pointer leaks restricted (kernel.kptr_restrict = 2)
+     - SUID core dumps disabled (fs.suid_dumpable = 0)
+     - ICMP redirects ignored and disabled (anti-spoofing)
+     - Reverse path filtering enabled (anti-IP spoofing)
+     - Martian/bogon packets logged
+  2. File Permissions:
+     - /etc/shadow   -> 0640 (root:shadow)
+     - /etc/gshadow  -> 0640 (root:shadow)
+     - /etc/passwd   -> 0644 (root:root)
+     - /etc/group    -> 0644 (root:root)
+
+HELPEOF
+    exit 0
+}
+
+APPLY_MODE=0
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        --apply)     APPLY_MODE=1 ;;
+        --dry-run)   APPLY_MODE=0 ;;
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1 ;;
+        -h|--help)   show_help ;;
+        --ai)        AI_VERDICT=1 ;;
+        --no-ai)     AI_VERDICT=0 ;;
+        *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+init_colors
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "hardenz"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  HARDEN.SH — System & Kernel Hardening                        ║
+   ║  Sysctl · File Perms · Core Dumps · CIS                       ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ─── Donut chart helper (audit outcome distribution) ───────────────────────
+donut_chart() {
+    local title="$1"
+    shift
+    local total=0
+    local -a labels=() counts=()
+    for rec in "$@"; do
+        [[ -z "$rec" ]] && continue
+        local label="${rec%%|*}"
+        local count="${rec##*|}"
+        labels+=("$label")
+        counts+=("$count")
+        total=$(( total + count ))
+    done
+    [[ $total -eq 0 ]] && { info "No data"; return; }
+    printf "${C_BOLD}%-30s${C_RESET}\n" "$title"
+    local colors=("$C_GREEN" "$C_YELLOW" "$C_RED" "$C_CYAN" "$C_MAGENTA" "$C_BLUE")
+    local i
+    for i in "${!labels[@]}"; do
+        local pct=$(( counts[i] * 100 / total ))
+        local arc_len=$(( counts[i] * 20 / total ))
+        (( arc_len == 0 )) && (( counts[i] > 0 )) && arc_len=1
+        local bar=""
+        for (( j=0; j<arc_len; j++ )); do bar+="█"; done
+        for (( j=arc_len; j<20; j++ )); do bar+=" "; done
+        local c="${colors[$(( i % 6 ))]}"
+        printf "  ${c}%-25s${C_RESET} ${c}%s${C_RESET} ${C_BOLD}%3d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+            "${labels[i]}" "$bar" "${counts[i]}" "$pct"
+    done
+}
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 3>&1
+    exec 1>/dev/null
+fi
+
+SUDO=""
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+elif [[ "$JSON_OUT" -eq 0 && "$APPLY_MODE" -eq 1 ]] && command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]; then
+    if sudo -v 2>/dev/null; then
+        SUDO="sudo"
+    fi
+fi
+
+heading "SYSTEM HARDENING & REMEDIATION TOOL"
+if [[ "$APPLY_MODE" -eq 1 ]]; then
+    emit "  ${C_BOLD}${C_RED}MODE: ACTIVE REMEDIATION (--apply)${C_RESET}\n"
+else
+    emit "  ${C_BOLD}${C_GREEN}MODE: DRY-RUN (Preview only, no changes will be made)${C_RESET}\n"
+fi
+info "Host: $HOSTNAME_SHORT | Timestamp: $TIMESTAMP"
+
+CHANGES_NEEDED=0
+CHANGES_APPLIED=0
+AUDIT_PASS=0
+AUDIT_WARN=0
+AUDIT_FAIL=0
+
+# ---------- 1. File Permissions Hardening ----------
+section "CREDENTIAL FILE PERMISSIONS"
+
+harden_file_perm() {
+    local f="$1" target_perm="$2" target_owner="${3:-root}" target_group="${4:-root}"
+    [[ ! -f "$f" ]] && return 0
+
+    local current_perm current_owner current_group
+    # Single stat call instead of three (perf + fewer fork()s).
+    IFS=$' ' read -r current_perm current_owner current_group < <(
+        stat -c '%a %U %G' "$f" 2>/dev/null
+    )
+    current_perm="${current_perm:-}"
+    current_owner="${current_owner:-}"
+    current_group="${current_group:-}"
+
+    if [[ "$current_perm" != "$target_perm" || "$current_owner" != "$target_owner" ]]; then
+        CHANGES_NEEDED=$((CHANGES_NEEDED + 1))
+        if [[ "$APPLY_MODE" -eq 1 ]]; then
+            if [[ $EUID -ne 0 && -z "$SUDO" ]]; then
+                AUDIT_FAIL=$((AUDIT_FAIL + 1))
+                critf "shadow_perms" "$f permissions need update to $target_perm ($target_owner:$target_group) but root/sudo is required" \
+                    "Re-run with 'sudo ./hardenz --apply' to fix credential file permissions"
+            else
+                $SUDO chmod "$target_perm" "$f" 2>/dev/null
+                $SUDO chown "$target_owner:$target_group" "$f" 2>/dev/null
+                CHANGES_APPLIED=$((CHANGES_APPLIED + 1))
+                AUDIT_PASS=$((AUDIT_PASS + 1))
+                ok "$f permissions updated: $current_perm -> $target_perm ($target_owner:$target_group)"
+            fi
+        else
+            AUDIT_WARN=$((AUDIT_WARN + 1))
+            warnf "shadow_perms" "[DRY-RUN] Would update $f: $current_perm ($current_owner:$current_group) -> $target_perm ($target_owner:$target_group)" \
+                "Re-run with 'sudo ./hardenz --apply' to apply CIS-compliant credential file permissions"
+        fi
+    else
+        AUDIT_PASS=$((AUDIT_PASS + 1))
+        ok "$f permissions already compliant ($current_perm, $current_owner:$current_group)"
+    fi
+}
+
+harden_file_perm "/etc/passwd" "644" "root" "root"
+harden_file_perm "/etc/group" "644" "root" "root"
+
+# On Debian/Ubuntu /etc/shadow is root:shadow 640
+SHADOW_GRP="shadow"
+getent group shadow >/dev/null 2>&1 || SHADOW_GRP="root"
+harden_file_perm "/etc/shadow" "640" "root" "$SHADOW_GRP"
+harden_file_perm "/etc/gshadow" "640" "root" "$SHADOW_GRP"
+
+# ---------- 2. Kernel Sysctl Hardening ----------
+section "KERNEL SYSCTL HARDENING"
+
+declare -A SYSCTL_RECOMMENDED=(
+    ["net.ipv4.conf.all.accept_redirects"]="0"
+    ["net.ipv4.conf.default.accept_redirects"]="0"
+    ["net.ipv4.conf.all.send_redirects"]="0"
+    ["net.ipv4.conf.default.send_redirects"]="0"
+    ["net.ipv4.conf.all.secure_redirects"]="0"
+    ["net.ipv4.conf.default.secure_redirects"]="0"
+    ["net.ipv4.conf.all.accept_source_route"]="0"
+    ["net.ipv4.conf.default.accept_source_route"]="0"
+    ["net.ipv4.conf.all.log_martians"]="1"
+    ["net.ipv4.conf.default.log_martians"]="1"
+    ["net.ipv4.conf.all.rp_filter"]="1"
+    ["net.ipv4.conf.default.rp_filter"]="1"
+    ["net.ipv4.icmp_echo_ignore_broadcasts"]="1"
+    ["net.ipv4.tcp_syncookies"]="1"
+    # IPv6 hardening (was missing — depth fix)
+    ["net.ipv6.conf.all.accept_redirects"]="0"
+    ["net.ipv6.conf.default.accept_redirects"]="0"
+    ["net.ipv6.conf.all.accept_source_route"]="0"
+    ["net.ipv6.conf.default.accept_source_route"]="0"
+    ["net.ipv6.conf.all.accept_ra"]="0"
+    ["net.ipv6.conf.default.accept_ra"]="0"
+    # Kernel hardening
+    ["kernel.randomize_va_space"]="2"
+    ["kernel.kptr_restrict"]="2"
+    ["kernel.dmesg_restrict"]="1"
+    ["kernel.yama.ptrace_scope"]="2"
+    ["fs.suid_dumpable"]="0"
+)
+
+SYSCTL_CONF="/etc/sysctl.d/99-security-hardening.conf"
+SYSCTL_NEEDS_UPDATE=0
+
+for key in "${!SYSCTL_RECOMMENDED[@]}"; do
+    target_val="${SYSCTL_RECOMMENDED[$key]}"
+    # Single sysctl -n call (faster + works for keys missing from /proc/sys).
+    curr_val=$(sysctl -n "$key" 2>/dev/null || echo "unknown")
+
+    if [[ "$curr_val" != "$target_val" ]]; then
+        CHANGES_NEEDED=$((CHANGES_NEEDED + 1))
+        SYSCTL_NEEDS_UPDATE=1
+        if [[ "$APPLY_MODE" -eq 1 ]]; then
+            AUDIT_WARN=$((AUDIT_WARN + 1))
+            warn "$key: currently $curr_val -> needs $target_val"
+        else
+            AUDIT_WARN=$((AUDIT_WARN + 1))
+            warn "[DRY-RUN] Would configure $key = $target_val (currently $curr_val)"
+        fi
+    else
+        AUDIT_PASS=$((AUDIT_PASS + 1))
+        ok "$key: compliant ($curr_val)"
+    fi
+done
+
+if [[ "$SYSCTL_NEEDS_UPDATE" -eq 1 && "$APPLY_MODE" -eq 1 ]]; then
+    if [[ $EUID -ne 0 && -z "$SUDO" ]]; then
+        critf "sysctl_unhardened" "Cannot write $SYSCTL_CONF without root/sudo privileges" \
+            "Re-run with 'sudo ./hardenz --apply' to write CIS sysctl hardening to /etc/sysctl.d/"
+    else
+        subsec "Applying Sysctl Configuration"
+        TMP_SYSCTL=$(mktemp)
+        cat << 'EOF' > "$TMP_SYSCTL"
+# Security Hardening Sysctl Settings
+# Generated by hardenz
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.tcp_syncookies = 1
+kernel.randomize_va_space = 2
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+fs.suid_dumpable = 0
+EOF
+        if [[ -f "$SYSCTL_CONF" ]]; then
+            $SUDO cp "$SYSCTL_CONF" "${SYSCTL_CONF}.bak" 2>/dev/null
+            info "Backed up existing config to ${SYSCTL_CONF}.bak"
+        fi
+        $SUDO cp "$TMP_SYSCTL" "$SYSCTL_CONF"
+        $SUDO chmod 644 "$SYSCTL_CONF"
+        rm -f "$TMP_SYSCTL"
+
+        if command -v sysctl >/dev/null 2>&1; then
+            $SUDO sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+            ok "Loaded $SYSCTL_CONF into running kernel"
+            CHANGES_APPLIED=$((CHANGES_APPLIED + 1))
+        fi
+    fi
+fi
+
+# ---------- Summary & Recommendations ----------
+section "REMEDIATION SUMMARY"
+
+# ─── Donut: audit outcome distribution ─────────────────────────────────────
+if [[ "$JSON_OUT" -eq 0 ]]; then
+    donut_chart "Hardening audit outcomes" \
+        "PASS (compliant)|$AUDIT_PASS" \
+        "WARN (needs change)|$AUDIT_WARN" \
+        "FAIL (blocked/no root)|$AUDIT_FAIL"
+    emit "\n"
+fi
+
+if [[ "$APPLY_MODE" -eq 1 ]]; then
+    ok "Remediation complete: $CHANGES_APPLIED applied, $CHANGES_NEEDED required"
+else
+    if (( CHANGES_NEEDED > 0 )); then
+        warn "Dry-run complete: $CHANGES_NEEDED hardening settings can be improved"
+        emit "  ${C_BOLD}${C_YELLOW}To apply these remediations safely, run:${C_RESET} ${C_CYAN}sudo ./hardenz --apply${C_RESET}\n"
+    else
+        ok "System is already fully compliant with baseline hardening standards!"
+    fi
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+fi
+
+add_json_field "mode" "$([ "$APPLY_MODE" -eq 1 ] && echo "apply" || echo "dry-run")" 0
+add_json_field "changes_needed" "$CHANGES_NEEDED" 1
+add_json_field "changes_applied" "$CHANGES_APPLIED" 1
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+emit_verdict
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "hardenz complete: apply=$APPLY_MODE changes_needed=$CHANGES_NEEDED changes_applied=$CHANGES_APPLIED" 2>/dev/null || true
+fi

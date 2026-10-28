@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# livez - Adaptive live system monitor (btop/htop-style, pure bash)
+# ----------------------------------------------------------------------------
+# Flicker-free TUI with a core-heat strip, sparkline history on every signal,
+# PSI pressure gauges, RAPL + battery power rails, GPU vitals and a live
+# process table. Auto-detects what your machine actually has (laptop,
+# desktop, server, VM) and only shows the panels that exist — the original
+# "watch -n5 'cat /sys/class/power_supply/BAT*/...'" problem (brace
+# expansion dead in quotes, no BAT0 on desktops) never even reaches the UI.
+#
+# Usage:
+#   ./livez                # TUI, 5s refresh
+#   ./livez 2              # 2s refresh
+#   ./livez --once         # render one frame and exit (no TUI takeover)
+#   ./livez --json         # one-shot machine-readable snapshot
+#   ./livez --plain        # scrolling frames, no alt-screen (pipes/CI)
+#   ./livez --cpu-only     # focus a panel (also --gpu-only --battery-only)
+#   ./livez --no-color     # disable ANSI colors
+#
+# Keys while running:  q quit · p pause · + faster · - slower
+# (Ctrl+C also quits — and actually works now)
+#
+# Requires: bash 4+, awk, procfs; optional: nvidia-smi, powercap sysfs, PSI
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Args ----------
+INTERVAL=5
+ONLY="all"
+ONCE=0
+JSON_OUT=0
+PLAIN=0
+NO_COLOR="${NO_COLOR:-0}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cpu-only)      ONLY="cpu" ;;
+    --gpu-only)      ONLY="gpu" ;;
+    --battery-only)  ONLY="battery" ;;
+    --once)          ONCE=1 ;;
+    --plain)         PLAIN=1 ;;
+    --json)          JSON_OUT=1 ;;
+    --no-color)      NO_COLOR=1 ;;
+    --ai|--no-ai)    : ;; # accepted for suite parity; livez is continuous
+    -h|--help)
+      awk 'NR>1 && /^# ===/{exit} NR>1 && /^#/{print substr($0,3)}' "$0"
+      exit 0 ;;
+    [0-9]*)          INTERVAL="$1" ;;
+    *)               echo "livez: unknown arg: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+TUI=0
+if [[ -t 1 && -t 0 && $ONCE -eq 0 && $JSON_OUT -eq 0 && $PLAIN -eq 0 ]]; then TUI=1; fi
+[[ -t 1 ]] || NO_COLOR=1
+
+# ---------- Colors ----------
+if [[ $NO_COLOR -eq 0 ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_INV=$'\033[7m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+  C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_INV=""; C_RED=""; C_GREEN=""
+  C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+fi
+
+# ---------- Capability detection (once) ----------
+HAS_BATTERY=0; HAS_AC=0; HAS_NVIDIA=0; HAS_AMDGPU=0; HAS_INTELGPU=0; HAS_RAPL=0; HAS_PSI=0
+shopt -s nullglob
+for ps_dev in /sys/class/power_supply/BAT*; do [[ -e "$ps_dev/capacity" ]] && HAS_BATTERY=1; done
+for ac in /sys/class/power_supply/AC*/online /sys/class/power_supply/ACAD/online /sys/class/power_supply/Mains/online; do
+  [[ -r "$ac" ]] && HAS_AC=1
+done
+shopt -u nullglob
+command -v nvidia-smi >/dev/null 2>&1 && timeout 3 nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1 && HAS_NVIDIA=1
+for d in /sys/class/drm/card*/device/hwmon/hwmon*; do
+  [[ -r "$d/name" ]] || continue
+  grep -q amdgpu "$d/name" 2>/dev/null && HAS_AMDGPU=1
+  grep -q i915  "$d/name" 2>/dev/null && HAS_INTELGPU=1
+done
+for rp in /sys/class/powercap/intel-rapl/intel-rapl:*/energy_uj; do [[ -r "$rp" ]] && HAS_RAPL=1; done
+[[ -r /proc/pressure/cpu ]] && HAS_PSI=1
+NCPU=$(nproc 2>/dev/null || echo 1)
+
+# ---------- History rings ----------
+SPN=44
+H_CPU=(); H_LOAD=(); H_MEM=()
+push() { # histname value maxval -> trims to SPN
+  local -n h=$1
+  h+=("$2"); (( ${#h[@]} > SPN )) && h=("${h[@]: -$SPN}")
+}
+SPK_CHARS="▁▂▃▄▅▆▇█"
+spark() { # histname maxval
+  local -n h=$1; local mx=${2:-0} out="" v i n
+  (( ${#h[@]} == 0 )) && { printf '%s' "(warming up)"; return; }
+  local len=${#SPK_CHARS}
+  for v in "${h[@]}"; do
+    n=0
+    if (( mx > 0 )); then n=$(( v * (len-1) / mx )); (( n < 0 )) && n=0; (( n >= len )) && n=$(( len-1 )); fi
+    out+="${SPK_CHARS:n:1}"
+  done
+  for (( i=${#h[@]}; i<SPN; i++ )); do out+=" "; done
+  printf '%s' "$out"
+}
+
+# ---------- Bar/gradient helpers ----------
+grad() { # pct -> color escape for bar fill
+  local p=$1
+  (( p >= 85 )) && { printf '%s' "$C_RED"; return; }
+  (( p >= 60 )) && { printf '%s' "$C_YELLOW"; return; }
+  (( p >= 35 )) && { printf '%s' "$C_GREEN"; return; }
+  printf '%s' "$C_DIM"
+}
+bar() { # pct width
+  local p=${1%.*} w=$2
+  [[ "$p" =~ ^[0-9]+$ ]] || p=0
+  (( p > 100 )) && p=100
+  local f=$(( (p * w + 50) / 100 )) e i s=""
+  e=$(( w - f ))
+  local c; c=$(grad "$p")
+  for (( i=0; i<f; i++ )); do s+="▓"; done
+  for (( i=0; i<e; i++ )); do s+="░"; done
+  printf '%s%s%s' "$c" "$s" "$C_RESET"
+}
+dot() { # pct -> one heat character colored by load
+  local p=${1%.*}
+  [[ "$p" =~ ^[0-9]+$ ]] || p=0
+  local ch
+  if   (( p < 10 )); then ch="·"
+  elif (( p < 30 )); then ch="▂"
+  elif (( p < 55 )); then ch="▄"
+  elif (( p < 80 )); then ch="▆"
+  else ch="█"; fi
+  printf '%s%s%s' "$(grad "$p")" "$ch" "$C_RESET"
+}
+box() { # title
+  local t=" $1 "
+  local n=$(( W - ${#t} - 4 )); (( n < 0 )) && n=0
+  printf '%s┌─%s%s%s┐%s\n' "$C_BLUE" "$C_BOLD$C_CYAN" "$t" "${C_RESET}$(repeat_char ─ $n)$C_BLUE" "$C_RESET"
+}
+repeat_char() { local c=$1 n=$2; (( n < 0 )) && n=0; printf "%${n}s" | tr ' ' "$c"; }
+bot() { local n=$(( W - 2 )); printf '%s└%s┘%s\n' "$C_BLUE" "$(repeat_char ─ $n)" "$C_RESET"; }
+
+# ---------- Terminal geometry ----------
+W=80; H=24
+get_size() {
+  if [[ -t 1 ]]; then
+    W=$(tput cols 2>/dev/null || echo 80)
+    H=$(tput rows 2>/dev/null || echo 24)
+  fi
+  (( W > 96 )) && W=96
+  (( W < 40 )) && W=40
+}
+get_size
+resize() { get_size; }
+trap resize WINCH
+
+# ---------- Cleanup / traps ----------
+cleanup() {
+  [[ -n "$_CLEANED" ]] && return; _CLEANED=1
+  if [[ $TUI -eq 1 ]]; then
+    printf '\033[?25h\033[0m\033[?1049l'
+  fi
+  rm -f /tmp/.live_rapl_* 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM          # ← the old trap never exited; Ctrl+C now works
+
+# ---------- Sampling state ----------
+declare -A CORE_PREV=()
+declare -A RAPL_PREV=()
+PREV_T=""
+PREV_PKG_E=0
+PAUSE=0
+
+stat_busy() { # reads /proc/stat cpu lines into global CPU_TOTAL + CPU_CORES[]
+  local line n vals total idle fields
+  CPU_TOTAL=-1; CPU_CORES=()
+  local idx=0
+  while IFS= read -r line; do
+    [[ "$line" == cpu* ]] || break
+    read -r -a fields <<< "$line"
+    n=${fields[0]#cpu}
+    total=0; idle=0
+    local i v
+    for (( i=1; i<${#fields[@]}; i++ )); do v=${fields[i]}; total=$(( total + v )); done
+    idle=$(( ${fields[4]:-0} + ${fields[5]:-0} ))
+    local key="p$n"
+    local prev=${CORE_PREV[$key]:-}
+    local pct=-1
+    if [[ -n "$prev" ]]; then
+      local pt=${prev%%:*} pi=${prev##*:}
+      local dt=$(( total - pt )) di=$(( idle - pi ))
+      (( dt > 0 )) && pct=$(( (dt - di) * 100 / dt ))
+    fi
+    CORE_PREV[$key]="$total:$idle"
+    if [[ "$n" == "" ]]; then CPU_TOTAL=$pct; else CPU_CORES+=("$pct"); fi
+    (( idx++ ))
+  done < /proc/stat
+}
+
+rapl_watts() { # prints "name watts" lines; uses wall-clock delta
+  local now_ns pkg name e prev_e prev_t cur_t d_ns w
+  now_ns=$(date +%s%N)
+  cur_t=${PREV_T:-$now_ns}
+  for pkg in /sys/class/powercap/intel-rapl/intel-rapl:*/; do
+    [[ -r "${pkg}energy_uj" ]] || continue
+    name=$(cat "${pkg}name" 2>/dev/null) || continue
+    [[ -z "$name" ]] && continue
+    e=$(cat "${pkg}energy_uj" 2>/dev/null) || continue
+    prev_e=${RAPL_PREV[$name]:-}
+    RAPL_PREV[$name]=$e
+    if [[ -n "$prev_e" ]] && (( e >= prev_e )); then
+      d_ns=$(( now_ns - cur_t ))
+      (( d_ns <= 0 )) && d_ns=1
+      w=$(awk -v d=$(( e - prev_e )) -v ns="$d_ns" 'BEGIN{printf "%.1f", d*1000/ns}')
+      printf '%s %s\n' "$name" "$w"
+    else
+      printf '%s %s\n' "$name" "-"
+    fi
+  done
+  PREV_T=$now_ns
+}
+
+batt_lines() { # prints "NAME pct status amps watts"
+  local b cap stat cur pwr cur_w pwr_w
+  shopt -s nullglob
+  for b in /sys/class/power_supply/BAT*; do
+    cap=$(cat "$b/capacity" 2>/dev/null || echo 0)
+    stat=$(cat "$b/status" 2>/dev/null || echo Unknown)
+    cur=$(cat "$b/current_now" 2>/dev/null || echo 0)
+    pwr=$(cat "$b/power_now" 2>/dev/null || echo 0)
+    cur_w=$(awk -v v="${cur:-0}" 'BEGIN{printf "%.2f", v/1000000}')
+    pwr_w=$(awk -v v="${pwr:-0}" 'BEGIN{printf "%.2f", v/1000000}')
+    printf '%s %s %s %s %s\n' "$(basename "$b")" "$cap" "$stat" "$cur_w" "$pwr_w"
+  done
+  shopt -u nullglob
+}
+
+ac_state() {
+  local f online
+  shopt -s nullglob
+  for f in /sys/class/power_supply/AC*/online /sys/class/power_supply/ACAD/online /sys/class/power_supply/Mains/online; do
+    [[ -r "$f" ]] || continue
+    online=$(cat "$f" 2>/dev/null)
+    if [[ "$online" == 1 ]]; then printf '%s● plugged in%s' "$C_GREEN" "$C_RESET"
+    else printf '%s○ on battery%s' "$C_YELLOW" "$C_RESET"; fi
+    shopt -u nullglob; return
+  done
+  shopt -u nullglob
+  printf '%s(AC not exposed)%s' "$C_DIM" "$C_RESET"
+}
+
+gpu_vitals() { # prints "util mem_pct temp fan power_w"
+  if (( HAS_NVIDIA )); then
+    local out
+    out=$(timeout 3 nvidia-smi \
+      --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw \
+      --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [[ -n "$out" ]]; then
+      local ut mu mt tc fs pd memp
+      IFS=',' read -r ut mu mt tc fs pd <<< "$out"
+      for v in ut mu mt tc fs pd; do eval "$v=\"\$(echo \"\${!v}\" | xargs)\""; done
+      [[ "$fs" == "[N/A]" || -z "$fs" ]] && fs="-"
+      [[ "$pd" == "[N/A]" || -z "$pd" ]] && pd="-"
+      memp=$(awk -v u="$mu" -v t="$mt" 'BEGIN{printf "%d", (t+0 > 0) ? (u+0)*100/(t+0) : 0}')
+      printf '%s %s %s %s %sW\n' "${ut:--}" "$memp" "${tc:--}" "${fs:--}" "${pd:--}"
+      return
+    fi
+    printf '%s\n' "- - - - -"; return
+  fi
+  if (( HAS_AMDGPU || HAS_INTELGPU )); then
+    local d t w out=""
+    for d in /sys/class/drm/card*/device/hwmon/hwmon*; do
+      [[ -r "$d/temp1_input" ]] || continue
+      t=$(( $(cat "$d/temp1_input") / 1000 ))
+      w="-"; [[ -r "$d/power1_input" ]] && w=$(awk '{printf "%.1f", $1/1000000}' "$d/power1_input")
+      out="- - $t - ${w}W"
+    done
+    printf '%s\n' "${out:-- - - - -}"; return
+  fi
+  printf '%s\n' "- - - - -"
+}
+
+# ---------- JSON snapshot (unchanged contract) ----------
+render_json() {
+  local ts up
+  ts=$(date '+%Y-%m-%d %H:%M:%S'); up=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
+  python3 - <<PYEOF
+import json, subprocess, os, glob
+def read(path, cast=str, default=None):
+    try:
+        with open(path) as f:
+            v = f.read().strip()
+            return cast(v)
+    except Exception:
+        return default
+data = {"timestamp": "$ts", "uptime_seconds": $up}
+try:
+    la = open("/proc/loadavg").read().split()
+    data["load_1"], data["load_5"], data["load_15"] = float(la[0]), float(la[1]), float(la[2])
+except Exception: pass
+for sub in ("cpu","io","memory"):
+    try:
+        for line in open(f"/proc/pressure/{sub}"):
+            for p in line.split():
+                if p.startswith("avg"):
+                    data[f"psi_{sub}_{p.split('=')[0]}"] = float(p.split("=")[1])
+    except Exception: pass
+try:
+    m = open("/proc/meminfo").read()
+    for k in ("MemTotal","MemAvailable","MemFree","Cached","Buffers","SwapTotal","SwapFree"):
+        for line in m.splitlines():
+            if line.startswith(k+":"):
+                data["mem_"+k.lower()] = int(line.split()[1]) * 1024
+except Exception: pass
+if $HAS_BATTERY:
+    data["batteries"] = []
+    for b in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        data["batteries"].append({"name": os.path.basename(b),
+            "capacity_pct": read(f"{b}/capacity", int), "status": read(f"{b}/status", str, "Unknown"),
+            "current_now_uA": read(f"{b}/current_now", int), "power_now_uW": read(f"{b}/power_now", int)})
+if $HAS_AC:
+    for ac in (glob.glob("/sys/class/power_supply/AC*/online") + glob.glob("/sys/class/power_supply/ACAD/online") + glob.glob("/sys/class/power_supply/Mains/online")):
+        data["ac_online"] = read(ac, int); break
+if $HAS_NVIDIA:
+    out = subprocess.run(["nvidia-smi",
+        "--query-gpu=power.draw,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total,fan.speed",
+        "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
+    if out.returncode == 0 and out.stdout.strip():
+        p = [x.strip() for x in out.stdout.strip().split(",")]
+        nn = lambda x: None if x in ("[N/A]","N/A","") else x
+        data["gpu"] = {"power_draw_w": nn(p[0]), "power_limit_w": nn(p[1]), "temp_c": nn(p[2]),
+                       "util_pct": nn(p[3]), "mem_used_mib": nn(p[4]), "mem_total_mib": nn(p[5]),
+                       "fan_pct": nn(p[6])}
+print(json.dumps(data, indent=2))
+PYEOF
+}
+
+# ---------- Frame ----------
+UP_HOST=$(hostname -s 2>/dev/null || echo host)
+frame() {
+  stat_busy
+  local ts up_h l1 l5 l15 mem_t mem_a mem_u_pct sw_t sw_f sw_u_pct out=""
+  ts=$(date '+%H:%M:%S')
+  up_h=$(awk '{s=$1; printf "%dd %dh %dm", s/86400, s%86400/3600, s%3600/60}' /proc/uptime)
+  read -r l1 l5 l15 _ < /proc/loadavg
+  local l1p; l1p=$(awk -v l="$l1" -v n="$NCPU" 'BEGIN{printf "%d", l*100/n}')
+  mem_t=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  mem_a=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+  mem_u_pct=$(( (mem_t - mem_a) * 100 / (mem_t > 0 ? mem_t : 1) ))
+  sw_t=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+  sw_f=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+  sw_u_pct=0; (( sw_t > 0 )) && sw_u_pct=$(( (sw_t - sw_f) * 100 / sw_t ))
+
+  local cpu_pct=${CPU_TOTAL:-−}
+  (( cpu_pct < 0 )) && cpu_pct=0
+
+  # history
+  push H_CPU "$cpu_pct"; push H_LOAD "$l1p"
+  push H_MEM "$mem_u_pct"
+  local pkg_w_max=0 row pkg pw
+  local pkg_lines; pkg_lines=$(rapl_watts)
+
+  # ── header ──
+  local mode="every ${INTERVAL}s"
+  (( PAUSE )) && mode="${C_YELLOW}⏸ PAUSED${C_RESET} — p resumes"
+  out+="${C_BLUE}${C_BOLD}╔${C_RESET}${C_CYAN}${C_BOLD} livez ${UP_HOST} ${C_RESET}${C_BLUE}╠${C_RESET}"
+  out+="$(repeat_char ─ $(( W - 11 - ${#UP_HOST} )))${C_BLUE}${C_BOLD}╗${C_RESET}
+"
+  out+="  ${C_DIM}${ts} · up ${up_h} · ${NCPU} cores · ${mode}${C_RESET}${C_BOLD}${C_DIM}  [q]uit [p]ause [+/−]speed${C_RESET}
+"
+
+  # ── CPU box ──
+  if [[ "$ONLY" == "all" || "$ONLY" == "cpu" ]]; then
+    out+="$(box "⚡ CPU")
+"
+    out+="  $(bar "$cpu_pct" 24) ${C_BOLD}$(printf '%3d' "$cpu_pct")%${C_RESET}  total   ${C_DIM}spark:${C_RESET}$(spark H_CPU 100)
+"
+    local lraw; lraw=$(printf '%s' "$l1")
+    out+="  ${C_DIM}load${C_RESET}  ${lraw} / ${l5} / ${l15} ${C_DIM}(${NCPU} cpu)${C_RESET}  $(bar "$l1p" 12) ${C_DIM}${l1p}%${C_RESET}$( [[ $l1p -gt 100 ]] && printf ' %sOVER${C_RESET}' "$C_BOLD$C_RED")
+"
+    # core heat strip (btop-style): each core one colored cell
+    local strip="" c
+    for c in "${CPU_CORES[@]}"; do strip+="$(dot "${c:-0}")"; done
+    out+="  ${C_DIM}cores${C_RESET} ${strip}  ${C_DIM}· ▂ ▄ ▆ █${C_RESET}
+"
+    # per-core bars when terminal is tall enough
+    if (( H > 26 && ${#CPU_CORES[@]} <= 16 )); then
+      local i=0 pv
+      for pv in "${CPU_CORES[@]}"; do
+        (( pv < 0 )) && pv=0
+        (( i % 2 == 0 )) && out+="  "
+        out+="$(printf 'cpu%-2d' "$i") $(bar "${pv:-0}" 10) $(printf '%3d' "${pv:-0}")%   "
+        (( i % 2 == 1 )) && out+=$'\n'
+        (( i++ ))
+      done
+      (( i % 2 == 1 )) && out+=$'\n'
+    fi
+    if (( HAS_PSI )); then
+      local sub line a10 a60 lbl
+      for sub in cpu io memory; do
+        [[ -r "/proc/pressure/$sub" ]] || continue
+        line=$(grep -m1 '^some' "/proc/pressure/$sub")
+        a10=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){split($i,x,"="); printf "%d", x[2]}}' <<< "$line")
+        a60=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){split($i,x,"="); printf "%d", x[2]}}' <<< "$line")
+        lbl="$sub"; [[ $sub == memory ]] && lbl="mem"
+        out+="  ${C_DIM}PSI${C_RESET} ${lbl}  $(bar "${a10:-0}" 10) ${C_DIM}10s:${a10:-0}% 60s:${a60:-0}%${C_RESET}
+"
+      done
+    fi
+    out+="$(bot)
+"
+
+    # top processes
+    out+="$(box "☰ TOP CPU")
+"
+    local rows=$(( H - 30 )); (( rows < 3 )) && rows=3; (( rows > 10 )) && rows=10
+    out+="  ${C_DIM}${C_BOLD}  PID USER         CPU  MEM  NAME${C_RESET}
+"
+    while read -r pid user cpu mem comm; do
+      [[ -z "$pid" ]] && continue
+      local cc; cc=$(grad "${cpu%.*}")
+      out+="  $(printf '%6s %-10s' "$pid" "$user")${cc}$(printf '%4s' "$cpu")${C_RESET}$(printf '%5s ' "$mem")${C_BOLD}${comm}${C_RESET}
+"
+    done < <(ps -eo pid,user,pcpu,pmem,comm --sort=-pcpu 2>/dev/null | awk 'NR>1{printf "%s %s %s %s %s\n",$1,$2,$3,$4,substr($0, index($0,$5))}' | head -"$rows")
+    out+="$(bot)
+"
+  fi
+
+  # ── MEMORY box ──
+  if [[ "$ONLY" == "all" || "$ONLY" == "cpu" ]]; then
+    out+="$(box "▦ MEMORY")
+"
+    local mt_gb ma_gb st_gb sf_gb
+    mt_gb=$(awk -v b="$mem_t" 'BEGIN{printf "%.1f", b/1024/1024}')
+    ma_gb=$(awk -v b="$mem_a" 'BEGIN{printf "%.1f", b/1024/1024}')
+    st_gb=$(awk -v b="$sw_t" 'BEGIN{printf "%.1f", b/1024/1024}')
+    sf_gb=$(awk -v b="$sw_f" 'BEGIN{printf "%.1f", b/1024/1024}')
+    out+="  RAM  $(bar "$mem_u_pct" 24) ${C_BOLD}$(printf '%3d' "$mem_u_pct")%${C_RESET}  ${ma_gb}/${mt_gb} GiB free   ${C_DIM}$(spark H_MEM 100)${C_RESET}
+"
+    out+="  SWAP $(bar "$sw_u_pct" 24) ${C_BOLD}$(printf '%3d' "$sw_u_pct")%${C_RESET}  ${sf_gb}/${st_gb} GiB free
+"
+    out+="$(bot)
+"
+  fi
+
+  # ── POWER box ──
+  if [[ "$ONLY" == "all" || "$ONLY" == "battery" || "$ONLY" == "cpu" ]]; then
+    local show_batt=0 show_rapl=0
+    [[ "$ONLY" == "all" || "$ONLY" == "battery" ]] && show_batt=1
+    [[ "$ONLY" == "all" || "$ONLY" == "cpu" ]] && show_rapl=1
+    local pbox=""
+    if (( show_rapl && HAS_RAPL )); then
+      while read -r pkg pw; do
+        [[ -z "$pkg" ]] && continue
+        local disp="$pw"; [[ "$pw" != "-" ]] && disp="${pw}W"
+        pbox+="  ${C_DIM}${pkg}${C_RESET}  ${C_MAGENTA}${disp}${C_RESET}
+"
+      done <<< "$pkg_lines"
+    fi
+    if (( show_batt )); then
+      if (( HAS_BATTERY )); then
+        while read -r b cap stat curw pwrw; do
+          [[ -z "$b" ]] && continue
+          pbox+="  ${C_DIM}${b}${C_RESET}  $(bar "$cap" 20) ${C_BOLD}$(printf '%3d' "$cap")%${C_RESET}  ${stat}  ${C_MAGENTA}${pwrw}W${C_RESET} ${C_DIM}${curw}A${C_RESET}
+"
+        done <<< "$(batt_lines)"
+      elif [[ "$ONLY" == "battery" ]]; then
+        pbox+="  ${C_DIM}no battery detected (desktop / server / VM)${C_RESET}
+"
+      fi
+      (( HAS_AC )) && pbox+="  mains: $(ac_state)
+"
+    fi
+    if [[ -n "$pbox" ]]; then
+      out+="$(box "⏻ POWER")
+${pbox}$(bot)
+"
+    fi
+  fi
+
+  # ── GPU box ──
+  if [[ "$ONLY" == "all" || "$ONLY" == "gpu" ]]; then
+    out+="$(box "◈ GPU")
+"
+    local gv ut memp tc fs pd
+    gv=$(gpu_vitals); read -r ut memp tc fs pd <<< "$gv"
+    if [[ "$ut" != "-" ]]; then
+      out+="  util $(bar "${ut:-0}" 20) ${C_BOLD}${ut}%${C_RESET}  vram $(bar "${memp:-0}" 12) ${memp}%
+"
+      out+="  temp ${C_RED}${tc}°C${C_RESET}  fan ${fs}  draw ${C_MAGENTA}${pd}${C_RESET}
+"
+    elif [[ "$tc" != "-" ]]; then
+      out+="  temp ${C_RED}${tc}°C${C_RESET}  draw ${C_MAGENTA}${pd}${C_RESET} ${C_DIM}(amdgpu/i915 hwmon — util needs vendor tooling)${C_RESET}
+"
+    elif (( HAS_NVIDIA )); then
+      out+="  ${C_DIM}nvidia-smi busy — retrying next frame${C_RESET}
+"
+    else
+      out+="  ${C_DIM}no GPU detected${C_RESET}
+"
+    fi
+    out+="$(bot)
+"
+  fi
+
+  # footer
+  out+="  ${C_DIM}heat: · <10 ▂ <30 ▄ <55 ▆ <80 █≥80 · refresh ${INTERVAL}s${C_RESET}"
+  printf '%b' "$out"
+}
+
+# ---------- Main ----------
+if (( JSON_OUT )); then render_json; exit 0; fi
+
+if (( ONCE )); then frame; echo; exit 0; fi
+
+if [[ $TUI -eq 1 ]]; then
+  printf '\033[?1049h\033[?25l'   # alt screen, hide cursor
+  while true; do
+    printf '\033[H'
+    frame
+    printf '\033[J'                            # wipe stale tail lines (resize-safe)
+    if (( PAUSE )); then
+      IFS= read -rsn1 -t 0.25 key || true
+    else
+      IFS= read -rsn1 -t "$INTERVAL" key || true
+    fi
+    case "${key:-}" in
+      q|Q) break ;;
+      p|P) PAUSE=$(( 1 - PAUSE )) ;;
+      +|=) (( INTERVAL > 1 )) && INTERVAL=$(( INTERVAL - 1 )) ;;
+      -)   (( INTERVAL < 30 )) && INTERVAL=$(( INTERVAL + 1 )) ;;
+    esac
+  done
+else
+  # --plain: scrolling frames for pipes/logs (chunked sleep so Ctrl+C lands fast)
+  while true; do
+    frame; printf '\n'
+    for (( _t=0; _t<INTERVAL*4; _t++ )); do sleep 0.25; done
+  done
+fi

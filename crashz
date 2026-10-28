@@ -1,0 +1,991 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# crashz - Crash & freeze forensics: why did the machine die, and how do I recover?
+# ----------------------------------------------------------------------------
+# Autopsies the journals of the current + previous boots, pstore (post-panic
+# RAM black box), SMART hints, thermal/PSI readings and package history, then
+# RANKS the probable causes of a crash or hard freeze (GPU hang, OOM, thermal
+# trip, disk I/O death, kernel panic, MCE, unclean power loss, desktop/app
+# crash). Ships a per-cause RECOVERY PLAYBOOK, hunts recoverable unsaved work,
+# exports an evidence BUNDLE for bug reports, and arms a WATCH flight-recorder
+# so the next "watching a video → suddenly froze" incident leaves a trail of
+# last words instead of a blank stare.
+#
+# Usage:
+#   ./crashz                      Full autopsy: evidence → ranked cause → playbook
+#   ./crashz why                  One-line answer: "why did it crash/freeze?"
+#   ./crashz freeze               Deep dive on hard freezes (GPU/thermal/lockup)
+#   ./crashz apps                 Which programs segfaulted / dumped core, how often
+#   ./crashz boot -1              Autopsy a specific boot (same as --boot -1)
+#   ./crashz recover              Recovery playbook + lost-work finder + safe fixes
+#   ./crashz smart                Drive SMART health (NVMe+ATA) — what the hardware says about your freezes
+#   ./crashz smart --from-file=F  Evaluate a smartctl log pasted from ANOTHER machine (F=- reads stdin)
+#   ./crashz bundle               Export evidence tarball for bug reports / later study
+#   ./crashz watch [SECONDS]      Flight recorder: log vitals until the next freeze
+#
+# Options:
+#   --boot=IDX       Focus boot: 0 (current), -1 (previous), -N
+#   --since=H        Look-back window for app crashes & update correlation (default 72h)
+#   --json           Machine-readable summary
+#   --no-color       Plain output
+#   --apply          (recover) run the safe non-destructive repairs now
+#   -h, --help       This text
+#
+# Requires: journalctl (systemd). Optional: coredumpctl, smartctl, sensors,
+# pstore (/sys/fs/pstore), apport (/var/crash). Read-only except `recover --apply`.
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+if [[ -f "$SCRIPT_DIR/lib/smart.sh" ]]; then
+    # shellcheck source=lib/smart.sh
+    source "$SCRIPT_DIR/lib/smart.sh"
+fi
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ---------- Command & flags ----------
+COMMAND="autopsy"
+BOOT_FOCUS=""            # empty = scan current + previous
+SINCE_H=72
+APPLY=0
+SMART_FROM=""
+WATCH_SECONDS=5
+case "${1:-}" in
+    autopsy|why|freeze|apps|recover|smart|bundle|watch)
+        COMMAND="$1"; shift ;;
+    boot)
+        COMMAND="autopsy"; shift; BOOT_FOCUS="${1:-}"; [[ "$BOOT_FOCUS" =~ ^-?[0-9]+$ ]] && shift
+        [[ "$BOOT_FOCUS" == "boot" ]] && BOOT_FOCUS="" ;;
+esac
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --boot)      shift; BOOT_FOCUS="${1:-}" ;;
+        --boot=*)    BOOT_FOCUS="${1#--boot=}" ;;
+        --since)     shift; SINCE_H="${1:-72}" ;;
+        --since=*)   SINCE_H="${1#--since=}" ;;
+        --from-file) shift; SMART_FROM="${1:--}" ;;
+        --from-file=*) SMART_FROM="${1#--from-file=}" ;;
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1; init_colors ;;
+        --apply)     APPLY=1 ;;
+        --ai)        AI_VERDICT=1 ;;
+        --no-ai)     AI_VERDICT=0 ;;
+        -h|--help)
+            awk '
+                /^# ={5,}[[:space:]]*$/ { n++; next }
+                n>=1 && !/^#/ { exit }
+                n==1 && /^#/ { line=$0; sub(/^# ?/, "", line); print line }
+            ' "$0"
+            exit 0 ;;
+        [0-9]*)      WATCH_SECONDS="$1" ;;
+        *)           printf 'crashz: unknown option "%s" (try --help)\n' "$1" >&2; exit 64 ;;
+    esac
+    shift
+done
+[[ "$SINCE_H" =~ ^[0-9]+$ ]] || { echo "crashz: --since must be an integer (hours)" >&2; exit 64; }
+[[ -z "$BOOT_FOCUS" || "$BOOT_FOCUS" =~ ^-?[0-9]+$ ]] || { echo "crashz: --boot must be 0 or -N" >&2; exit 64; }
+
+if declare -f run_comparison_init >/dev/null 2>&1 && [[ "${JSON_OUT:-0}" -eq 0 && "$COMMAND" != "watch" ]]; then
+    run_comparison_init "crashz" "JSON_OUT=$JSON_OUT" 2>/dev/null
+fi
+finish() {
+    if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "${JSON_OUT:-0}" -eq 0 ]]; then
+        run_comparison_finalize 2>/dev/null || true
+    fi
+}
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# ---------- Capability detection ----------
+HAVE_JOURNAL=0;  command -v journalctl    >/dev/null 2>&1 && HAVE_JOURNAL=1
+HAVE_COREDUMP=0; command -v coredumpctl   >/dev/null 2>&1 && HAVE_COREDUMP=1
+HAVE_SMART=0;    command -v smartctl      >/dev/null 2>&1 && HAVE_SMART=1
+HAVE_SENSORS=0;  command -v sensors       >/dev/null 2>&1 && HAVE_SENSORS=1
+WATCH_LOG="${SECURITY_LOG_DIR:-$HOME/.security-logs}/crashz-watch.log"
+
+if [[ $HAVE_JOURNAL -eq 0 ]]; then
+    crit "journalctl not found — crashz needs a systemd journal"
+    finish
+    emit_verdict
+fi
+
+# ---------- Temp workspace ----------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/crashz.XXXXXX")"
+cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# ---------- Evidence store ----------
+declare -A EV_COUNT=() EV_SAMPLE=()
+declare -A CAUSE_WEIGHT=(
+    [KernelPanic]=100 [MCE]=95 [GpuHang]=85 [Thermal]=80 [OOM]=75
+    [HungTask]=70 [DiskIO]=65 [Unclean]=60 [DesktopCrash]=45 [Segfault]=35
+)
+declare -A CAUSE_SEV=(
+    [KernelPanic]=crit [MCE]=crit [GpuHang]=crit [Thermal]=crit [OOM]=crit
+    [HungTask]=crit [DiskIO]=crit [Unclean]=crit [DesktopCrash]=warn [Segfault]=warn
+)
+declare -A CAUSE_REGEX=(
+    [KernelPanic]='kernel panic|Oops:|Oops -|BUG: unable to handle|general protection fault|null pointer dereference|list_del corruption|slab corruption|kernel BUG at|tainting kernel'
+    [MCE]='mce: |Machine check|CPU[0-9]+: (Single|Bank)|caterr|CMCI|Hardware Error.*memory'
+    [GpuHang]='gpu hang|GPU Hang|resetting chip|ring (gfx|sdma|compute|vcn).*fail|engine recovery|NVRM: Xid|i915.*hang|amdgpu.*hang|amdgpu.*reset|drm.*scheduler.*timed out|vc4.*hang|v3d.*hang'
+    [Thermal]='thermal.*(critical|shutdown)|temperature above threshold|Critical temperature|Overtemp|throttl|shutting down due to.*temperature'
+    [OOM]='invoked oom-killer|Out of memory|Killed process [0-9]+|oom-kill:|memory cgroup out of memory'
+    [HungTask]='hung task|blocked for more than [0-9]+|soft lockup|hard LOCKUP|rcu_[a-z]* ?detected stalls|watchdog: BUG'
+    [DiskIO]='I/O error|buffer I/O error|EXT4-fs error|XFS.*error|nvme[0-9]+.*(timeout|error|abort)|ata[0-9]+.*(exception|failed|hard resetting)|medium error|uncorrectable|unrecovered read error'
+    [DesktopCrash]='(gnome-shell|plasmashell|kwin|mutter|Xorg|xfce4-panel|gdm-session|sddm).* (crashed|dumped core|core dumped)|X server fatal|display server.*died'
+    [Segfault]='segfault at|general protection|core dumped|dumped core|SIGSEGV|signal 11'
+)
+CAUSE_ORDER=(KernelPanic MCE GpuHang Thermal OOM HungTask DiskIO Unclean DesktopCrash Segfault)
+declare -a TARGET_LABELS=()
+
+# harvest <key> <file...> — count regex hits, stash samples, log the finding
+harvest() {
+    local key="$1"; shift
+    [[ -z "${CAUSE_REGEX[$key]:-}" ]] && return 0   # Unclean is computed by assess_boots
+    local total=0 n samples="" f
+    for f in "$@"; do
+        [[ -s "$f" ]] || continue
+        n=$(grep -icE "${CAUSE_REGEX[$key]}" "$f" 2>/dev/null || true)
+        n=$(echo "${n:-0}" | tr -d '[:space:]')
+        total=$((total + n))
+    done
+    for f in "$@"; do
+        [[ -s "$f" ]] || continue
+        local s
+        s=$(grep -iE "${CAUSE_REGEX[$key]}" "$f" 2>/dev/null | tail -2 | cut -c1-170)
+        [[ -n "$s" ]] && samples+="$s"$'\n'
+    done
+    samples=$(printf '%s' "$samples" | tail -2)
+    EV_COUNT[$key]=$total
+    EV_SAMPLE[$key]="$samples"
+    (( total == 0 )) && return 0
+    local first_ts
+    first_ts=$(printf '%s\n' "$samples" | head -1 | awk '{print $1" "$2" "$3}')
+    local msg="${key}: ${total} hit(s) in ${TARGET_LABELS[*]:-journals} (near ${first_ts:-?})"
+    if [[ "${CAUSE_SEV[$key]}" == "crit" ]]; then
+        critf "$key" "$msg" "Recovery playbook below — or run: ./crashz recover"
+    else
+        warnf "$key" "$msg" "Recovery playbook below — or run: ./crashz recover"
+    fi
+}
+
+# ---------- Scan pipeline ----------
+J_WIN="$WORK/window.txt"; : > "$J_WIN"
+
+scan_all() {
+    local -a boots=(-1 0)
+    [[ -n "$BOOT_FOCUS" ]] && boots=("$BOOT_FOCUS")
+    TARGET_LABELS=()
+    local b out
+    for b in "${boots[@]}"; do
+        out="$WORK/journal_$b.txt"
+        timeout 30 journalctl --no-pager -b "$b" 2>/dev/null | tail -n 300000 > "$out" || true
+        if [[ ! -s "$out" ]]; then
+            [[ "$b" == "0" ]] || info "boot $b: no journal recorded (or needs sudo to read)"
+        else
+            TARGET_LABELS+=("boot $b")
+        fi
+    done
+    if [[ ! -s "$WORK/journal_-1.txt" && ! -s "$WORK/journal_0.txt" ]] \
+        && [[ -z "$(journalctl --no-pager -b 0 2>&1 >/dev/null; true)" ]] \
+        && ! journalctl -b 0 -n 1 >/dev/null 2>&1; then
+        critf "JournalAccess" "journal returned nothing — running unprivileged?" \
+            "Re-run with sudo, or: sudo usermod -aG adm,systemd-journal $USER (then re-login)"
+    fi
+
+    # pstore: the kernel's black box — panic text survives even a hard freeze
+    local ps="$WORK/pstore.txt"; : > "$ps"
+    if [[ -d /sys/fs/pstore ]]; then
+        local pf pfound=0
+        for pf in /sys/fs/pstore/*; do
+            [[ -e "$pf" ]] || continue
+            pfound=1
+            if [[ -r "$pf" ]]; then
+                { echo "--- pstore: ${pf##*/} ---"; head -c 4000 "$pf"; echo; } >> "$ps"
+            else
+                echo "--- pstore: ${pf##*/} exists, root-readable only (sudo cat it) ---" >> "$ps"
+            fi
+        done
+        (( pfound )) && TARGET_LABELS+=("pstore")
+    fi
+
+    # --since window: used only for app-crash & update correlation (cmd apps)
+    timeout 30 journalctl --no-pager --since "${SINCE_H} hours ago" 2>/dev/null \
+        | tail -n 300000 > "$J_WIN" || true
+
+    # harvest all causes across boot journals + pstore (no double counting)
+    local key
+    for key in "${CAUSE_ORDER[@]}"; do
+        harvest "$key" "$WORK"/journal_*.txt "$ps"
+    done
+
+    assess_boots
+    correlate_packages
+    live_thermal_evidence
+    smart_crash_evidence
+}
+
+# ---------- SMART drive evidence (shared parser: lib/smart.sh) ----------
+_smart_unclean_hook() {   # $1=dev $2=unsafe_shutdowns count
+    EV_COUNT[Unclean]=$(( ${EV_COUNT[Unclean]:-0} + 1 ))
+    EV_SAMPLE[Unclean]+="$1: drive-internal unsafe_shutdowns=$2 — the hardware kept its own power-loss counter"$'\n'
+    UNCLEAN_DETECTED=1
+}
+
+smart_crash_evidence() {
+    declare -F smart_collect >/dev/null 2>&1 || return 0
+    smart_collect || return 0
+    TARGET_LABELS+=("SMART")
+    SMART_UNSAFE_HOOK=_smart_unclean_hook
+    smart_findings
+}
+
+# ---------- Live thermal circumstantial evidence ----------
+live_thermal_evidence() {
+    local lt="" t tz
+    for tz in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -r "$tz" ]] || continue
+        t=$(( $(cat "$tz" 2>/dev/null || echo 0) / 1000 ))
+        [[ -z "$lt" || $t -gt $lt ]] && lt=$t
+    done
+    [[ -z "$lt" ]] && return 0
+    if (( lt >= 85 )); then
+        EV_COUNT[Thermal]=$(( ${EV_COUNT[Thermal]:-0} + 1 ))
+        EV_SAMPLE[Thermal]+="live reading at scan time: ${lt}°C — in the throttle/danger band"$'\n'
+        warnf "Thermal" "live thermal reading ${lt}°C right now — heat is a proven freeze cause under video load" \
+            "Thermal playbook: ./crashz recover · live watch: ./topz or 'watch -n1 sensors'"
+    fi
+}
+
+# ---------- Package-change correlation ----------
+correlate_packages() {
+    [[ -r /var/log/apt/history.log ]] || return 0
+    local pkgs sus
+    pkgs=$(awk -v h="$SINCE_H" '
+        BEGIN{ t=systime()-h*3600; sec=0 }
+        /^Start-Date:/{ cmd="date -d \"" substr($0,12) "\" +%s"; cmd | getline ts; close(cmd); sec=(ts>=t)?1:0 }
+        sec && (/^Upgrade:/ || /^Install:/ || /^Remove:/){ print }
+    ' /var/log/apt/history.log 2>/dev/null | head -8)
+    [[ -z "$pkgs" ]] && return 0
+    sus=$(printf '%s\n' "$pkgs" | grep -icE 'linux-image|nvidia|mesa|libgl|xserver|xorg|firmware|amdgpu|intel-media' || true)
+    sus=${sus:-0}
+    if (( sus > 0 )); then
+        warnf "PkgChange" "package updates in the last ${SINCE_H}h — ${sus} touch kernel/GPU/graphics (crash correlation suspected)" \
+            "Compare update dates vs crash timestamps: less /var/log/apt/history.log — if episodes started after one, ./crashz bundle and report upstream"
+    fi
+}
+
+# ---------- Unclean shutdown detection ----------
+UNCLEAN_DETECTED=0
+assess_boots() {
+    local list
+    list=$(journalctl --list-boots --no-legend 2>/dev/null)
+    [[ -z "$list" ]] && return 0
+
+    local -a idx=() firstt=() lastt=()
+    local n=0 line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local i id rest f_epoch l_epoch
+        i=$(echo "$line" | awk '{print $1}')
+        [[ "$i" =~ ^-?[0-9]+$ ]] || continue
+        rest=$(echo "$line" | awk '{$1="";$2="";print}' | sed 's/^ *//')
+        f_epoch=$(date -d "$(echo "$rest" | awk '{print $2" "$3" "$4" "$5}')" +%s 2>/dev/null || echo 0)
+        l_epoch=$(date -d "$(echo "$rest" | awk '{print $7" "$8" "$9" "$10}')" +%s 2>/dev/null || echo 0)
+        n=$((n+1)); idx[$n]="$i"; firstt[$n]="${f_epoch:-0}"; lastt[$n]="${l_epoch:-0}"
+    done <<< "$list"
+
+    local j
+    for ((j=1; j<n; j++)); do
+        local bi="${idx[$j]}" bnext="${idx[$((j+1))]}"
+        local bfirst="${firstt[$((j+1))]:-0}" blast="${lastt[$j]:-0}"
+        (( bfirst == 0 || blast == 0 )) && continue
+        local gap=$(( bfirst - blast )); gap=${gap#-}
+        if [[ -n "$BOOT_FOCUS" && "$bi" != "$BOOT_FOCUS" ]]; then continue; fi
+        local tail_lines clean=0
+        tail_lines=$(timeout 10 journalctl --no-pager -b "$bi" -n 40 2>/dev/null)
+        if echo "$tail_lines" | grep -qiE 'Reached target.*(Power Off|Shutdown|Reboot)|Rebooting|Powering down|systemd-shutdown|Unmounting|Stopped target'; then
+            clean=1
+        fi
+        if [[ $clean -eq 0 ]]; then
+            UNCLEAN_DETECTED=1
+            EV_COUNT[Unclean]=$(( ${EV_COUNT[Unclean]:-0} + 1 ))
+            local last_words
+            last_words=$(printf '%s\n' "$tail_lines" | tail -3 | cut -c1-170)
+            EV_SAMPLE[Unclean]="boot $bi ended $(date -d "@$blast" '+%F %T' 2>/dev/null), next boot $bnext at $(date -d "@$bfirst" '+%F %T' 2>/dev/null) (gap ${gap}s) — NO shutdown sequence found
+${last_words}"
+            critf "Unclean" "boot $bi ended abruptly — no shutdown sequence in its last 40 journal lines (gap to next boot: ${gap}s)" \
+                "Signature of a hard freeze or power loss — see LAST WORDS section; arm ./crashz watch next time"
+            suggest_tool powerz "abrupt power loss suspected — powerz audits supply/battery/UPS events"
+            suggest_tool bootz "boot $bi died without shutdown — bootz --boot $bi for the full error stream"
+        fi
+    done
+
+    # filesystem orphan-recovery hints in the CURRENT boot confirm the death
+    if [[ -s "$WORK/journal_0.txt" ]]; then
+        local orph
+        orph=$(grep -icE 'error recovering journal|orphan cleanup|not shut down clean|EXT4-fs warning.*check time|mounted with journal recovery' "$WORK/journal_0.txt" 2>/dev/null || true)
+        orph=${orph:-0}
+        if (( orph > 0 && UNCLEAN_DETECTED == 0 )); then
+            UNCLEAN_DETECTED=1
+            EV_COUNT[Unclean]=$(( ${EV_COUNT[Unclean]:-0} + orph ))
+            EV_SAMPLE[Unclean]=$(grep -iE 'error recovering journal|orphan cleanup|not shut down clean' "$WORK/journal_0.txt" 2>/dev/null | tail -2 | cut -c1-170)
+            critf "Unclean" "current boot shows ${orph} filesystem journal-recovery message(s) — previous shutdown was not clean" \
+                "Read how the last session died: ./crashz (LAST WORDS section)"
+        fi
+    fi
+}
+
+# ---------- Ranked causes ----------
+declare -a RANKED=()
+RANKED_TOTAL=0
+rank_causes() {
+    RANKED=(); RANKED_TOTAL=0
+    local key
+    for key in "${CAUSE_ORDER[@]}"; do
+        local c="${EV_COUNT[$key]:-0}"
+        (( c > 0 )) || continue
+        local w=${CAUSE_WEIGHT[$key]:-50}
+        local s=$(( w + (c > 15 ? 15 : c) ))
+        RANKED_TOTAL=$((RANKED_TOTAL + s))
+        RANKED+=("$s|$key")
+    done
+    (( ${#RANKED[@]} > 0 )) && mapfile -t RANKED < <(printf '%s\n' "${RANKED[@]}" | sort -t'|' -k1 -rn)
+}
+
+cause_title() {
+    case "$1" in
+        KernelPanic)   echo "Kernel panic / Oops" ;;
+        MCE)           echo "Machine-check hardware error (CPU/RAM/bus)" ;;
+        GpuHang)       echo "GPU hang / driver reset" ;;
+        Thermal)       echo "Thermal trip (overheat throttle/shutdown)" ;;
+        OOM)           echo "Out-of-memory kill cascade" ;;
+        HungTask)      echo "Kernel hung-task / soft lockup (system wedge)" ;;
+        DiskIO)        echo "Disk / storage I/O failure" ;;
+        Unclean)       echo "Unclean shutdown — froze or lost power mid-session" ;;
+        DesktopCrash)  echo "Desktop / display server crash" ;;
+        Segfault)      echo "Application segfaults / core dumps" ;;
+        *)             echo "$1" ;;
+    esac
+}
+
+# ============================================================================
+# PLAYBOOKS — recovery knowledge per cause
+# ============================================================================
+declare -A PLAYBOOK=(
+[KernelPanic]='Export evidence: ./crashz bundle — attach it to any distro/kernel bug report.
+Read the panic text: sudo cat /sys/fs/pstore/console-ramoops-0 (it survives in RAM across the crash).
+Study kernel + taints: ./kernelz   ·   run-up errors: ./bootz --boot -1
+If reproducible, boot the previous kernel from GRUB; ./kernelz recover pins a known-good default.
+Bad RAM is the #1 silent panic cause — run memtest86+ overnight: sudo apt install memtest86+'
+[MCE]='Decode it: sudo apt install rasdaemon && sudo systemctl enable --now rasdaemon; then ras-mc-ctl --errors
+Update microcode + BIOS: sudo apt install intel-microcode amd64-microcode; check vendor BIOS errata.
+Disable XMP / overclocking in BIOS as a test — MCE often means unstable RAM timings or clocks.
+Run memtest86+ overnight; re-seat RAM sticks one at a time to isolate the bad module.
+If it trips under video load only, suspect PSU voltage droop — test with another supply.'
+[GpuHang]='Identify the driver stack: ./driverz (video section) — nvidia/nouveau/amdgpu/i915 each hang differently.
+Classic "watching a video → froze": disable hardware acceleration in the browser and retest.
+Force software GL for one session: LIBGL_ALWAYS_SOFTWARE=1 firefox — if the freeze stops, GPU driver confirmed.
+Most GPU hangs die upstream: ./kernelz upgrade (GRUB fallback included) && sudo apt install --only-upgrade mesa-vulkan-drivers firmware-misc-nonfree
+NVIDIA: each "NVRM: Xid" code maps to a failure mode — ./crashz bundle captures them; look up the exact Xid.
+Arm the flight recorder: ./crashz watch 5 — the next hang lands in the log with timestamps.'
+[Thermal]='Watch live temps + throttling: ./cpuz · ./topz · sudo apt install lm-sensors && sudo sensors-detect
+Physical first: blow out dust, verify every fan spins, re-seat the cooler — video decode is a heat spike.
+Install the Linux thermal daemon: sudo apt install thermald && sudo systemctl enable --now thermald
+Stopgap power limits: sudo nvidia-smi -pl <watts> · sudo cpupower frequency-set -d 2.5GHz
+Check BIOS fan curves and thermal-shutdown threshold — too high a threshold freezes before throttling saves you.'
+[OOM]='See who ate the RAM: ./memoryz · journalctl -b -1 | grep -B2 -A12 "invoked oom-killer"
+Add swap now: sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile — then add the fstab line
+Install earlyoom to kill politely BEFORE the wedge: sudo apt install earlyoom && sudo systemctl enable --now earlyoom
+Desktop-friendly knob: echo vm.swappiness=100 | sudo tee /etc/sysctl.d/99-desktop.conf && sudo sysctl --system
+4K video + many tabs can eat 2GB+ each — ./browserz audits the browser footprint; consider a tab suspender.'
+[HungTask]='Almost always the storage layer: ./diskz (SMART + error scan) · ./slowz (rank what waits on I/O)
+Re-seat SATA/NVMe; check link renegotiation: sudo dmesg | grep -iE "ata[0-9]|nvme"
+Journal + disk-full wedges: ./logz, then sudo journalctl --vacuum-size=200M; confirm df -h / has headroom
+NFS/CIFS hard-mount hangs freeze the box — check mount options (timeo/soft) and ./networkz
+Newer kernels rework block/nvme timeout paths — ./kernelz to evaluate an upgrade.'
+[DiskIO]='SMART verdict: sudo apt install smartmontools && sudo smartctl -a /dev/sdX (crashz bundle includes it when present)
+The death rattle: sudo smartctl -A /dev/sdX | grep -E "Reallocated|Pending|Uncorrectable|CRC errors"
+Read-only triage: sudo fsck -n /dev/sdXN — schedule the real fsck from a live USB if it reports errors
+BACK UP USER DATA TODAY — I/O errors are the drive writing its own suicide note
+Under warranty: ./crashz bundle + smartctl output is exactly what an RMA wants.'
+[Unclean]='Read the last words: LAST WORDS section below, or: journalctl -b -1 -n 50
+Freeze vs power-cut: if the final journal line is mundane (not an error), it froze dead — the OS stopped writing while still powered. Arm ./crashz watch 5 and reproduce.
+Power path: ./powerz (battery/PSU/UPS events); try a different cable/adapter/outlet on desktops.
+Random hard freezes are also bad RAM: memtest86+ overnight, then re-seat sticks one at a time.
+Make sure evidence survives the NEXT freeze — persist the journal: sudo mkdir -p /var/log/journal && sudo systemd-tmpfiles --create --prefix /var/log/journal
+Shrink lost work: enable editor autosave + browser session restore (./crashz recover lists recoverable finds).'
+[DesktopCrash]='The box lived, the session died. Find why: journalctl -b | grep -iE "gdm|sddm|gnome-shell|Xorg|wayland" | tail -30
+GPU angle dominates — see the GpuHang playbook.
+Full /tmp or /var kills display managers: df -h; sudo journalctl --vacuum-size=200M
+Emergency session restore: sudo systemctl restart gdm (or sddm / lightdm)
+Config corruption test: log out, mv ~/.config ~/.config.broken, log in fresh — bisect back if clean.'
+[Segfault]='Who crashed, how often: ./crashz apps shows the fault leaderboard
+Grab the core: coredumpctl list; then sudo coredumpctl info <PID> (when systemd-coredump is present)
+apport reports: /var/crash/*.crash — report upstream: ubuntu-bug <package>, or attach ./crashz bundle
+Correlate with updates: ./crashz lists package changes near the crash (PkgChange)
+Update just the offender: sudo apt install --only-upgrade <package>'
+)
+
+# ============================================================================
+# RENDER HELPERS
+# ============================================================================
+banner() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'EOF'
+   ____                             __
+  / ___|_ __ __ _ _ __ ___  _ __    \ \
+  \__ \ / '__/ _` | '_ ` _ \| '_ \    \ \
+   __) | | | (_| | | | | | | |_) |   / /
+  /____/|_|  \__,_|_| |_| |_| .__/   /_/
+                            |_|
+EOF
+    printf "${C_RESET}${C_DIM}  Crash & freeze forensics — %s on %s${C_RESET}\n" \
+        "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$(hostname -s 2>/dev/null || echo host)"
+}
+
+print_evidence() {
+    section "EVIDENCE LEDGER"
+    local any=0 key
+    table_begin "CAUSE" "HITS" "SCANNED SOURCES"
+    for key in "${CAUSE_ORDER[@]}"; do
+        local c="${EV_COUNT[$key]:-0}"
+        (( c > 0 )) || continue
+        any=1
+        table_row "$(cause_title "$key")" "$c" "$(IFS=', '; echo "${TARGET_LABELS[*]:-journals}")"
+    done
+    table_end
+    (( any == 0 )) && ok "No crash fingerprints in $(IFS=', '; echo "${TARGET_LABELS[*]:-the scanned sources}")"
+    for key in "${CAUSE_ORDER[@]}"; do
+        (( ${EV_COUNT[$key]:-0} > 0 )) || continue
+        subsec "$(cause_title "$key") — sample lines"
+        while IFS= read -r l; do
+            [[ -n "$l" ]] && printf "  ${C_DIM}%s${C_RESET}\n" "$l"
+        done <<< "${EV_SAMPLE[$key]:-}"
+    done
+}
+
+print_ranking() {
+    section "RANKED PROBABLE CAUSES"
+    if [[ ${#RANKED[@]} -eq 0 ]]; then
+        ok "Nothing ranked — no evidence weight to score"
+        info "A true hard freeze leaves no logs. Prepare: ./crashz watch 5 (flight recorder)"
+        return
+    fi
+    local top_score="${RANKED[0]%%|*}" i=0 entry
+    for entry in "${RANKED[@]}"; do
+        i=$((i+1)); (( i > 4 )) && break
+        local score="${entry%%|*}" key="${entry#*|}"
+        local pct=$(( score * 100 / top_score ))
+        printf "  ${C_BOLD}#%d${C_RESET}  %-48s %s\n" "$i" "$(cause_title "$key")" "$(bar "$pct" 14)"
+    done
+    echo
+    local top="${RANKED[0]#*|}"
+    local conf=$(( RANKED_TOTAL > 0 ? top_score * 100 / RANKED_TOTAL : 100 ))
+    (( conf > 99 )) && conf=99
+    printf "  ${C_BOLD}${C_GREEN}MOST LIKELY → %s${C_RESET}  ${C_DIM}(%d%% of evidence weight, %s hit(s))${C_RESET}\n" \
+        "$(cause_title "$top")" "$conf" "${EV_COUNT[$top]}"
+}
+
+print_last_words() {
+    local b="${1:--1}"
+    [[ -n "$BOOT_FOCUS" ]] && b="$BOOT_FOCUS"
+    section "LAST WORDS OF BOOT $b (final journal breaths before the death)"
+    local lines
+    lines=$(timeout 10 journalctl --no-pager -b "$b" -n 8 2>/dev/null)
+    if [[ -n "$lines" ]]; then
+        while IFS= read -r l; do
+            [[ -z "$l" ]] && continue
+            (( ${#l} > 150 )) && l="${l:0:147}…"
+            printf "  ${C_YELLOW}%s${C_RESET}\n" "$l"
+        done <<< "$lines"
+        info "Full stream: journalctl -b $b | less   ·   errors only: journalctl -b $b -p err"
+    else
+        info "No journal for boot $b (not recorded, or needs sudo)"
+    fi
+}
+
+print_playbook() {
+    section "RECOVERY PLAYBOOK — TOP CAUSE"
+    if [[ -z "${RANKED[0]:-}" ]]; then
+        ok "No crash evidence — nothing to recover from this time"
+        info "Prevention: ./crashz watch 5 arms a flight recorder for the next episode"
+        return
+    fi
+    local top="${RANKED[0]#*|}"
+    subsec "$(cause_title "$top")"
+    local pb="${PLAYBOOK[$top]:-See ./crashz recover for the full catalog.}"
+    local i=0 l
+    while IFS= read -r l; do
+        [[ -z "$l" ]] && continue
+        i=$((i+1))
+        printf "  ${C_CYAN}#%d${C_RESET} %s\n" "$i" "$l"
+    done <<< "$pb"
+}
+
+live_vitals() {
+    local psi_cpu psi_mem psi_io temp="" t tz
+    psi_cpu=$(awk -F'[= ]' '/^some/{print $3}' /proc/pressure/cpu 2>/dev/null)
+    psi_mem=$(awk -F'[= ]' '/^some/{print $3}' /proc/pressure/memory 2>/dev/null)
+    psi_io=$(awk -F'[= ]' '/^some/{print $3}' /proc/pressure/io 2>/dev/null)
+    for tz in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -r "$tz" ]] || continue
+        t=$(( $(cat "$tz" 2>/dev/null || echo 0) / 1000 ))
+        [[ -z "$temp" || $t -gt $temp ]] && temp=$t
+    done
+    kpi "CPU stall" "${psi_cpu:-?}% avg10" "$C_YELLOW"
+    kpi "MEM stall" "${psi_mem:-?}% avg10" "$C_YELLOW"
+    local iocol="$C_GREEN"; (( ${psi_io%.*} >= 25 )) 2>/dev/null && iocol="$C_RED"
+    kpi "IO stall"  "${psi_io:-?}% avg10" "$iocol"
+    kpi "Max temp"  "${temp:-?}°C" "$(temp_color "${temp:-0}")"
+    kpi "Load"      "$(cut -d' ' -f1 /proc/loadavg 2>/dev/null) / $(nproc 2>/dev/null || echo '?') cores" "$C_GREEN"
+}
+
+lost_work_finder() {
+    section "RECOVERABLE WORK — WHERE YOUR UNSAVED STUFF LIVES"
+    local found=0 p
+    for p in "$HOME/.config/google-chrome" "$HOME/.config/chromium"; do
+        [[ -d "$p" ]] || continue
+        if compgen -G "$p/*/Sessions" > /dev/null 2>&1; then
+            found=1; ok "Chrome/Chromium session store under $p — relaunch and accept the Restore prompt"
+        fi
+    done
+    for p in "$HOME"/.mozilla/firefox/*/sessionstore-backups; do
+        [[ -d "$p" ]] && { found=1; ok "Firefox session backups: $p (History → Restore Previous Session)"; break; }
+    done
+    for p in "$HOME/.config/libreoffice/4/user/backup"; do
+        [[ -d "$p" ]] && { found=1; ok "LibreOffice autosaves: $p ($(find "$p" -type f 2>/dev/null | wc -l) file(s))"; }
+    done
+    [[ -f "$HOME/.local/share/recently-used.xbel" ]] && \
+        { found=1; info "Recently-used registry: ~/.local/share/recently-used.xbel — lists what was open when it died"; }
+    [[ -d "$HOME/.config/Code/User/History" ]] && \
+        { found=1; ok "VS Code local history: ~/.config/Code/User/History — Timeline pane restores unsaved edits"; }
+    local swaps
+    swaps=$(timeout 10 find "$HOME/Documents" "$HOME/Desktop" "$HOME/Downloads" -maxdepth 3 \
+        \( -name '*.swp' -o -name '*.swo' -o -name '*~' -o -name '.~lock.*#' \) \
+        -newermt "${SINCE_H} hours ago" 2>/dev/null | head -8)
+    [[ -n "$swaps" ]] && { found=1; subsec "Editor swap/lock files newer than ${SINCE_H}h (open the parent app to recover)"; printf '  ${C_DIM}·${C_RESET} %s\n' $swaps; }
+    [[ -d "$HOME/.local/share/Trash/files" ]] && \
+        info "Accidentally-lost files may be in Trash: ~/.local/share/Trash/files"
+    (( found == 0 )) && info "Nothing obvious in standard autosave locations (newer than ${SINCE_H}h)"
+}
+
+emit_json_summary() {
+    local key
+    add_json_field "command" "$COMMAND"
+    add_json_field "boot_focus" "${BOOT_FOCUS:-current+previous}"
+    add_json_field "scanned" "${TARGET_LABELS[*]:-none}"
+    add_json_field "unclean_detected" "${UNCLEAN_DETECTED:-0}" 1
+    local causes="{" first=1
+    for key in "${CAUSE_ORDER[@]}"; do
+        (( ${EV_COUNT[$key]:-0} > 0 )) || continue
+        [[ $first -eq 0 ]] && causes+=","
+        first=0
+        causes+="\"$key\":${EV_COUNT[$key]}"
+    done
+    causes+="}"
+    add_json_field "evidence" "$causes" 1
+    if [[ -n "${RANKED[0]:-}" ]]; then
+        add_json_field "top_cause" "${RANKED[0]#*|}"
+    else
+        add_json_field "top_cause" "none"
+    fi
+}
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+cmd_autopsy() {
+    banner
+    with_spin "harvesting crash evidence" scan_all
+    print_evidence
+    rank_causes
+    print_ranking
+    print_last_words "${BOOT_FOCUS:--1}"
+    print_playbook
+    section "FLIGHT RECORDER"
+    if [[ -s "$WATCH_LOG" ]]; then
+        ok "Watch log present: $(wc -l < "$WATCH_LOG") tick(s) → $WATCH_LOG"
+        info "Read the last lines: tail -20 $WATCH_LOG"
+    else
+        info "No flight-recorder log yet — the next freeze will be silent unless you arm it:"
+        printf "    ${C_GREEN}./crashz watch 5${C_RESET}  ${C_DIM}— one line per 5s: PSI stalls, temp, load, new journal errors${C_RESET}\n"
+    fi
+    emit_json_summary
+    finish
+    emit_verdict
+}
+
+cmd_why() {
+    with_spin "reading the evidence" scan_all
+    rank_causes
+    if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        emit_json_summary
+        emit_verdict
+    fi
+    if [[ ${#RANKED[@]} -eq 0 ]]; then
+        echo "crashz why → no crash evidence in the scanned journals — if it froze dead, run ./crashz watch 5 to prepare for next time"
+        finish; exit 0
+    fi
+    local entry="${RANKED[0]}"
+    local key="${entry#*|}" score="${entry%%|*}"
+    local conf=$(( RANKED_TOTAL > 0 ? score * 100 / RANKED_TOTAL : 100 )); (( conf > 99 )) && conf=99
+    local first_ts
+    first_ts=$(printf '%s\n' "${EV_SAMPLE[$key]:-}" | head -1 | awk '{print $2" "$3" "$4}')
+    echo "crashz why → MOST LIKELY: $(cause_title "$key") (${conf}%, ${EV_COUNT[$key]} hit(s)${first_ts:+, near ${first_ts}}) — ./crashz freeze for the story · ./crashz recover for fixes"
+    finish; exit 0
+}
+
+cmd_freeze() {
+    banner
+    with_spin "hunting freeze fingerprints" scan_all
+    rank_causes
+    section "FREEZE SUSPECTS (hard-freeze signatures)"
+    local key any=0
+    table_begin "SIGNATURE" "HITS" "WHY IT FREEZES THE BOX"
+    for key in GpuHang HungTask DiskIO Thermal OOM MCE KernelPanic Unclean; do
+        (( ${EV_COUNT[$key]:-0} > 0 )) || continue
+        any=1
+        local why=""
+        case "$key" in
+            GpuHang)     why="compositor waits on a GPU that never answers → everything stops" ;;
+            HungTask)    why="kernel task blocked >120s in uninterruptible I/O → UI can't be scheduled" ;;
+            DiskIO)      why="journal/swap stalls on a dying drive → the system freezes before it dies" ;;
+            Thermal)     why="hardware thermal trip cuts clocks mid-frame → hard stop" ;;
+            OOM)         why="thrashing before the kill → everything crawls, then wedges" ;;
+            MCE)         why="machine-check under video load = silicon or power-supply instability" ;;
+            KernelPanic) why="oops with no console output looks exactly like a freeze" ;;
+            Unclean)     why="no shutdown sequence found — it died mid-session" ;;
+        esac
+        table_row "$(cause_title "$key")" "${EV_COUNT[$key]}" "$why"
+    done
+    table_end
+    if (( any )); then
+        print_last_words
+        print_playbook
+    else
+        ok "No freeze signatures in the logged evidence"
+        info "Video-time freezes with ZERO logs = hard lockup (power/RAM/GPU hardware)."
+        printf "  ${C_DIM}Arm the recorder, then reproduce:${C_RESET} ./crashz watch 5\n"
+        printf "  ${C_DIM}Test the video pipeline:${C_RESET} LIBGL_ALWAYS_SOFTWARE=1 <your browser> ${C_DIM}— freeze gone = GPU driver${C_RESET}\n"
+    fi
+    section "LIVE VITALS (right now)"
+    live_vitals
+    if [[ $HAVE_SENSORS -eq 1 ]]; then
+        subsec "sensors (readings)"
+        timeout 5 sensors 2>/dev/null | head -24 | while IFS= read -r l; do
+            printf "  ${C_DIM}%s${C_RESET}\n" "$l"
+        done
+    fi
+    if [[ $HAVE_SMART -eq 0 ]]; then
+        info "smartctl absent — for storage-error depth: sudo apt install smartmontools"
+    fi
+    emit_json_summary
+    finish
+    emit_verdict
+}
+
+cmd_apps() {
+    banner
+    with_spin "counting app casualties" scan_all
+    section "APP CRASH LEADERBOARD (last ${SINCE_H}h)"
+    local win="$J_WIN"
+    [[ -s "$win" ]] || win="$WORK/journal_0.txt"
+    if [[ -s "$win" ]]; then
+        local faults board
+        faults=$(grep -iE 'segfault at|general protection|dumped core|core dumped' "$win" 2>/dev/null)
+        if [[ -n "$faults" ]]; then
+            board=$( {
+                printf '%s\n' "$faults" | grep -oE '\([A-Za-z0-9_.+-]+\) of user' | sed -E 's/^\(|\) of user$//g'
+                printf '%s\n' "$faults" | grep -oE '[A-Za-z0-9_.+-]+\[[0-9]+\]: (segfault|traps)' | cut -d'[' -f1
+                printf '%s\n' "$faults" | grep -oE 'traps: [A-Za-z0-9_.+-]+' | sed 's/traps: //'
+            } 2>/dev/null | sort | uniq -c | sort -rn | head -10 )
+        fi
+        if [[ -n "$board" ]]; then
+            table_begin "CRASHES" "BINARY"
+            while read -r n name; do
+                [[ -z "${n:-}" ]] && continue
+                local col="$C_CYAN"
+                table_row "${C_RED}${n}${C_RESET}" "${name:-unknown}"
+            done <<< "$board"
+            table_end
+        else
+            ok "No segfault / core-dump fingerprints in the window"
+        fi
+    fi
+    if [[ $HAVE_COREDUMP -eq 1 ]]; then
+        subsec "systemd-coredump (latest 8)"
+        timeout 10 coredumpctl list --no-pager 2>/dev/null | tail -9 | while IFS= read -r l; do
+            printf "  ${C_DIM}%s${C_RESET}\n" "$l"
+        done
+    fi
+    shopt -s nullglob
+    local crashes=("/var/crash/"*.crash)
+    shopt -u nullglob
+    if [[ ${#crashes[@]} -gt 0 ]]; then
+        subsec "apport crash reports (${#crashes[@]} file(s))"
+        local f shown=0 ptype exe
+        for f in "${crashes[@]}"; do
+            (( shown >= 6 )) && break
+            ptype=$(grep -m1 '^ProblemType:' "$f" 2>/dev/null | awk '{print $2}')
+            exe=$(grep -m1 '^ExecutablePath:' "$f" 2>/dev/null | awk '{print $2}')
+            printf "  ${C_RED}✗${C_RESET} %-16s %s\n" "${ptype:-?}" "${exe:-?}"
+            shown=$((shown+1))
+        done
+        info "Report upstream: ubuntu-bug <package>   ·   evidence: ./crashz bundle"
+    fi
+    rank_causes
+    emit_json_summary
+    finish
+    emit_verdict
+}
+
+cmd_recover() {
+    banner
+    with_spin "building the recovery plan" scan_all
+    rank_causes
+    section "IMMEDIATE ACTIONS"
+    if (( APPLY == 1 )); then
+        sync 2>/dev/null || true
+        ok "sync — dirty pages flushed to storage"
+        if [[ $EUID -eq 0 ]]; then
+            systemctl reset-failed 2>/dev/null && ok "systemctl reset-failed — failed-unit ledger cleared"
+        else
+            info "reset-failed needs root: sudo systemctl reset-failed"
+        fi
+    else
+        printf "  ${C_GREEN}→${C_RESET} Re-run with ${C_BOLD}--apply${C_RESET} to execute the safe ones (sync, reset-failed)\n"
+        printf "  ${C_GREEN}→${C_RESET} Arm the flight recorder before the next episode: ${C_BOLD}./crashz watch 5${C_RESET}\n"
+        printf "  ${C_GREEN}→${C_RESET} Export evidence while journals are fresh: ${C_BOLD}./crashz bundle${C_RESET}\n"
+    fi
+    local failed
+    failed=$(systemctl --no-pager --state=failed --plain 2>/dev/null | grep -c '\.service' || true)
+    failed=${failed:-0}
+    if (( failed > 0 )); then
+        warnf "failed_service" "${failed} failed systemd unit(s) right now — aftermath cleanup" \
+            "sudo systemctl reset-failed (or crashz recover --apply), then investigate survivors with logz"
+        suggest_tool logz "failed units remain after the crash — logz shows their error stream"
+    fi
+    if [[ ${#RANKED[@]} -gt 0 ]]; then
+        section "PLAYBOOKS — IN EVIDENCE ORDER"
+        local entry i=0 key l
+        for entry in "${RANKED[@]}"; do
+            i=$((i+1)); (( i > 3 )) && break
+            key="${entry#*|}"
+            subsec "$i. $(cause_title "$key")"
+            while IFS= read -r l; do
+                [[ -z "$l" ]] && continue
+                printf "    ${C_CYAN}•${C_RESET} %s\n" "$l"
+            done <<< "${PLAYBOOK[$key]:-}"
+        done
+    else
+        section "PLAYBOOK"
+        ok "No crash evidence found — good news. Still arm the recorder (./crashz watch) before the next episode."
+    fi
+    lost_work_finder
+    emit_json_summary
+    finish
+    emit_verdict
+}
+
+cmd_smart() {
+    banner
+    if [[ -n "$SMART_FROM" ]]; then
+        section "PASTED SMART LOG — ${SMART_FROM}"
+        local ok=0
+        if [[ "$SMART_FROM" == "-" ]]; then
+            smart_parse_text_stream "pasted-log" && ok=1
+        else
+            [[ -r "$SMART_FROM" ]] || { crit "cannot read $SMART_FROM"; finish; emit_verdict; }
+            smart_parse_text_stream "$SMART_FROM" < "$SMART_FROM" && ok=1
+        fi
+        (( ok )) || crit "no SMART health fields recognized — paste the smartctl -A output verbatim"
+        rank_causes
+        if [[ ${#RANKED[@]} -gt 0 ]]; then
+            subsec "Reading across from the other machine"
+            info "unsafe_shutdowns is the drive's own crash counter — a high value there means those freezes were real power-loss-grade deaths"
+            info "Run ./crashz there too (autopsy + watch) once it is installed; ./crashz bundle carries this analysis"
+        fi
+        finish; emit_verdict
+    fi
+    if ! declare -F smart_collect >/dev/null 2>&1; then
+        crit "lib/smart.sh missing — SMART reporting unavailable"
+        finish; emit_verdict
+    fi
+    if ! command -v smartctl >/dev/null 2>&1 && [[ ! -x /usr/sbin/smartctl ]]; then
+        crit "smartctl not installed — sudo apt install smartmontools (jq also required)"
+        finish; emit_verdict
+    fi
+    if ! with_spin "reading drive health logs" smart_collect; then
+        crit "smartctl returned no parseable data — try: sudo ./crashz smart (NVMe full logs need root on most systems)"
+        finish; emit_verdict
+    fi
+    section "DRIVE HEALTH (NVMe + ATA SMART)"
+    smart_table
+    info "sudo reveals more (error logs, self-tests): sudo ./crashz smart"
+    # findings + the Unclean corroboration hook, same rules as the autopsy
+    if [[ $HAVE_JOURNAL -eq 1 ]]; then
+        SMART_UNSAFE_HOOK=_smart_unclean_hook
+    else
+        SMART_UNSAFE_HOOK=""
+    fi
+    smart_findings
+    rank_causes
+    if [[ ${#RANKED[@]} -gt 0 ]]; then
+        section "READ — THE DRIVE'S SIDE OF THE STORY"
+        local row dev kind model health temp used spare spareth unsafe merr realloc pending crc uncorr poh pc errlog critwarn
+        for row in "${SMART_ROWS[@]}"; do
+            IFS=$'\t' read -r dev kind model health temp used spare spareth unsafe merr realloc pending crc uncorr poh pc errlog critwarn <<< "$row"
+            [[ "$kind" == "?" ]] && continue
+            subsec "$dev ($kind) ${model:0:28}"
+            if [[ "$kind" == "NVMe" ]]; then
+                info "wear ${used:-?}% · spare ${spare:-?}% (thresh ${spareth:-?}%) · temp ${temp:-?}°C"
+                info "unsafe_shutdowns ${unsafe:-?} vs power_cycles ${pc:-?} — every unsafe entry = one death without a clean shutdown"
+                info "media_errors ${merr:-?} · err-log entries ${errlog:-?} · power-on ${poh:-?}h · critical_warning ${critwarn:-0}"
+            else
+                info "realloc ${realloc:-0} · pending ${pending:-0} · CRC(link) ${crc:-0} · uncorrectable ${uncorr:-0} · temp ${temp:-?}°C · power-on ${poh:-?}h"
+            fi
+        done
+        print_playbook
+    else
+        ok "Drives report no crash-relevant SMART findings — storage likely not your freeze cause"
+    fi
+    add_json_field "smart_drives" "${#SMART_ROWS[@]}" 1
+    finish; emit_verdict
+}
+
+cmd_bundle() {
+    banner
+    with_spin "collecting the evidence" scan_all
+    rank_causes
+    local stage="$WORK/bundle" host ts dir out
+    host=$(hostname -s 2>/dev/null || echo host)
+    ts=$(date '+%Y%m%d-%H%M%S')
+    dir="${SECURITY_LOG_DIR:-$HOME/.security-logs}/bundles"
+    mkdir -p "$dir" 2>/dev/null || true
+    out="$dir/crashz-${host}-${ts}.tar.gz"
+    mkdir -p "$stage" 2>/dev/null || { crit "cannot create $dir"; exit 1; }
+
+    { echo "crashz evidence bundle — $(date)"
+      echo "kernel: $(uname -sr)   host: $host   focus: ${BOOT_FOCUS:-current+previous}   since: ${SINCE_H}h"
+      echo "cmdline: $(cat /proc/cmdline 2>/dev/null)"
+      echo "boot mode: $( [[ -d /sys/firmware/efi ]] && echo UEFI || echo legacy-BIOS )"
+      echo "uptime: $(uptime 2>/dev/null)"; } > "$stage/00-meta.txt"
+    journalctl --list-boots --no-legend 2>/dev/null | tail -10 > "$stage/01-boots.txt"
+    tail -4000 "$WORK/journal_-1.txt" > "$stage/02-journal-previous.txt" 2>/dev/null || : > "$stage/02-journal-previous.txt"
+    tail -4000 "$WORK/journal_0.txt"  > "$stage/03-journal-current.txt"  2>/dev/null || : > "$stage/03-journal-current.txt"
+    ( dmesg -T 2>/dev/null || journalctl -k -b --no-pager 2>/dev/null ) | tail -800 > "$stage/04-dmesg.txt"
+    { echo "== apt history (tail) =="; tail -120 /var/log/apt/history.log 2>/dev/null
+      echo "== kernel/graphics packages =="
+      dpkg -l 2>/dev/null | grep -iE 'linux-image|nvidia|mesa|libgl|xserver|firmware' | tail -40; } > "$stage/05-packages.txt"
+    { echo "== VGA =="; lspci -nn 2>/dev/null | grep -iE 'vga|3d|display'
+      echo "== block =="; lsblk -o NAME,SIZE,MODEL,ROTA,STATE 2>/dev/null
+      echo "== mem ==";  free -h
+      echo "== smart summary =="
+      if declare -F smart_collect >/dev/null 2>&1 && smart_collect; then
+          smart_dump
+          echo "== smartctl -a (full where permitted) =="
+          local d
+          for d in $(lsblk -dnrpo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | head -4); do
+              echo "--- $d ---"; timeout 15 smartctl -a "$d" 2>/dev/null | head -70; echo
+          done
+      else echo "smartmontools/jq not available"; fi; } > "$stage/06-hardware.txt"
+    cp "$WORK/pstore.txt" "$stage/07-pstore.txt" 2>/dev/null || : > "$stage/07-pstore.txt"
+    last -Fx 2>/dev/null | head -40 > "$stage/08-last.txt"
+    tail -200 "$WATCH_LOG" > "$stage/09-watch-log.txt" 2>/dev/null || : > "$stage/09-watch-log.txt"
+    { local entry key
+      echo "crashz ranked findings ($(date))"
+      for entry in "${RANKED[@]:-}"; do
+          [[ -z "$entry" ]] && continue
+          echo "  score ${entry%%|*}  $(cause_title "${entry#*|}")  hits=${EV_COUNT[${entry#*|}]}"
+      done
+      for key in "${CAUSE_ORDER[@]}"; do
+          (( ${EV_COUNT[$key]:-0} > 0 )) || continue
+          echo; echo "== $key sample =="; echo "${EV_SAMPLE[$key]:-}"
+      done; } > "$stage/10-findings.txt"
+    if [[ $HAVE_COREDUMP -eq 1 ]]; then
+        timeout 10 coredumpctl list --no-pager 2>/dev/null | tail -50 > "$stage/11-coredumps.txt" || true
+    fi
+    if command -v tar >/dev/null 2>&1; then
+        tar czf "$out" -C "$stage" . 2>/dev/null
+    else
+        crit "tar not found — cannot bundle"
+        finish; exit 1
+    fi
+
+    section "EVIDENCE BUNDLE"
+    if [[ -s "$out" ]]; then
+        ok "Written: $out ($(humansize "$(stat -c%s "$out" 2>/dev/null || echo 0)"))"
+        info "Attach to bug reports / RMA / a colleague: journals, pstore, SMART, packages, findings."
+        echo
+    else
+        crit "bundle write failed — check permissions on $dir"
+        finish; exit 1
+    fi
+    finish; exit 0
+}
+
+cmd_watch() {
+    local interval="$WATCH_SECONDS"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+    (( interval < 1 )) && interval=1
+    banner
+    printf "  ${C_BOLD}FLIGHT RECORDER ARMED${C_RESET} — one vital line every ${interval}s to:\n"
+    printf "  ${C_DIM}%s${C_RESET}\n\n" "$WATCH_LOG"
+    printf "  ${C_DIM}Leave it running. If the box freezes, the LAST LINE of that file is the moment of death.${C_RESET}\n"
+    printf "  ${C_DIM}Log is sync'd every tick so a hard freeze can't eat the trail.  Ctrl+C stops.${C_RESET}\n\n"
+    local tick=0
+    trap 'printf "\n  ${C_DIM}watch stopped after %s tick(s) — inspect: tail -40 %s${C_RESET}\n\n" "$tick" "$WATCH_LOG"; exit 0' INT TERM
+    while :; do
+        tick=$((tick+1))
+        local now pc pm pi temp="" t tz load topcpu terr
+        now=$(date '+%Y-%m-%d %H:%M:%S')
+        pc=$(awk -F'[= ]' '/^some/{print $3}' /proc/pressure/cpu 2>/dev/null)
+        pm=$(awk -F'[= ]' '/^some/{print $3}' /proc/pressure/memory 2>/dev/null)
+        pi=$(awk -F'[= ]' '/^some/{print $3}' /proc/pressure/io 2>/dev/null)
+        for tz in /sys/class/thermal/thermal_zone*/temp; do
+            [[ -r "$tz" ]] || continue
+            t=$(( $(cat "$tz" 2>/dev/null || echo 0) / 1000 ))
+            [[ -z "$temp" || $t -gt $temp ]] && temp=$t
+        done
+        load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+        topcpu=$(ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -1 | awk '{printf "%s%% %s", $1, $2}')
+        terr=$(timeout 5 journalctl --no-pager -p err --since "-${interval}s" 2>/dev/null | grep -c . || true)
+        terr=${terr:-0}
+        printf '%s | psi cpu=%s mem=%s io=%s | temp=%s | load=%s | top=%s | new_err=%s\n' \
+            "$now" "${pc:-?}" "${pm:-?}" "${pi:-?}" "${temp:-?}" "${load:-?}" "${topcpu:-?}" "$terr" >> "$WATCH_LOG"
+        sync 2>/dev/null || true
+        if [[ "${JSON_OUT:-0}" -eq 0 ]]; then
+            local col="$C_DIM"
+            awk -v x="${pc:-0}" 'BEGIN{exit !(x+0>15)}' 2>/dev/null && col="$C_YELLOW"
+            [[ -n "$temp" ]] && (( temp > 80 )) && col="$C_RED"
+            printf "  ${col}%s${C_RESET}\n" "$(tail -1 "$WATCH_LOG")"
+        fi
+        (( tick % 200 == 0 )) && tail -4000 "$WATCH_LOG" > "$WORK/wl" 2>/dev/null && mv "$WORK/wl" "$WATCH_LOG"
+        sleep "$interval"
+    done
+}
+
+# ============================================================================
+# DISPATCH
+# ============================================================================
+case "$COMMAND" in
+    autopsy) cmd_autopsy ;;
+    why)     cmd_why ;;
+    freeze)  cmd_freeze ;;
+    apps)    cmd_apps ;;
+    recover) cmd_recover ;;
+    smart)   cmd_smart ;;
+    bundle)  cmd_bundle ;;
+    watch)   cmd_watch ;;
+    *)       echo "crashz: unknown command '$COMMAND' (try --help)" >&2; exit 64 ;;
+esac

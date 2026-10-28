@@ -1,0 +1,646 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# bootz - Boot diagnostic
+# ----------------------------------------------------------------------------
+# Scans the most recent boot (and optionally prior boots) for errors, warnings,
+# firmware/ACPI issues, OOM events, and failed systemd units. Reports boot
+# duration and top slowest-starting services via systemd-analyze.
+#
+# Usage:
+#   ./bootz                 # current boot, all errors+warnings
+#   ./bootz --boot -1       # previous boot
+#   ./bootz --boot 0        # current boot (explicit)
+#   ./bootz --boot all      # aggregate over every recorded boot
+#   ./bootz --level warning # only warning level (default: err)
+#   ./bootz --no-color      # plain output
+#   ./bootz --json          # machine-readable summary
+#
+# Requires: journalctl (systemd)
+# Optional: systemd-analyze, jq
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+NO_COLOR=0
+JSON_OUT=0
+BOOT_IDX="0"          # which boot: -N, 0, or "all"
+LEVEL="err"           # err|warning|notice|info|debug
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --boot=*)       BOOT_IDX="${arg#--boot=}" ;;
+    --boot)         i=$((i+1)); BOOT_IDX="${ARGS[$i]:-0}" ;;
+    --level=*)      LEVEL="${arg#--level=}" ;;
+    --level)        i=$((i+1)); LEVEL="${ARGS[$i]:-err}" ;;
+    --no-color)     NO_COLOR=1 ;;
+    --json)         JSON_OUT=1 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          bootz — Boot Diagnostic                              ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Scans the most recent boot (and optionally prior boots) for errors,
+  warnings, firmware/ACPI issues, OOM events, and failed systemd units.
+  Reports boot duration and top slowest-starting services.
+
+USAGE
+  ./bootz                 Current boot, all errors+warnings
+  ./bootz --boot -1       Previous boot
+  ./bootz --boot 0        Current boot (explicit)
+  ./bootz --boot all      Aggregate over every recorded boot
+  ./bootz --level warning Only warning level (default: err)
+  ./bootz --no-color      Plain output
+  ./bootz --json          Machine-readable summary
+
+OPTIONS
+  --boot=IDX      Boot index: 0 (current), -N (previous), or "all"
+  --level=LEVEL   Minimum priority: err|warning|notice|info|debug
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  systemd-analyze                    Total boot time breakdown
+  systemd-analyze blame              Slowest starting services
+  systemd-analyze critical-chain     Critical boot path
+  systemctl --failed                 Currently failed units
+  journalctl -b                      Current boot journal
+  journalctl -b -1                   Previous boot journal
+  dmesg                              Kernel ring buffer (current boot)
+  systemd-analyze plot > boot.svg    Visual boot timeline (SVG)
+
+WARNING → INVESTIGATION COMMANDS
+  Firmware load failures            →  sudo dmesg | grep -i 'firmware.*failed'
+  ACPI errors                       →  sudo dmesg | grep -i acpi
+  OOM kills during boot             →  sudo journalctl -b | grep -i oom
+  Segfaults / core dumps            →  sudo journalctl -b | grep -i segfault
+  Hardware errors (MCE)             →  sudo dmesg | grep -iE 'machine check|mce|hardware error'
+  Failed systemd units              →  systemctl --failed  and  systemctl status <unit>
+  Disk I/O errors                   →  sudo dmesg | grep -iE 'I/O error|ata.*failed'
+  Slow boot                         →  systemd-analyze blame  and  systemd-analyze critical-chain
+
+HELPEOF
+      exit 0 ;;
+    --ai)         AI_VERDICT=1 ;;
+    --no-ai)      AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "bootz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "${C_BOLD}${C_MAGENTA}"
+  cat << 'EOF'
+   ____              _
+  |  _ \            | |
+  | |_) | ___   ___ | | ___
+  |  _ < / _ \ / _ \| |/ _ \
+  | |_) | (_) | (_) | |  __/
+  |____/ \___/ \___/|_|\___|
+
+EOF
+  printf "${C_RESET}${C_DIM}  Boot diagnostic — %s on %s${C_RESET}\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT"
+  echo
+fi
+
+# ---------- Detect tools ----------
+HAVE_JOURNALCTL=0;  command -v journalctl      >/dev/null 2>&1 && HAVE_JOURNALCTL=1
+HAVE_ANALYZE=0;     command -v systemd-analyze >/dev/null 2>&1 && HAVE_ANALYZE=1
+HAVE_JQ=0;          command -v jq              >/dev/null 2>&1 && HAVE_JQ=1
+
+if [[ $HAVE_JOURNALCTL -eq 0 ]]; then
+  crit "journalctl not found (this script needs systemd)"
+  exit 1
+fi
+
+# Validate --level
+case "$LEVEL" in
+  emerg|alert|crit|err|warning|notice|info|debug) ;;
+  *) echo "Invalid --level '$LEVEL' (use err|warning|notice|info|debug)" >&2; exit 64 ;;
+esac
+
+# Resolve boot selector → journalctl -b argument
+case "$BOOT_IDX" in
+  all)  BOOT_ARG="" ;;             # empty = no -b filter, scan everything
+  0)    BOOT_ARG="-b" ;;           # current
+  -*)   BOOT_ARG="-b $BOOT_IDX" ;; # negative = previous
+  *)    echo "--boot must be 0, -N, or 'all'" >&2; exit 64 ;;
+esac
+
+# Current boot ID for headline (or aggregate count if --boot all)
+if [[ "$BOOT_IDX" == "all" ]]; then
+  BOOT_COUNT=$(journalctl --list-boots --no-legend --output=short 2>/dev/null | wc -l)
+else
+  BOOT_COUNT=1
+fi
+
+# ============================================================================
+# SECTION 1: Boot list
+# ============================================================================
+section "RECORDED BOOTS"
+
+BOOT_LIST=$(journalctl --list-boots --no-pager 2>/dev/null)
+if [[ -n "$BOOT_LIST" ]]; then
+  printf "  ${C_DIM}%-5s %-34s  %-19s  %-19s${C_RESET}\n" \
+    "IDX" "BOOT ID" "FIRST ENTRY" "LAST ENTRY"
+  printf "  ${C_DIM}%-5s %-34s  %-19s  %-19s${C_RESET}\n" \
+    "-----" "----------------------------------" "-------------------" "-------------------"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Skip the column header line
+    [[ "$line" == IDX* ]] && continue
+    [[ "$line" == "BOOT"* ]] && continue
+    # Format: " -4 147e125be3744289b421f4c427b9284b Thu 2026-08-06 08:01:17 PDT Sun 2026-08-09 03:19:58 PDT"
+    idx=$(echo "$line" | awk '{print $1}')
+    # Only process lines where idx is numeric (positive, negative, or zero)
+    [[ ! "$idx" =~ ^-?[0-9]+$ ]] && continue
+    bid=$(echo "$line" | awk '{print $2}')
+    # Strip first two fields, then split remaining into first/last entry by midpoint
+    rest=$(echo "$line" | awk '{$1="";$2="";print}' | sed 's/^ *//')
+    # Each entry is 5 tokens (weekday mday time TZ); use 5/5 split
+    first=$(echo "$rest" | awk '{for(i=1;i<=5;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+    last=$(echo "$rest" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+    if [[ "$idx" == "0" ]]; then
+      printf "  ${C_BOLD}${C_CYAN}%-5s${C_RESET} ${C_GREEN}%-34s${C_RESET}  ${C_BOLD}%-19s${C_RESET}  %s\n" \
+        "$idx" "$bid" "$first" "$last"
+    else
+      printf "  ${C_DIM}%-5s %-34s  %-19s  %s${C_RESET}\n" \
+        "$idx" "$bid" "$first" "$last"
+    fi
+  done <<< "$BOOT_LIST" | head -10
+
+  if [[ "$BOOT_IDX" == "all" ]]; then
+    info "Aggregate over ${C_BOLD}${BOOT_COUNT}${C_RESET} recorded boot(s)"
+  else
+    info "Selected boot: ${C_BOLD}${BOOT_IDX}${C_RESET}"
+  fi
+else
+  crit "No recorded boots — journal may be ephemeral"
+fi
+
+# ============================================================================
+# SECTION 2: Boot timing (systemd-analyze)
+# ============================================================================
+section "BOOT TIMING (systemd-analyze)"
+
+if [[ $HAVE_ANALYZE -eq 1 ]]; then
+  # Only show for current boot; prior-boot analyze not supported
+  if [[ "$BOOT_IDX" == "0" || "$BOOT_IDX" == "all" ]]; then
+    TIME_OUT=$(systemd-analyze 2>/dev/null)
+    if [[ -n "$TIME_OUT" ]]; then
+      info "$TIME_OUT"
+
+      # Extract total time for the headline
+      TOTAL_TIME=$(echo "$TIME_OUT" | sed -n 's/.*=\s*//p' | tr -d ' ' | head -1)
+      # Fallback if regex misses
+      [[ -z "$TOTAL_TIME" ]] && TOTAL_TIME=$(echo "$TIME_OUT" | awk -F'=' '{print $2}' | tr -d ' ')
+      JSON_FIELDS+=("\"boot_time\":\"$TOTAL_TIME\"")
+
+      subsec "Slowest starting units (top 5)"
+      BLAME=$(systemd-analyze blame 2>/dev/null | head -6)
+      if [[ -n "$BLAME" ]]; then
+        echo "$BLAME" | while IFS= read -r line; do
+          printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+        done
+      fi
+
+      subsec "Critical-path chain"
+      CRIT_CHAIN=$(systemd-analyze critical-chain 2>/dev/null)
+      if [[ -n "$CRIT_CHAIN" ]]; then
+        echo "$CRIT_CHAIN" | head -20 | while IFS= read -r line; do
+          printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+        done
+      fi
+    else
+      info "systemd-analyze returned no data"
+    fi
+  else
+    info "systemd-analyze only available for current boot — skipping for boot $BOOT_IDX"
+  fi
+else
+  info "systemd-analyze not available"
+fi
+
+# ============================================================================
+# SECTION 3: Errors & warnings from selected boot
+# ============================================================================
+section "ERRORS & WARNINGS"
+
+# Resolve the journalctl selector for our boot choice
+if [[ "$BOOT_IDX" == "all" ]]; then
+  JCMD=(journalctl --no-pager -p "$LEVEL")
+  RANGE_LABEL="all recorded boots"
+else
+  JCMD=(journalctl --no-pager -b "$BOOT_IDX" -p "$LEVEL")
+  RANGE_LABEL="boot ${BOOT_IDX}"
+fi
+
+# Total message count
+TOTAL_MSG=$(timeout 15 "${JCMD[@]}" 2>/dev/null | wc -l)
+info "Total ${C_BOLD}${LEVEL}${C_RESET} messages in ${RANGE_LABEL}: ${C_BOLD}${TOTAL_MSG}${C_RESET}"
+
+# Count by priority
+if [[ $HAVE_JQ -eq 1 ]]; then
+  JSON_LOG=$(timeout 30 "${JCMD[@]}" --output=json 2>/dev/null)
+  if [[ -n "$JSON_LOG" ]]; then
+    CRIT_COUNT=$(printf '%s' "$JSON_LOG" | jq -r '..|.PRIORITY? // empty' 2>/dev/null \
+      | awk '$1<=3 {c++} END{print c+0}')
+    ERR_COUNT=$(printf '%s' "$JSON_LOG" | jq -r '..|.PRIORITY? // empty' 2>/dev/null \
+      | awk '$1==3 {c++} END{print c+0}')
+    WARN_COUNT=$(printf '%s' "$JSON_LOG" | jq -r '..|.PRIORITY? // empty' 2>/dev/null \
+      | awk '$1==4 {c++} END{print c+0}')
+    info "  Critical (0-3): ${C_BOLD}${CRIT_COUNT}${C_RESET}"
+    info "  Errors (3):     ${C_BOLD}${ERR_COUNT}${C_RESET}"
+    info "  Warnings (4):   ${C_BOLD}${WARN_COUNT}${C_RESET}"
+    JSON_FIELDS+=("\"crit_count\":$CRIT_COUNT")
+    JSON_FIELDS+=("\"err_count\":$ERR_COUNT")
+    JSON_FIELDS+=("\"warn_count\":$WARN_COUNT")
+  fi
+fi
+
+# ============================================================================
+# SECTION 4: Categorised issues
+# ============================================================================
+section "CATEGORISED ISSUES"
+
+# Pull raw lines once (we already have $JCMD)
+RAW_LOG=$(timeout 15 "${JCMD[@]}" 2>/dev/null)
+
+declare -A CAT_COUNT
+
+# Helper: count regex matches robustly (no newline concat bug)
+count_matches() {
+  local pat="$1"
+  local n
+  n=$(printf '%s\n' "$RAW_LOG" | grep -ciE "$pat")
+  n=${n:-0}
+  # Sanitize: strip whitespace/newlines (grep -c shouldn't add them, but just in case)
+  n=$(echo "$n" | tr -d '[:space:]')
+  echo "${n:-0}"
+}
+
+FIRMWARE_FAILS=$(count_matches 'firmware: failed to load|firmware load.*failed|request_firmware failed')
+ACPI_FAILS=$(count_matches 'ACPI (Error|Warning)|acpi.*fail')
+OOM_KILLS=$(count_matches 'Out of memory: Killed process|killed process.*out of memory|invoked oom-killer')
+SEGFAULTS=$(count_matches 'segfault at|core-dump|coredump|gdb.*signal')
+HW_ERRORS=$(count_matches 'hardware error|MCE|machine check|PCIe.*AER|I/O error')
+USB_ERR=$(count_matches 'usb.*error|usb.*disconnect|hub.*failed|usb [0-9]-[0-9]+.*failed')
+DISK_ERR=$(count_matches 'I/O error|ata[0-9]+:.*failed|nvme.*I/O')
+NET_ERR=$(count_matches 'eth[0-9]+.*link down|wlan[0-9]+.*deauthenticat|network.*down|IPv6.*duplicate address')
+
+cat_count() {
+  local label="$1"
+  local count="$2"
+  local sev="$3"
+  printf "  ${C_DIM}%-32s${C_RESET} ${sev}%4d${C_RESET}\n" "$label" "$count"
+}
+
+cat_count "Firmware load failures"   "$FIRMWARE_FAILS" "$C_RED"
+cat_count "ACPI errors/warnings"     "$ACPI_FAILS"     "$C_RED"
+cat_count "OOM kills"                "$OOM_KILLS"      "$C_RED"
+cat_count "Segfaults / core dumps"   "$SEGFAULTS"      "$C_RED"
+cat_count "Hardware errors (MCE)"    "$HW_ERRORS"      "$C_RED"
+cat_count "USB errors"               "$USB_ERR"        "$C_YELLOW"
+cat_count "Disk I/O errors"          "$DISK_ERR"       "$C_RED"
+cat_count "Network errors"           "$NET_ERR"        "$C_YELLOW"
+
+# Promote counts to global warning/critical counters
+if (( FIRMWARE_FAILS > 0 || ACPI_FAILS > 0 || OOM_KILLS > 0 || SEGFAULTS > 0 || HW_ERRORS > 0 || DISK_ERR > 0 )); then
+  CRITICAL=$((CRITICAL+1))
+fi
+if (( USB_ERR > 0 || NET_ERR > 0 )); then
+  WARNINGS=$((WARNINGS+1))
+fi
+
+JSON_FIELDS+=("\"firmware\":$FIRMWARE_FAILS")
+JSON_FIELDS+=("\"acpi\":$ACPI_FAILS")
+JSON_FIELDS+=("\"oom\":$OOM_KILLS")
+JSON_FIELDS+=("\"segfault\":$SEGFAULTS")
+JSON_FIELDS+=("\"hardware\":$HW_ERRORS")
+JSON_FIELDS+=("\"usb_err\":$USB_ERR")
+JSON_FIELDS+=("\"disk_err\":$DISK_ERR")
+JSON_FIELDS+=("\"net_err\":$NET_ERR")
+
+# ============================================================================
+# SECTION 5: Top recurring messages
+# ============================================================================
+section "TOP RECURRING MESSAGES"
+
+TOP_N=10
+# Strip timestamp + host + pid, then take the message body and count duplicates.
+# Format: "Aug 27 11:50:50 ashy sudo[294447]: pam_unix(...)" → "sudo: pam_unix(...)"
+TOP_RECURRING=$(printf '%s\n' "$RAW_LOG" \
+  | sed -E 's/^[A-Z][a-z]+ +[0-9]+ +[0-9:]+ +[^ ]+ +//' \
+  | sed -E 's/^([a-zA-Z0-9_-]+)(\[[0-9]+\])?: /\1: /' \
+  | awk -F': ' '{print $1": "}' \
+  | sort | uniq -c | sort -rn | head -"$TOP_N")
+
+if [[ -n "$TOP_RECURRING" ]] && [[ "$(echo "$TOP_RECURRING" | head -1 | awk '{print $1}')" != "1" ]]; then
+  printf "  ${C_DIM}%-7s %s${C_RESET}\n" "Count" "Service/subsystem"
+  printf "  ${C_DIM}%-7s %s${C_RESET}\n" "-------" "------------------------------------------------------"
+  while IFS= read -r line; do
+    cnt=$(echo "$line" | awk '{print $1}')
+    # After the count, the line may have leading spaces, then "service: "
+    msg=$(echo "$line" | sed -E 's/^ *[0-9]+ +//' | sed -E 's/: *$//')
+    printf "  ${C_CYAN}%-7s${C_RESET} %s\n" "$cnt" "$msg"
+  done <<< "$TOP_RECURRING"
+else
+  ok "No recurring error/warning patterns"
+fi
+
+# ============================================================================
+# SECTION 6: Failed systemd units
+# ============================================================================
+section "FAILED SYSTEMD UNITS"
+
+  FAILED_UNITS=$(systemctl --no-pager --state=failed 2>/dev/null | head -20)
+  if [[ -n "$FAILED_UNITS" ]]; then
+    FAILED_COUNT=$(systemctl --no-pager --state=failed --plain 2>/dev/null | grep -c '\.service' || true)
+    if [[ -z "$FAILED_COUNT" || "$FAILED_COUNT" == "0" || "$FAILED_COUNT" == $'0\n0' ]]; then
+      ok "No failed units"
+    else
+      crit "${FAILED_COUNT} failed unit(s) at this moment"
+      echo "$FAILED_UNITS"
+    fi
+  else
+    ok "No failed units"
+  fi
+
+# Also pull journalctl units in failed state during this boot
+if [[ "$BOOT_IDX" != "all" ]]; then
+  FAILED_BOOT=$(timeout 10 journalctl --no-pager -b "$BOOT_IDX" -p err _SYSTEMD_UNIT= 2>/dev/null \
+    | grep -oE '[a-zA-Z0-9_-]+\.(service|target|mount|swap|timer)' \
+    | sort | uniq -c | sort -rn | head -5)
+  if [[ -n "$FAILED_BOOT" ]]; then
+    subsec "Most chatty failing units (boot $BOOT_IDX)"
+    echo "$FAILED_BOOT" | while IFS= read -r line; do
+      cnt=$(echo "$line" | awk '{print $1}')
+      unit=$(echo "$line" | awk '{print $2}')
+      printf "  ${C_CYAN}%-40s${C_RESET} ${C_DIM}%d err msg${C_RESET}\n" "$unit" "$cnt"
+    done
+  fi
+fi
+
+# ============================================================================
+# SECTION 7: Boot duration vs prior boot (sanity trend)
+# ============================================================================
+section "BOOT DURATION TREND"
+
+if [[ $HAVE_ANALYZE -eq 1 && "$BOOT_IDX" == "0" ]]; then
+  # Compare current vs previous
+  CUR_MS=$(systemd-analyze 2>/dev/null | grep -oE '[0-9.]+(s|min)' | head -3 | awk '{sum += $1} END {print sum*1000}')
+  if [[ -n "$CUR_MS" && "$CUR_MS" =~ ^[0-9.]+$ ]]; then
+    info "Current boot total time: ${C_BOLD}${TOTAL_TIME}${C_RESET}"
+
+    # Try to compute previous from journalctl -b -1 timestamps
+    PREV_FIRST=$(journalctl --list-boots --no-legend 2>/dev/null \
+      | awk '$1==-1 {print $4" "$5" "$6" "$7" "$8}')
+    PREV_LAST=$(journalctl --list-boots --no-legend 2>/dev/null \
+      | awk '$1==-1 {print $9" "$10" "$11" "$12" "$13}')
+    if [[ -n "$PREV_FIRST" && -n "$PREV_LAST" ]]; then
+      info "Previous boot window: ${PREV_FIRST} → ${PREV_LAST}"
+    fi
+  fi
+else
+  info "Trend analysis only available for current boot"
+fi
+
+# ============================================================================
+# SECTION 8: Recent samples (last 10 raw error lines)
+# ============================================================================
+section "RECENT SAMPLES (last 10 ${LEVEL} lines)"
+
+SAMPLES=$(printf '%s\n' "$RAW_LOG" | tail -10)
+if [[ -n "$SAMPLES" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Truncate long lines
+    if (( ${#line} > 110 )); then
+      line="${line:0:107}…"
+    fi
+    printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+  done <<< "$SAMPLES"
+else
+  ok "No ${LEVEL}-level samples"
+fi
+
+# ============================================================================
+# SECTION 8b: BOOT SECURITY POSTURE — Secure Boot, bootloader perms, mount opts
+# ============================================================================
+section "BOOT SECURITY POSTURE"
+
+# 1. UEFI Secure Boot status (depth: bootz didn't cover this at all)
+if command -v mokutil >/dev/null 2>&1; then
+    SB_STATE=$(mokutil --sb-state 2>&1 | tail -1)
+    if [[ "$SB_STATE" == *"enabled"* ]]; then
+        ok "UEFI Secure Boot: enabled"
+    elif [[ "$SB_STATE" == *"disabled"* ]]; then
+        critf "secure_boot_off" "UEFI Secure Boot is DISABLED — boot chain unsigned" \
+            "Enable in UEFI/BIOS settings: Security → Secure Boot → Enabled"
+    else
+        info "Secure Boot status: $SB_STATE"
+    fi
+elif [[ -d /sys/firmware/efi ]]; then
+    warn "UEFI system but mokutil not installed — can't verify Secure Boot status"
+    info "  Install: 'sudo apt install mokutil' (Debian) or 'sudo dnf install mokutil' (RHEL)"
+fi
+
+# 2. /boot mount options (should have nosuid,nodev,noexec)
+if findmnt /boot >/dev/null 2>&1; then
+    BOOT_OPTS=$(findmnt -no OPTIONS /boot 2>/dev/null)
+    for missing in nosuid nodev; do
+        if [[ "$BOOT_OPTS" != *"$missing"* ]]; then
+            critf "boot_mount_opts" "/boot mount options missing '$missing' (current: $BOOT_OPTS)" \
+                "Add '$missing' to fstab for /boot and remount: 'sudo mount -o remount,$missing /boot'"
+        fi
+    done
+    ok "/boot mount options: $BOOT_OPTS"
+fi
+if findmnt /boot/efi >/dev/null 2>&1; then
+    EFI_OPTS=$(findmnt -no OPTIONS /boot/efi 2>/dev/null)
+    for missing in nosuid nodev noexec; do
+        if [[ "$EFI_OPTS" != *"$missing"* ]]; then
+            warn "/boot/efi mount options missing '$missing' (current: $EFI_OPTS)"
+        fi
+    done
+    ok "/boot/efi mount options: $EFI_OPTS"
+fi
+
+# 3. /boot/efi permissions (UEFI vars are critical — only root should write)
+if [[ -d /boot/efi ]]; then
+    EFI_PERM=$(stat -c '%a' /boot/efi 2>/dev/null)
+    EFI_OWNER=$(stat -c '%U' /boot/efi 2>/dev/null)
+    if [[ "$EFI_OWNER" != "root" ]]; then
+        crit "/boot/efi owned by '$EFI_OWNER' (must be root)"
+    elif [[ "$EFI_PERM" =~ ^[0-6][0-7][0-7]$ ]] && (( (8#$EFI_PERM & 022) != 0 )); then
+        crit "/boot/efi is group/world-writable (perms=$EFI_PERM) — anyone can modify EFI binaries"
+        info "  Run: 'sudo chmod 700 /boot/efi'"
+    fi
+fi
+
+# 4. GRUB config permissions (should be 600 — contains root= kernel cmdline)
+for grb in /boot/grub/grub.cfg /boot/grub2/grub.cfg /efi/boot/grub/grub.cfg /boot/grub/grub.conf; do
+    [[ -r "$grb" ]] || continue
+    grp_perm=$(stat -c '%a' "$grb" 2>/dev/null)
+    if [[ "$grp_perm" =~ ^[0-6][0-7][0-7]$ ]] && (( (8#$grp_perm & 022) != 0 )); then
+        crit "$grb perms=$grp_perm — group/world-readable (kernel cmdline disclosed)"
+        info "  Run: 'sudo chmod 600 $grb'"
+    fi
+done
+
+# 5. GRUB password (boot-time menu protection)
+if [[ -r /boot/grub/grub.cfg ]]; then
+    if grep -q '^[[:space:]]*set[[:space:]]\+superusers\|^[[:space:]]*password' /boot/grub/grub.cfg 2>/dev/null; then
+        ok "GRUB password protection configured"
+    else
+        warn "No GRUB superuser/password — anyone at console can edit boot params (e.g. init=/bin/bash)"
+        info "  Run 'grub2-mkpasswd-pbkdf2' and add 'set superusers=' + 'password_pbkdf2 <user> <hash>' to grub.cfg"
+    fi
+fi
+
+# 6. initramfs / initrd world-readability (sometimes world-writable = critical)
+for img in /boot/initramfs-* /boot/initrd-* /boot/initramfs-*.img; do
+    [[ -f "$img" ]] || continue
+    img_perm=$(stat -c '%a' "$img" 2>/dev/null)
+    if [[ "$img_perm" =~ ^[0-6][0-7][0-7]$ ]] && (( (8#$img_perm & 022) != 0 )); then
+        crit "$img perms=$img_perm — boot image writable (kernel-level code injection risk)"
+    fi
+done
+
+# 7. Boot chain summary line
+if [[ -d /sys/firmware/efi ]]; then
+    info "Boot mode: UEFI"
+else
+    info "Boot mode: legacy BIOS"
+fi
+
+# ============================================================================
+# SECTION 9: Headline
+# ============================================================================
+section "BOOT HEADLINE"
+
+# Compute total issues
+TOTAL_ISSUES=$((FIRMWARE_FAILS + ACPI_FAILS + OOM_KILLS + SEGFAULTS + HW_ERRORS + USB_ERR + DISK_ERR + NET_ERR))
+
+H1="Boot:         $BOOT_IDX (${RANGE_LABEL})"
+H2="Boot time:    ${TOTAL_TIME:-unknown}"
+H3="Messages:     ${TOTAL_MSG} at level ${LEVEL}"
+H4="Issues:       $TOTAL_ISSUES across categories"
+H5="Failed units: $([[ $HAVE_ANALYZE -eq 1 ]] && systemctl --no-pager --state=failed --plain 2>/dev/null | grep -c '\.service' || echo 0)"
+
+widest=0
+for line in "$H1" "$H2" "$H3" "$H4" "$H5"; do
+  w=${#line}
+  (( w > widest )) && widest=$w
+done
+BOX_W=$(( widest + 4 ))
+[[ $BOX_W -lt 50 ]] && BOX_W=50
+[[ $BOX_W -gt 72 ]] && BOX_W=72
+
+TOP="╔$(printf '═%.0s' $(seq 1 $BOX_W))╗"
+BOT="╚$(printf '═%.0s' $(seq 1 $BOX_W))╝"
+
+printf "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$TOP"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H1"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H2"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H3"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H4"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H5"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$BOT"
+
+# ============================================================================
+# SECTION 10: Recommendations & Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+
+rec() {
+  printf "  ${C_CYAN}#%d${C_RESET} → %s\n" "$1" "$2"
+}
+
+rec 1 "Compare boots:            journalctl --list-boots"
+rec 2 "Specific boot details:    journalctl -b -1 -p err"
+rec 3 "Follow live:              journalctl -f -p warning"
+rec 4 "Boot graph (SVG):         systemd-analyze plot > /tmp/boot.svg"
+rec 5 "Deepest service analysis: systemd-analyze critical-chain"
+
+if (( FIRMWARE_FAILS > 0 )); then
+  rec 6 "Missing firmware blobs: apt install firmware-linux firmware-realtek (or vendor package)"
+fi
+if (( OOM_KILLS > 0 )); then
+  rec 7 "OOM kills detected — add swap or reduce memory-hungry services"
+fi
+if (( ACPI_FAILS > 0 )); then
+  rec 8 "ACPI errors — try kernel parameter acpi=strict or update BIOS"
+fi
+
+# ---------- Verdict ----------
+section "VERDICT"
+
+ELAPSED=$(( $(date +%s) - START_TS ))
+
+if (( CRITICAL > 0 )); then
+  printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical category(ies)\n" "$CRITICAL"
+  EXIT=2
+elif (( WARNINGS > 0 )); then
+  printf "  ${C_YELLOW}${C_BOLD}WARNINGS${C_RESET}: %d warning category(ies)\n" "$WARNINGS"
+  EXIT=1
+else
+  printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: boot looks clean\n"
+  EXIT=0
+fi
+
+printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+printf "\n"
+
+# ---------- JSON output ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+  FIELDS=$(IFS=,; echo "${JSON_FIELDS[*]}")
+  printf '{"script":"boot","host":"%s","timestamp":"%s","boot":"%s","level":"%s","messages":%d,"issues":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
+    "$HOSTNAME_SHORT" "$TIMESTAMP" "$BOOT_IDX" "$LEVEL" "$TOTAL_MSG" "$TOTAL_ISSUES" "$WARNINGS" "$CRITICAL" "$EXIT"
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "bootz complete: boot=$BOOT_IDX level=$LEVEL issues=$TOTAL_ISSUES warnings=$WARNINGS critical=$CRITICAL" 2>/dev/null || true
+fi
+
+exit $EXIT

@@ -1,0 +1,567 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# studyz — AI-Powered Security Study
+# ============================================================================
+# Runs the essential security scripts, captures structured output, and sends
+# everything to a local LLM for deep analysis, ideas, and recommendations.
+#
+# Think of it as "all.sh but the AI reads all the results and explains
+# what's actually going on and what to do about it."
+#
+# Usage:
+#   ./studyz                  Full study (run scripts + AI analysis)
+#   ./studyz --quick          Fast mode (skip slow.sh, shorter prompt)
+#   ./studyz --no-ai          Run scripts only, skip AI analysis
+#   ./studyz --no-color       Disable ANSI colors
+#   ./studyz --json           Machine-readable output
+#   ./studyz --model MODEL    Override the default LLM model
+#   ./studyz --timeout SEC    AI response timeout (default: 60)
+#   ./studyz --prompt FILE    Use a custom prompt file instead of built-in
+#   ./studyz --save FILE      Save the full report to a file
+#   ./studyz --help           Show this help
+#
+# Requires: curl, jq (optional but recommended), ask (local LLM client)
+# AI server: llama.cpp on localhost:8080 or Ollama on 127.0.0.1:11434
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ─── Defaults ────────────────────────────────────────────────────────────────
+QUICK=0
+NO_AI=0
+NO_COLOR=0
+JSON_OUT=0
+TIMEOUT=60
+MODEL=""
+PROMPT_FILE=""
+SAVE_FILE=""
+INTERACTIVE=1
+[[ ! -t 0 ]] && INTERACTIVE=0
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+if [[ -t 1 ]] && [[ "${NO_COLOR:-0}" -eq 0 ]]; then
+    RST=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'
+    BLU=$'\033[34m'; MAG=$'\033[35m'; CYN=$'\033[36m'
+else
+    RST=""; BOLD=""; DIM=""
+    RED=""; GRN=""; YLW=""; BLU=""; MAG=""; CYN=""
+fi
+
+# ─── Help ────────────────────────────────────────────────────────────────────
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          studyz — AI-Powered Security Study                   ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Runs the essential security scripts, captures their output, and feeds
+  everything to a local LLM for deep analysis. The AI reads all the
+  results together — cross-referencing findings across scripts — and
+  provides a unified analysis with specific ideas and next steps.
+
+  This is the "smart" version of all.sh: instead of just listing what
+  to run, it actually interprets the results for you.
+
+USAGE
+  ./studyz                  Full study — run all essential scripts + AI analysis
+  ./studyz --quick          Fast mode — skip slow.sh, shorter prompt
+  ./studyz --no-ai          Run scripts only, display raw output (no AI)
+  ./studyz --no-color       Disable ANSI colors
+  ./studyz --json           Machine-readable JSON output
+  ./studyz --model MODEL    Override the LLM model (default: llama.cpp local)
+  ./studyz --timeout SEC    AI response timeout (default: 60s)
+  ./studyz --prompt FILE    Use a custom prompt file
+  ./studyz --save FILE      Save the full AI report to a file
+  ./studyz --help           Show this help
+
+WHAT IT RUNS
+  1. security.sh   — Full 91-check security audit (always)
+  2. ports.sh      — Listening socket & Docker UFW bypass (always)
+  3. slow.sh       — CPU/memory/disk/network health (always, skipped in --quick)
+  4. logs.sh       — System log scanner (always)
+  5. ssh_audit.sh  — SSH config & crypto audit (if sshd running)
+  6. specs.sh      — Hardware specs (always)
+  7. ai.sh         — AI server status (if ai.json present)
+  8. cpu.sh        — CPU diagnostic (optional, adds depth)
+  9. memory.sh     — Memory diagnostic (optional, adds depth)
+  10. network.sh   — Network diagnostic (optional, adds depth)
+
+AI BACKEND
+  Automatically picks the first available:
+  1. llama.cpp server on localhost:8080 (ask command)
+  2. Ollama on 127.0.0.1:11434 (via curl)
+  3. OpenAI-compatible on 127.0.0.1:8000 (via curl)
+
+  Override with --model or set ASK_ENDPOINT_BASE / ASK_MODEL env vars.
+
+WHAT THE AI PROVIDES
+  • Cross-script analysis — correlates findings from multiple scripts
+  • Root cause analysis — identifies the most likely explanations
+  • Priority ranking — what to fix first, what can wait
+  • Specific commands — exact commands to run for remediation
+  • Security posture summary — plain-English overview
+  • Ideas & hardening suggestions — things the scripts don't check
+  • Risk assessment — severity and exploitability of findings
+
+HELPEOF
+    exit 0
+}
+
+# ─── Args ────────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)     show_help ;;
+        --quick)       QUICK=1; shift ;;
+        --no-ai)       NO_AI=1; shift ;;
+        --ai)          NO_AI=0; shift ;;
+        --no-color)    NO_COLOR=1; shift ;;
+        --json)        JSON_OUT=1; shift ;;
+        --model)       MODEL="${2:-}"; shift 2 ;;
+        --model=*)     MODEL="${1#--model=}"; shift ;;
+        --timeout)     TIMEOUT="${2:-60}"; shift 2 ;;
+        --timeout=*)   TIMEOUT="${1#--timeout=}"; shift ;;
+        --prompt)      PROMPT_FILE="${2:-}"; shift 2 ;;
+        --prompt=*)    PROMPT_FILE="${1#--prompt=}"; shift ;;
+        --save)        SAVE_FILE="${2:-}"; shift 2 ;;
+        --save=*)      SAVE_FILE="${1#--save=}"; shift ;;
+        *)             shift ;;
+    esac
+done
+
+if [[ "$JSON_OUT" != "1" ]] && declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "studyz"; fi
+
+if [[ $NO_COLOR -eq 1 ]]; then
+    RST=""; BOLD=""; DIM=""
+    RED=""; GRN=""; YLW=""; BLU=""; MAG=""; CYN=""
+fi
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+has_cmd() { command -v "$1" &>/dev/null; }
+
+log() { printf "${CYN}▸${RST} %s\n" "$1"; }
+ok()  { printf "  ${GRN}✓${RST} %s\n" "$1"; }
+warn(){ printf "  ${YLW}!${RST} %s\n" "$1"; }
+err() { printf "  ${RED}✗${RST} %s\n" "$1"; }
+sec() { printf "\n${BOLD}${BLU}━━━ %s ━━━${RST}\n" "$1"; }
+
+run_script_capture() {
+    local script="$1"; shift
+    local path="$SCRIPT_DIR/$script"
+    if [[ ! -f "$path" ]]; then
+        warn "$script not found — skipping"
+        echo ""
+        return 1
+    fi
+    if [[ ! -x "$path" ]]; then
+        chmod +x "$path" 2>/dev/null || true
+    fi
+
+    local args=("--json" "--no-color")
+    if [[ "$script" == "security.sh" ]]; then
+        args=("--json" "--no-color")
+    elif [[ "$script" == "harden.sh" ]]; then
+        args=("--dry-run" "--json" "--no-color")
+    fi
+    # Append any extra flags
+    args+=("$@")
+
+    local script_timeout=30
+    # Give slower scripts more time
+    case "$script" in
+        security.sh) script_timeout=45 ;;
+        slow.sh)     script_timeout=40 ;;
+        network.sh)  script_timeout=25 ;;
+        ai.sh)       script_timeout=20 ;;
+    esac
+    local output
+    output=$(timeout "$script_timeout" bash "$path" "${args[@]}" </dev/null 2>&1 || echo '{"error":"timeout or script failure"}')
+    printf '%s' "$output"
+}
+
+detect_ai_backend() {
+    # 1. Try the ask command (llama.cpp)
+    if declare -F ask &>/dev/null || has_cmd ask; then
+        AI_BACKEND="ask"
+        return 0
+    fi
+
+    # 2. Try Ollama on primary
+    if curl -s --max-time 2 "http://127.0.0.1:11434/api/tags" &>/dev/null; then
+        AI_BACKEND="ollama"
+        AI_HOST="127.0.0.1"
+        AI_PORT="11434"
+        # Pick first available model
+        AI_MODEL=$(curl -s "http://127.0.0.1:11434/api/tags" 2>/dev/null | jq -r '.models[0].name // empty' 2>/dev/null)
+        [[ -z "$AI_MODEL" ]] && AI_MODEL="llama3.2"
+        return 0
+    fi
+
+    # 3. Try secondary OpenAI-compatible
+    if curl -s --max-time 2 "http://127.0.0.1:8000/v1/models" &>/dev/null; then
+        AI_BACKEND="openai"
+        AI_HOST="127.0.0.1"
+        AI_PORT="8000"
+        AI_MODEL=$(curl -s "http://127.0.0.1:8000/v1/models" 2>/dev/null | jq -r '.data[0].id // empty' 2>/dev/null)
+        [[ -z "$AI_MODEL" ]] && AI_MODEL="default"
+        return 0
+    fi
+
+    return 1
+}
+
+ask_ai() {
+    local prompt="$1"
+    local reply=""
+
+    case "${AI_BACKEND:-none}" in
+        ask)
+            # Use the ask command (prefer bash function for speed)
+            if declare -F ask &>/dev/null; then
+                reply=$(timeout "$TIMEOUT" ask --max-tokens 4096 --temp 0.3 "$prompt" 2>&1)
+            else
+                reply=$(timeout "$TIMEOUT" ask --max-tokens 4096 --temp 0.3 "$prompt" 2>&1)
+            fi
+            ;;
+        ollama)
+            local payload
+            payload=$(jq -n --arg prompt "$prompt" '{
+                model: "'"$AI_MODEL"'",
+                prompt: $prompt,
+                stream: false,
+                options: {num_predict: 4096, temperature: 0.3}
+            }')
+            reply=$(curl -s --max-time "$TIMEOUT" \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "http://${AI_HOST}:${AI_PORT}/api/generate" 2>/dev/null \
+                | jq -r '.response // empty' 2>/dev/null)
+            ;;
+        openai)
+            local payload
+            payload=$(jq -n --arg prompt "$prompt" '{
+                model: "'"$AI_MODEL"'",
+                messages: [{role: "user", content: $prompt}],
+                max_tokens: 4096,
+                temperature: 0.3,
+                stream: false
+            }')
+            reply=$(curl -s --max-time "$TIMEOUT" \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "http://${AI_HOST}:${AI_PORT}/v1/chat/completions" 2>/dev/null \
+                | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+            ;;
+        *)
+            reply=""
+            ;;
+    esac
+
+    printf '%s' "$reply"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 1: SYSTEM DETECTION (lightweight)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+printf "\n"
+printf "${BOLD}${MAG}"
+cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  STUDY.SH — AI-Powered Security Study                        ║
+   ║  Run scripts · Capture results · Ask the AI what's going on  ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+printf "${RST}\n"
+printf "${DIM}  %s on %s${RST}\n\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$(hostname -s 2>/dev/null || echo host)"
+
+sec "PHASE 1: DETECTING SYSTEM STATE"
+
+HAS_SSHD=false
+HAS_AI_CONFIG=false
+HAS_JOURNAL=false
+HAS_SYSTEMD=false
+
+systemctl is-active sshd &>/dev/null && HAS_SSHD=true
+systemctl is-active ssh &>/dev/null && HAS_SSHD=true
+[[ -f /etc/ssh/sshd_config ]] && HAS_SSHD=true
+[[ -f "$SCRIPT_DIR/ai.json" ]] && HAS_AI_CONFIG=true
+has_cmd journalctl && HAS_JOURNAL=true
+has_cmd systemctl && HAS_SYSTEMD=true
+
+printf "  SSH server:  %s\n" "$(if $HAS_SSHD; then printf "${GRN}yes${RST}"; else printf "${DIM}no${RST}"; fi)"
+printf "  ai.json:    %s\n" "$(if $HAS_AI_CONFIG; then printf "${GRN}present${RST}"; else printf "${DIM}not found${RST}"; fi)"
+printf "  Quick mode: %s\n" "$(if [[ $QUICK -eq 1 ]]; then printf "${YLW}yes${RST}"; else printf "${DIM}no${RST}"; fi)"
+
+# ─── Detect AI backend ────────────────────────────────────────────────────
+if [[ $NO_AI -eq 0 ]]; then
+    printf "\n  ${DIM}Detecting AI backend...${RST} "
+    if detect_ai_backend; then
+        printf "${GRN}found: ${AI_BACKEND}${RST}\n"
+        case "${AI_BACKEND}" in
+            ask)    printf "  ${DIM}Endpoint: localhost:8080 (llama.cpp)${RST}\n" ;;
+            ollama) printf "  ${DIM}Endpoint: ${AI_HOST}:${AI_PORT} (Ollama, model: ${AI_MODEL})${RST}\n" ;;
+            openai) printf "  ${DIM}Endpoint: ${AI_HOST}:${AI_PORT} (OpenAI-compat, model: ${AI_MODEL})${RST}\n" ;;
+        esac
+    else
+        printf "${YLW}no AI backend found${RST}\n"
+        printf "  ${DIM}Install ask, or ensure Ollama/OpenAI server is running.${RST}\n"
+        printf "  ${DIM}Falling back to --no-ai mode.${RST}\n"
+        NO_AI=1
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 2: RUN ESSENTIAL SCRIPTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sec "PHASE 2: RUNNING ESSENTIAL SECURITY SCRIPTS"
+
+declare -A RESULTS=()
+declare -a SCRIPT_ORDER=()
+TOTAL_SCRIPTS=0
+SCRIPTS_RAN=0
+
+capture() {
+    local name="$1"
+    local script="${2:-$1}"
+    shift 2 2>/dev/null || shift 1 2>/dev/null || true
+    local extra_args=("$@")
+    printf "  ${CYN}▸${RST} %-18s " "$name"
+    local t0 t1 dur
+    t0=$(date +%s%N)
+    local output
+    output=$(run_script_capture "$script" "${extra_args[@]}")
+    t1=$(date +%s%N)
+    dur=$(( (t1 - t0) / 1000000 ))
+
+    if [[ -n "$output" ]]; then
+        RESULTS["$name"]="$output"
+        SCRIPT_ORDER+=("$name")
+        SCRIPTS_RAN=$((SCRIPTS_RAN + 1))
+        local size=${#output}
+        printf "${GRN}✓${RST} ${DIM}(%d bytes, %dms)${RST}\n" "$size" "$dur"
+    else
+        printf "${YLW}∅${RST} ${DIM}(empty output)${RST}\n"
+    fi
+    TOTAL_SCRIPTS=$((TOTAL_SCRIPTS + 1))
+}
+
+capture "security" "security.sh"
+capture "ports" "ports.sh"
+capture "logs" "logs.sh"
+
+if [[ $QUICK -eq 0 ]]; then
+    capture "slow" "slow.sh"
+fi
+
+if $HAS_SSHD; then
+    capture "ssh_audit" "ssh_audit.sh"
+fi
+
+capture "specs" "specs.sh"
+
+if $HAS_AI_CONFIG; then
+    capture "ai_status" "ai.sh"
+fi
+
+# Deeper diagnostics for richer AI analysis (non-quick mode)
+if [[ $QUICK -eq 0 ]]; then
+    capture "cpu" "cpu.sh"
+    capture "memory" "memory.sh"
+    capture "network" "network.sh" "--quick"
+fi
+
+sec "CAPTURE SUMMARY"
+
+printf "  Scripts run:  ${BOLD}%d${RST} / %d detected\n" "$SCRIPTS_RAN" "$TOTAL_SCRIPTS"
+
+# Calculate total data size
+TOTAL_BYTES=0
+for key in "${!RESULTS[@]}"; do
+    TOTAL_BYTES=$((TOTAL_BYTES + ${#RESULTS[$key]}))
+done
+printf "  Total data:   ${BOLD}%d bytes${RST}\n" "$TOTAL_BYTES"
+
+if [[ $JSON_OUT -eq 1 ]]; then
+    # JSON mode: emit structured data
+    printf '{"timestamp":"%s","scripts_run":%d,"total_bytes":%d,"results":{' \
+        "$(date -Iseconds)" "$SCRIPTS_RAN" "$TOTAL_BYTES"
+    first=1
+    for key in "${SCRIPT_ORDER[@]}"; do
+        [[ $first -eq 1 ]] || printf ','
+        first=0
+        # Escape the JSON for embedding
+        escaped=$(printf '%s' "${RESULTS[$key]}" | jq -Rs . 2>/dev/null || echo '""')
+        printf '"%s":%s' "$key" "$escaped"
+    done
+    printf '}}\n'
+    exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 3: BUILD THE AI PROMPT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+sec "PHASE 3: BUILDING AI ANALYSIS PROMPT"
+
+# Build a comprehensive prompt that feeds all script results to the AI
+build_prompt() {
+    local prompt=""
+
+    # Custom prompt file overrides
+    if [[ -n "$PROMPT_FILE" && -f "$PROMPT_FILE" ]]; then
+        prompt=$(cat "$PROMPT_FILE")
+        # Append all script results
+        for key in "${SCRIPT_ORDER[@]}"; do
+            prompt+="\n\n=== $key.sh OUTPUT ===\n"
+            prompt+="${RESULTS[$key]}"
+        done
+        printf '%s' "$prompt"
+        return
+    fi
+
+    # Default comprehensive prompt
+    prompt="You are a senior Linux security engineer reviewing automated audit results.
+You have been given the raw output from multiple security scanning scripts run on a live system.
+Your job is to read ALL the results below, cross-reference findings across scripts, and provide a detailed analysis.
+
+IMPORTANT RULES:
+- Read every script's output carefully before forming conclusions
+- Cross-reference: if ports.sh finds an open port and security.sh flags a weak service, connect those dots
+- Prioritize by severity: remote-exploitable > local-privilege-escalation > misconfiguration > informational
+- Be specific: give exact file paths, exact commands, exact config lines to change
+- Be honest: if the system looks fine, say so — don't invent problems
+- Consider the human context: this is a personal workstation/server, not a corporate environment
+
+PLEASE PROVIDE YOUR ANALYSIS IN THIS EXACT FORMAT:
+
+## SECURITY POSTURE SUMMARY
+2-3 sentences: Is this system in good shape? What's the overall risk level?
+
+## CRITICAL FINDINGS (fix immediately)
+Numbered list of things that are actively dangerous or exploitable RIGHT NOW.
+For each: what the finding means, why it's critical, and the exact command to fix it.
+
+## IMPORTANT FINDINGS (fix soon)
+Numbered list of significant issues that should be addressed but aren't emergencies.
+For each: what it is, the risk, and how to remediate.
+
+## CROSS-SCRIPT INSIGHTS
+Things you noticed by comparing results across multiple scripts. For example:
+- A port flagged in ports.sh that security.sh didn't mention
+- A service issue in logs.sh that explains a warning in slow.sh
+- Correlations between CPU/memory issues and specific running services
+
+## HIDDEN RISKS & IDEAS
+Things the scripts DON'T check but you think are worth investigating:
+- Missing security tools (rkhunter, chkrootkit, auditd, etc.)
+- Unusual configurations that aren't technically broken but are risky
+- Best practices the system isn't following
+- Performance optimizations that would help
+- Anything else a security-conscious admin should know
+
+## SPECIFIC REMEDIATION PLAN
+A numbered, step-by-step plan for fixing everything you found, ordered by priority.
+Each step should be a single command or a small set of commands.
+Include the reasoning for the order you chose.
+
+## BONUS: WHAT THE SCRIPTS MISSED
+Optional: anything you think the automated scripts should have caught but didn't.
+Any blind spots in the audit coverage.
+
+--- BEGIN SCRIPT OUTPUTS ---"
+
+    for key in "${SCRIPT_ORDER[@]}"; do
+        prompt+="\n\n### $key.sh ###\n"
+        # Truncate very large outputs to stay within context limits
+        local data="${RESULTS[$key]}"
+        if [[ ${#data} -gt 8000 ]]; then
+            data="${data:0:8000}\n\n[... truncated, ${#data} bytes total ...]"
+        fi
+        prompt+="$data"
+    done
+
+    prompt+="\n\n--- END SCRIPT OUTPUTS ---"
+
+    printf '%s' "$prompt"
+}
+
+PROMPT=$(build_prompt)
+PROMPT_SIZE=${#PROMPT}
+printf "  Prompt built: ${BOLD}%d characters${RST}\n" "$PROMPT_SIZE"
+
+if [[ $PROMPT_SIZE -gt 50000 ]]; then
+    printf "  ${YLW}Warning: prompt is very large — may exceed model context window${RST}\n"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 4: AI ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [[ $NO_AI -eq 1 ]]; then
+    sec "PHASE 4: AI ANALYSIS (SKIPPED)"
+    printf "  ${DIM}--no-ai flag set or no AI backend available.${RST}\n"
+    printf "  ${DIM}Raw script outputs were captured above.${RST}\n"
+    printf "  ${DIM}Install 'ask' or run an Ollama server for AI analysis.${RST}\n"
+    echo ""
+    exit 0
+fi
+
+sec "PHASE 4: AI ANALYSIS"
+printf "  ${DIM}Sending %d bytes to %s — timeout %ds ...${RST}\n" "$PROMPT_SIZE" "$AI_BACKEND" "$TIMEOUT"
+printf "  ${DIM}(this may take 10-60 seconds depending on model and server load)${RST}\n\n"
+
+AI_T0=$(date +%s)
+AI_REPLY=$(ask_ai "$PROMPT")
+AI_T1=$(date +%s)
+AI_ELAPSED=$((AI_T1 - AI_T0))
+
+if [[ -z "${AI_REPLY// /}" ]]; then
+    printf "  ${RED}AI returned empty response (timeout or error)${RST}\n"
+    printf "  ${DIM}Tip: check that your AI server is running:${RST}\n"
+    printf "  ${DIM}  ./ai.sh${RST}\n"
+    echo ""
+    exit 1
+fi
+
+AI_REPLY_SIZE=${#AI_REPLY}
+
+# ─── Display the AI analysis ──────────────────────────────────────────────
+sec "AI ANALYSIS (${AI_ELAPSED}s, ${AI_REPLY_SIZE} chars)"
+
+printf '%s\n' "$AI_REPLY"
+
+# ─── Save to file if requested ────────────────────────────────────────────
+if [[ -n "$SAVE_FILE" ]]; then
+    {
+        printf "# Security Study Report — %s on %s\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$(hostname -s)"
+        printf "# Scripts: %d | Data: %d bytes | AI: %s (%ds)\n\n" "$SCRIPTS_RAN" "$TOTAL_BYTES" "$AI_BACKEND" "$AI_ELAPSED"
+        printf '%s\n' "$AI_REPLY"
+    } > "$SAVE_FILE"
+    ok "Report saved to: $SAVE_FILE"
+fi
+
+# ─── Verdict ────────────────────────────────────────────────────────────────
+sec "STUDY COMPLETE"
+
+printf "  Scripts run:   ${BOLD}%d${RST}\n" "$SCRIPTS_RAN"
+printf "  Data analyzed: ${BOLD}%d bytes${RST}\n" "$TOTAL_BYTES"
+printf "  AI backend:    ${BOLD}%s${RST}\n" "$AI_BACKEND"
+printf "  AI time:       ${BOLD}%ds${RST}\n" "$AI_ELAPSED"
+printf "  AI response:   ${BOLD}%d chars${RST}\n" "$AI_REPLY_SIZE"
+echo ""
+printf "  ${DIM}Full logs (append-only): ~/.security-logs/errors.txt${RST}\n"
+if [[ -n "$SAVE_FILE" ]]; then
+    printf "  ${DIM}Report saved to: %s${RST}\n" "$SAVE_FILE"
+fi
+if [[ "$JSON_OUT" != "1" ]] && declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null || true; fi
+echo ""

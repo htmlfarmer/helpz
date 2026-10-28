@@ -1,0 +1,1174 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+#
+# allz — Security Script Orchestrator
+# Detects system state, determines which scripts to run, and gives recommendations.
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ─── Help ────────────────────────────────────────────────────────────────────
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          allz — Security Script Orchestrator                  ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Detects system state and determines which security scripts to run.
+  Scans for hardware (GPU, battery, USB), services (SSH, PostgreSQL),
+  network connectivity, and Python dependencies. Then recommends which
+  scripts are MUST-RUN, RECOMMENDED, OPTIONAL, or not applicable.
+
+USAGE
+  ./allz                       Interactive — choose which scripts to run
+  ./allz -b / --batch          Batch mode — scan and display recommendations, then exit
+  ./allz --batch --run=1       Run MUST-RUN scripts in non-interactive batch mode
+  ./allz --batch --run=2       Run MUST-RUN + RECOMMENDED scripts in batch mode
+  ./allz --batch --run=3       Run ALL applicable scripts in batch mode
+  ./allz --quick / --run=quick Run only essentials in ~10-20s, compact summary
+  ./allz --no-color            Disable ANSI color formatting
+  ./allz 2>&1 | tee scan.txt   Save recommendations to file
+
+OPTIONS
+  -h, --help       Show this help message and exit
+  -b, --batch      Non-interactive mode (never prompts for input)
+  --quick          Fast essentials scan — runs only must-run scripts in --json mode, ~10-20s
+  --run=<1|2|3|quick>  Batch execution target (1=must-run, 2=recommended, 3=all, quick=fast)
+  --no-color       Disable ANSI color output
+
+WHAT IT DOES
+  1. Detects hardware (GPU, battery, USB, PCI, sensors)
+  2. Detects services (systemd, SSH, PostgreSQL, journald)
+  3. Checks network connectivity and listening ports
+  4. Scans Python environment for required modules
+  5. Recommends scripts based on what's available
+  6. Offers to run scripts in priority order
+
+ALTERNATIVE APPROACH — Run individual scripts directly:
+  ./securityz        Full security audit (always run first)
+  ./portz           Listening sockets & Docker UFW bypass audit
+  ./slowz            Quick system health check
+  ./logz            Scan system logs for errors
+  ./sshauditz       SSH server configuration, crypto & key audit
+  ./specz           Hardware specifications and virtualization info
+  ./cpuz             CPU diagnostic
+  ./memoryz          Memory diagnostic
+  ./diskz            Disk/filesystem diagnostic
+  ./networkz         Network diagnostic
+  ./gpuz             GPU diagnostic (if GPU detected)
+  ./bootz            Boot diagnostic (if systemd present)
+  ./powerz           Battery diagnostic (if laptop)
+  ./usbz             USB diagnostic (if USB devices)
+  ./pciz             PCI diagnostic (if lspci available)
+  ./sqlz             PostgreSQL diagnostic (if installed)
+  aiz              AI server monitor (if ai.json exists)
+  ./hardenz          Automated CIS remediation (--dry-run/--apply)
+  ./benchmarkz       System performance benchmarks
+  ./timingz          Script runtime profiler for entire suite
+  ./abusez           SSH abuse reporter (if SSH server)
+  ./checkz           Live log monitor (interactive)
+
+TIPS
+  - Run ./securityz first — it's the core audit
+  - Run ./portz to verify firewall isolation and exposed services
+  - Run ./slowz for a quick health snapshot
+  - Run ./logz to surface hidden errors
+  - Re-run ./allz weekly to track changes
+  - Use ./timingz to benchmark script execution times
+
+HELPEOF
+    exit 0
+}
+
+# ─── Command Line Options ───────────────────────────────────────────────────
+BATCH=0
+QUICK=0
+RUN_TARGET=""
+NO_COLOR=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            ;;
+        -b|--batch)
+            BATCH=1
+            shift
+            ;;
+        --quick)
+            QUICK=1
+            shift
+            ;;
+        --run=*)
+            RUN_TARGET="${1#*=}"
+            [[ "${RUN_TARGET,,}" == "quick" ]] && QUICK=1
+            shift
+            ;;
+        --run)
+            RUN_TARGET="${2:-}"
+            [[ "${RUN_TARGET,,}" == "quick" ]] && QUICK=1
+            shift 2
+            ;;
+        --no-color)
+            NO_COLOR=1
+            shift
+            ;;
+        --ai)
+            AI_VERDICT=1
+            shift
+            ;;
+        --no-ai)
+            AI_VERDICT=0
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "allz" "BATCH=$BATCH QUICK=$QUICK" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+if [[ $NO_COLOR -eq 1 ]] || [[ -n "${NO_COLOR:-}" && "$NO_COLOR" != "0" ]]; then
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    MAGENTA=''
+    BOLD=''
+    DIM=''
+    NC=''
+fi
+
+# ─── Counters ────────────────────────────────────────────────────────────────
+MUST_RUN=0
+RECOMMENDED=0
+OPTIONAL=0
+NOT_APPLICABLE=0
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+has_cmd() { command -v "$1" &>/dev/null; }
+
+has_py_mod() { python3 -c "import $1" 2>/dev/null; }
+
+section() {
+    echo ""
+    echo -e "${BLUE}${BOLD}══════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}${BOLD}  $1${NC}"
+    echo -e "${BLUE}${BOLD}══════════════════════════════════════════════════════════════════${NC}"
+}
+
+subsection() {
+    echo ""
+    echo -e "${CYAN}${BOLD}── $1 ${NC}"
+}
+
+tag_must() {
+    echo -e "  ${RED}${BOLD}[MUST RUN]${NC}  ${BOLD}$1${NC}"
+    echo -e "             ${DIM}$2${NC}"
+    ((MUST_RUN += 1))
+}
+
+tag_rec() {
+    echo -e "  ${YELLOW}${BOLD}[RECOMMENDED]${NC} ${BOLD}$1${NC}"
+    echo -e "             ${DIM}$2${NC}"
+    ((RECOMMENDED += 1))
+}
+
+tag_opt() {
+    echo -e "  ${GREEN}${BOLD}[OPTIONAL]${NC}   ${BOLD}$1${NC}"
+    echo -e "             ${DIM}$2${NC}"
+    ((OPTIONAL += 1))
+}
+
+tag_na() {
+    echo -e "  ${DIM}[SKIP]      $1 — $2${NC}"
+    ((NOT_APPLICABLE += 1))
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SYSTEM DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║          SECURITY SUITE — SCRIPT ORCHESTRATOR                   ║${NC}"
+echo -e "${BOLD}║          $(date '+%Y-%m-%d %H:%M:%S %Z')                        ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+
+
+# ─── Quick Mode ──────────────────────────────────────────────────────────────
+# Runs only the essentials using --json mode (~10-20s total).
+
+# ─── Quick Mode ──────────────────────────────────────────────────────────────
+# Runs only the essentials (security, ports, slow, ssh_audit) using --json
+# mode to keep total wall-clock to ~10-20 seconds. Aggregates per-script
+# verdicts into a single summary.
+# ─── probe_system ──────────────────────────────────────────────────────────
+# Quick 1-second snapshot of system health. Returns 1 if any probe fires
+# "abnormal". Sets globals: PROBE_LOAD, PROBE_MEM_PCT, PROBE_SWAP_PCT,
+# PROBE_DISK_PCT, PROBE_CONNS, PROBE_SYN_RCVD, PROBE_OOM, PROBE_FAILS,
+# PROBE_WEB_ACTIVE, PROBE_HAS_SVC.
+probe_system() {
+    # Load (1-minute, integer)
+    PROBE_LOAD=$(awk '{print int($1)}' /proc/loadavg 2>/dev/null | head -1)
+    PROBE_LOAD=${PROBE_LOAD:-0}
+    PROBE_CPU_COUNT=$(nproc 2>/dev/null | head -1)
+    PROBE_CPU_COUNT=${PROBE_CPU_COUNT:-1}
+
+    # Memory %
+    PROBE_MEM_PCT=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2}
+        END {if (t>0) print int((t-a)*100/t); else print 0}' /proc/meminfo 2>/dev/null | head -1)
+    PROBE_MEM_PCT=${PROBE_MEM_PCT:-0}
+    PROBE_SWAP_PCT=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2}
+        END {if (t>0) print int((t-f)*100/t); else print 0}' /proc/meminfo 2>/dev/null | head -1)
+    PROBE_SWAP_PCT=${PROBE_SWAP_PCT:-0}
+
+    # Worst filesystem %
+    PROBE_DISK_PCT=$(df -P 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev/ {
+        gsub("%","",$5); if ($5+0 > max) max=$5+0
+    } END {print max+0}' | head -1)
+    PROBE_DISK_PCT=${PROBE_DISK_PCT:-0}
+
+    # Connection counts
+    PROBE_CONNS=$(ss -tan state established 2>/dev/null | tail -n +2 | wc -l | head -1)
+    PROBE_CONNS=${PROBE_CONNS:-0}
+    PROBE_SYN_RCVD=$(ss -tan state syn-recv 2>/dev/null | tail -n +2 | wc -l | head -1)
+    PROBE_SYN_RCVD=${PROBE_SYN_RCVD:-0}
+
+    # OOM events in last hour
+    PROBE_OOM=$( journalctl -k --since "1 hour ago" --no-pager -q 2>/dev/null \
+        | grep -ci "out of memory\|killed process" 2>/dev/null | head -1 || true)
+    PROBE_OOM=${PROBE_OOM:-0}
+    [[ -z "$PROBE_OOM" ]] && PROBE_OOM=0
+
+    # Failed systemd units (excluding printer noise)
+    PROBE_FAILS=$( systemctl --failed --no-pager --no-legend 2>/dev/null \
+        | grep -vcE 'configure-printer@|cups\.|cups-browsed' 2>/dev/null | head -1 || true)
+    PROBE_FAILS=${PROBE_FAILS:-0}
+    [[ -z "$PROBE_FAILS" ]] && PROBE_FAILS=0
+
+    # Web server running with active access log?
+    PROBE_WEB_ACTIVE=0
+    for svc in nginx apache2 caddy; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            # Check if access log has been written in last 5 min
+            for log in /var/log/${svc}/access.log /var/log/${svc}/access_log; do
+                [[ -f "$log" ]] || continue
+                age_min=$(( ( $(date +%s) - $(stat -c %Y "$log") ) / 60 ))
+                if (( age_min < 5 )); then
+                    PROBE_WEB_ACTIVE=1
+                    break 2
+                fi
+            done
+        fi
+    done
+
+    # Web server installed?
+    PROBE_HAS_SVC=0
+    for svc in nginx apache2 caddy; do
+        if systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+            | grep -q "^${svc}.service"; then
+            PROBE_HAS_SVC=1; break
+        fi
+    done
+
+    # Detect what's actually abnormal → which sections to run
+    NEED_CPU=0
+    NEED_MEMORY=0
+    NEED_DISK=0
+    NEED_NETWORK=0
+    NEED_CRASH=0
+    NEED_WEB=0
+
+    # Load > 2x cores OR load > cores → CPU pressure
+    if (( PROBE_LOAD > PROBE_CPU_COUNT * 2 )); then NEED_CPU=1
+    elif (( PROBE_LOAD > PROBE_CPU_COUNT )); then NEED_CPU=1
+    fi
+
+    # Memory > 85% OR swap > 30% → memory pressure
+    (( PROBE_MEM_PCT >= 85 )) && NEED_MEMORY=1
+    (( PROBE_SWAP_PCT >= 30 )) && NEED_MEMORY=1
+
+    # Disk > 90% on any filesystem
+    (( PROBE_DISK_PCT >= 90 )) && NEED_DISK=1
+
+    # SYN flood OR >5000 connections → network anomaly
+    (( PROBE_SYN_RCVD >= 50 )) && NEED_NETWORK=1
+    (( PROBE_CONNS >= 5000 )) && NEED_NETWORK=1
+
+    # OOM in last hour OR failed services → crash signal
+    (( PROBE_OOM > 0 )) && NEED_CRASH=1
+    (( PROBE_FAILS > 0 )) && NEED_CRASH=1
+
+    # Web server active with recent activity → check it
+    (( PROBE_WEB_ACTIVE == 1 )) && NEED_WEB=1
+
+    # Always check security basics — it's fast and comprehensive
+    NEED_SECURITY=1
+    # Always check ports listening — fast
+    NEED_PORTS=1
+    # SSH audit if sshd is running
+    NEED_SSH=0
+    systemctl is-active --quiet ssh 2>/dev/null && NEED_SSH=1
+    systemctl is-active --quiet sshd 2>/dev/null && NEED_SSH=1
+}
+
+# ─── run_quick (auto-detect) ───────────────────────────────────────────────
+run_quick() {
+    local total_t0 total_elapsed critical_total warnings_total script_count
+    total_t0=$(date +%s)
+
+    # Probe first — decides what to actually run
+    probe_system
+
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║          QUICK MODE — auto-detect essentials in ~10-20s         ║${NC}"
+    echo -e "${BOLD}║          $(date '+%Y-%m-%d %H:%M:%S %Z')                        ║${NC}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Show what we detected and what we're going to run
+    echo -e "  ${DIM}PROBE RESULTS:${NC}"
+    echo -e "    ${DIM}load=${PROBE_LOAD}/${PROBE_CPU_COUNT}c  mem=${PROBE_MEM_PCT}%  swap=${PROBE_SWAP_PCT}%  disk=${PROBE_DISK_PCT}%  conns=${PROBE_CONNS}  syn_rcv=${PROBE_SYN_RCVD}  oom_1h=${PROBE_OOM}  fails=${PROBE_FAILS}${NC}"
+    echo ""
+
+    # Per-script summary accumulators
+    declare -A QUICK_RESULTS=()
+    declare -A QUICK_JSON=()
+    declare -A QUICK_CRIT=()
+    declare -A QUICK_WARN=()
+    declare -A QUICK_DUR=()
+    critical_total=0
+    warnings_total=0
+    script_count=0
+
+    # Build the essentials list (respect hardware/service detection)
+    local essentials=()
+    essentials+=("securityz")
+    essentials+=("portz")
+    essentials+=("slowz")
+    $HAS_SSHD && essentials+=("sshauditz")
+    essentials+=("logz")
+
+    # Pre-fire all essential sub-scripts in parallel; collect JSON + duration into tmpfiles.
+    # Each script keeps its own timeout budget; total wall time = max(per-script) not sum.
+    QUICK_DIR=$(mktemp -d -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp -d)
+    trap "rm -rf '$QUICK_DIR' 2>/dev/null" RETURN
+    declare -a _Q_PIDS=()
+    declare -a _Q_FILES=()
+    declare -a _Q_DUR=()
+    declare -a _Q_ARGS=()
+    declare -a _Q_NAMES=()
+    _q_idx=0
+    for s in "${essentials[@]}"; do
+        local path="$SCRIPT_DIR/$s"
+        [[ ! -f "$path" ]] && continue
+        script_count=$((script_count + 1))
+
+        # Build per-script args
+        local args=()
+        if [[ "$s" == "securityz" ]]; then
+            args=("--json" "--no-color")
+        elif [[ "$s" == "slowz" ]]; then
+            args=("--json" "--no-color")
+            (( NEED_CPU     )) && args+=("--cpu")
+            (( NEED_MEMORY  )) && args+=("--memory")
+            (( NEED_DISK    )) && args+=("--disk")
+            (( NEED_NETWORK )) && args+=("--network")
+            (( NEED_CRASH   )) && args+=("--crash")
+            (( NEED_WEB     )) && args+=("--web")
+            if (( ${#args[@]} == 2 )); then args+=("--cpu" "--memory"); fi
+        else
+            args=("--json" "--no-color")
+        fi
+
+        local script_timeout=10
+        if [[ "$s" == "securityz" ]]; then script_timeout=30
+        elif [[ "$s" == "slowz"  ]]; then
+            local n_sections=$(( ${#args[@]} - 2 ))
+            [[ $n_sections -lt 1 ]] && n_sections=2
+            script_timeout=$(( 6 + n_sections * 3 ))
+        elif [[ "$s" == "logz"  ]]; then script_timeout=8
+        else script_timeout=6; fi
+        # portz --quick: key ports only, skip docker deep-dive (it was the slow one)
+        if [[ "$s" == "portz" ]]; then args=("--json" "--no-color" "--quick"); script_timeout=6; fi
+
+        local out_file="$QUICK_DIR/json.$_q_idx"
+        local dur_file="$QUICK_DIR/dur.$_q_idx"
+        local t0_file="$QUICK_DIR/t0.$_q_idx"
+        printf '%s' "$(date +%s)" > "$t0_file"
+        (
+            timeout "$script_timeout" bash "$path" "${args[@]}" </dev/null > "$out_file" 2>/dev/null || true
+            local e=$?
+            local now; now=$(date +%s)
+            local t0; t0=$(cat "$t0_file" 2>/dev/null || echo "$now")
+            printf '%s' "$((now - t0))" > "$dur_file"
+            # mark timeout
+            [[ $e -ne 0 && ! -s "$out_file" ]] && rm -f "$out_file"
+        ) &
+        _Q_PIDS+=($!)
+        _Q_FILES+=("$out_file")
+        _Q_DUR+=("$dur_file")
+        _Q_NAMES+=("$s")
+        _q_idx=$((_q_idx + 1))
+    done
+    for pid in "${_Q_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+    # Display loop preserves original order
+    local _qi=0
+    for s in "${_Q_NAMES[@]}"; do
+        local json_out verdict c w s_dur
+        json_out=$(cat "${_Q_FILES[$_qi]}" 2>/dev/null || true)
+        QUICK_JSON[$s]="$json_out"
+        s_dur=$(cat "${_Q_DUR[$_qi]}" 2>/dev/null || echo 0)
+        _qi=$((_qi + 1))
+
+        printf "  ${CYAN}▸${NC} %-20s " "$s"
+
+        if [[ -z "$json_out" ]]; then
+            QUICK_RESULTS[$s]="TIMEOUT"
+            QUICK_DUR[$s]="$s_dur"
+            printf "${YELLOW}TIMEOUT${NC} (${s_dur}s)\n"
+            continue
+        fi
+
+        # Parse critical/warnings from JSON (jq preferred, grep fallback)
+        if has_cmd jq; then
+            c=$(printf '%s' "$json_out" | jq -r '.critical // .critical_issues // empty' 2>/dev/null | head -1)
+            w=$(printf '%s' "$json_out" | jq -r '.warnings // .warning_entries // empty' 2>/dev/null | head -1)
+            verdict=$(printf '%s' "$json_out" | jq -r '.verdict // empty' 2>/dev/null | head -1)
+        else
+            c=$(printf '%s' "$json_out" | grep -oE '"(critical|critical_issues)"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
+            w=$(printf '%s' "$json_out" | grep -oE '"(warnings|warning_entries)"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+$')
+            verdict=$(printf '%s' "$json_out" | grep -oE '"verdict"[[:space:]]*:[[:space:]]*"[a-z]+"' | head -1 | grep -oE '"[a-z]+"$' | tr -d '"')
+        fi
+
+        # If verdict is missing, infer
+        if [[ -z "$verdict" ]]; then
+            if [[ "${c:-0}" -gt 0 ]]; then verdict="critical"
+            elif [[ "${w:-0}" -gt 0 ]]; then verdict="warning"
+            else verdict="healthy"; fi
+        fi
+
+        c=${c:-0}
+        w=${w:-0}
+        QUICK_RESULTS[$s]="$verdict"
+        QUICK_CRIT[$s]="$c"
+        QUICK_WARN[$s]="$w"
+        QUICK_DUR[$s]="$s_dur"
+        critical_total=$((critical_total + c))
+        warnings_total=$((warnings_total + w))
+
+        # Color-coded line
+        if [[ "$verdict" == "critical" ]]; then
+            printf "${RED}${BOLD}CRITICAL${NC}  ${DIM}(crit=%s warn=%s, %ss)${NC}\n" "$c" "$w" "$s_dur"
+        elif [[ "$verdict" == "warning" ]]; then
+            printf "${YELLOW}WARNING${NC}   ${DIM}(crit=%s warn=%s, %ss)${NC}\n" "$c" "$w" "$s_dur"
+        else
+            printf "${GREEN}HEALTHY${NC}   ${DIM}(%ss)${NC}\n" "$s_dur"
+        fi
+    done
+
+    total_elapsed=$(($(date +%s) - total_t0))
+
+    echo ""
+    local health=$((100 - critical_total * 12 - warnings_total * 3)); (( health < 0 )) && health=0
+    local hcol=$GREEN hgrade="A+"
+    (( health < 85 )) && { hcol=$CYAN; hgrade="B"; }
+    (( health < 70 )) && { hcol=$YELLOW; hgrade="C"; }
+    (( health < 40 )) && { hcol=$RED;  hgrade="D"; }
+    local hb="" hi
+    for ((hi=0; hi<24; hi++)); do (( (hi + 1) * 100 / 24 <= health )) && hb+="█" || hb+="░"; done
+
+    echo -e "  ${BOLD}${MAGENTA}═══ ALLZ SWEEP ═════════════════════════════════════════════════${NC}"
+    printf  "  ${BOLD}health${NC}   %b%s${NC}   ${BOLD}%b%d/100${NC}  ${BOLD}[%s]${NC}\n" "$hcol" "$hb" "$hcol" "$health" "$hgrade"
+    printf  "  ${BOLD}impact${NC}   ${RED}%d critical${NC} · ${YELLOW}%d warnings${NC} · ${DIM}%d scripts in %ds${NC}\n" "$critical_total" "$warnings_total" "$script_count" "$total_elapsed"
+    echo ""
+    echo -e "  ${BOLD}per-script weight${NC} ${DIM}(▰ = 1pt · crit=3pt · warn=1pt)${NC}"
+    local s2 pts bar2 b2 col2
+    for s2 in "${_Q_NAMES[@]}"; do
+        pts=$(( ${QUICK_CRIT[$s2]:-0} * 3 + ${QUICK_WARN[$s2]:-0} ))
+        (( pts == 0 )) && [[ "${QUICK_RESULTS[$s2]}" == TIMEOUT ]] && pts=-1
+        bar2=""
+        local blen=$(( pts < 0 ? 1 : pts )); (( blen > 30 )) && blen=30
+        for ((b2=0;b2<blen;b2++)); do bar2+="▰"; done
+        [[ -z "$bar2" ]] && bar2="▱"
+        col2=$GREEN
+        [[ "${QUICK_RESULTS[$s2]}" == critical ]] && col2=$RED
+        [[ "${QUICK_RESULTS[$s2]}" == warning  ]] && col2=$YELLOW
+        [[ "${QUICK_RESULTS[$s2]}" == TIMEOUT   ]] && col2=$MAGENTA
+        printf "    ${col2}▸${NC} ${BOLD}%-16s${NC} %b%s${NC} ${DIM}%s · %ss${NC}\n" \
+               "$s2" "$col2" "$bar2" "$([[ $pts -ge 0 ]] && echo "${pts} pts" || echo "no JSON")" "${QUICK_DUR[$s2]:-0}"
+    done
+    echo ""
+    echo -e "  ${BOLD}TOP PROBLEMS${NC}"
+    local shown=0 s3 raw cat msg jsrc
+    for s3 in "${_Q_NAMES[@]}"; do
+        jsrc="${QUICK_JSON[$s3]:-}"
+        [[ -z "$jsrc" ]] && continue
+        if has_cmd jq; then
+            while IFS= read -r raw; do
+                [[ -z "$raw" || $shown -ge 10 ]] && continue
+                cat="${raw%%|*}"; msg="${raw#*|}"; msg="${msg%%|*}"
+                printf "    ${RED}✗${NC} ${DIM}%s${NC} ${BOLD}%-22s${NC} %s\n" "$s3" "$cat" "${msg:0:84}"
+                shown=$((shown+1))
+            done < <(printf '%s' "$jsrc" | jq -r '.critical_issues[]?' 2>/dev/null)
+            while IFS= read -r raw; do
+                [[ -z "$raw" || $shown -ge 10 ]] && continue
+                cat="${raw%%|*}"; msg="${raw#*|}"; msg="${msg%%|*}"
+                printf "    ${YELLOW}!${NC} ${DIM}%s${NC} ${BOLD}%-22s${NC} %s\n" "$s3" "$cat" "${msg:0:84}"
+                shown=$((shown+1))
+            done < <(printf '%s' "$jsrc" | jq -r '.warning_entries[]?' 2>/dev/null)
+        else
+            while IFS= read -r raw; do
+                [[ -z "$raw" || $shown -ge 10 ]] && continue
+                printf "    ${YELLOW}!${NC} ${DIM}%s${NC} %s\n" "$s3" "${raw:0:96}"
+                shown=$((shown+1))
+            done < <(grep -oE '"[A-Za-z_0-9]+\|[^"]+"' <<< "$jsrc" | tr -d '"')
+        fi
+    done
+    (( shown == 0 )) && printf "    ${GREEN}✓${NC} ${DIM}no findings reported by the sweep${NC}\n"
+    echo ""
+
+    # Show what the probe detected and what was actually flagged for follow-up
+    echo -e "  ${DIM}Detected anomalies (run slowz --<section> for details):${NC}"
+    local flagged=0
+    (( NEED_CPU     )) && { echo -e "    ${YELLOW}▸${NC} CPU pressure (load=${PROBE_LOAD}/${PROBE_CPU_COUNT}c) — ${CYAN}./slowz --cpu${NC}"; flagged=1; }
+    (( NEED_MEMORY  )) && { echo -e "    ${YELLOW}▸${NC} Memory pressure (mem=${PROBE_MEM_PCT}% swap=${PROBE_SWAP_PCT}%) — ${CYAN}./slowz --memory${NC}"; flagged=1; }
+    (( NEED_DISK    )) && { echo -e "    ${YELLOW}▸${NC} Disk near full (${PROBE_DISK_PCT}%) — ${CYAN}./slowz --disk${NC}"; flagged=1; }
+    (( NEED_NETWORK )) && { echo -e "    ${YELLOW}▸${NC} Network anomaly (syn_rcv=${PROBE_SYN_RCVD} conns=${PROBE_CONNS}) — ${CYAN}./slowz --network${NC}"; flagged=1; }
+    (( NEED_CRASH   )) && { echo -e "    ${YELLOW}▸${NC} Crash signal (oom=${PROBE_OOM} fails=${PROBE_FAILS}) — ${CYAN}./slowz --crash${NC}"; flagged=1; }
+    (( NEED_WEB     )) && { echo -e "    ${YELLOW}▸${NC} Web server active with traffic — ${CYAN}./slowz --web${NC}"; flagged=1; }
+    (( flagged == 0 )) && echo -e "    ${GREEN}✓${NC} None — system looks healthy across all probes"
+    echo ""
+
+    if [[ $critical_total -gt 0 ]]; then
+        echo -e "  ${RED}${BOLD}╔═══ ⚠  CRITICAL ISSUES FOUND — chase the ✗ items above ═══╗${NC}"
+        echo -e "  ${RED}${BOLD}║${NC} deep-dive: ${CYAN}./allz --run=1${NC}   or the flagged tools above  ${RED}${BOLD}║${NC}"
+        echo -e "  ${RED}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+        exit 2
+    elif [[ $warnings_total -gt 0 ]]; then
+        echo -e "  ${YELLOW}${BOLD}◆ Warnings found — the ! items above are worth a look${NC}"
+        echo -e "  ${DIM}full pass: ./allz --run=1${NC}"
+        exit 1
+    else
+        echo -e "  ${GREEN}${BOLD}◆ CLEAN SWEEP — all essentials passed${NC} ${DIM}(health ${health}/100)${NC}"
+        exit 0
+    fi
+}
+
+section "SYSTEM DETECTION"
+
+# ─── Hardware ─────────────────────────────────────────────────────────────
+subsection "Hardware"
+
+HAS_GPU=false
+GPU_TYPE="none"
+if has_cmd lspci; then
+    if lspci 2>/dev/null | grep -qiE 'VGA|3D|Display'; then
+        HAS_GPU=true
+        if lspci 2>/dev/null | grep -qi 'nvidia'; then
+            GPU_TYPE="nvidia"
+        elif lspci 2>/dev/null | grep -qiE 'amd|radeon'; then
+            GPU_TYPE="amd"
+        else
+            GPU_TYPE="other"
+        fi
+    fi
+fi
+echo -e "  GPU        : $(if $HAS_GPU; then echo -e "${GREEN}detected ($GPU_TYPE)${NC}"; else echo -e "${DIM}none${NC}"; fi)"
+
+HAS_BATTERY=false
+if [[ -d /sys/class/power_supply ]] && ls /sys/class/power_supply/BAT* &>/dev/null; then
+    HAS_BATTERY=true
+fi
+echo -e "  Battery    : $(if $HAS_BATTERY; then echo -e "${GREEN}yes (laptop/portable)${NC}"; else echo -e "${DIM}no (desktop/server)${NC}"; fi)"
+
+HAS_USB=false
+if has_cmd lsusb && lsusb 2>/dev/null | grep -qv '^$'; then
+    HAS_USB=true
+fi
+echo -e "  USB        : $(if $HAS_USB; then echo -e "${GREEN}devices present${NC}"; else echo -e "${DIM}none or no lsusb${NC}"; fi)"
+
+HAS_PCI=false
+if has_cmd lspci && [[ $(lspci 2>/dev/null | wc -l) -gt 0 ]]; then
+    HAS_PCI=true
+fi
+echo -e "  PCI bus    : $(if $HAS_PCI; then echo -e "${GREEN}$(lspci 2>/dev/null | wc -l) devices${NC}"; else echo -e "${DIM}no lspci${NC}"; fi)"
+
+# CPU temp sensors
+HAS_SENSORS=false
+if has_cmd sensors && sensors 2>/dev/null | grep -qiE 'temp|core'; then
+    HAS_SENSORS=true
+fi
+echo -e "  Temp sens. : $(if $HAS_SENSORS; then echo -e "${GREEN}available${NC}"; else echo -e "${DIM}not detected${NC}"; fi)"
+
+# ─── Services ─────────────────────────────────────────────────────────────
+subsection "Services"
+
+HAS_SYSTEMD=false
+if has_cmd systemctl && systemctl --version &>/dev/null; then
+    HAS_SYSTEMD=true
+fi
+echo -e "  systemd    : $(if $HAS_SYSTEMD; then echo -e "${GREEN}yes${NC}"; else echo -e "${DIM}no${NC}"; fi)"
+
+HAS_SSHD=false
+if systemctl is-active sshd &>/dev/null || systemctl is-active ssh &>/dev/null || [[ -f /etc/ssh/sshd_config ]]; then
+    HAS_SSHD=true
+fi
+echo -e "  SSH server : $(if $HAS_SSHD; then echo -e "${GREEN}running${NC}"; else echo -e "${DIM}not detected${NC}"; fi)"
+
+HAS_POSTGRES=false
+if has_cmd psql || has_cmd pg_lsclusters || systemctl is-active postgresql &>/dev/null; then
+    HAS_POSTGRES=true
+fi
+echo -e "  PostgreSQL : $(if $HAS_POSTGRES; then echo -e "${GREEN}installed/running${NC}"; else echo -e "${DIM}not detected${NC}"; fi)"
+
+HAS_JOURNAL=false
+if has_cmd journalctl; then
+    HAS_JOURNAL=true
+fi
+echo -e "  Journald   : $(if $HAS_JOURNAL; then echo -e "${GREEN}available${NC}"; else echo -e "${DIM}not available${NC}"; fi)"
+
+# ─── Network ──────────────────────────────────────────────────────────────
+subsection "Network"
+
+HAS_INTERNET=false
+if ping -c1 -W2 8.8.8.8 &>/dev/null || ping -c1 -W2 1.1.1.1 &>/dev/null; then
+    HAS_INTERNET=true
+fi
+echo -e "  Internet   : $(if $HAS_INTERNET; then echo -e "${GREEN}connected${NC}"; else echo -e "${DIM}disconnected${NC}"; fi)"
+
+HAS_WIFI=false
+if has_cmd iwconfig && iwconfig 2>/dev/null | grep -q 'ESSID'; then
+    HAS_WIFI=true
+elif [[ -d /sys/class/wireless ]] && ls /sys/class/wireless/* &>/dev/null 2>&1; then
+    HAS_WIFI=true
+fi
+echo -e "  Wi-Fi      : $(if $HAS_WIFI; then echo -e "${GREEN}interface present${NC}"; else echo -e "${DIM}none${NC}"; fi)"
+
+LISTENING_PORTS=0
+if has_cmd ss; then
+    LISTENING_PORTS=$(ss -tln 2>/dev/null | tail -n+2 | wc -l || echo 0)
+fi
+echo -e "  Listening  : ${BOLD}$LISTENING_PORTS${NC} TCP ports"
+
+# ─── Python & Libraries ──────────────────────────────────────────────────
+subsection "Python Environment"
+
+HAS_PYTHON=false
+if has_cmd python3; then
+    HAS_PYTHON=true
+    PY_VER=$(python3 --version 2>&1 | awk '{print $2}')
+    echo -e "  Python     : ${GREEN}$PY_VER${NC}"
+else
+    echo -e "  Python     : ${DIM}not installed${NC}"
+fi
+
+HAS_SCAPY=false; has_py_mod scapy && HAS_SCAPY=true
+HAS_PSUTIL=false; has_py_mod psutil && HAS_PSUTIL=true
+HAS_FLASK=false; has_py_mod flask && HAS_FLASK=true
+HAS_URWID=false; has_py_mod urwid && HAS_URWID=true
+HAS_REQUESTS=false; has_py_mod requests && HAS_REQUESTS=true
+
+echo -e "  scapy      : $(if $HAS_SCAPY; then echo -e "${GREEN}yes${NC}"; else echo -e "${DIM}no${NC}"; fi)"
+echo -e "  psutil     : $(if $HAS_PSUTIL; then echo -e "${GREEN}yes${NC}"; else echo -e "${DIM}no${NC}"; fi)"
+echo -e "  flask      : $(if $HAS_FLASK; then echo -e "${GREEN}yes${NC}"; else echo -e "${DIM}no${NC}"; fi)"
+echo -e "  urwid      : $(if $HAS_URWID; then echo -e "${GREEN}yes${NC}"; else echo -e "${DIM}no${NC}"; fi)"
+echo -e "  requests   : $(if $HAS_REQUESTS; then echo -e "${GREEN}yes${NC}"; else echo -e "${DIM}no${NC}"; fi)"
+
+# ─── Config Files ─────────────────────────────────────────────────────────
+subsection "Config & Data"
+
+HAS_AI_CONFIG=false
+if [[ -f "$SCRIPT_DIR/ai.json" ]]; then
+    HAS_AI_CONFIG=true
+fi
+echo -e "  ai.json    : $(if $HAS_AI_CONFIG; then echo -e "${GREEN}present${NC}"; else echo -e "${DIM}not found${NC}"; fi)"
+
+HAS_FIREWALL=false
+if has_cmd iptables || has_cmd nft || has_cmd ufw || has_cmd firewall-cmd; then
+    HAS_FIREWALL=true
+fi
+echo -e "  Firewall   : $(if $HAS_FIREWALL; then echo -e "${GREEN}detected${NC}"; else echo -e "${DIM}none found${NC}"; fi)"
+
+# Privilege
+echo -e "  Running as : ${BOLD}$(whoami)${NC} (UID=$EUID)"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCRIPT RECOMMENDATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+section "SCRIPT RECOMMENDATIONS"
+
+# ─── Shell Scripts ────────────────────────────────────────────────────────
+subsection "Shell Scripts"
+
+echo ""
+
+# securityz — ALWAYS must run
+# ─── Quick-mode short-circuit ─────────────────────────────────────────────
+# If --quick or --run=quick was passed, skip the heavy recommendations
+# display and go straight to running essentials (~10-20s).
+if [[ $QUICK -eq 1 ]]; then
+    run_quick
+    exit $?
+fi
+
+tag_must "securityz" "Full system-wide security audit — the core of this suite"
+
+# portz — ALWAYS must run
+tag_must "portz" "Listening socket auditor — checks exposed ports & Docker UFW bypass"
+
+# slowz — ALWAYS recommended (quick health check)
+tag_must "slowz" "System slowness diagnostic — aggregates CPU/RAM/disk/network health"
+
+# logz — ALWAYS recommended
+tag_must "logz" "System log scanner — finds errors, warnings, and security events"
+
+# sshauditz — must run if SSH server detected
+if $HAS_SSHD; then
+    tag_must "sshauditz" "SSH security audit — crypto algorithms, config, and authorized_keys"
+else
+    tag_na "sshauditz" "no SSH server detected"
+fi
+
+# specz — always relevant
+tag_rec "specz" "System specs diagnostic — CPU features, virtualization, and topology"
+
+# cpuz — always relevant
+tag_rec "cpuz" "CPU diagnostic — topology, frequencies, thermals, vulnerabilities"
+
+# memoryz — always relevant
+tag_rec "memoryz" "Memory diagnostic — RAM, swap, OOM history, pressure stalls"
+
+# diskz — always relevant
+tag_rec "diskz" "Disk/filessystem diagnostic — usage, inodes, I/O stats, SMART"
+
+# networkz — always relevant
+tag_rec "networkz" "Network diagnostic — interfaces, ports, connections, reachability"
+
+# bootz — needs systemd
+if $HAS_SYSTEMD && $HAS_JOURNAL; then
+    tag_rec "bootz" "Boot diagnostic — boot errors, failed services, boot duration"
+else
+    tag_na "bootz" "requires systemd/journald (not detected)"
+fi
+
+# gpuz — needs GPU
+if $HAS_GPU; then
+    tag_rec "gpuz" "GPU diagnostic — $GPU_TYPE detected, check thermals and utilization"
+else
+    tag_na "gpuz" "no GPU detected"
+fi
+
+# powerz — needs battery
+if $HAS_BATTERY; then
+    tag_rec "powerz" "Power/battery diagnostic — laptop battery health and wear"
+else
+    tag_na "powerz" "no battery (desktop/server)"
+fi
+
+# usbz — needs USB
+if $HAS_USB; then
+    tag_opt "usbz" "USB bus diagnostic — devices, speeds, drivers"
+else
+    tag_na "usbz" "no USB devices or lsusb unavailable"
+fi
+
+# pciz — needs lspci
+if $HAS_PCI; then
+    tag_opt "pciz" "PCI/PCIe bus diagnostic — device hierarchy, IOMMU groups"
+else
+    tag_na "pciz" "lspci not available"
+fi
+
+# sqlz — needs PostgreSQL
+if $HAS_POSTGRES; then
+    tag_rec "sqlz" "PostgreSQL diagnostic — connections, locks, bloat, replication"
+else
+    tag_na "sqlz" "PostgreSQL not installed/running"
+fi
+
+# ai.sh — needs ai.json
+if $HAS_AI_CONFIG; then
+    tag_rec "aiz" "AI server monitor — ai.json found, probe server health"
+else
+    tag_na "aiz" "no ai.json config found"
+fi
+
+# hardenz — CIS remediation tool
+tag_opt "hardenz" "Automated CIS remediation — kernel sysctl and credential hardening (--dry-run)"
+
+# benchmarkz — system speed test
+tag_opt "benchmarkz" "System benchmark suite — CPU, RAM, disk, network, and process throughput"
+
+# timingz — execution speed profiler
+tag_opt "timingz" "Script runtime benchmark — profiles execution speed of all security scripts"
+
+# abusez — needs SSH server
+if $HAS_SSHD; then
+    tag_opt "abusez" "SSH abuse reporter — SSH server detected, check for brute-force"
+else
+    tag_na "abusez" "no SSH server detected"
+fi
+
+# checkz — needs journalctl (interactive/live)
+if $HAS_JOURNAL; then
+    tag_opt "checkz" "Live log monitor — real-time journal tail (interactive, Ctrl+C to stop)"
+else
+    tag_na "checkz" "requires journalctl"
+fi
+
+# ─── Python Scripts ───────────────────────────────────────────────────────
+subsection "Python Scripts"
+
+echo ""
+
+# info.py — needs psutil
+if $HAS_PYTHON && $HAS_PSUTIL; then
+    tag_rec "info.py" "Network interface info — all NICs, IPs, MACs"
+elif $HAS_PYTHON; then
+    tag_na "info.py" "missing Python module: psutil (pip install psutil)"
+else
+    tag_na "info.py" "Python not installed"
+fi
+
+# (python extras archived 2026-09-26 — suite is one-word bash only)
+
+# ─── Quick-mode short-circuit ─────────────────────────────────────────────
+# If --quick or --run=quick was passed, skip the heavy recommendations
+# display and go straight to running essentials (~10-20s).
+if [[ $QUICK -eq 1 ]]; then
+    run_quick
+    exit $?
+fi
+
+section "OVERALL SECURITY RECOMMENDATIONS"
+
+REC_NUM=0
+rec() {
+    ((REC_NUM += 1))
+    echo -e "  ${BOLD}$REC_NUM.${NC} $1"
+}
+
+echo ""
+
+# ─── Critical first steps ────────────────────────────────────────────────
+rec "Run ${RED}${BOLD}securityz${NC} first — it's your baseline audit (91 checks across 11 categories)"
+
+rec "Run ${RED}${BOLD}portz${NC} — audit listening sockets and detect Docker UFW bypass"
+
+rec "Run ${RED}${BOLD}slowz${NC} for a quick overall health snapshot before diving deeper"
+
+rec "Run ${RED}${BOLD}logz${NC} to surface errors and security events hiding in your logs"
+
+# ─── Hardware health ────────────────────────────────────────────────────
+echo ""
+echo -e "  ${CYAN}${BOLD}Hardware Health:${NC}"
+rec "Run ${YELLOW}${BOLD}specz${NC} — audit CPU features, virtualization, and motherboard/firmware"
+rec "Run ${YELLOW}${BOLD}cpuz${NC} — check for CPU vulnerabilities (Spectre, Meltdown, etc.) and thermals"
+rec "Run ${YELLOW}${BOLD}memoryz${NC} — check OOM events, swap pressure, and overcommit policy"
+rec "Run ${YELLOW}${BOLD}diskz${NC} — check filesystem usage, inode exhaustion, and I/O health"
+
+if $HAS_GPU; then
+    rec "Run ${YELLOW}${BOLD}gpuz${NC} — $GPU_TYPE GPU detected, check temperatures and VRAM"
+fi
+
+if $HAS_BATTERY; then
+    rec "Run ${YELLOW}${BOLD}powerz${NC} — check battery wear level and charge cycles"
+fi
+
+# ─── Network ─────────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${CYAN}${BOLD}Network Security:${NC}"
+rec "Run ${YELLOW}${BOLD}networkz${NC} — audit open ports, connections, DNS, and reachability"
+
+if $HAS_FIREWALL; then
+    rec "Verify your firewall rules — securityz and portz cover this, but networkz gives deeper detail"
+else
+    rec "${RED}${BOLD}Install a firewall${NC} — no firewall detected (apt install ufw && ufw enable)"
+fi
+
+if [[ $LISTENING_PORTS -gt 10 ]]; then
+    rec "${YELLOW}You have $LISTENING_PORTS listening TCP ports — review which are necessary"
+fi
+
+# ─── SSH hardening ───────────────────────────────────────────────────────
+if $HAS_SSHD; then
+    echo ""
+    echo -e "  ${CYAN}${BOLD}SSH Hardening:${NC}"
+    rec "Run ${YELLOW}${BOLD}sshauditz${NC} — comprehensive SSH server configuration, cryptography & key audit"
+    rec "securityz audits sshd_config — review its findings carefully"
+    rec "Consider running ${YELLOW}abusez${NC} to check for brute-force attempts in SSH logs"
+    rec "Run ${YELLOW}checkz${NC} for real-time SSH login monitoring"
+fi
+
+# ─── Database ────────────────────────────────────────────────────────────
+if $HAS_POSTGRES; then
+    echo ""
+    echo -e "  ${CYAN}${BOLD}Database:${NC}"
+    rec "Run ${YELLOW}${BOLD}sqlz${NC} — check for long queries, locks, bloat, and replication health"
+fi
+
+# ─── Python tools ────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${CYAN}${BOLD}Python Tools (install missing deps for more coverage):${NC}"
+
+missing_py=()
+$HAS_SCAPY || missing_py+=("scapy")
+$HAS_PSUTIL || missing_py+=("psutil")
+$HAS_FLASK || missing_py+=("flask")
+$HAS_URWID || missing_py+=("urwid")
+$HAS_REQUESTS || missing_py+=("requests")
+
+if [[ ${#missing_py[@]} -gt 0 ]]; then
+    rec "Install missing Python modules to unlock more tools:"
+    echo -e "     ${DIM}pip install ${missing_py[*]}${NC}"
+    echo ""
+    echo -e "     This would enable:"
+    if ! $HAS_SCAPY; then
+        echo -e "       ${GREEN}+${NC} analyzer.py        — packet capture & analysis"
+        echo -e "       ${GREEN}+${NC} live_leak_detector.py — advanced TUI network analyzer"
+        echo -e "       ${GREEN}+${NC} my_monitor.py      — local traffic monitor"
+    fi
+    if ! $HAS_PSUTIL; then
+        echo -e "       ${GREEN}+${NC} info.py            — detailed network interface info"
+    fi
+    if ! $HAS_FLASK || ! $HAS_REQUESTS; then
+        echo -e "       ${GREEN}+${NC} web_server.py      — web-based connection visualizer"
+    fi
+    if ! $HAS_REQUESTS; then
+        echo -e "       ${GREEN}+${NC} tracemap.py        — ASCII traceroute with geo-mapping"
+    fi
+else
+    rec "All Python dependencies present — full Python tool suite available"
+fi
+
+# ─── General ─────────────────────────────────────────────────────────────
+echo ""
+echo -e "  ${CYAN}${BOLD}General Hygiene:${NC}"
+rec "Review security recommendations and run ${YELLOW}hardenz --dry-run${NC} to preview CIS remediation"
+rec "Run ${YELLOW}benchmarkz${NC} to measure system compute, memory, disk, and network speed"
+rec "Run this orchestrator (${BOLD}allz${NC}) weekly to track changes over time"
+rec "Re-run ${BOLD}securityz${NC} after any system change (new packages, config edits)"
+rec "Consider installing: ${DIM}rkhunter chkrootkit debsums auditd${NC}"
+rec "Keep packages updated: ${DIM}sudo apt update && sudo apt upgrade${NC}"
+rec "Review cron jobs and systemd timers periodically"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║                      SUMMARY                                    ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${RED}${BOLD}MUST RUN     : $MUST_RUN${NC}"
+echo -e "  ${YELLOW}${BOLD}RECOMMENDED  : $RECOMMENDED${NC}"
+echo -e "  ${GREEN}${BOLD}OPTIONAL     : $OPTIONAL${NC}"
+echo -e "  ${DIM}SKIP         : $NOT_APPLICABLE${NC}"
+echo ""
+
+TOTAL_SCRIPTS=$((MUST_RUN + RECOMMENDED + OPTIONAL + NOT_APPLICABLE))
+RUNNABLE=$((MUST_RUN + RECOMMENDED + OPTIONAL))
+echo -e "  Total scripts in suite : ${BOLD}$TOTAL_SCRIPTS${NC}"
+echo -e "  Applicable to this host: ${BOLD}$RUNNABLE${NC}"
+echo -e "  Not applicable         : ${DIM}$NOT_APPLICABLE${NC}"
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RUN PROMPT & EXECUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+run_script() {
+    local script="$1"
+    shift
+    local path="$SCRIPT_DIR/$script"
+    if [[ ! -f "$path" ]]; then
+        echo -e "  ${RED}✗ $script not found${NC}"
+        return
+    fi
+    if [[ ! -x "$path" ]]; then
+        chmod +x "$path" 2>/dev/null || true
+    fi
+    echo ""
+    echo -e "${MAGENTA}${BOLD}▶▶▶ Running: $script $*${NC}"
+    echo -e "${MAGENTA}${BOLD}────────────────────────────────────────────────────────────${NC}"
+    if [[ "$script" == *.py ]]; then
+        python3 "$path" "$@" </dev/null 2>&1 || true
+    else
+        bash "$path" "$@" </dev/null 2>&1 || true
+    fi
+    echo -e "${MAGENTA}${BOLD}◀◀◀ Done: $script ${NC}"
+    echo ""
+}
+
+echo -e "${BOLD}──────────────────────────────────────────────────────────────────${NC}"
+echo ""
+echo -e "  ${BOLD}What would you like to run?${NC}"
+echo ""
+echo -e "    ${RED}1${NC}) Run MUST-RUN scripts only       (securityz, portz, slowz, logz, sshauditz)"
+echo -e "    ${YELLOW}2${NC}) Run MUST-RUN + RECOMMENDED    (hardware, network & spec diagnostics)"
+echo -e "    ${GREEN}3${NC}) Run ALL applicable scripts    (everything that matches this system)"
+echo -e "    ${BLUE}4${NC}) Choose scripts individually"
+echo -e "    ${CYAN}q${NC}) Quit — just show recommendations"
+echo -e "    ${MAGENTA}f${NC}) Quick essentials scan (~10-20s, no prompts)"
+echo ""
+
+if [[ -n "$RUN_TARGET" ]]; then
+    case "${RUN_TARGET,,}" in
+        1|must|must-run) choice="1" ;;
+        2|rec|recommended) choice="2" ;;
+        3|all) choice="3" ;;
+        *) choice="$RUN_TARGET" ;;
+    esac
+    echo -e "  ${BOLD}Auto-selected from --run flag:${NC} $choice"
+elif [[ $BATCH -eq 1 ]] || [[ ! -t 0 ]]; then
+    choice="q"
+    echo -e "  ${DIM}Batch mode / non-interactive: defaulting to quit (review recommendations above).${NC}"
+else
+    read -rp "  Choice [1-4/q]: " choice || choice="q"
+fi
+
+case "${choice,,}" in
+    f|quick)
+        run_quick
+        exit $?
+        ;;
+    1)
+        echo ""
+        echo -e "  ${RED}${BOLD}Running MUST-RUN scripts...${NC}"
+        run_script "securityz"
+        run_script "portz"
+        run_script "slowz"
+        run_script "logz"
+        $HAS_SSHD && run_script "sshauditz"
+        ;;
+    2)
+        echo ""
+        echo -e "  ${YELLOW}${BOLD}Running MUST-RUN + RECOMMENDED scripts...${NC}"
+        run_script "securityz"
+        run_script "portz"
+        run_script "slowz"
+        run_script "logz"
+        $HAS_SSHD && run_script "sshauditz"
+        run_script "specz"
+        run_script "cpuz"
+        run_script "memoryz"
+        run_script "diskz"
+        run_script "networkz"
+        $HAS_SYSTEMD && $HAS_JOURNAL && run_script "bootz"
+        $HAS_GPU && run_script "gpuz"
+        $HAS_BATTERY && run_script "powerz"
+        $HAS_POSTGRES && run_script "sqlz"
+        $HAS_AI_CONFIG && run_script "aiz"
+        $HAS_PYTHON && $HAS_PSUTIL && run_script "info.py"
+        ;;
+    3)
+        echo ""
+        echo -e "  ${GREEN}${BOLD}Running ALL applicable scripts...${NC}"
+        # Shell scripts
+        run_script "securityz"
+        run_script "portz"
+        run_script "slowz"
+        run_script "logz"
+        $HAS_SSHD && run_script "sshauditz"
+        run_script "specz"
+        for s in cpuz memoryz diskz networkz; do
+            run_script "$s"
+        done
+        $HAS_SYSTEMD && $HAS_JOURNAL && run_script "bootz"
+        $HAS_GPU && run_script "gpuz"
+        $HAS_BATTERY && run_script "powerz"
+        $HAS_USB && run_script "usbz"
+        $HAS_PCI && run_script "pciz"
+        $HAS_POSTGRES && run_script "sqlz"
+        $HAS_AI_CONFIG && run_script "aiz"
+        $HAS_SSHD && run_script "abusez"
+        run_script "hardenz" "--dry-run"
+        # Python scripts
+        $HAS_PYTHON && $HAS_PSUTIL && run_script "info.py"
+        $HAS_PYTHON && $HAS_SCAPY && run_script "analyzer.py"
+        $HAS_PYTHON && $HAS_SCAPY && $HAS_URWID && run_script "live_leak_detector.py"
+        $HAS_PYTHON && $HAS_SCAPY && run_script "my_monitor.py"
+        $HAS_PYTHON && $HAS_REQUESTS && $HAS_INTERNET && run_script "tracemap.py"
+        $HAS_PYTHON && $HAS_FLASK && $HAS_REQUESTS && run_script "web_server.py"
+        $HAS_SSHD && $HAS_PYTHON && run_script "render_reports.py"
+        ;;
+    4)
+        echo ""
+        echo -e "  ${BLUE}${BOLD}Enter script numbers separated by spaces (e.g. 1 3 5):${NC}"
+        echo ""
+        # Build numbered list of runnable scripts
+        ALL_SCRIPTS=()
+        IDX=0
+        for s in securityz portz slowz logz sshauditz specz cpuz memoryz diskz networkz bootz gpuz powerz usbz pciz sqlz ai.sh hardenz benchmarkz timingz abusez checkz info.py analyzer.py live_leak_detector.py my_monitor.py tracemap.py web_server.py render_reports.py; do
+            if [[ -f "$SCRIPT_DIR/$s" ]]; then
+                ((IDX += 1))
+                ALL_SCRIPTS+=("$s")
+                echo -e "    ${BOLD}$IDX${NC}) $s"
+            fi
+        done
+        echo ""
+        read -rp "  Scripts to run: " selections || selections=""
+        for num in $selections; do
+            if [[ "$num" -ge 1 && "$num" -le ${#ALL_SCRIPTS[@]} ]] 2>/dev/null; then
+                target_script="${ALL_SCRIPTS[$((num - 1))]}"
+                if [[ "$target_script" == "securityz" ]]; then
+                    run_script "$target_script"
+                elif [[ "$target_script" == "hardenz" ]]; then
+                    run_script "$target_script" "--dry-run"
+                else
+                    run_script "$target_script"
+                fi
+            else
+                echo -e "  ${RED}Skipping invalid selection: $num${NC}"
+            fi
+        done
+        ;;
+    q|quit|exit|"")
+        echo ""
+        echo -e "  ${DIM}Exiting — review recommendations above.${NC}"
+        ;;
+    *)
+        echo -e "  ${RED}Unknown choice: $choice${NC}"
+        ;;
+esac
+
+echo ""
+echo -e "  ${BOLD}Orchestrator completed at: $(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+echo ""
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "allz complete: batch=$BATCH quick=$QUICK run_target=${RUN_TARGET:-all}" 2>/dev/null || true
+fi

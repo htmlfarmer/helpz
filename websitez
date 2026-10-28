@@ -1,0 +1,1877 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# websitez — Universal Website Audit & Diagnostics
+# ----------------------------------------------------------------------------
+# Pass it any URL (or domain), and it tells you:
+#   - Speed & connectivity: DNS, TCP, TLS, TTFB, total — multi-sample stats
+#   - HTTP response headers (full map)
+#   - Security-header audit (HSTS, CSP, X-Frame-Options, X-Content-Type-Options …)
+#   - TLS certificate: issuer, subject, validity, days remaining
+#   - DNS deep dive: A/AAAA/MX/NS/TXT/CNAME/SOA/CAA/SRV/NAPTR with TTL +
+#     resolver stats; SOA serial/refresh/retry/expire/min-TTL parsed;
+#     TXT categorized into SPF / DMARC / DKIM / MTA-STS / TLS-RPT /
+#     verification records
+#   - WHOIS deep: registrar, created/updated/expires, nameservers, status
+#     flags, DNSSEC, abuse contact, reseller, IANA/registry IDs, referral
+#     URL, domain age; plus IP-whois for ASN / org / CIDR / net-abuse
+#   - Refresh / redirect policy: HTTP Refresh header + <meta http-equiv>
+#     + redirect hops
+#   - HTML structure & key code: doctype, lang, charset, meta tags,
+#     Open Graph + Twitter Cards, JSON-LD, scripts (inline vs external,
+#     async/defer/module, preload/prefetch), stylesheets, iframes, forms
+#   - JS module load timing: per-script HTTP timing (DNS/TCP/TLS/TTFB/
+#     total + size), slowest first, total JS payload
+#   - Technology fingerprint: ~15 framework signatures (WordPress,
+#     Next.js, React, Vue, Hono, Bun, Caddy, Nginx, Cloudflare,
+#     Leaflet, DOMPurify …)
+#   - Third-party connections: external domains referenced by HTML
+#   - robots.txt + sitemap.xml deep parse: index vs sitemap, URL count,
+#     lastmod/priority/changefreq stats, first/last modified, gzip
+#     detection, additional sitemaps discovered in robots.txt
+#   - API discovery: probes common paths and prints ready-to-run curl
+#     examples
+#   - Traceroute to origin with geo
+#   - Geo-location of every public endpoint
+#
+# Usage:
+#   ./websitez xyzo.org
+#   ./websitez https://xyzo.org
+#   ./websitez hivv.org --quick
+#   ./websitez xyzo.org --api-only
+#   ./websitez xyzo.org --json
+#   ./websitez xyzo.org --outdir ./reports
+#   ./websitez xyzo.org --depth deep   (quick | deep | forensic)
+#   ./websitez xyzo.org --samples 20
+#
+# Requires: curl (required). Optional but recommended: dig/host, openssl,
+# whois, jq, traceroute. Missing optional tools are skipped with a warning
+# rather than crashing the script.
+#
+# A timestamped .txt report is saved to ./website-reports/ by default. Pass
+# --json to also save a machine-readable summary. Pass --outdir DIR to change
+# the destination.
+# ============================================================================
+
+set +o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ─── Defaults ─────────────────────────────────────────────────────────────
+URL=""
+QUICK=0
+API_ONLY=0
+WRITE_JSON=0
+OUTDIR="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")-reports"
+DEPTH="quick"             # quick | deep | forensic
+SAMPLE_N=3
+declare -a TARGETS=()
+declare -a LIVE_ENDPOINTS=()
+
+while [[ $# -gt 0 ]]; do
+    # Bare "help" / "?" as the only argument should show help
+    if [[ "${1}" == "help" || "${1}" == "?" ]]; then
+        set -- --help
+    fi
+    case "$1" in
+        --quick)             QUICK=1; DEPTH="quick"; SAMPLE_N=3 ;;
+        --api-only)          API_ONLY=1 ;;
+        --json)              WRITE_JSON=1 ;;
+        --outdir)            OUTDIR="$2"; shift ;;
+        --depth)             DEPTH="${2:-quick}"; case "$DEPTH" in
+                                 quick)    SAMPLE_N=3 ;;
+                                 deep)     SAMPLE_N=10 ;;
+                                 forensic) SAMPLE_N=20 ;;
+                             esac ;;
+        --samples)           SAMPLE_N="${2:-3}" ;;
+        --no-color)          NO_COLOR=1 ;;
+        --ai)                AI_VERDICT=1 ;;
+        --no-ai)             AI_VERDICT=0 ;;
+        -h|--help)
+            cat << 'EOF'
+
+  ╭─────────────────────────────────────────────────────────────╮
+  │         websitez — Universal Website Audit                │
+  ╰─────────────────────────────────────────────────────────────╯
+
+USAGE
+  ./websitez <url|domain> [options]
+
+OPTIONS
+  --quick             Fast pass: skip whois, TLS deep dive, traceroute
+  --api-only          Only run API discovery + curl examples
+  --json              Also write a JSON summary
+  --outdir DIR        Where to save reports (default: ./website-reports)
+  --depth MODE        quick (default) | deep | forensic
+  --samples N         Override timing sample count (auto by depth)
+  --no-color          Plain output (for piping / logs)
+  -h, --help          Show this help
+
+EXAMPLES
+  ./websitez xyzo.org
+  ./websitez https://hivv.org --json
+  ./websitez xyzo.org --quick
+  ./websitez xyzo.org --api-only
+  ./websitez xyzo.org --depth deep --samples 20
+
+SECTIONS PRODUCED
+  0   Realm snapshot (local IP / network)
+  1   Speed & connectivity (DNS/TCP/TLS/TTFB/total — multi-sample stats)
+  2   HTTP response headers (full map)
+  3   Security headers audit
+  4   TLS certificate (issuer / subject / SANs / days remaining)
+  5   DNS deep (every record type with TTL, resolver stats, SOA breakdown,
+      TXT categorized as SPF/DMARC/DKIM/MTA-STS/TLS-RPT/verification,
+      CAA authorized CAs)
+  5b  WHOIS deep (registrar, dates, nameservers, status flags, DNSSEC,
+      abuse, reseller, IANA/registry IDs, referral, age) + IP-whois
+      (ASN, CIDR, network abuse)
+  5c  Refresh / redirect policy (HTTP Refresh header + meta refresh +
+      redirect hops)
+  6   HTML structure & key code (doctype / lang / charset / meta tags /
+      OG / Twitter / JSON-LD / scripts / stylesheets / iframes / forms)
+  6b  JS module load timing (per-script DNS/TCP/TLS/TTFB/total + size)
+  7   Third-party connections
+  8   robots.txt + sitemap.xml deep (index vs sitemap, URL count,
+      lastmod / priority / changefreq stats, gzip, additional sitemaps
+      discovered via robots.txt)
+  9   Traceroute to origin
+  10  API discovery + ready-to-run curl examples
+
+REQUIRES
+  curl                  (required)
+  dig / host / getent   (one of these, for DNS)
+  openssl               (optional, for TLS cert details)
+  whois                 (optional, for hosting/ASN info)
+  jq                    (optional, for pretty-printing API responses)
+  traceroute            (optional, for hop-by-hop latency)
+  xmlstarlet / xmllint  (optional, for sitemap XML parsing)
+
+OUTPUT
+  All run results are appended (tee) to a timestamped .txt report.
+  --json adds a parallel .json file with structured findings.
+EOF
+            exit 0 ;;
+        *)
+            TARGETS+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "websitez" "QUICK=$QUICK JSON_OUT=$WRITE_JSON" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    echo "Usage: $0 <url|domain> [--quick] [--api-only] [--json] [--outdir DIR] [--depth MODE]" >&2
+    echo "Try '$0 --help' for details." >&2
+    exit 1
+fi
+
+# ─── Helpers ──────────────────────────────────────────────────────────────
+have() { command -v "$1" >/dev/null 2>&1; }
+warn_missing() {
+    local tool="$1" purpose="$2"
+    if ! have "$tool"; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "  ${C_YELLOW}!${C_RESET} ${C_DIM}%s not installed — skipping %s${C_RESET}\n" "$tool" "$purpose"
+        fi
+        return 1
+    fi
+    return 0
+}
+# Safe integer coercion: tail to last line, strip non-digits, default to 0
+safe_int() {
+    local val
+    val=$(echo "${1:-}" | tail -1 | tr -dc '0-9')
+    echo "${val:-0}"
+}
+
+# ─── Normalize targets ────────────────────────────────────────────────────
+for i in "${!TARGETS[@]}"; do
+    if [[ ! "${TARGETS[$i]}" =~ ^https?:// ]]; then
+        TARGETS[$i]="https://${TARGETS[$i]}"
+    fi
+done
+
+# ─── Output setup ─────────────────────────────────────────────────────────
+HOST_LEAD="${TARGETS[0]}"
+HOST_LEAD="${HOST_LEAD#https://}"
+HOST_LEAD="${HOST_LEAD#http://}"
+HOST_LEAD="${HOST_LEAD%%/*}"
+HOST_LEAD="${HOST_LEAD%%:*}"
+mkdir -p "$OUTDIR"
+STAMP=$(date +%Y%m%d-%H%M%S)
+REPORT="$OUTDIR/${HOST_LEAD}-${STAMP}.txt"
+JSON_REPORT="$OUTDIR/${HOST_LEAD}-${STAMP}.json"
+
+# Capture output (tee to report file) but still echo to terminal.
+if [[ $JSON_OUT -eq 0 ]]; then
+    exec > >(tee -a "$REPORT") 2>&1
+fi
+
+# ─── Banner ───────────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  WEBSITE.SH  — Universal Website Audit & Diagnostics         ║
+   ║  DNS · WHOIS · TLS · Speed · Headers · JS · Sitemap · API    ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}Targets: %s${C_RESET}\n" "${TARGETS[*]}"
+    printf "${C_DIM}Depth:   %s   Samples: %d   Quick: %s   Report: %s${C_RESET}\n" \
+        "$DEPTH" "$SAMPLE_N" "$QUICK" "$REPORT"
+    echo ""
+fi
+
+CURL_UA="websitez/1.1 (+diagnostic probe)"
+CURL_BASE=(curl -sS -L --max-redirs 5 --max-time 15 -A "$CURL_UA")
+
+# ─────────────────────────────────────────────────────────────────────────
+# AUDIT EACH TARGET SEQUENTIALLY
+# ─────────────────────────────────────────────────────────────────────────
+for URL in "${TARGETS[@]}"; do
+    if [[ -z "$URL" ]]; then continue; fi
+
+    # Strip scheme/host/path from URL
+    if [[ "$URL" =~ ^https?:// ]]; then
+        URL_SCHEME="${URL%%://*}"
+        URL_REST="${URL#*://}"
+    else
+        URL_SCHEME="https"
+        URL_REST="$URL"
+    fi
+    URL_HOST="${URL_REST%%/*}"
+    URL_HOST="${URL_HOST%%:*}"
+    URL_REST="${URL_REST#*/}"
+    URL_PATH="/${URL_REST}"
+
+    if [[ $JSON_OUT -eq 0 ]]; then
+        printf "${C_BOLD}${C_CYAN}━━━ AUDIT: %s ━━━${C_RESET}\n" "$URL"
+        printf "${C_DIM}  depth=%s  samples=%d  quick=%s  api-only=%s${C_RESET}\n\n" \
+            "$DEPTH" "$SAMPLE_N" "$QUICK" "$API_ONLY"
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 0: REALM SNAPSHOT
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $JSON_OUT -eq 0 ]]; then
+        printf "${C_BOLD}  ── 0. REALM SNAPSHOT ──${C_RESET}\n"
+        printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Local IP:" "$(hostname -I 2>/dev/null | awk '{print $1}' || echo "?")"
+        if have curl; then
+            localip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Local network:" \
+                "$(enrich_ip "$localip" 2>/dev/null || echo "?")"
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 1: SPEED & CONNECTIVITY (multi-sample stats)
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 1. SPEED & CONNECTIVITY ──${C_RESET}\n"
+            printf "  ${C_DIM}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "Sampling:" "$SAMPLE_N samples — min/median/avg/p95/max/σ"
+        fi
+
+        declare -a S_DNS=() S_CONN=() S_TLS=() S_TTFB=() S_TOTAL=()
+        LAST_CODE="" LAST_PROTO="" LAST_ALPN="" LAST_REMOTE="" LAST_REDIRS="0"
+
+        # Use --http2 to enable ALPN h2 detection
+        CURL_TIMING=(curl -sS -L --max-redirs 5 --max-time 15 --http2 \
+            -A "$CURL_UA" -o /dev/null -D /tmp/website-sh-hdr.$$ \
+            -w "%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{http_code}|%{http_version}|%{alpn_protocol}|%{remote_ip}|%{num_redirects}")
+
+        set +e +o pipefail
+        for (( s=1; s<=SAMPLE_N; s++ )); do
+            line=$("${CURL_TIMING[@]}" "$URL" 2>/dev/null)
+            [[ -z "$line" ]] && continue
+            line="${line//$'\r'/}"
+            # Use last complete line only (in case of stderr noise)
+            line=$(grep -E '^[0-9.]+\|[0-9.]+\|' <<< "$line" | tail -1)
+            [[ -z "$line" ]] && continue
+            S_DNS+=($(awk -F'|' '{print $1}'   <<< "$line"))
+            S_CONN+=($(awk -F'|' '{print $2}' <<< "$line"))
+            S_TLS+=($(awk -F'|' '{print $3}' <<< "$line"))
+            S_TTFB+=($(awk -F'|' '{print $4}' <<< "$line"))
+            S_TOTAL+=($(awk -F'|' '{print $5}' <<< "$line"))
+            LAST_CODE=$(awk -F'|' '{print $6}' <<< "$line")
+            LAST_PROTO=$(awk -F'|' '{print $7}' <<< "$line")
+            LAST_ALPN=$(awk -F'|' '{print $8}' <<< "$line")
+            LAST_REMOTE=$(awk -F'|' '{print $9}' <<< "$line")
+            LAST_REDIRS=$(awk -F'|' '{print $10}' <<< "$line")
+        done
+        set +e +o pipefail
+
+        # Stats helper — min/median/avg/p95/max/σ per phase
+        stats_row() {
+            local name="$1"; shift
+            local arr=("$@")
+            [[ ${#arr[@]} -eq 0 ]] && return
+            local out
+            out=$(awk -v a="$*" 'BEGIN {
+                n = split(a, v, " ")
+                for (i = 1; i <= n; i++) { if (v[i] == "" || v[i] == "0") continue; m[++mc] = v[i] + 0 }
+                if (mc == 0) { printf "(no samples)"; exit }
+                mn = m[1]; mx = m[1]; sum = 0
+                for (i = 1; i <= mc; i++) { if (m[i] < mn) mn = m[i]; if (m[i] > mx) mx = m[i]; sum += m[i] }
+                avg = sum / mc
+                for (i = 1; i < mc; i++) for (j = i+1; j <= mc; j++) if (m[i] > m[j]) { t = m[i]; m[i] = m[j]; m[j] = t }
+                med = (mc % 2 == 1) ? m[(mc+1)/2] : (m[mc/2] + m[mc/2+1]) / 2
+                pi = int((mc * 95) / 100); if (pi < 1) pi = 1; if (pi > mc) pi = mc; p95 = m[pi]
+                ss = 0
+                for (i = 1; i <= mc; i++) ss += (m[i] - avg) * (m[i] - avg)
+                sd = (mc > 1) ? sqrt(ss / (mc - 1)) : 0
+                printf "min=%.3fs  median=%.3fs  avg=%.3fs  p95=%.3fs  max=%.3fs  σ=%.3f", mn, med, avg, p95, mx, sd
+            }')
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}%-12s${C_RESET} ${C_CYAN}%s${C_RESET} ${C_DIM}(n=%d)${C_RESET}\n" \
+                    "$name" "$out" "${#arr[@]}"
+            fi
+        }
+
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%s${C_RESET}\n" "Last HTTP code:" "$LAST_CODE"
+            printf "  ${C_DIM}%-22s${C_RESET} %s\n" "HTTP protocol:" "$LAST_PROTO"
+            printf "  ${C_DIM}%-22s${C_RESET} %s\n" "ALPN:" "${LAST_ALPN:-none}"
+            printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Origin IP:" "${LAST_REMOTE:-?}"
+            printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Redirects seen:" "${LAST_REDIRS:-0}"
+
+            printf "\n  ${C_DIM}Stats (s):${C_RESET}\n"
+            stats_row "DNS"      "${S_DNS[@]}"
+            stats_row "TCP/Conn" "${S_CONN[@]}"
+            stats_row "TLS"      "${S_TLS[@]}"
+            stats_row "TTFB"     "${S_TTFB[@]}"
+            stats_row "Total"    "${S_TOTAL[@]}"
+        fi
+
+        # Score based on median total
+        med_total=$(awk -v a="${S_TOTAL[*]}" 'BEGIN{
+            n=split(a,v," "); arr_n=0
+            for(i=1;i<=n;i++) if(v[i]!=""){m[++arr_n]=v[i]+0}
+            if(arr_n==0){print ""; exit}
+            for(i=1;i<arr_n;i++) for(j=i+1;j<=arr_n;j++) if(m[i]>m[j]){t=m[i];m[i]=m[j];m[j]=t}
+            if(arr_n%2==1) print m[(arr_n+1)/2]; else print (m[arr_n/2]+m[arr_n/2+1])/2
+        }')
+        if [[ -n "$med_total" ]]; then
+            SPEED_SCORE=$(awk -v t="$med_total" 'BEGIN{
+                if (t < 0.5) s=100;
+                else if (t < 1.0) s=90;
+                else if (t < 2.0) s=75;
+                else if (t < 4.0) s=60;
+                else if (t < 8.0) s=40;
+                else s=20;
+                printf "%d", s
+            }')
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%d/100${C_RESET} ${C_DIM}(median=%.3fs)${C_RESET}\n" \
+                    "Speed score:" "$SPEED_SCORE" "$med_total"
+                if [[ "$SPEED_SCORE" -lt 60 ]]; then
+                    printf "  ${C_RED}✗${C_RESET} ${C_BOLD}Site is slower than expected${C_RESET}\n"
+                elif [[ "$SPEED_SCORE" -ge 90 ]]; then
+                    printf "  ${C_GREEN}✓${C_RESET} ${C_BOLD}Site is fast${C_RESET}\n"
+                fi
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 2: HTTP RESPONSE HEADERS
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 2. HTTP RESPONSE HEADERS ──${C_RESET}\n"
+        fi
+        HEADERS=$("${CURL_BASE[@]}" -sI "$URL" 2>/dev/null)
+        if [[ -n "$HEADERS" ]]; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                echo "$HEADERS" | sed 's/^/  /'
+            fi
+            SERVER=$(echo "$HEADERS"   | grep -i '^server:'           | head -1 | cut -d: -f2- | xargs)
+            POWERED=$(echo "$HEADERS"  | grep -i '^x-powered-by:'     | head -1 | cut -d: -f2- | xargs)
+            ENCODING=$(echo "$HEADERS" | grep -i '^content-encoding:' | head -1 | cut -d: -f2- | xargs)
+            CACHE=$(echo "$HEADERS"    | grep -i '^cache-control:'    | head -1 | cut -d: -f2- | xargs)
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}(no headers — site may be unreachable)${C_RESET}\n"
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 3: SECURITY HEADERS AUDIT
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 && -n "${HEADERS:-}" ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 3. SECURITY HEADERS ──${C_RESET}\n"
+        fi
+        # Check the presence of each
+        check_sec_header() {
+            local name="$1"
+            local value
+            value=$(echo "$HEADERS" | grep -i "^${name}:" | head -1 | sed -E "s/^[^:]+:[[:space:]]*//" | tr -d '\r')
+            if [[ -n "$value" ]]; then
+                if [[ $JSON_OUT -eq 0 ]]; then
+                    printf "  ${C_GREEN}✓${C_RESET} %s present" "$name"
+                    case "$name" in
+                        strict-transport-security)
+                            if [[ "$value" =~ max-age=([0-9]+) ]]; then
+                                local ma="${BASH_REMATCH[1]}"
+                                if (( ma < 31536000 )); then
+                                    printf "  ${C_DIM}(max-age=%d, <1y — too short)${C_RESET}" "$ma"
+                                else
+                                    printf "  ${C_DIM}(max-age=%d, %0.1fy)${C_RESET}" "$ma" "$(awk -v s="$ma" 'BEGIN{printf "%.1f", s/31536000}')"
+                                fi
+                                if [[ "$value" != *"includeSubDomains"* ]]; then
+                                    printf " ${C_YELLOW}!${C_RESET} missing includeSubDomains"
+                                fi
+                                if [[ "$value" != *"preload"* ]]; then
+                                    printf " ${C_DIM}(no preload)${C_RESET}"
+                                fi
+                            else
+                                printf " ${C_RED}!${C_RESET} no max-age directive"
+                            fi
+                            ;;
+                        content-security-policy)
+                            if [[ "$value" == *"unsafe-inline"* || "$value" == *"unsafe-eval"* ]]; then
+                                printf "  ${C_RED}!${C_RESET} contains unsafe-inline/unsafe-eval"
+                            fi
+                            local csp_lower
+                            csp_lower=$(tr '[:upper:]' '[:lower:]' <<<"$value")
+                            for dir in default-src script-src object-src; do
+                                local dv
+                                dv=$(awk -v d="$dir" 'BEGIN{RS=";"} $1==d {sub(/^[^ ]+ */,""); print}' <<<"$csp_lower" | head -1 | tr -d ' ')
+                                if [[ "$dv" == "*" || "$dv" == "* "* ]]; then
+                                    printf "  ${C_YELLOW}!${C_RESET} ${dir}=* (overly permissive)"
+                                    break
+                                fi
+                            done
+                            if [[ "$value" != *"frame-ancestors"* ]]; then
+                                printf "  ${C_DIM}(no frame-ancestors — fallback to X-Frame-Options)${C_RESET}"
+                            fi
+                            ;;
+                        x-frame-options)
+                            local xfo_lc
+                            xfo_lc=$(tr '[:upper:]' '[:lower:]' <<<"$value" | tr -d ' ')
+                            if [[ "$xfo_lc" != "deny" && "$xfo_lc" != "sameorigin" ]]; then
+                                printf "  ${C_YELLOW}!${C_RESET} weak value: '%s'" "$value"
+                            fi
+                            ;;
+                        referrer-policy)
+                            local rp_lc
+                            rp_lc=$(tr '[:upper:]' '[:lower:]' <<<"$value" | tr -d ' ')
+                            case "$rp_lc" in
+                                unsafe-url|no-referrer-when-downgrade) printf "  ${C_YELLOW}!${C_RESET} leaks referrer on downgrade" ;;
+                            esac
+                            ;;
+                        permissions-policy)
+                            if [[ ${#value} -lt 20 ]]; then
+                                printf "  ${C_DIM}(near-empty policy — no features restricted)${C_RESET}"
+                            fi
+                            ;;
+                    esac
+                    printf "\n"
+                fi
+            else
+                if [[ $JSON_OUT -eq 0 ]]; then
+                    printf "  ${C_YELLOW}!${C_RESET} %s ${C_DIM}missing${C_RESET}\n" "$name"
+                fi
+            fi
+        }
+        check_sec_header "strict-transport-security"
+        check_sec_header "content-security-policy"
+        check_sec_header "x-frame-options"
+        check_sec_header "x-content-type-options"
+        check_sec_header "referrer-policy"
+        check_sec_header "permissions-policy"
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 4: TLS CERTIFICATE (skip in --quick)
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 && $QUICK -eq 0 && "$URL_SCHEME" == "https" ]]; then
+        if have openssl; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n${C_BOLD}  ── 4. TLS CERTIFICATE ──${C_RESET}\n"
+            fi
+            set +e
+            CERT=$(timeout 10 openssl s_client -servername "$URL_HOST" \
+                -connect "${URL_HOST}:443" </dev/null 2>/dev/null \
+                | openssl x509 -noout -issuer -subject -dates 2>/dev/null)
+            # Depth #14: full chain verification against system trust store.
+            # -verify_return_error makes s_client exit non-zero if chain validation fails.
+            CHAIN_VERIFY_OUT=$(timeout 10 openssl s_client -servername "$URL_HOST" \
+                -connect "${URL_HOST}:443" -verify_return_error </dev/null 2>&1 || true)
+            # Pull the "Verify return code:" / "Verification" lines for display.
+            CHAIN_RESULT=$(grep -E '^Verify return code|^Verification|^verify return' <<<"$CHAIN_VERIFY_OUT" | head -3 || true)
+            # Also capture SAN count + sig algorithm via the leaf cert.
+            if [[ -n "$CERT" ]]; then
+                SAN_COUNT=$(timeout 5 openssl s_client -servername "$URL_HOST" \
+                    -connect "${URL_HOST}:443" </dev/null 2>/dev/null \
+                    | openssl x509 -noout -text 2>/dev/null \
+                    | grep -cE '^\s*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\s*=' \
+                    || echo 0)
+                SIG_ALGO=$(timeout 5 openssl s_client -servername "$URL_HOST" \
+                    -connect "${URL_HOST}:443" </dev/null 2>/dev/null \
+                    | openssl x509 -noout -text 2>/dev/null \
+                    | awk -F: '/Signature Algorithm/ {gsub(/^[ \t]+/, ""); print $1": "$2; exit}' \
+                    || true)
+            fi
+            set -e
+            if [[ -n "$CERT" ]]; then
+                if [[ $JSON_OUT -eq 0 ]]; then
+                    echo "$CERT" | sed 's/^/  /'
+                fi
+                # Calculate days remaining
+                end_date=$(echo "$CERT" | awk -F= '/notAfter=/{print $2; exit}')
+                if [[ -n "$end_date" ]]; then
+                    end_epoch=$(date -d "$end_date" +%s 2>/dev/null || echo 0)
+                    if [[ "$end_epoch" -gt 0 ]]; then
+                        days=$(( (end_epoch - $(date +%s)) / 86400 ))
+                        if [[ $JSON_OUT -eq 0 ]]; then
+                            color="${C_GREEN}"
+                            [[ $days -lt 30 ]] && color="${C_YELLOW}"
+                            [[ $days -lt 7 ]]  && color="${C_RED}"
+                            printf "  ${C_DIM}%-22s${C_RESET} ${color}%d days${C_RESET}\n" \
+                                "Days remaining:" "$days"
+                            [[ $days -lt 14 ]] && \
+                                printf "  ${C_RED}✗${C_RESET} Cert expires in $days days — renew via 'sudo certbot renew'\n"
+                        fi
+                    fi
+                fi
+                # Depth #14: chain, SAN count, signature algorithm
+                if [[ -n "${SAN_COUNT:-}" ]]; then
+                    printf "  ${C_DIM}%-22s${C_RESET} %s\n" "SAN entries:" "$SAN_COUNT"
+                fi
+                if [[ -n "${SIG_ALGO:-}" ]]; then
+                    color="${C_GREEN}"
+                    # SHA-1 signatures on a leaf cert are considered weak
+                    if [[ "$SIG_ALGO" == *"sha1"* || "$SIG_ALGO" == *"SHA1"* ]]; then
+                        color="${C_RED}"
+                    fi
+                    printf "  ${C_DIM}%-22s${C_RESET} ${color}%s${C_RESET}\n" "Signature algorithm:" "$SIG_ALGO"
+                fi
+                if [[ -n "${CHAIN_RESULT:-}" ]]; then
+                    if grep -qi 'ok$\|^Verification: OK' <<<"$CHAIN_RESULT"; then
+                        printf "  ${C_DIM}%-22s${C_RESET} ${C_GREEN}OK (trusted)${C_RESET}\n" "Chain validation:"
+                    else
+                        printf "  ${C_DIM}%-22s${C_RESET} ${C_RED}FAILED${C_RESET}\n" "Chain validation:"
+                        printf "      ${C_DIM}%s${C_RESET}\n" "$(head -1 <<<"$CHAIN_RESULT" | cut -c1-100)"
+                    fi
+                fi
+            else
+                if [[ $JSON_OUT -eq 0 ]]; then
+                    printf "  ${C_DIM}(could not retrieve cert)${C_RESET}\n"
+                fi
+            fi
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n${C_BOLD}  ── 4. TLS CERTIFICATE ──${C_RESET}\n"
+                printf "  ${C_DIM}openssl not installed — skipping TLS detail${C_RESET}\n"
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 5: DNS RECORDS (deep) — every type, TTL, resolver stats,
+    # SOA breakdown, TXT categorized, CAA, geo of origin
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 5. DNS DEEP DIVE ──${C_RESET}\n"
+        fi
+        IP=""
+        # Records we'll collect for downstream sections
+        DNS_A_COUNT=0; DNS_AAAA_COUNT=0; DNS_MX_COUNT=0
+        DNS_NS_COUNT=0; DNS_TXT_COUNT=0; DNS_SOA=""; DNS_CAA_COUNT=0
+        TTL_MIN=0; TTL_MAX=0
+        declare -a SCRIPT_URLS_INTERNAL=()
+        declare -a SCRIPT_URLS_EXTERNAL=()
+
+        if have dig; then
+            # ── Resolver / stats panel ─────────────────────────────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                STATS=$(dig +stats "$URL_HOST" A 2>/dev/null | grep -E '^;;' \
+                    | grep -iE 'server:|query time:|when:|msg size:|flags:' )
+                if [[ -n "$STATS" ]]; then
+                    printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Resolver stats:" ""
+                    echo "$STATS" | sed -E 's/^;;[[:space:]]*//' \
+                        | sed 's/^/    /'
+                fi
+            fi
+
+            # ── Query every record type with TTL ────────────────────────
+            for T in A AAAA MX NS TXT CNAME SOA CAA SRV NAPTR; do
+                # Skip SRV/NAPTR for apex records (they are service-specific)
+                if [[ "$T" == "SRV" || "$T" == "NAPTR" ]]; then
+                    [[ -z "$(dig +short "$URL_HOST" "$T" 2>/dev/null)" ]] && continue
+                fi
+
+                RAW=$(dig +noall +answer +ttlunits "$URL_HOST" "$T" 2>/dev/null \
+                    | grep -E "^${URL_HOST//./\\.}\.[[:space:]]+[0-9]+([smhd])?([0-9]+[smhd])?[[:space:]]+IN[[:space:]]+${T}\b" \
+                    || true)
+                # Fallback: match by IN class + record type anywhere on line
+                if [[ -z "$RAW" ]]; then
+                    RAW=$(dig +noall +answer +ttlunits "$URL_HOST" "$T" 2>/dev/null \
+                        | grep -E "IN[[:space:]]+${T}\b" || true)
+                fi
+                [[ -z "$RAW" ]] && continue
+
+                # Count by type
+                DNS_COUNT=$(echo "$RAW" | wc -l)
+                case "$T" in
+                    A)     DNS_A_COUNT=$DNS_COUNT ;;
+                    AAAA)  DNS_AAAA_COUNT=$DNS_COUNT ;;
+                    MX)    DNS_MX_COUNT=$DNS_COUNT ;;
+                    NS)    DNS_NS_COUNT=$DNS_COUNT ;;
+                    TXT)   DNS_TXT_COUNT=$DNS_COUNT ;;
+                    CNAME) DNS_CNAME_COUNT=$DNS_COUNT ;;
+                    SOA)   DNS_SOA_COUNT=$DNS_COUNT ;;
+                    CAA)   DNS_CAA_COUNT=$DNS_COUNT ;;
+                esac
+
+                # Extract first resolved A and TTL mins/maxes
+                if [[ "$T" == "A" ]]; then
+                    IP=$(echo "$RAW" | awk 'NR==1 {print $5; exit}')
+                fi
+                if [[ "$T" == "SOA" ]]; then
+                    DNS_SOA=$(echo "$RAW" | head -1)
+                fi
+
+                if [[ $JSON_OUT -eq 0 ]]; then
+                    echo "$RAW" | while IFS= read -r line; do
+                        TTL=$(awk '{print $2}' <<< "$line")
+                        DATA=$(awk '{for(i=5;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line" \
+                            | sed 's/[^[:print:]]//g; s/^ //; s/ $//')
+                        # Track min/max
+                        update_ttl() {
+                            # shellcheck disable=SC2034
+                            local t="$1"
+                            echo "$t"
+                        }
+                        printf "  ${C_DIM}%-6s${C_RESET} ${C_MAGENTA}%-8s${C_RESET} %s\n" \
+                            "$T" "ttl=$TTL" "$DATA"
+                    done
+                fi
+            done
+
+            # ── TTL min/max summary ────────────────────────────────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                ALL_TTLS=$(dig +noall +answer +ttlunits "$URL_HOST" ANY 2>/dev/null \
+                    | awk '$4 ~ /^(A|AAAA|MX|NS|TXT|CNAME|CAA)$/ {print $2}' \
+                    | grep -E '^[0-9]+(s|m|h|d)?$' || true)
+                if [[ -n "$ALL_TTLS" ]]; then
+                    TTL_MIN=$(awk '{print $1+0}' <<< "$ALL_TTLS" | sort -n | head -1)
+                    TTL_MAX=$(awk '{print $1+0}' <<< "$ALL_TTLS" | sort -n | tail -1)
+                    printf "\n  ${C_DIM}%-22s${C_RESET} %s records  ttl_range=%s..%s\n" \
+                        "Record counts:" \
+                        "$(echo "$ALL_TTLS" | wc -l | tr -d ' ')" "$TTL_MIN" "$TTL_MAX"
+                fi
+            fi
+
+            # ── SOA breakdown ───────────────────────────────────────────
+            if [[ -n "$DNS_SOA" && $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  SOA (zone authority):${C_RESET}\n"
+                # SOA RDATA is: primary NS, admin email (with first . replaced by @), serial, refresh, retry, expire, min-TTL
+                echo "$DNS_SOA" | awk '{
+                    ns=$5; admin=$6; serial=$7; refresh=$8; retry=$9; expire=$10; min=$11
+                    # Convert admin (root.example.net → root@example.net)
+                    gsub("\\.", "@", admin); sub("@", ".", admin)
+                    printf "    Primary NS : %s\n", ns
+                    printf "    Admin MB   : %s\n", admin
+                    printf "    Serial     : %s\n", serial
+                    printf "    Refresh    : %s\n", refresh
+                    printf "    Retry      : %s\n", retry
+                    printf "    Expire     : %s\n", expire
+                    printf "    Min TTL    : %s\n", min
+                }'
+            fi
+
+            # ── TXT records: categorize SPF/DMARC/DKIM/MTA-STS/TLS-RPT ─
+            TXT=$(dig +noall +answer "$URL_HOST" TXT 2>/dev/null \
+                | awk '{$1=""; $2=""; $3=""; $4=""; sub(/^[[:space:]]+/,""); print}' \
+                | sed 's/" "//g; s/^"//; s/"$//')
+            if [[ -n "$TXT" && $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  TXT (categorized):${C_RESET}\n"
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && continue
+                    case "$line" in
+                        "v=spf1"*)              cat_lbl="${C_CYAN}SPF${C_RESET}";         cat_dim="" ;;
+                        *"v=DMARC1"*)           cat_lbl="${C_CYAN}DMARC${C_RESET}";       cat_dim="" ;;
+                        *"v=DKIM1"*)            cat_lbl="${C_CYAN}DKIM${C_RESET}";        cat_dim="" ;;
+                        *"mta-sts"*)            cat_lbl="${C_CYAN}MTA-STS${C_RESET}";     cat_dim="" ;;
+                        *"v=TLSRPTv1"*)         cat_lbl="${C_CYAN}TLS-RPT${C_RESET}";     cat_dim="" ;;
+                        google-site-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Google" ;;
+                        MS=*)                   cat_lbl="${C_CYAN}MS${C_RESET}";          cat_dim="" ;;
+                        facebook-domain-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Facebook" ;;
+                        apple-domain-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Apple" ;;
+                        docusign=*)             cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" DocuSign" ;;
+                        atlassian-domain-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Atlassian" ;;
+                        adobe-idp-site-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Adobe" ;;
+                        *"v=BIMI1"*)            cat_lbl="${C_CYAN}BIMI${C_RESET}";        cat_dim="" ;;
+                        protonmail-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Proton" ;;
+                        mailgun=*)              cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Mailgun" ;;
+                        h1-domain-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" H1" ;;
+                        globalsign-smime-dv=*)  cat_lbl="${C_CYAN}S/MIME${C_RESET}";      cat_dim="" ;;
+                        cisco-ci-domain-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Cisco" ;;
+                        stripe-verification=*)  cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Stripe" ;;
+                        zoom_verify_*)          cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" Zoom" ;;
+                        onetrust-domain-verification=*)\
+                            cat_lbl="${C_GREEN}Verify${C_RESET}";   cat_dim=" OneTrust" ;;
+                        *)                      cat_lbl="${C_DIM}Other${C_RESET}";       cat_dim="" ;;
+                    esac
+                    printf "    %b %-12s %s\n" "$cat_lbl" "$cat_dim" "$line"
+                done <<< "$TXT"
+            fi
+
+            # ── CAA — which CAs are authorized ─────────────────────────
+            CAA=$(dig +noall +answer "$URL_HOST" CAA 2>/dev/null \
+                | awk '{$1=""; $2=""; $3=""; $4=""; sub(/^[[:space:]]+/,""); print}' \
+                | sed 's/" "//g; s/^"//; s/"$//')
+            if [[ -n "$CAA" && $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  CAA (authorized CAs):${C_RESET}\n"
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && continue
+                    printf "    ${C_MAGENTA}%s${C_RESET}\n" "$line"
+                done <<< "$CAA"
+            fi
+
+            # Fallback IP from simple dig if +noall +answer produced none
+            if [[ -z "$IP" ]]; then
+                IP=$(dig +short "$URL_HOST" A 2>/dev/null | grep -v '^;' | head -1)
+            fi
+        elif have host; then
+            host "$URL_HOST" 2>/dev/null | sed 's/^/  /'
+            IP=$(getent hosts "$URL_HOST" 2>/dev/null | awk '{print $1}' | head -1)
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}dig/host not installed — using getent fallback${C_RESET}\n"
+                getent hosts "$URL_HOST" 2>/dev/null | sed 's/^/  /'
+            fi
+            IP=$(getent hosts "$URL_HOST" 2>/dev/null | awk '{print $1}' | head -1)
+        fi
+
+        # ── Resolved IP + geo (always show once we have it) ───────────
+        if [[ -n "$IP" && $JSON_OUT -eq 0 ]]; then
+            printf "\n  ${C_DIM}%-22s${C_RESET} ${C_CYAN}%s${C_RESET}\n" "Resolved A:" "$IP"
+            printf "  ${C_DIM}%-22s${C_RESET} ${C_CYAN}%s${C_RESET}\n" "Geo of origin:" \
+                "$(enrich_ip "$IP" 2>/dev/null || echo "?")"
+        fi
+
+        # ─────────────────────────────────────────────────────────────────
+        # SECTION 5b: WHOIS DEEP — domain registrar + IP network / ASN
+        # ─────────────────────────────────────────────────────────────────
+        if [[ $QUICK -eq 0 && $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 5b. WHOIS — REGISTRAR & NETWORK ──${C_RESET}\n"
+            if have whois; then
+                # ── Domain whois ──────────────────────────────────────────
+                printf "  ${C_BOLD}Domain registration:${C_RESET}\n"
+                set +e +o pipefail
+                WHD=$(timeout 12 whois "$URL_HOST" 2>/dev/null)
+                set +e +o pipefail
+
+                if [[ -n "$WHD" ]]; then
+                    # Helper: pull value of a "Key: value" line
+                    wh_field() {
+                        local label="$1"
+                        echo "$WHD" | grep -iE "^[[:space:]]*${label}[[:space:]]*:" \
+                            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//'
+                    }
+
+                    REGISTRAR=$(wh_field 'Registrar')
+                    [[ -z "$REGISTRAR" ]] && REGISTRAR=$(echo "$WHD" \
+                        | grep -iE 'Sponsoring Registrar' | head -1 \
+                        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    REGISTRAR_URL=$(wh_field 'Registrar URL')
+                    [[ -z "$REGISTRAR_URL" ]] && REGISTRAR_URL=$(echo "$WHD" \
+                        | grep -iE '^(Registrar Website|Referral URL)' | head -1 \
+                        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+
+                    CREATED_RAW=$(echo "$WHD" \
+                        | grep -iE '(Creation Date|Created:|Created Date|Registered on|Registered:|Registration Date)' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    EXPIRES_RAW=$(echo "$WHD" \
+                        | grep -iE '(Registry Expiry Date|Expiration Date|Expires:|Expires on|Expiry Date)' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    UPDATED_RAW=$(echo "$WHD" \
+                        | grep -iE '(Updated Date|Last Updated|Last Modified|Modified Date)' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+
+                    [[ -n "$REGISTRAR"     ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Registrar:" "$REGISTRAR"
+                    [[ -n "$REGISTRAR_URL" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Registrar URL:" "$REGISTRAR_URL"
+                    [[ -n "$CREATED_RAW"   ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Created:" "$CREATED_RAW"
+                    [[ -n "$UPDATED_RAW"   ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Last updated:" "$UPDATED_RAW"
+
+                    # Expiry with countdown + heat
+                    EXPIRES_HUMAN="$EXPIRES_RAW"
+                    if [[ -n "$EXPIRES_RAW" ]] && have date; then
+                        EX_EPOCH=$(date -d "$EXPIRES_RAW" +%s 2>/dev/null || echo 0)
+                        if [[ "$EX_EPOCH" -gt 0 ]]; then
+                            DLEFT=$(( (EX_EPOCH - $(date +%s)) / 86400 ))
+                            EX_COLOR="${C_GREEN}"
+                            [[ $DLEFT -lt 30 ]] && EX_COLOR="${C_YELLOW}"
+                            [[ $DLEFT -lt 7  ]] && EX_COLOR="${C_RED}"
+                            printf "    ${C_DIM}%-22s${C_RESET} %s ${EX_COLOR}(%d days)${C_RESET}\n" \
+                                "Expires:" "$EXPIRES_HUMAN" "$DLEFT"
+                            [[ $DLEFT -lt 0 ]] && \
+                                printf "    ${C_RED}✗ Domain is expired${C_RESET}\n"
+                        else
+                            printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Expires:" "$EXPIRES_HUMAN"
+                        fi
+                    else
+                        [[ -n "$EXPIRES_HUMAN" ]] && \
+                            printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Expires:" "$EXPIRES_HUMAN"
+                    fi
+
+                    # Domain age
+                    if [[ -n "$CREATED_RAW" ]] && have date; then
+                        CR_EPOCH=$(date -d "$CREATED_RAW" +%s 2>/dev/null || echo 0)
+                        if [[ "$CR_EPOCH" -gt 0 ]]; then
+                            AGE_DAYS=$(( ($(date +%s) - CR_EPOCH) / 86400 ))
+                            YEARS=$(( AGE_DAYS / 365 ))
+                            REM=$(( AGE_DAYS % 365 ))
+                            printf "    ${C_DIM}%-22s${C_RESET} ~%d years %d days (%d total days)\n" \
+                                "Domain age:" "$YEARS" "$REM" "$AGE_DAYS"
+                            # Save for JSON
+                            WHOIS_AGE_DAYS="$AGE_DAYS"
+                        fi
+                    fi
+
+                    # Nameservers
+                    NS_LIST=$(echo "$WHD" \
+                        | grep -iE '^[[:space:]]*Name Server[[:space:]]*:|^[[:space:]]*Nameserver[[:space:]]*:' \
+                        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' \
+                        | tr 'A-Z' 'a-z' | sort -u)
+                    NS_N=0
+                    if [[ -n "$NS_LIST" ]]; then
+                        NS_N=$(echo "$NS_LIST" | wc -l)
+                        printf "    ${C_DIM}%-22s${C_RESET} %d found\n" "Nameservers:" "$NS_N"
+                        echo "$NS_LIST" | head -8 | sed 's/^/      ↳ /'
+                        [[ $NS_N -gt 8 ]] && printf "      ${C_DIM}… and %d more${C_RESET}\n" "$((NS_N-8))"
+                    fi
+
+                    # Status flags
+                    STATUS=$(echo "$WHD" \
+                        | grep -iE '^[[:space:]]*(Domain Status|Status)[[:space:]]*:' \
+                        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' \
+                        | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+                    if [[ -n "$STATUS" ]]; then
+                        printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Domain status:" "$STATUS"
+                        WHOIS_STATUS="$STATUS"
+                    fi
+
+                    # DNSSEC
+                    DNSSEC=$(echo "$WHD" | grep -iE '^[[:space:]]*DNSSEC[[:space:]]*:' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    if [[ -n "$DNSSEC" ]]; then
+                        case "${DNSSEC,,}" in
+                            *unsigned*) DS_COLOR="${C_RED}" ;;
+                            *signed*)   DS_COLOR="${C_GREEN}" ;;
+                            *)          DS_COLOR="${C_DIM}" ;;
+                        esac
+                        printf "    ${C_DIM}%-22s${C_RESET} ${DS_COLOR}%s${C_RESET}\n" "DNSSEC:" "$DNSSEC"
+                        WHOIS_DNSSEC="$DNSSEC"
+                    fi
+
+                    # Reseller / IANA / Registry
+                    RESELLER=$(echo "$WHD" | grep -iE '^[[:space:]]*Reseller[[:space:]]*:' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    [[ -n "$RESELLER" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Reseller:" "$RESELLER"
+
+                    IANA_ID=$(echo "$WHD" | grep -iE '^[[:space:]]*(Registrar IANA ID|IANA ID)[[:space:]]*:' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    [[ -n "$IANA_ID" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Registrar IANA ID:" "$IANA_ID"
+
+                    REG_ID=$(echo "$WHD" | grep -iE '^[[:space:]]*Registry Domain ID[[:space:]]*:' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    [[ -n "$REG_ID" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Registry Domain ID:" "$REG_ID"
+
+                    REG_NAME=$(echo "$WHD" | grep -iE '^[[:space:]]*Registry[[:space:]]*:' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    [[ -n "$REG_NAME" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Registry:" "$REG_NAME"
+
+                    # Abuse contacts
+                    ABUSE_REG=$(echo "$WHD" \
+                        | grep -iE '^[[:space:]]*(Registrar Abuse Contact Email|Registrar Abuse Contact|Abuse Contact)[[:space:]]*:' \
+                        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                    [[ -n "$ABUSE_REG" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Registrar abuse:" "$ABUSE_REG"
+                else
+                    printf "    ${C_DIM}(domain whois returned no data)${C_RESET}\n"
+                fi
+
+                # ── IP whois (ASN / org / CIDR / net abuse) ────────────────
+                if [[ -n "$IP" ]]; then
+                    printf "\n  ${C_BOLD}Network / ASN:${C_RESET}\n"
+                    set +e +o pipefail
+                    WHI=$(timeout 12 whois "$IP" 2>/dev/null)
+                    set -e +o pipefail
+
+                    if [[ -n "$WHI" ]]; then
+                        # ASN (Origin / aut-num / as-name)
+                        ASN_LINE=$(echo "$WHI" | grep -iE '^[[:space:]]*(OriginAS|origin|aut-num|as-name)[[:space:]]*:' \
+                            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                        [[ -n "$ASN_LINE" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "ASN:" "$ASN_LINE"
+
+                        # Org / netname / descr
+                        for LBL in 'OrgName' 'Organization' 'org-name' 'descr' 'netname' 'NetName'; do
+                            V=$(echo "$WHI" | grep -iE "^[[:space:]]*${LBL}[[:space:]]*:" \
+                                | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                            [[ -n "$V" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "$LBL:" "$V"
+                        done
+
+                        # Country
+                        CTRY=$(echo "$WHI" | grep -iE '^[[:space:]]*(Country|country)[[:space:]]*:' \
+                            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                        [[ -n "$CTRY" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Country:" "$CTRY"
+
+                        # CIDR / route / inetnum / inet6num
+                        CIDRS=$(echo "$WHI" | grep -iE '^[[:space:]]*(inetnum|inet6num|route|route6|CIDR|NetRange|Customer|Prefix|Address)[[:space:]]*:' \
+                            | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' \
+                            | sort -u | head -5)
+                        if [[ -n "$CIDRS" ]]; then
+                            printf "    ${C_DIM}%-22s${C_RESET}\n" "Allocated block(s):"
+                            echo "$CIDRS" | sed 's/^/      ↳ /'
+                        fi
+
+                        # Network abuse contact
+                        NABUSE=$(echo "$WHI" \
+                            | grep -iE '^[[:space:]]*(OrgAbuseEmail|abuse-mailbox|abuse-c|Abuse Contact)[[:space:]]*:' \
+                            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+                        [[ -n "$NABUSE" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Network abuse:" "$NABUSE"
+                    fi
+                fi
+
+                # Save for JSON
+                WHOIS_REGISTRAR="$REGISTRAR"
+            else
+                warn_missing whois "WHOIS / Registrar / ASN lookup"
+            fi
+        fi
+
+        # ─────────────────────────────────────────────────────────────────
+        # SECTION 5c: REFRESH / REDIRECT POLICY
+        # ─────────────────────────────────────────────────────────────────
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 5c. REFRESH / REDIRECT POLICY ──${C_RESET}\n"
+            # 5c.1 HTTP Refresh header
+            REFRESH_HDR=$(echo "${HEADERS:-}" | grep -i '^refresh:' \
+                | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+            if [[ -n "$REFRESH_HDR" ]]; then
+                R_DELAY=$(awk '{print $1}' <<< "$REFRESH_HDR")
+                R_URL=$(awk '{print $2}' <<< "$REFRESH_HDR")
+                printf "  ${C_CYAN}●${C_RESET} ${C_BOLD}HTTP Refresh header${C_RESET} ${C_DIM}→ delay=%ss  target=%s${C_RESET}\n" \
+                    "${R_DELAY:-?}" "${R_URL:-<same page>}"
+            else
+                printf "  ${C_DIM}— no HTTP Refresh header${C_RESET}\n"
+            fi
+
+            # 5c.2 <meta http-equiv="refresh">
+            META_REFRESH=$(echo "${BODY:-}" | grep -oiE '<meta[^>]*http-equiv=["'"'"']?refresh["'"'"']?[^>]*>' | head -1)
+            if [[ -n "$META_REFRESH" ]]; then
+                CONTENT=$(echo "$META_REFRESH" | grep -oiE 'content=["'"'"'][^"'"'"']*' | head -1 \
+                    | sed -E 's/content=["'"'"']//I; s/["'"'"']$//')
+                META_DELAY=$(awk -F';' '{print $1}' <<< "$CONTENT" | sed 's/[[:space:]]*$//' | sed 's/^[[:space:]]*//; s/[^0-9].*//')
+                META_URL=$(awk -F'url=' '{print $2}' <<< "$CONTENT" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed 's/["'"'"']//g')
+                printf "  ${C_CYAN}●${C_RESET} ${C_BOLD}meta refresh${C_RESET}         ${C_DIM}→ delay=%ss  target=%s${C_RESET}\n" \
+                    "${META_DELAY:-?}" "${META_URL:-<same page>}"
+            fi
+
+            # 5c.3 Redirect hops observed in curl
+            if [[ "${LAST_REDIRS:-0}" -gt 0 ]]; then
+                printf "  ${C_CYAN}●${C_RESET} ${C_BOLD}Redirect hops${C_RESET}        ${C_DIM}→ %s redirect(s) followed${C_RESET}\n" "$LAST_REDIRS"
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 6: HTML STRUCTURE & KEY CODE
+    #   doctype / lang / charset / meta tags / OG / Twitter / JSON-LD
+    #   scripts (inline vs external, async/defer/module/preload)
+    #   stylesheets / iframes / forms / framework fingerprints
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 ]]; then
+        # All metrics below are diagnostic counts/greps — failures are non-fatal.
+        set +e
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 6. HTML STRUCTURE & KEY CODE ──${C_RESET}\n"
+        fi
+        BODY=$("${CURL_BASE[@]}" "$URL" 2>/dev/null)
+        if [[ -n "$BODY" ]]; then
+            [[ -n "${SERVER:-}"  ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Server header:"  "$SERVER"
+            [[ -n "${POWERED:-}" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "X-Powered-By:"   "$POWERED"
+            [[ -n "${ENCODING:-}" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Compression:" "$ENCODING" \
+                || printf "  ${C_YELLOW}!${C_RESET} No Content-Encoding — response isn't compressed\n"
+
+            # ── 6.1 Document basics: doctype, lang, charset ────────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                DOCTYPE=$(echo "$BODY" | head -1 | grep -oiE '<!doctype[^>]*>')
+                [[ -n "$DOCTYPE" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "DOCTYPE:" "$(sed -E 's/<!/- /; s/>/$/' <<< "$DOCTYPE" | head -c 80)"
+
+                H_LANG=$(echo "$BODY" | grep -oiE '<html[^>]*\slang=["'"'"'][^"'"'"']*' | head -1 \
+                    | grep -oiE 'lang=["'"'"'][^"'"'"']*' | head -1 | sed -E 's/lang=["'"'"']//; s/["'"'"']$//')
+                [[ -n "$H_LANG" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Document lang:" "$H_LANG"
+
+                CHARSET=$(echo "$BODY" | grep -oiE 'charset=["'"'"']?[^"'"'"'>[:space:]]+' | head -1 \
+                    | sed -E 's/charset=["'"'"']?//; s/["'"'"']$//')
+                [[ -n "$CHARSET" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Charset:" "$CHARSET"
+
+                VIEWPORT=$(echo "$BODY" | grep -oiE '<meta[^>]*name=["'"'"']viewport["'"'"'][^>]*>' | head -1 \
+                    | sed -E 's/.*content=["'"'"']*([^"'"'"']*)["'"'"']*.*/Viewport: \1/' \
+                    | head -1)
+                [[ -n "$VIEWPORT" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Viewport meta:" "$VIEWPORT"
+
+                # Body size & DOM size estimate
+                B_SIZE=$(echo -n "$BODY" | wc -c)
+                B_LINES=$(echo "$BODY" | wc -l)
+                printf "  ${C_DIM}%-22s${C_RESET} %s bytes, %s lines\n" "Body size:" "$B_SIZE" "$B_LINES"
+            fi
+
+            # ── 6.2 Standard meta tags (description/keywords/author/etc) ─
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  Meta tags:${C_RESET}\n"
+                for tag in description keywords author robots theme-color generator application-name referrer color-scheme; do
+                    META_VAL=$(echo "$BODY" | TAG="${tag}" python3 <<'PYEOF'
+import re, sys, os
+src = sys.stdin.read()
+tag = os.environ.get('TAG', '')
+m = re.search(r'<meta[^>]*name=["\x27]?' + re.escape(tag) + r'["\x27]?[^>]*content="([^"]+)"', src)
+print(m.group(1) if m else '')
+PYEOF
+)
+                    [[ -n "$META_VAL" ]] && \
+                        printf "    ${C_DIM}%-12s${C_RESET} %s\n" "$tag:" "$META_VAL"
+                done
+            fi
+
+            # ── 6.3 Open Graph + Twitter Cards + JSON-LD ───────────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                OG_COUNT=$(safe_int "$(echo "$BODY" | grep -ciE '<meta[^>]*property=\"og:' 2>/dev/null)")
+                if [[ $OG_COUNT -gt 0 ]]; then
+                    printf "\n  ${C_BOLD}  Open Graph${C_RESET} ${C_DIM}- %s tags -${C_RESET}\n" "$OG_COUNT"
+                    echo "$BODY" | python3 <<'PYEOF'
+import re, sys
+pat = re.compile(r'<meta[^>]+property="og:([^"]+)"[^>]+content="([^"]+)"')
+for line in sys.stdin.read().splitlines()[:10]:
+    m = pat.search(line)
+    if m:
+        print('    og:' + m.group(1) + ' = ' + m.group(2))
+PYEOF
+                fi
+
+                TW_COUNT=$(echo "$BODY" | grep -ciE '<meta[^>]*name="twitter:')
+                if [[ $TW_COUNT -gt 0 ]]; then
+                    printf "\n  ${C_BOLD}  Twitter Cards${C_RESET} ${C_DIM}- %s tags -${C_RESET}\n" "$TW_COUNT"
+                    echo "$BODY" | python3 <<'PYEOF'
+import re, sys
+pat = re.compile(r'<meta[^>]+name="twitter:([^"]+)"[^>]+content="([^"]+)"')
+for line in sys.stdin.read().splitlines()[:8]:
+    m = pat.search(line)
+    if m:
+        print('    twitter:' + m.group(1) + ' = ' + m.group(2))
+PYEOF
+                fi
+
+                JL_BLOBS=$(echo "$BODY" | grep -c 'application/ld+json')
+                if [[ $JL_BLOBS -gt 0 ]]; then
+                    printf "\n  ${C_BOLD}  JSON-LD structured data${C_RESET} ${C_DIM}- %s blocks -${C_RESET}\n" "$JL_BLOBS"
+                    echo "$BODY" | python3 <<'PYEOF'
+import re, sys
+src = sys.stdin.read()
+types = set(re.findall(r'"@type"\s*:\s*"([^"]+)"', src))
+for t in sorted(types)[:8]:
+    print('    ' + t)
+PYEOF
+                fi
+            fi
+
+            # ── 6.4 Script inventory (inline vs external + attributes) ───
+            if [[ $JSON_OUT -eq 0 ]]; then
+                # All script tags (excluding data blocks)
+                S_TAGS=$(echo "$BODY" | grep -oiE '<script[^>]*>' | head -200)
+                S_COUNT=$(safe_int "$(echo "$S_TAGS" | grep -c '<script' 2>/dev/null)")
+                INLINE_COUNT=$(safe_int "$(echo "$BODY" | grep -c -E '<script[^>]*>([[:space:]]*$|[^<])' 2>/dev/null)")
+
+                # External scripts with their attributes - via Python heredoc for clean parsing
+                EXTERNAL_SCRIPTS=$(echo "$S_TAGS" | python3 <<'PYEOF'
+import re, sys
+attrs_pat = {
+    'async':       re.compile(r'\basync\b'),
+    'defer':       re.compile(r'\bdefer\b'),
+    'nomodule':    re.compile(r'\bnomodule\b'),
+    'module':      re.compile(r'type=["'"'"']?module'),
+    'crossorigin': re.compile(r'\bcrossorigin\b'),
+    'sri':         re.compile(r'\bintegrity=['"'"'"]'),
+    'nonce':       re.compile(r'\bnonce=['"'"'"]'),
+}
+src_pat = re.compile(r'src=["'"'"']([^"'"'"']+)["'"'"']')
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('<script'):
+        continue
+    m = src_pat.search(line)
+    if not m:
+        continue
+    src = m.group(1)
+    flags = []
+    for label, pat in attrs_pat.items():
+        if pat.search(line):
+            flags.append('ATTR=' + label)
+    print('SRC=' + src + (' ' + ' '.join(flags) if flags else ''))
+PYEOF
+                )
+
+                # Count externals/inlines
+                EXT_COUNT=$(echo "$EXTERNAL_SCRIPTS" | grep -c "^SRC=" 2>/dev/null)
+                EXT_COUNT=${EXT_COUNT:-0}
+                EXT_COUNT=$(echo "$EXT_COUNT" | tail -1 | tr -dc '0-9')
+                EXT_COUNT=${EXT_COUNT:-0}
+                ASYNC_COUNT=$(safe_int "$(echo "$EXTERNAL_SCRIPTS" | grep -c "ATTR=async" 2>/dev/null)")
+                DEFER_COUNT=$(safe_int "$(echo "$EXTERNAL_SCRIPTS" | grep -c "ATTR=defer" 2>/dev/null)")
+                MOD_COUNT=$(safe_int "$(echo "$EXTERNAL_SCRIPTS" | grep -c "ATTR=module" 2>/dev/null)")
+                SRI_COUNT=$(safe_int "$(echo "$EXTERNAL_SCRIPTS" | grep -c "ATTR=sri" 2>/dev/null)")
+
+                printf "\n  ${C_BOLD}  Script inventory:${C_RESET}\n"
+                printf "    ${C_DIM}%-22s${C_RESET} %s total (%s external, %s inline-typed body)${C_RESET}\n" \
+                    "Scripts in <script>:" "$S_COUNT" "$EXT_COUNT" "$INLINE_COUNT"
+
+                # Render attribute breakdown
+                if [[ "$EXT_COUNT" -gt 0 ]]; then
+                    printf "    ${C_DIM}%-22s${C_RESET} async=%s  defer=%s  module=%s  sri=%s\n" \
+                        "Attribute counts:" "$ASYNC_COUNT" "$DEFER_COUNT" "$MOD_COUNT" "$SRI_COUNT"
+                    if [[ "$SRI_COUNT" -gt 0 ]]; then
+                        printf "      ${C_GREEN}✓${C_RESET} ${C_DIM}SRI enabled on %d script(s) — good integrity posture${C_RESET}\n" "$SRI_COUNT"
+                    elif [[ "$EXT_COUNT" -gt 2 ]]; then
+                        printf "      ${C_YELLOW}!${C_RESET} ${C_DIM}No SRI on external scripts — consider adding integrity attributes${C_RESET}\n"
+                    fi
+                    if [[ "$MOD_COUNT" -gt 0 && "$DEFER_COUNT" -eq 0 && "$ASYNC_COUNT" -eq 0 ]]; then
+                        printf "      ${C_DIM}Note: ESM scripts load deferred by default${C_RESET}\n"
+                    fi
+                    # Show first 20 external scripts
+                    printf "\n    ${C_DIM}External script URLs (sorted by impact):${C_RESET}\n"
+                    echo "$EXTERNAL_SCRIPTS" | grep "^SRC=" | sort -u | head -20 | sed 's/^      /      /; s/SRC=//; s/ATTR=/[/; s/$/]/'
+
+                    # Stash the list for Section 6b
+                    BODY_SCRIPT_LIST=$(echo "$EXTERNAL_SCRIPTS" | grep "^SRC=" \
+                        | sed 's/SRC=//; s/[[:space:]].*ATTR=.*//' | sort -u)
+                fi
+            fi
+
+            # ── 6.5 Inline content / key code fingerprints ─────────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                # Detect module / loader / framework code patterns
+                printf "\n  ${C_BOLD}  Key code fingerprints (HTML body matches):${C_RESET}\n"
+                declare -A CODE_SIGNS=(
+                    ["ESM imports"]="^[[:space:]]*(import\\s|import\\{)"
+                    ["JSON inlined"]='application/json[^>]*>[[:space:]]*\\{'
+                    ["Stripe.js"]="stripe\\.com/v"
+                    ["Google Analytics"]="gtag\\(|ga\\('"
+                    ["Google Tag Manager"]="googletagmanager"
+                    ["Segment"]="segment\\.com"
+                    ["Sentry"]="sentry"
+                    ["Intercom"]="intercom"
+                    ["Hotjar"]="hotjar"
+                    ["Mixpanel"]="mixpanel"
+                    ["Cloudflare beacon"]="cloudflareinsights"
+                    ["OpenTelemetry"]="opentelemetry"
+                    ["Vercel analytics"]="va\\.vercel-scripts"
+                    ["Build manifest"]="BUILD_ID"
+                    ["Service worker"]="navigator\\.serviceWorker\\.register"
+                    ["WebSocket init"]="new WebSocket\\("
+                )
+                FOUND_CODE=0
+                for name in "${!CODE_SIGNS[@]}"; do
+                    pat="${CODE_SIGNS[$name]}"
+                    if echo "$BODY" | grep -qiE "$pat"; then
+                        printf "    ${C_GREEN}●${C_RESET} ${C_BOLD}%-22s${C_RESET} ${C_DIM}(%s)${C_RESET}\n" "$name" "$pat"
+                        FOUND_CODE=1
+                    fi
+                done
+                [[ $FOUND_CODE -eq 0 ]] && printf "    ${C_DIM}(no major third-party trackers / module patterns matched)${C_RESET}\n"
+            fi
+
+            # ── 6.6 Stylesheets / iframes / forms / preloaders ─────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  Other elements:${C_RESET}\n"
+
+                # Stylesheets
+                CSS_COUNT=$(safe_int "$(echo "$BODY" | grep -cE '<link[^>]*rel=[\"'\'']stylesheet[\"'\'']|<style' 2>/dev/null)")
+                CSS_INTERNAL=$(safe_int "$(echo "$BODY" | grep -oE '<link[^>]*rel=[\"'\'']stylesheet[\"'\''][^>]*href=[\"'\''][^\"'\'']+' \
+                    | grep -oE 'href=[\"'\''][^\"'\'']+' | grep -v "http" | wc -l 2>/dev/null)")
+                CSS_EXTERNAL=$(safe_int "$(echo "$BODY" | grep -oE '<link[^>]*rel=[\"'\'']stylesheet[\"'\''][^>]*href=[\"'\'']https?://[^\"'\'']+' \
+                    | wc -l 2>/dev/null)")
+                printf "    ${C_DIM}%-22s${C_RESET} %s links/styles (≈%s external, %s internal)${C_RESET}\n" \
+                    "Stylesheets:" "$CSS_COUNT" "$CSS_EXTERNAL" "$CSS_INTERNAL"
+
+                # Iframes
+                IFRAME_COUNT=$(safe_int "$(echo "$BODY" | grep -c '<iframe' 2>/dev/null)")
+                IFRAME_3P=$(safe_int "$(echo "$BODY" | grep -oE '<iframe[^>]*src=[\"'\'']https?://[^\"'\'']+' \
+                    | grep -cv "$URL_HOST" 2>/dev/null)")
+                IFRAME_SAME=$(safe_int "$(echo "$BODY" | grep -cE '<iframe[^>]*src=[\"'\''][^\"'\'']*'\"$URL_HOST\" 2>/dev/null)")
+                printf "    ${C_DIM}%-22s${C_RESET} %s total - approx %s third-party -\n" \
+                    "Iframes:" "$IFRAME_COUNT" "$IFRAME_3P"
+
+                # Forms
+                FORM_COUNT=$(safe_int "$(echo "$BODY" | grep -c '<form' 2>/dev/null)")
+                INPUT_COUNT=$(safe_int "$(echo "$BODY" | grep -c '<input' 2>/dev/null)")
+                printf "    ${C_DIM}%-22s${C_RESET} %s forms, %s inputs${C_RESET}\n" \
+                    "Forms:" "$FORM_COUNT" "$INPUT_COUNT"
+
+                # Preload/prefetch hints
+                PRELOAD=$(safe_int "$(echo "$BODY" | grep -coE '<link[^>]*rel=[\"'\''](preload|prefetch|preconnect|dns-prefetch|modulepreload)[\"'\'']' 2>/dev/null)")
+                MODULE_PRELOAD=$(safe_int "$(echo "$BODY" | grep -cE '<link[^>]*rel=[\"'\'']modulepreload[\"'\'']' 2>/dev/null)")
+                printf "    ${C_DIM}%-22s${C_RESET} %s hint(s); modulepreload=%s${C_RESET}\n" \
+                    "Resource hints:" "$PRELOAD" "$MODULE_PRELOAD"
+
+                # Inline styles?
+                INLINE_STYLES=$(safe_int "$(echo "$BODY" | grep -cE '<style[^>]*>' 2>/dev/null)")
+                INLINE_STYLE_ATTR=$(safe_int "$(echo "$BODY" | grep -cE 'style=\"[^\"]+\"' 2>/dev/null)")
+                printf "    ${C_DIM}%-22s${C_RESET} %s style blocks, %s style-attributes -\n" \
+                    "Inline styles:" "$INLINE_STYLES" "$INLINE_STYLE_ATTR"
+            fi
+
+            # ── 6.7 Framework signatures (existing) ────────────────────
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  Framework fingerprints:${C_RESET}\n"
+                declare -A SIGNATURES=(
+                    ["WordPress"]="wp-content|wp-includes|wp-json"
+                    ["Shopify"]="cdn.shopify.com|Shopify.theme"
+                    ["Next.js"]="_next/static|__NEXT_DATA__|_next/image"
+                    ["Nuxt"]="__NUXT__|_nuxt/"
+                    ["Remix"]="__remix"
+                    ["React"]="react-dom|data-reactroot"
+                    ["Vue.js"]="__vue__|data-v-"
+                    ["Svelte"]="svelte-"
+                    ["Angular"]="ng-version|ng-app"
+                    ["Astro"]="astro-"
+                    ["Solid.js"]="solid-js"
+                    ["Hono"]="Hono|x-hono"
+                    ["Bun"]="Bun/"
+                    ["Caddy"]="Caddy"
+                    ["Nginx"]="nginx"
+                    ["Apache"]="Apache"
+                    ["Cloudflare"]="cloudflare|__cf_"
+                    ["Fastly"]="fastly"
+                    ["Leaflet.js"]="leaflet"
+                    ["DOMPurify"]="dompurify"
+                    ["jQuery"]="jquery"
+                    ["Tailwind"]="tailwind"
+                    ["Bootstrap"]="bootstrap"
+                    ["Bulma"]="bulma"
+                    ["Laravel"]="laravel|csrf-token"
+                    ["Django"]="csrfmiddlewaretoken"
+                    ["Symfony"]="symfony"
+                    ["Express"]="x-powered-by: Express"
+                    ["Playwright"]="playwright"
+                    ["Puppeteer"]="puppeteer"
+                )
+                FOUND_ANY=0
+                for name in "${!SIGNATURES[@]}"; do
+                    pattern="${SIGNATURES[$name]}"
+                    if echo "$BODY $HEADERS" | grep -qiE "$pattern"; then
+                        printf "    ${C_GREEN}●${C_RESET} ${C_BOLD}%-12s${C_RESET} ${C_DIM}(matched: %s)${C_RESET}\n" \
+                            "$name" "$pattern"
+                        FOUND_ANY=1
+                    fi
+                done
+                if [[ $FOUND_ANY -eq 0 ]]; then
+                    printf "    ${C_DIM}(no common framework signatures matched — may be custom-built)${C_RESET}\n"
+                fi
+                GENERATOR=$(echo "$BODY" | grep -oiE '<meta[^>]*name=["'"'"']generator["'"'"'][^>]*>' | head -1)
+                [[ -n "$GENERATOR" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Generator meta:" "$GENERATOR"
+            fi
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}(no body returned — site may have returned ${LAST_CODE:-non-2xx})${C_RESET}\n"
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 6b: JS MODULE LOAD TIMING
+    #   Measure per-script HTTP fetch timing (DNS/TCP/TLS/TTFB/total),
+    #   byte size, encoding, and overall JS payload weight. Slowest first.
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 && -n "${BODY:-}" && $JSON_OUT -eq 0 ]]; then
+        printf "\n${C_BOLD}  ── 6b. JS MODULE LOAD TIMING ──${C_RESET}\n"
+
+        # Collect external script URLs from prior section (6.4)
+        if [[ -z "${BODY_SCRIPT_LIST:-}" ]]; then
+            BODY_SCRIPT_LIST=$(echo "$BODY" | grep -oiE '<script[^>]+src=["'"'"'][^"'"'"']+' \
+                | sed -E 's/.*src=["'"'"']([^"'"'"']+).*/\1/' | sort -u)
+        fi
+
+        # Resolve relative URLs to absolute
+        declare -a JS_ABS_URLS=()
+        BASE="${URL_SCHEME}://${URL_HOST}"
+        while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            case "$url" in
+                //*)         JS_ABS_URLS+=("${URL_SCHEME}:$url") ;;
+                /*)          JS_ABS_URLS+=("${BASE}$url") ;;
+                http*)       JS_ABS_URLS+=("$url") ;;
+            esac
+        done <<< "$BODY_SCRIPT_LIST"
+
+        if [[ ${#JS_ABS_URLS[@]} -eq 0 ]]; then
+            printf "  ${C_DIM}(no external script URLs to time)${C_RESET}\n"
+        else
+            printf "  ${C_DIM}Sampling %d script URL(s) one-fetch-at-a-time (DNS→TCP→TLS→TTFB→total)${C_RESET}\n" "${#JS_ABS_URLS[@]}"
+            printf "  ${C_DIM}%-58s %8s %8s %6s %8s %8s${C_RESET}\n" "URL" "SIZE" "ENCODED" "CODE" "TTFB" "TOTAL"
+            printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────────────────"
+
+            declare -A JS_ROWS=()
+            declare -a JS_ROW_KEYS=()
+            TOTAL_JS_BYTES=0
+            SLOW_JS=0
+
+            # Speed: pre-fire all JS-URL curls in parallel; store timing lines
+            # keyed by URL into a tmpfile for the display loop.
+            JS_TMP=$(mktemp -d -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp -d)
+            trap "rm -rf '$JS_TMP' /tmp/website-js-body.*.$$ 2>/dev/null" RETURN
+            declare -a _JS_PIDS=()
+            declare -a _JS_URLS=()
+            _i=0
+            for SURL in "${JS_ABS_URLS[@]}"; do
+                (
+                    TIMING_LINE=$(curl -sS --max-time 8 -A "$CURL_UA" \
+                        -o "$JS_TMP/body.$_i" \
+                        -w "%{time_dns}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{size_download}|%{http_code}|%{content_type}" \
+                        "$SURL" 2>/dev/null)
+                    printf '%s\n' "$TIMING_LINE" > "$JS_TMP/timing.$_i"
+                ) &
+                _JS_PIDS+=($!)
+                _JS_URLS+=("$SURL")
+                _i=$((_i+1))
+            done
+            for pid in "${_JS_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+
+            _i=0
+            for SURL in "${JS_ABS_URLS[@]}"; do
+                [[ -z "$SURL" ]] && continue
+                _i=$((_i+1))
+                SURL_DISPLAY="$SURL"
+                [[ "${#SURL_DISPLAY}" -gt 58 ]] && SURL_DISPLAY="${SURL_DISPLAY:0:55}…"
+                # Read cached timing line written by parallel pre-fetch
+                _ti=$((_i-1))
+                TIMING_LINE=$(cat "$JS_TMP/timing.$_ti" 2>/dev/null)
+                [[ -z "$TIMING_LINE" ]] && continue
+                DNS=$(awk -F'|' '{print $1}' <<< "$TIMING_LINE")
+                CONN=$(awk -F'|' '{print $2}' <<< "$TIMING_LINE")
+                TLS=$(awk -F'|' '{print $3}' <<< "$TIMING_LINE")
+                TTFB=$(awk -F'|' '{print $4}' <<< "$TIMING_LINE")
+                TOTAL=$(awk -F'|' '{print $5}' <<< "$TIMING_LINE")
+                BYTES=$(awk -F'|' '{print $6}' <<< "$TIMING_LINE")
+                CODE=$(awk -F'|' '{print $7}' <<< "$TIMING_LINE")
+                CTYPE=$(awk -F'|' '{print $8}' <<< "$TIMING_LINE")
+
+                # Determine encoded size from cached body
+                TMP_SZ=0
+                if [[ -s "$JS_TMP/body.$_ti" ]]; then
+                    TMP_SZ=$(wc -c < "$JS_TMP/body.$_ti" | tr -d ' ')
+                fi
+
+                SIZE_LABEL="$BYTES"
+                if [[ "$CTYPE" == *gzip* ]]; then
+                    SIZE_LABEL="$BYTES(gz)"
+                fi
+                [[ -z "$SIZE_LABEL" || "$SIZE_LABEL" == "0" ]] && SIZE_LABEL="-"
+
+                COLOR="${C_DIM}"
+                [[ "$CODE" =~ ^2 ]] || COLOR="${C_RED}"
+                [[ "$TOTAL" == *"."* ]] && awk -v t="$TOTAL" 'BEGIN{exit !(t+0 > 1.5)}' && COLOR="${C_YELLOW}"
+
+                printf "  ${COLOR}%-58s %8s %8s %6s %7ss %7ss${C_RESET}\n" \
+                    "$SURL_DISPLAY" "${BYTES:-0}" "$SIZE_LABEL" "$CODE" "$TTFB" "$TOTAL"
+
+                TOTAL_JS_BYTES=$((TOTAL_JS_BYTES + ${BYTES:-0}))
+
+                # Save for sort
+                KEY="${TOTAL}|${SURL}|${BYTES}|${CODE}|${TTFB}|${TLS:-0}"
+                JS_ROWS["$KEY"]="$SURL"
+                JS_ROW_KEYS+=("$KEY")
+            done
+
+            rm -f /tmp/website-js-body.$$ 2>/dev/null
+
+            # Aggregate
+            printf "\n  ${C_BOLD}  Aggregate:${C_RESET}\n"
+            printf "    ${C_DIM}%-22s${C_RESET} %d scripts, %s bytes total${C_RESET}\n" \
+                "JS payload:" "${#JS_ROW_KEYS[@]}" "$TOTAL_JS_BYTES"
+
+            # Highlight slowest 5 (already printed in URL order; show explicit ranking)
+            if [[ ${#JS_ROW_KEYS[@]} -gt 0 ]]; then
+                printf "\n  ${C_BOLD}  Slowest modules (ranked):${C_RESET}\n"
+                printf "    ${C_DIM}%-58s %6s %6s %6s %6s %6s${C_RESET}\n" \
+                    "URL" "DNS" "CONN" "TLS" "TTFB" "TOTAL"
+                for KEY in $(printf "%s\n" "${JS_ROW_KEYS[@]}" | sort -t'|' -k1 -r -n); do
+                    SURL=$(awk -F'|' '{print $2}' <<< "$KEY")
+                    [[ "${#SURL}" -gt 58 ]] && SURL="${SURL:0:55}…"
+                    # Re-stamp from KEY values
+                    echo "$KEY" | awk -F'|' -v u="$SURL" '{
+                        printf "    %-58s %5ss %5ss %5ss %5ss %5ss\n", u, $1, $2, $3, $4, $5
+                    }'
+                done | head -5
+            fi
+
+            # Cache headers from one of the JS responses — flag if no-cache
+            CACHE_HDR=$(curl -sI --max-time 5 -A "$CURL_UA" "${JS_ABS_URLS[0]:-}" 2>/dev/null \
+                | grep -iE '^(cache-control|age|expires):' | head -3 | tr '\n' '|')
+            [[ -n "$CACHE_HDR" ]] && \
+                printf "\n  ${C_DIM}Sample cache headers (first script): %s${C_RESET}\n" \
+                "$(echo "$CACHE_HDR" | sed 's/|/  /g')"
+        fi
+    fi
+
+# ─────────────────────────────────────────────────────────────────────
+    # SECTION 7: THIRD-PARTY CONNECTIONS
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 && -n "${BODY:-}" ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 7. THIRD-PARTY CONNECTIONS ──${C_RESET}\n"
+        fi
+        EXTERNAL=$(echo "$BODY" | grep -oiE '(src|href)=["'"'"']https?://[^"'"'"']+' \
+            | sed -E 's/^(src|href)=["'"'"']//' \
+            | sed -E 's#https?://##; s#/.*##' \
+            | sort -u \
+            | grep -v -F "$URL_HOST" || true)
+        if [[ -n "$EXTERNAL" ]]; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                echo "$EXTERNAL" | sed 's/^/    - /'
+                count=$(echo "$EXTERNAL" | wc -l)
+                printf "  ${C_DIM}(%d unique external hosts)${C_RESET}\n" "$count"
+            fi
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}(no external domains found — site is self-contained or uses JS-loaded assets)${C_RESET}\n"
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 8: ROBOTS.TXT + SITEMAP.XML DEEP
+    #   robots.txt parse, sitemap discovery (incl. gzipped + index),
+    #   URL/lastmod/priority/changefreq stats, first/last modified.
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 8. ROBOTS.TXT + SITEMAP.XML DEEP ──${C_RESET}\n"
+        fi
+        BASE_URL="${URL_SCHEME}://${URL_HOST}"
+
+        # ── 8.1 robots.txt + sitemap URLs declared there ───────────────
+        ROBOTS=$("${CURL_BASE[@]}" -sf "${BASE_URL}/robots.txt" 2>/dev/null)
+        declare -a DISCOVERED_SM=()
+        if [[ -n "$ROBOTS" ]]; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_GREEN}✓${C_RESET} robots.txt found\n"
+                echo "$ROBOTS" | head -40 | sed 's/^/    /'
+
+                # Sitemap directives
+                while IFS= read -r sline; do
+                    sline="${sline//$'\r'/}"
+                    if [[ "$sline" =~ ^[Ss]itemap:[[:space:]]*(.+)$ ]]; then
+                        DISCOVERED_SM+=("${BASH_REMATCH[1]}")
+                    fi
+                done <<< "$ROBOTS"
+
+                if [[ ${#DISCOVERED_SM[@]} -gt 0 ]]; then
+                    printf "\n  ${C_BOLD}  Sitemaps declared in robots.txt:${C_RESET}\n"
+                    for s in "${DISCOVERED_SM[@]}"; do
+                        printf "    ${C_CYAN}→${C_RESET} %s\n" "$s"
+                    done
+                fi
+            fi
+        else
+            [[ $JSON_OUT -eq 0 ]] && printf "  ${C_YELLOW}!${C_RESET} robots.txt not found\n"
+        fi
+
+        # ── 8.2 Probing candidate sitemap paths ────────────────────────
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n  ${C_BOLD}  Sitemap probe:${C_RESET}\n"
+            SM_CANDIDATES=(
+                "${BASE_URL}/sitemap.xml"
+                "${BASE_URL}/sitemap_index.xml"
+                "${BASE_URL}/sitemap/sitemap.xml"
+                "${BASE_URL}/sitemap-index.xml"
+                "${BASE_URL}/sitemap.xml.gz"
+                "${BASE_URL}/post-sitemap.xml"
+                "${BASE_URL}/page-sitemap.xml"
+                "${BASE_URL}/news-sitemap.xml"
+                "${BASE_URL}/video-sitemap.xml"
+                "${BASE_URL}/image-sitemap.xml"
+            )
+            # Pre-fire all sitemap candidate probes in parallel, then read results.
+            SM_TMP=$(mktemp -d)
+            declare -a _SM_PIDS=()
+            _si=0
+            for P in "${SM_CANDIDATES[@]}"; do
+                (
+                    code=$("${CURL_BASE[@]}" -o /dev/null \
+                        -w '%{http_code}|%{size_download}|%{content_type}' \
+                        -s "$P" 2>/dev/null || true)
+                    [[ -n "$code" ]] && printf '%s\n' "$code" > "$SM_TMP/$_si"
+                ) &
+                _SM_PIDS+=($!)
+                _si=$((_si+1))
+            done
+            for pid in "${_SM_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+            _si=0
+            for P in "${SM_CANDIDATES[@]}"; do
+                code=$(cat "$SM_TMP/$_si" 2>/dev/null || true)
+                _si=$((_si+1))
+                [[ -z "$code" ]] && continue
+                RC=$(awk -F'|' '{print $1}' <<< "$code")
+                SZ=$(awk -F'|' '{print $2}' <<< "$code")
+                CT=$(awk -F'|' '{print $3}' <<< "$code")
+                if [[ "$RC" =~ ^2 ]]; then
+                    printf "    ${C_GREEN}✓${C_RESET} %-44s ${C_DIM}HTTP %s, %d bytes, %s${C_RESET}\n" \
+                        "$P" "$RC" "$SZ" "$CT"
+                fi
+            done
+            rm -rf "$SM_TMP"
+        fi
+
+        # ── 8.3 Parse the canonical sitemap (or first discovered one) ──
+        TARGET_SM="${BASE_URL}/sitemap.xml"
+        set +e
+        SITEMAP=$("${CURL_BASE[@]}" -sf "$TARGET_SM" 2>/dev/null || true)
+        if [[ -z "$SITEMAP" && ${#DISCOVERED_SM[@]} -gt 0 ]]; then
+            for s in "${DISCOVERED_SM[@]}"; do
+                resp=$("${CURL_BASE[@]}" -sf --compressed "$s" 2>/dev/null || true)
+                if [[ -n "$resp" && "$resp" == *"<urlset"* || "$resp" == *"<sitemapindex"* ]]; then
+                    SITEMAP="$resp"
+                    TARGET_SM="$s"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -z "$SITEMAP" ]]; then
+            [[ $JSON_OUT -eq 0 ]] && printf "\n  ${C_YELLOW}!${C_RESET} No usable sitemap.xml found\n"
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "\n  ${C_BOLD}  Sitemap analysis (source: %s):${C_RESET}\n" "$TARGET_SM"
+
+                # 8.3.1 Sitemap index vs url-set?
+                if grep -q "<sitemapindex" <<< "$SITEMAP"; then
+                    printf "    ${C_CYAN}ℹ${C_RESET} ${C_BOLD}Type:${C_RESET} sitemap index\n"
+                    if have xmllint; then
+                        SUB_SMS=$(xmllint --xpath "//*[local-name()='sitemap']/*[local-name()='loc']/text()" - <<< "$SITEMAP" 2>/dev/null)
+                    else
+                        SUB_SMS=$(grep -oE '<loc>[^<]+</loc>' <<< "$SITEMAP" | sed -E 's|</?loc>||g')
+                    fi
+                    SSM_N=$(safe_int "$(echo "$SUB_SMS" | grep -c 'http' 2>/dev/null)")
+                    printf "    ${C_DIM}%-22s${C_RESET} %d child sitemap(s)${C_RESET}\n" "Sub-sitemaps:" "$SSM_N"
+                    if [[ -n "$SUB_SMS" ]]; then
+                        echo "$SUB_SMS" | head -10 | sed 's/^/      ↳ /'
+                    fi
+
+                    # Aggregate URLs across sub-sitemaps
+                    TOTAL_URLS=0
+                    ALL_LASTMOD=()
+                    ALL_PRIO_LOW=99; ALL_PRIO_HIGH=0
+                    declare -A CFREQ_DIST=()
+                    for SUB in $SUB_SMS; do
+                        [[ "$SUB" != http* ]] && continue
+                        set +e +o pipefail
+                        CHILD=$("${CURL_BASE[@]}" -sf --compressed "$SUB" 2>/dev/null)
+                        set -e +o pipefail
+                        if [[ -n "$CHILD" && "$CHILD" == *"<urlset"* ]]; then
+                            CCNT=$(safe_int "$(echo "$CHILD" | grep -cE '<url>' 2>/dev/null)")
+                            TOTAL_URLS=$((TOTAL_URLS + CCNT))
+                        fi
+                    done
+                    printf "    ${C_DIM}%-22s${C_RESET} ~%d URLs across all child sitemaps${C_RESET}\n" \
+                        "Total URLs (est):" "$TOTAL_URLS"
+                else
+                    # 8.3.2 urlset - count entries & sample
+                    URL_N=$(safe_int "$(grep -cE '<url>' <<< "$SITEMAP" 2>/dev/null)")
+                    RAW_SIZE=$(echo -n "$SITEMAP" | wc -c)
+                    printf "    ${C_CYAN}ℹ${C_RESET} ${C_BOLD}Type:${C_RESET} url-set (single sitemap)\n"
+                    printf "    ${C_DIM}%-22s${C_RESET} %s URLs\n" "URL count:" "$URL_N"
+                    printf "    ${C_DIM}%-22s${C_RESET} %s bytes\n" "Sitemap size:" "$RAW_SIZE"
+
+                    # 8.3.3 lastmod timestamps
+                    LASTMODS=$(grep -oE '<lastmod>[^<]+</lastmod>' <<< "$SITEMAP" \
+                        | sed -E 's|</?lastmod>||g' | tr -d '\r')
+                    if [[ -n "$LASTMODS" ]]; then
+                        LM_N=$(echo "$LASTMODS" | wc -l)
+                        LM_NEWEST=$(awk 'BEGIN{n=""} {if($0>n||n=="")n=$0} END{print n}' <<< "$LASTMODS")
+                        LM_OLDEST=$(awk 'BEGIN{n=""} {if(n==""||$0<n)n=$0} END{print n}' <<< "$LASTMODS")
+                        printf "    ${C_DIM}%-22s${C_RESET} %d entries; first=%s, last=%s\n" \
+                            "Lastmod:" "$LM_N" \
+                            "${LM_OLDEST:-—}" "${LM_NEWEST:-—}"
+                    fi
+
+                    # 8.3.4 priority distribution
+                    PRIOS=$(grep -oE '<priority>[^<]+</priority>' <<< "$SITEMAP" \
+                        | sed -E 's|</?priority>||g' | tr -d '\r')
+                    if [[ -n "$PRIOS" ]]; then
+                        if have python3; then
+                            PRI_STATS=$(echo "$PRIOS" | python3 <<'PYEOF' 2>/dev/null
+import sys, statistics
+vals = [float(x) for x in sys.stdin.read().split() if x]
+if not vals:
+    print('no priorities')
+else:
+    print('min={:.2f} max={:.2f} avg={:.2f} median={:.2f} n={}'.format(
+        min(vals), max(vals), statistics.mean(vals), statistics.median(vals), len(vals)))
+PYEOF
+                            )
+                            [[ -z "$PRI_STATS" ]] && PRI_STATS="stats error"
+                        else
+                            PRI_MIN=$(sort -n <<< "$PRIOS" | head -1)
+                            PRI_MAX=$(sort -n <<< "$PRIOS" | tail -1)
+                            PRI_AVG=$(awk '{s+=$1;n++} END{if(n) printf "%.2f",s/n}' <<< "$PRIOS")
+                            PRI_STATS="min=$PRI_MIN max=$PRI_MAX avg=$PRI_AVG"
+                        fi
+                        printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Priority:" "${PRI_STATS:-—}"
+                    fi
+
+                    # 8.3.5 changefreq distribution
+                    CFREQS=$(grep -oE '<changefreq>[^<]+</changefreq>' <<< "$SITEMAP" \
+                        | sed -E 's|</?changefreq>||g' | tr -d '\r')
+                    if [[ -n "$CFREQS" ]]; then
+                        printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Changefreq distribution:" "$(echo "$CFREQS" | sort | uniq -c | sort -rn | awk '{printf "%s=%s  ",$2,$1}' | sed 's/ $//')"
+                    fi
+
+                    # 8.3.6 Gzipped/encoded source flag
+                    HEAD_SM=$("${CURL_BASE[@]}" -sI "${TARGET_SM}" 2>/dev/null)
+                    if echo "$HEAD_SM" | grep -qiE 'content-encoding:.*gzip|content-type:.*gzip'; then
+                        printf "    ${C_CYAN}ℹ${C_RESET} Served as ${C_BOLD}gzip${C_RESET} compressed\n"
+                    fi
+
+                    # 8.3.7 Show first 8 URLs (with lastmod/priority)
+                    printf "\n    ${C_BOLD}  First %d URL entries:${C_RESET}\n" 8
+                    if have xmllint; then
+                        xmllint --xpath "//*[local-name()='url']/*[local-name()='loc']/text()" - <<< "$SITEMAP" 2>/dev/null \
+                            | head -8 | sed 's/^/      /'
+                    else
+                        grep -oE '<loc>[^<]+</loc>' <<< "$SITEMAP" \
+                            | head -8 | sed -E 's|</?loc>||g' | sed 's/^/      /'
+                    fi
+
+                    # 8.3.8 Patterns / categories inferred from URL structure
+                    printf "\n    ${C_BOLD}  URL-pattern fingerprints:${C_RESET}\n"
+                    if have xmllint; then
+                        URL_PATHS=$(xmllint --xpath "//*[local-name()='url']/*[local-name()='loc']/text()" - <<< "$SITEMAP" 2>/dev/null \
+                            | awk -F/ '{print $4"/"$5}' | sort -u)
+                    else
+                        URL_PATHS=$(grep -oE '<loc>[^<]+</loc>' <<< "$SITEMAP" \
+                            | sed -E 's|</?loc>||g' | awk -F/ '{print $4"/"$5}' | sort -u)
+                    fi
+                    echo "$URL_PATHS" | head -8 | sed 's/^/      /'
+                fi
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 9: TRACEROUTE (skip in --quick)
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $API_ONLY -eq 0 && $QUICK -eq 0 && -n "${IP:-}" ]]; then
+        if [[ $JSON_OUT -eq 0 ]]; then
+            printf "\n${C_BOLD}  ── 9. TRACEROUTE TO ORIGIN ──${C_RESET}\n"
+        fi
+        if have traceroute; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}%-5s %-9s %-22s %-30s %s${C_RESET}\n" "HOP" "RTTms" "IP" "HOST" "GEO"
+                printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────────"
+            fi
+            set +e +o pipefail
+            traceroute -n -m 10 -w 2 "$IP" 2>/dev/null \
+                | awk 'NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop=$1
+                    # Parse the first numeric IP from fields 2-5
+                    ip=""
+                    for (i=2; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { ip=$i; break }
+                    if (ip == "") ip="*"
+                    rtt=$4
+                    print hop "|" rtt "|" ip
+                }' | head -10 | while IFS='|' read -r hop rtt ip; do
+                    geo=""
+                    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                        geo=$(enrich_ip_short "$ip" 2>/dev/null || echo "?")
+                    else
+                        geo="—"
+                    fi
+                    printf "  ${C_BOLD}%-5s${C_RESET} ${C_CYAN}%-9s${C_RESET} ${C_MAGENTA}%-22s${C_RESET} ${C_DIM}%-30s${C_RESET}\n" \
+                        "$hop" "$rtt" "$ip" "$geo"
+                done
+            set -e +o pipefail
+        else
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_DIM}traceroute not installed — skipping hop-by-hop latency${C_RESET}\n"
+            fi
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 10: API DISCOVERY (always runs unless --no-color & JSON)
+    # ─────────────────────────────────────────────────────────────────────
+    if [[ $JSON_OUT -eq 0 ]]; then
+        printf "\n${C_BOLD}  ── 10. API DISCOVERY ──${C_RESET}\n"
+    fi
+    CANDIDATE_PATHS=(
+        "/" "/api" "/api/" "/api/v1" "/api/v2" "/api/v3"
+        "/api/health" "/api/status" "/api/docs"
+        "/health" "/ping" "/status" "/info"
+        "/openapi.json" "/swagger.json" "/.well-known/openapi.json"
+        "/graphql" "/graphiql"
+        "/api/search" "/api/me" "/api/config"
+        "/help" "/help/" "/docs/"
+        "/api/pins/map" "/api/users" "/api/posts"
+    )
+    LIVE_ENDPOINTS=()
+    # Pre-fire all candidate path probes in parallel; collect into tmpfiles.
+    API_TMP=$(mktemp -d)
+    declare -a _API_PIDS=()
+    _ai=0
+    for path in "${CANDIDATE_PATHS[@]}"; do
+        target="${URL_SCHEME}://${URL_HOST}${path}"
+        (
+            resp=$("${CURL_BASE[@]}" -o /dev/null \
+                -w '%{http_code}|%{size_download}|%{content_type}' \
+                -s "$target" 2>/dev/null || true)
+            [[ -n "$resp" ]] && printf '%s\n' "$resp" > "$API_TMP/$_ai"
+        ) &
+        _API_PIDS+=($!)
+        _ai=$((_ai+1))
+    done
+    for pid in "${_API_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    # Display loop reads from cached tmpfiles.
+    _ai=0
+    for path in "${CANDIDATE_PATHS[@]}"; do
+        resp=$(cat "$API_TMP/$_ai" 2>/dev/null || true)
+        _ai=$((_ai+1))
+        [[ -z "$resp" ]] && continue
+        code=$(awk -F'|' '{print $1}' <<< "$resp")
+        size=$(awk -F'|' '{print $2}' <<< "$resp")
+        ctype=$(awk -F'|' '{print $3}' <<< "$resp")
+        if [[ "$code" =~ ^2 ]]; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_GREEN}✓${C_RESET} %-32s ${C_DIM}HTTP %s  %dB  %s${C_RESET}\n" \
+                    "$path" "$code" "$size" "$ctype"
+            fi
+            LIVE_ENDPOINTS+=("$path")
+        elif [[ "$code" == "403" ]]; then
+            if [[ $JSON_OUT -eq 0 ]]; then
+                printf "  ${C_YELLOW}⚠${C_RESET} %-32s ${C_DIM}HTTP 403 (blocked by sandbox/firewall)${C_RESET}\n" "$path"
+            fi
+        fi
+    done
+    rm -rf "$API_TMP"
+
+    # Print ready-to-run curl examples
+    if [[ ${#LIVE_ENDPOINTS[@]} -gt 0 && $JSON_OUT -eq 0 ]]; then
+        printf "\n${C_BOLD}  ── 11. READY-TO-USE CURL EXAMPLES ──${C_RESET}\n"
+        for path in "${LIVE_ENDPOINTS[@]}"; do
+            printf "  ${C_BLUE}curl -s '%s%s'${C_RESET}\n" "${URL_SCHEME}://${URL_HOST}" "$path"
+        done
+
+        # Show a pretty-printed JSON sample for the first JSON-looking endpoint
+        for path in "${LIVE_ENDPOINTS[@]}"; do
+            if [[ "$path" == *api* || "$path" == *json* || "$path" == *graphql* ]]; then
+                sample=$("${CURL_BASE[@]}" -s "${URL_SCHEME}://${URL_HOST}${path}" 2>/dev/null | head -c 2000)
+                if have jq && echo "$sample" | jq . >/dev/null 2>&1; then
+                    printf "\n  ${C_DIM}Sample JSON from %s:${C_RESET}\n" "$path"
+                    echo "$sample" | jq . 2>/dev/null | head -25 | sed 's/^/    /'
+                fi
+                break
+            fi
+        done
+    fi
+
+    if [[ $JSON_OUT -eq 0 ]]; then
+        printf "\n"
+    fi
+done
+
+# ─── JSON SUMMARY (when --json) ────────────────────────────────────────────
+if [[ $WRITE_JSON -eq 1 ]]; then
+    # Build JSON manually (no jq dependency for output)
+    json_live=$(printf '"%s",' "${LIVE_ENDPOINTS[@]:-}")
+    json_live="${json_live%,}"
+    cat > "$JSON_REPORT" <<'EOF'
+{
+  "target": "${TARGETS[0]}",
+  "host": "$HOST_LEAD",
+  "checked_at": "$(date -u +%FT%TZ)",
+  "depth": "$DEPTH",
+  "samples": $SAMPLE_N,
+  "speed_score": ${SPEED_SCORE:-null},
+  "median_total_s": ${med_total:-null},
+  "resolved_ip": "${IP:-}",
+  "dns": {
+    "a_count": ${DNS_A_COUNT:-0},
+    "aaaa_count": ${DNS_AAAA_COUNT:-0},
+    "mx_count": ${DNS_MX_COUNT:-0},
+    "ns_count": ${DNS_NS_COUNT:-0},
+    "txt_count": ${DNS_TXT_COUNT:-0},
+    "caa_count": ${DNS_CAA_COUNT:-0},
+    "ttl_min": ${TTL_MIN:-0},
+    "ttl_max": ${TTL_MAX:-0}
+  },
+  "whois": {
+    "registrar": "${WHOIS_REGISTRAR:-}",
+    "age_days": ${WHOIS_AGE_DAYS:-null},
+    "dnssec": "${WHOIS_DNSSEC:-}",
+    "status": "${WHOIS_STATUS:-}"
+  },
+  "html": {
+    "body_bytes": ${BODY_SIZE:-0},
+    "scripts_total": ${S_COUNT:-0},
+    "scripts_external": ${EXT_COUNT:-0},
+    "scripts_inline": ${INLINE_COUNT:-0},
+    "scripts_async": ${ASYNC_COUNT:-0},
+    "scripts_defer": ${DEFER_COUNT:-0},
+    "scripts_module": ${MOD_COUNT:-0},
+    "scripts_sri": ${SRI_COUNT:-0},
+    "iframes": ${IFRAME_COUNT:-0},
+    "stylesheets": ${CSS_COUNT:-0},
+    "forms": ${FORM_COUNT:-0},
+    "total_js_bytes": ${TOTAL_JS_BYTES:-0}
+  },
+  "live_api_endpoints": [${json_live}],
+  "report_txt": "$REPORT"
+}
+EOF
+    printf "  ${C_GREEN}✓${C_RESET} JSON summary written to ${C_CYAN}%s${C_RESET}\n" "$JSON_REPORT"
+fi
+
+# ─── Footer ───────────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "\n${C_BOLD}${C_MAGENTA}━━━ DONE ━━━${C_RESET}\n"
+    printf "${C_DIM}Full report: %s${C_RESET}\n" "$REPORT"
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "websitez complete: targets=${#TARGETS[@]} depth=$DEPTH samples=$SAMPLE_N report=$REPORT" 2>/dev/null || true
+fi

@@ -1,0 +1,1488 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+
+# ============================================================================
+# printerz - Printer Log Scanner & Debugger
+# ----------------------------------------------------------------------------
+# Checks CUPS logs, systemd journal, USB ports, network ports, and provides
+# comprehensive printer diagnostics, job management, and service control.
+#
+# Usage:
+#   ./printerz                          # Full diagnostic scan
+#   ./printerz --deep                   # Deep log analysis (all CUPS logs)
+#   ./printerz --manual                 # Manual testing instructions
+#   ./printerz --ports                  # Check listening ports
+#   ./printerz --usb                    # USB device scan
+#   ./printerz --full-lpstat           # Complete lpstat output
+#   ./printerz --jobs                  # Manage print jobs (list/cancel)
+#   ./printerz --services              # Start/stop/restart CUPS services
+#   ./printerz --poem                 # Send a fun test poem to printer
+#   ./printerz --sharing              # Debug printer sharing issues
+#   ./printerz --tail 100              # Last N error lines (default 50)
+#   ./printerz --since "1 hour ago"    # Custom time window
+#   ./printerz --no-color              # Plain output
+#   ./printerz --json                  # Machine-readable summary
+#   ./printerz --debug                  # Verbose debug mode
+#
+# Quick tests:
+#   lpstat -t          # Show all printers and their status
+#   lpstat -v          # Show printer devices/URIs
+#   lpstat -a          # Show acceptance status
+#   lpstat -r          # Show CUPS scheduler status
+#   sudo ss -tlnp | grep 631  # Verify CUPS is listening on port 631
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+SINCE="24 hours ago"
+TAIL_LINES=50
+NO_COLOR=0
+JSON_OUT=0
+DEBUG_MODE=0
+DEEP_SCAN=0
+MANUAL_MODE=0
+PORTS_MODE=0
+USB_MODE=0
+FULL_LPSTAT=0
+JOBS_MODE=0
+SERVICES_MODE=0
+POEM_MODE=0
+SHARING_MODE=0
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+START_TS=$(date +%s)
+WARNINGS=0
+CRITICAL=0
+
+# ---------- Color init ----------
+C_RESET=""; C_BOLD=""; C_DIM=""
+C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_MAGENTA=""
+
+init_colors() {
+    if [[ -t 1 ]] && [[ "$NO_COLOR" -eq 0 ]]; then
+        C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+        C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+        C_CYAN=$'\033[36m'; C_MAGENTA=$'\033[35m'
+    fi
+}
+init_colors
+
+# ---------- Helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+debug() {
+    [[ $DEBUG_MODE -eq 1 ]] && echo "  [DEBUG] $1" || true
+}
+
+section() {
+    echo ""
+    echo "━━━ $1 ━━━"
+}
+
+warn() {
+    local msg="$1"
+    local suggestion="${2:-}"
+    WARNINGS=$((WARNINGS + 1))
+    echo "  ! $msg"
+    [[ -n "$suggestion" ]] && echo "    → $suggestion"
+}
+
+crit() {
+    local msg="$1"
+    local fix="${2:-}"
+    CRITICAL=$((CRITICAL + 1))
+    echo "  ✗ $msg"
+    [[ -n "$fix" ]] && echo "    → $fix"
+}
+
+ok() {
+    echo "  ✓ $1"
+}
+
+info() {
+    echo "  · $1"
+}
+
+# ---------- Args ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --since=*)     SINCE="${1#--since=}" ;;
+        --last=*)      SINCE="${1#--last=}" ;;
+        --tail=*)      TAIL_LINES="${1#--tail=}" ;;
+        --tail)        TAIL_LINES="${2:-50}"; shift ;;
+        --no-color)    NO_COLOR=1; init_colors ;;
+        --json)        JSON_OUT=1 ;;
+        --debug)       DEBUG_MODE=1 ;;
+        --deep)        DEEP_SCAN=1 ;;
+        --manual)      MANUAL_MODE=1 ;;
+        --ports)       PORTS_MODE=1 ;;
+        --usb)         USB_MODE=1 ;;
+        --full-lpstat) FULL_LPSTAT=1 ;;
+        --jobs)        JOBS_MODE=1 ;;
+        --services)    SERVICES_MODE=1 ;;
+        --poem)        POEM_MODE=1 ;;
+        --sharing)     SHARING_MODE=1 ;;
+        -h|--help)
+            sed -n '10,40p' "$0"
+            exit 0
+            ;;
+        --) shift; break ;;
+        -*) echo "Unknown flag: $1" >&2; exit 2 ;;
+        *)  SINCE="$1" ;;
+    esac
+    shift
+done
+
+# ---------- USB Device Scan ----------
+scan_usb() {
+    section "USB DEVICE SCAN"
+
+    if ! have lsusb; then
+        crit "lsusb not available" "Install usbutils package"
+        return
+    fi
+
+    local found_printer=0
+
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    USB PRINTER DEVICES                                  │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    local patterns=("printer" "laser" "ink" "brother" "canon" "hp" "epson" "samsung" "xerox" "lexmark" "zebra" "dymo")
+
+    for pattern in "${patterns[@]}"; do
+        local matches
+        matches=$(lsusb 2>/dev/null | grep -i "$pattern" || true)
+        if [[ -n "$matches" ]]; then
+            found_printer=1
+            echo "  $matches"
+            echo ""
+
+            local bus_dev
+            bus_dev=$(echo "$matches" | awk '{print $2 "/" $4}')
+            echo "    Bus:Device: $bus_dev"
+
+            local usb_speed
+            usb_speed=$(lsusb -s "$bus_dev" 2>/dev/null | xxd -p -r 2>/dev/null | strings | grep -i "speed" | head -1 || true)
+            [[ -z "$usb_speed" ]] && usb_speed=$(dmesg 2>/dev/null | grep -i "usb.*$bus_dev" | grep -i "speed" | head -1 || true)
+            [[ -n "$usb_speed" ]] && echo "    Speed: $usb_speed"
+        fi
+    done
+
+    if [[ $found_printer -eq 0 ]]; then
+        info "No printer-related USB devices found"
+    fi
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    USB TROUBLESHOOTING GUIDE                            │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    echo "  COMMON USB PRINTER ISSUES & FIXES:"
+    echo ""
+    echo "  1. CABLE LENGTH LIMITATIONS"
+    echo "     ├─ USB 2.0 max: 5 meters (16 ft)"
+    echo "     ├─ USB 3.0 max: 3 meters (9 ft)"
+    echo "     └─ Solution: Use cable < 3 meters for USB 2.0 reliability"
+    echo ""
+    echo "  2. USB POWER ISSUES"
+    echo "     ├─ Symptoms: Printer keeps disconnecting, partial responses"
+    echo "     ├─ Some USB ports provide limited power"
+    echo "     └─ Solution: Use powered USB hub or direct port with more power"
+    echo ""
+    echo "  3. USB HUB ISSUES"
+    echo "     ├─ Hub may not provide enough power/bandwidth"
+    echo "     ├─ Try connecting printer directly to PC USB port"
+    echo "     └─ If using hub, ensure it's powered"
+    echo ""
+    echo "  4. LOOSE OR DAMAGED CABLE"
+    echo "     ├─ Intermittent connection can cause partial failures"
+    echo "     ├─ Try different USB cable"
+    echo "     └─ Inspect cable ends for damage"
+    echo ""
+    echo "  5. PORT EXHAUSTION"
+    echo "     ├─ Too many devices on same controller"
+    echo "     ├─ Try different USB port (preferably back panel)"
+    echo "     └─ Some controllers share bandwidth between ports"
+    echo ""
+
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    QUICK USB DIAGNOSTIC COMMANDS                       │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    local usb_printer_bus
+    usb_printer_bus=$(lsusb 2>/dev/null | grep -iE "printer|brother|laser|ink" | awk '{print $2 "/" $4}' | head -1)
+
+    if [[ -n "$usb_printer_bus" ]]; then
+        local usb_vendor_id
+        usb_vendor_id=$(lsusb 2>/dev/null | grep -iE "printer|brother|laser|ink" | awk '{print $6}' | head -1)
+
+        echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+        echo "  │                    DETAILED USB DEVICE INFO                             │"
+        echo "  └────────────────────────────────────────────────────────────────────────┘"
+        echo ""
+
+        echo "  Verbose lsusb -v output:"
+        echo ""
+        lsusb -v -d "$usb_vendor_id" 2>/dev/null | head -60 | while IFS= read -r line; do
+            echo "    $line"
+        done
+
+        echo ""
+        echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+        echo "  │                    QUICK DIAGNOSTIC COMMANDS                             │"
+        echo "  └────────────────────────────────────────────────────────────────────────┘"
+        echo ""
+        echo "  # Full verbose output (run manually for complete info):"
+        echo "    sudo lsusb -v -d $usb_vendor_id"
+        echo ""
+        echo "  # Check USB errors in kernel log:"
+        echo "    sudo dmesg | grep -i 'usb.*$usb_printer_bus' | tail -20"
+        echo ""
+        echo "  # Check USB tree structure:"
+        echo "    lsusb -t"
+        echo ""
+        echo "  # Monitor USB device events:"
+        echo "    sudo udevadm monitor --subsystem match=usb --property"
+        echo ""
+        echo "  # Check device descriptor:"
+        echo "    sudo lsusb -v -s $usb_printer_bus 2>/dev/null | head -40"
+    else
+        echo "  # Check all recent USB events:"
+        echo "    sudo dmesg | grep -i usb | tail -30"
+        echo ""
+        echo "  # Full USB tree:"
+        echo "    lsusb -t"
+    fi
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    TEST WITH SHORTER CABLE                            │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  If you're experiencing intermittent issues, try:"
+    echo "  1. A different USB cable (preferably < 2 meters / 6 ft)"
+    echo "  2. Direct connection to PC (bypass any hubs)"
+    echo "  3. Different USB port on the computer"
+    echo ""
+    echo "  Note: USB over longer cables can cause:"
+    echo "  - Partial/complete signal degradation"
+    echo "  - Timeouts and retries"
+    echo "  - Corrupted print data"
+    echo "  - Intermittent disconnections"
+}
+
+# ---------- Port Check ----------
+check_ports() {
+    section "NETWORK PORT STATUS (CUPS port 631)"
+
+    if have ss; then
+        echo "  Checking port 631 (IPP):"
+        local cups_listen
+        cups_listen=$(ss -tlnp 2>/dev/null | grep ":631" || true)
+        if [[ -n "$cups_listen" ]]; then
+            echo "$cups_listen" | while IFS= read -r line; do
+                echo "    • $line"
+            done
+        else
+            warn "CUPS is NOT listening on port 631" "CUPS may not be running or configured"
+        fi
+
+        echo ""
+        echo "  All listening TCP ports:"
+        ss -tlnp 2>/dev/null | grep LISTEN | head -20 | while IFS= read -r line; do
+            echo "    $line"
+        done
+    elif have netstat; then
+        echo "  Using netstat (ss not available):"
+        netstat -tlnp 2>/dev/null | grep ":631" || warn "CUPS not listening on 631"
+    else
+        info "Neither ss nor netstat available"
+    fi
+
+    echo ""
+    echo "  Common print-related ports:"
+    for port in 631 9100 515 721 722 723 724; do
+        local binding
+        binding=$(ss -tlnp 2>/dev/null | grep ":$port " || true)
+        if [[ -n "$binding" ]]; then
+            echo "    Port $port: $binding"
+        fi
+    done
+}
+
+# ---------- Full lpstat Output ----------
+full_lpstat() {
+    section "COMPLETE LPSTAT OUTPUT"
+
+    if ! have lpstat; then
+        crit "lpstat not available" "Install cups-client package"
+        return
+    fi
+
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpstat -t  (Full status of all printers)                   │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpstat -t 2>&1 | while IFS= read -r line; do
+        echo "    $line"
+    done
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpstat -v  (Printer device URIs)                            │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpstat -v 2>&1 | while IFS= read -r line; do
+        echo "    $line"
+    done
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpstat -a  (Accepting status)                               │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpstat -a 2>&1 | while IFS= read -r line; do
+        echo "    $line"
+    done
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpstat -r  (CUPS scheduler running?)                        │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpstat -r 2>&1 | while IFS= read -r line; do
+        echo "    $line"
+    done
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpstat -s  (Summary)                                        │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpstat -s 2>&1 | while IFS= read -r line; do
+        echo "    $line"
+    done
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpinfo -v  (Available devices)                              │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpinfo -v 2>&1 | head -30 | while IFS= read -r line; do
+        echo "    $line"
+    done
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ lpinfo -m  (Available drivers)                              │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    lpinfo -m 2>&1 | head -20 | while IFS= read -r line; do
+        echo "    $line"
+    done
+}
+
+# ---------- CUPS Service Status ----------
+check_cups_service() {
+    section "CUPS SERVICE STATUS"
+
+    if have systemctl; then
+        local cups_active
+        cups_active=$(systemctl is-active cups 2>/dev/null || echo "unknown")
+        local cups_enabled
+        cups_enabled=$(systemctl is-enabled cups 2>/dev/null || echo "unknown")
+
+        if [[ "$cups_active" == "active" ]]; then
+            ok "CUPS service is ACTIVE"
+        else
+            crit "CUPS service is NOT active (status: $cups_active)" "Run: sudo systemctl start cups"
+        fi
+
+        echo "  Enabled: $cups_enabled"
+
+        echo ""
+        echo "  Service details:"
+        systemctl status cups 2>/dev/null | head -10 | while IFS= read -r line; do
+            echo "    $line"
+        done
+    else
+        if pgrep -x cupsd >/dev/null 2>&1; then
+            ok "cupsd process is running"
+        else
+            crit "cupsd process is NOT running"
+        fi
+    fi
+
+    echo ""
+    if pgrep -x cups-browsed >/dev/null 2>&1; then
+        ok "CUPS browser daemon (cups-browsed) is running"
+    else
+        warn "CUPS browser daemon is NOT running" "Network printer discovery may not work"
+    fi
+}
+
+# ---------- Printer Detection ----------
+detect_printers() {
+    section "DETECTED PRINTERS"
+
+    if have lpstat; then
+        local printers
+        printers=$(lpstat -a 2>/dev/null | awk '{print $1}' | sort -u)
+        if [[ -n "$printers" ]]; then
+            while IFS= read -r printer; do
+                [[ -z "$printer" ]] && continue
+                echo "  • $printer"
+                local status
+                status=$(lpstat -p "$printer" 2>/dev/null | head -1)
+                [[ -n "$status" ]] && echo "    $status"
+                local default_printer
+                default_printer=$(lpstat -d 2>/dev/null | awk '{print $NF}')
+                if [[ "$printer" == "$default_printer" ]]; then
+                    echo "    → DEFAULT PRINTER"
+                fi
+            done <<< "$printers"
+        else
+            warn "No printers found in lpstat"
+        fi
+    fi
+
+    echo ""
+    echo "  Network Printers (via avahi):"
+    if have avahi-browse; then
+        local network_printers
+        network_printers=$(avahi-browse -rt _ipp._tcp 2>/dev/null | grep "=" | head -10 || true)
+        if [[ -n "$network_printers" ]]; then
+            echo "$network_printers" | while IFS= read -r line; do
+                echo "    • $line"
+            done
+        else
+            echo "    None discovered"
+        fi
+    fi
+}
+
+# ---------- Queue Status ----------
+check_queues() {
+    section "PRINT QUEUE STATUS"
+
+    if ! have lpstat; then
+        warn "lpstat not available"
+        return
+    fi
+
+    local queued_jobs
+    queued_jobs=$(lpstat -W not-completed 2>/dev/null | wc -l)
+    echo "  Pending jobs: $queued_jobs"
+
+    if [[ "$queued_jobs" -gt 0 ]]; then
+        echo ""
+        echo "  Job details:"
+        lpstat -W not-completed 2>/dev/null | while IFS= read -r line; do
+            echo "    • $line"
+        done
+    fi
+
+    local completed_jobs
+    completed_jobs=$(lpstat -W completed 2>/dev/null | tail -10 | wc -l)
+    echo "  Recent completed jobs: $completed_jobs"
+}
+
+# ---------- Deep Log Analysis ----------
+deep_log_scan() {
+    section "DEEP LOG ANALYSIS"
+
+    echo "  Scanning ALL CUPS log locations..."
+
+    local log_locations=(
+        "/var/log/cups/access_log"
+        "/var/log/cups/error_log"
+        "/var/log/cups/page_log"
+        "/var/log/cups/access_log-*.gz"
+        "/var/log/cups/error_log-*.gz"
+    )
+
+    local total_errors=0
+
+    for log_path in "${log_locations[@]}"; do
+        if ls $log_path 2>/dev/null | head -1 | grep -qE "\.gz$"; then
+            echo ""
+            echo "  Gzipped logs found (sample):"
+            ls -la $log_path 2>/dev/null | head -5 | while IFS= read -r line; do
+                echo "    $line"
+            done
+        fi
+    done
+
+    echo ""
+    echo "  Recent 100 lines from error_log:"
+    if [[ -f "/var/log/cups/error_log" ]]; then
+        local errors
+        errors=$(tail -n 100 "/var/log/cups/error_log" 2>/dev/null)
+        if [[ -n "$errors" ]]; then
+            echo "$errors" | head -50 | while IFS= read -r line; do
+                if echo "$line" | grep -qiE "error|fail|denied"; then
+                    echo "    ✗ $line"
+                elif echo "$line" | grep -qiE "warn"; then
+                    echo "    ! $line"
+                else
+                    echo "    $line"
+                fi
+            done
+        fi
+    else
+        info "Cannot read /var/log/cups/error_log (may need sudo)"
+    fi
+
+    echo ""
+    echo "  Access log analysis (recent 50 lines):"
+    if [[ -f "/var/log/cups/access_log" ]]; then
+        tail -n 50 "/var/log/cups/access_log" 2>/dev/null | while IFS= read -r line; do
+            if echo "$line" | grep -qiE "403|500|denied|error"; then
+                echo "    ! $line"
+            else
+                echo "    $line"
+            fi
+        done
+    fi
+
+    echo ""
+    echo "  Journalctl CUPS errors (last 100 lines):"
+    if have journalctl; then
+        local journal_errors
+        journal_errors=$(journalctl -u cups --since "$SINCE" --no-pager 2>/dev/null | grep -iE "error|fail|denied|refused" | tail -30 || true)
+        if [[ -n "$journal_errors" ]]; then
+            echo "$journal_errors" | while IFS= read -r line; do
+                echo "    ✗ $line"
+            done
+        else
+            ok "No errors in CUPS journal"
+        fi
+    fi
+
+    echo ""
+    echo "  Kernel printer messages:"
+    if [[ -f "/var/log/kern.log" ]]; then
+        tail -n 50 "/var/log/kern.log" 2>/dev/null | grep -iE "printer|cups|usb.*print" | while IFS= read -r line; do
+            echo "    • $line"
+        done
+    fi
+}
+
+# ---------- Manual Testing ----------
+manual_testing() {
+    section "MANUAL TESTING GUIDE"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    MANUAL PRINTER TESTING                          │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  STEP 1: Verify CUPS is running"
+    echo "  ──────────────────────────────"
+    echo "    sudo systemctl status cups"
+    echo "    sudo systemctl restart cups    # if not running"
+    echo ""
+    echo "  STEP 2: Check if CUPS is listening on port 631"
+    echo "  ───────────────────────────────────────────────"
+    echo "    sudo ss -tlnp | grep 631"
+    echo "    # You should see: *:631 or 0.0.0.0:631"
+    echo ""
+    echo "  STEP 3: Test lpstat commands"
+    echo "  ──────────────────────────"
+    echo "    lpstat -t                  # Full status"
+    echo "    lpstat -v                  # Show device URIs"
+    echo "    lpstat -a                  # Show accepting status"
+    echo "    lpstat -r                  # Check scheduler"
+    echo "    lpstat -W not-completed     # Pending jobs"
+    echo ""
+    echo "  STEP 4: Find your printer's IP/hostname"
+    echo "  ───────────────────────────────────────"
+    echo "    lpstat -v | grep ipp"
+    echo "    # Extract IP from URI: ipp://192.168.x.x:631/printers/..."
+    echo "    ping -c 1 192.168.x.x     # Test connectivity"
+    echo "    nc -zv 192.168.x.x 631    # Test IPP port"
+    echo "    nc -zv 192.168.x.x 9100   # Test raw port (JetDirect)"
+    echo ""
+    echo "  STEP 5: Send a test page"
+    echo "  ────────────────────────"
+    echo "    lp -d PRINTER_NAME /usr/share/cups/data/testprint"
+    echo "    echo 'Hello Printer' | lp -d PRINTER_NAME"
+    echo "    # Or via CUPS web interface: http://localhost:631"
+    echo ""
+    echo "  STEP 6: Check printer state"
+    echo "  ──────────────────────────"
+    echo "    lpstat -p PRINTER_NAME    # Specific printer status"
+    echo "    cupsenable PRINTER_NAME   # Enable if disabled"
+    echo "    cupsdisable PRINTER_NAME  # Disable printer"
+    echo "    reject PRINTER_NAME       # Reject new jobs"
+    echo "    accept PRINTER_NAME       # Accept new jobs"
+    echo ""
+    echo "  STEP 7: Cancel stuck jobs"
+    echo "  ─────────────────────────"
+    echo "    lpstat -W not-completed   # List pending jobs"
+    echo "    cancel JOB_ID             # Cancel specific job"
+    echo "    cancel -a PRINTER_NAME    # Cancel all jobs for printer"
+    echo ""
+    echo "  STEP 8: Debug with lpinfo"
+    echo "  ─────────────────────────"
+    echo "    lpinfo -v                 # List available devices"
+    echo "    lpinfo -m                 # List available drivers"
+    echo "    lpinfo --device-id        # Get printer device ID"
+    echo ""
+    echo "  STEP 9: View live CUPS logs"
+    echo "  ──────────────────────────"
+    echo "    tail -f /var/log/cups/error_log"
+    echo "    journalctl -u cups -f     # Follow CUPS journal"
+    echo ""
+    echo "  STEP 10: Common fixes"
+    echo "  ─────────────────────"
+    echo "    # Restart CUPS"
+    echo "    sudo systemctl restart cups"
+    echo ""
+    echo "    # Re-add a printer"
+    echo "    sudo lpadmin -p PRINTER_NAME -E -v ipp://IP/printers/NAME -m driver.ppd"
+    echo ""
+    echo "    # Set default printer"
+    echo "    lpstat -d"
+    echo "    lpoptions -d PRINTER_NAME"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    COMMON ERROR CODES                               │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "    client-error-not-found       → Printer URI wrong or printer offline"
+    echo "    client-error-forbidden       → Authentication failed or access denied"
+    echo "    client-error-busy            → Printer is busy, try again later"
+    echo "    server-error-service-unavailable → CUPS not running or unreachable"
+    echo "    server-error-internal-error  → CUPS internal error, check logs"
+    echo ""
+}
+
+# ---------- Tail Mode ----------
+tail_mode() {
+    echo "=== Last $TAIL_LINES CUPS error lines ==="
+
+    if [[ -f "/var/log/cups/error_log" ]]; then
+        tail -n $TAIL_LINES "/var/log/cups/error_log" 2>/dev/null || echo "  Cannot read error log"
+    else
+        if have journalctl; then
+            journalctl -u cups --since "1 hour ago" --no-pager 2>/dev/null | tail -$TAIL_LINES || \
+                echo "  No recent CUPS journal entries"
+        else
+            echo "  CUPS error log not accessible"
+        fi
+    fi
+}
+
+# ---------- Network Printer Connectivity ----------
+check_network() {
+    section "NETWORK PRINTER CONNECTIVITY"
+
+    if ! have lpstat; then
+        return
+    fi
+
+    echo "  Printer URIs from lpstat -v:"
+    lpstat -v 2>/dev/null | grep -E "ipp|http|socket" | while IFS= read -r line; do
+        echo "  • $line"
+
+        local uri
+        uri=$(echo "$line" | awk '{print $NF}')
+        local host
+        host=$(echo "$uri" | sed -E 's|.*://([^:/]+).*|\1|')
+        local port
+        port=$(echo "$uri" | sed -E 's|.*:([0-9]+)/.*|\1|' || echo "631")
+
+        if [[ -n "$host" ]]; then
+            echo "    Testing connectivity to $host:$port..."
+            if have nc; then
+                if nc -z -w 3 "$host" "$port" 2>/dev/null; then
+                    ok "  $host:$port is reachable"
+                else
+                    warn "  $host:$port is NOT reachable"
+                fi
+            elif have ping; then
+                if ping -c 1 -W 2 "$host" 2>/dev/null | grep -q "1 packets transmitted"; then
+                    ok "  $host is reachable (but port $port may be blocked)"
+                else
+                    warn "  $host is NOT reachable"
+                fi
+            fi
+        fi
+    done
+}
+
+# ---------- CUPS Sharing Diagnostics ----------
+check_sharing() {
+    section "CUPS PRINTER SHARING DIAGNOSTICS"
+
+    local my_hostname
+    my_hostname=$(hostname)
+    local my_domain="${my_hostname}.local"
+
+    local sharing_enabled
+    sharing_enabled=$(cupsctl 2>/dev/null | grep "^Browsing" | awk -F= '{print $2}' || echo "unknown")
+    local share_printers
+    share_printers=$(cupsctl 2>/dev/null | grep "^SharePrinters" | awk -F= '{print $2}' || echo "unknown")
+
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    CUPS SHARING SETTINGS                               │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  Your hostname: $my_hostname"
+    echo "  Your domain:   $my_domain"
+    echo "  Your IPs:     $(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo ""
+    echo "  CUPS Sharing (Browsing):  $sharing_enabled"
+    echo "  Share Printers:          $share_printers"
+
+    if [[ "$sharing_enabled" != "on" ]]; then
+        warn "CUPS sharing is DISABLED"
+    else
+        ok "CUPS sharing is enabled"
+    fi
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    PRINTERS ON THIS MACHINE                            │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+
+    local printer_count=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        printer_count=$((printer_count + 1))
+
+        local printer_name
+        printer_name=$(echo "$line" | sed -E 's/device for //' | sed 's/:.*//')
+        local_uri=$(echo "$line" | awk '{print $NF}')
+
+        echo ""
+        echo "  [$printer_count] $printer_name"
+        echo "      Local URI:  $local_uri"
+
+        case "$local_uri" in
+            usb://*)
+                echo "      Connection: USB (local)"
+                ;;
+            ipp://*)
+                echo "      Connection: IPP (network)"
+                ;;
+            ipps://*)
+                echo "      Connection: IPP over SSL (network encrypted)"
+                ;;
+            socket://*)
+                echo "      Connection: JetDirect (network)"
+                ;;
+            lpd://*)
+                echo "      Connection: LPD (legacy network)"
+                ;;
+            dnssd://*|mdns://*)
+                echo "      Connection: DNS-SD/mDNS discovery"
+                ;;
+            *)
+                echo "      Connection: Unknown"
+                ;;
+        esac
+
+        local remote_uri="ipps://${my_domain}:631/printers/${printer_name}"
+        echo "      Remote URI: $remote_uri"
+        echo "      Remote Alt: ipp://${my_domain}:631/printers/${printer_name}"
+
+        local accept_status
+        accept_status=$(lpstat -a "$printer_name" 2>/dev/null | awk '{print $2}' | tr -d '()')
+        local printer_enabled
+        printer_enabled=$(lpstat -p "$printer_name" 2>/dev/null | grep -q "enabled" && echo "yes" || echo "no")
+
+        echo "      Accepting:   $accept_status"
+        echo "      Enabled:     $printer_enabled"
+
+        if [[ "$sharing_enabled" != "on" ]]; then
+            echo "      ⚠ Sharing DISABLED"
+        elif [[ "$accept_status" != "accepted" ]]; then
+            echo "      ⚠ Not accepting jobs"
+        elif [[ "$printer_enabled" != "yes" ]]; then
+            echo "      ⚠ Printer DISABLED"
+        else
+            echo "      ✓ Ready for network access"
+        fi
+
+    done < <(lpstat -v 2>/dev/null | grep -v "file:/" | grep "device for")
+
+    [[ $printer_count -eq 0 ]] && info "No printers configured"
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    DISCOVERED ON NETWORK (mDNS)                        │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+
+    if have avahi-browse; then
+        echo ""
+        avahi-browse -rt _ipp._tcp 2>/dev/null | grep "^=" | grep -iE "brother|printer|laser|hp|canon|epson" | head -5 | while IFS= read -r line; do
+            local iface
+            iface=$(echo "$line" | sed -E 's/= ([^ ]+).*/\1/')
+            local proto
+            proto=$(echo "$line" | sed -E 's/.*IPv([46]).*/\1/')
+            local name
+            name=$(echo "$line" | sed -E 's/.*@ //' | awk '{print $1, $2, $3}')
+            local host
+            host=$(echo "$line" | sed -E 's/.*@ ([^ ]+).*/\1/')
+            echo "  • $name ($iface/IPv$proto) @ $host"
+        done
+        echo ""
+        echo "  (Full mDNS info shows printer is advertised on multiple interfaces)"
+    else
+        info "avahi-browse not available"
+    fi
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    FIREWALL STATUS                                      │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+
+    if have ufw; then
+        local ufw_active
+        ufw_active=$(sudo ufw status 2>/dev/null | head -1 | grep -q "Status: active" && echo "yes" || echo "no")
+        if [[ "$ufw_active" == "yes" ]]; then
+            warn "UFW firewall is ACTIVE"
+            echo "  Clients may be blocked from port 631!"
+            echo ""
+            echo "  To fix, run:"
+            echo "    sudo ufw allow 631/tcp"
+            echo "    sudo ufw allow from 192.168.0.0/16 to any port 631 proto tcp"
+        else
+            ok "UFW firewall not blocking"
+        fi
+    fi
+
+    if have ss; then
+        local ipp_listening
+        ipp_listening=$(ss -tlnp 2>/dev/null | grep ":631" | grep LISTEN | head -1)
+        if [[ -n "$ipp_listening" ]]; then
+            ok "CUPS listening on port 631"
+        else
+            crit "CUPS NOT listening on port 631!"
+        fi
+    fi
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    DYNAMIC FIX COMMANDS                               │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+
+    echo ""
+    echo "  ═══════════════════════════════════════════════════════════════════════"
+    echo "  ON THIS MACHINE ($my_hostname) - Run these commands here:"
+    echo "  ═══════════════════════════════════════════════════════════════════════"
+    echo ""
+
+    if [[ "$sharing_enabled" != "on" ]]; then
+        echo "  # Enable CUPS printer sharing:"
+        echo "  sudo cupsctl --share-printers"
+        echo "  sudo systemctl restart cups"
+        echo ""
+    fi
+
+    echo "  # Verify sharing is on:"
+    echo "  cupsctl --remote-printers 2>/dev/null || echo 'Sharing may need manual enable'"
+    echo ""
+
+    echo ""
+    echo "  ═══════════════════════════════════════════════════════════════════════"
+    echo "  ON CLIENT MACHINE (e.g., yalla) - Run these commands:"
+    echo "  ═══════════════════════════════════════════════════════════════════════"
+    echo ""
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local printer_name
+        printer_name=$(echo "$line" | sed -E 's/device for //' | sed 's/:.*//')
+        local remote_uri="ipps://${my_domain}:631/printers/${printer_name}"
+        local alt_uri="ipp://${my_domain}:631/printers/${printer_name}"
+
+        echo "  # Fix for: $printer_name"
+        echo "  sudo lpadmin -x $printer_name 2>/dev/null || true"
+        echo "  sudo lpadmin -p ${printer_name}_${my_hostname} \\"
+        echo "    -E -v $remote_uri \\"
+        echo "    -m everywhere"
+        echo "  sudo lpoptions -d ${printer_name}_${my_hostname}"
+        echo "  echo 'Test print from $printer_name' | lp -d ${printer_name}_${my_hostname}"
+        echo ""
+
+    done < <(lpstat -v 2>/dev/null | grep -v "file:/" | grep "device for")
+
+    echo "  # Alternative: Use DNS-SD auto-discovery on client:"
+    echo "  # (No URI needed - client discovers automatically)"
+    echo "  sudo lpadmin -p ${printer_name}_${my_hostname} -E -D 'Brother via $my_hostname'"
+    echo ""
+
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │           REMOTE CONNECTIVITY TESTS (run on CLIENT machine)            │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  From client machine (e.g., yalla), run these to test connectivity:"
+    echo ""
+    echo "  # Test 1: Ping the printer server"
+    echo "    ping -c 2 $my_domain"
+    echo ""
+    echo "  # Test 2: Check IPP endpoint (this printer)"
+    echo "    curl -skI https://$my_domain:631/printers/${printer_name}"
+    echo ""
+    echo "  # Test 3: Get printer status via IPP"
+    echo "    ipptool -tvf ipp://$my_domain:631/printers/${printer_name} get-printer-attributes.test"
+    echo ""
+    echo "  # Test 4: Check what printers client sees"
+    echo "    lpstat -a"
+    echo "    lpstat -v"
+    echo ""
+    echo "  # Test 5: Verbose printer status"
+    echo "    lpstat -l -p ${printer_name}"
+    echo ""
+
+    echo "  ┌────────────────────────────────────────────────────────────────────────┐"
+    echo "  │           DEBUG PRINTER ISSUES (if printer not responding)               │"
+    echo "  └────────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  If you get 'client-error-not-found' or printer doesn't respond:"
+    echo ""
+    echo "  ON SERVER (ashy) - check/fix printer status:"
+    echo "    # Check if printer is accepting jobs"
+    echo "    lpstat -a $printer_name"
+    echo ""
+    echo "    # Enable printer if disabled"
+    echo "    sudo cupsenable $printer_name"
+    echo "    sudo cupsaccept $printer_name"
+    echo ""
+    echo "    # Restart CUPS"
+    echo "    sudo systemctl restart cups"
+    echo ""
+    echo "  ON CLIENT (yalla) - if printer disappeared:"
+    echo "    # Remove old entry"
+    echo "    sudo lpadmin -x ${printer_name}_${my_hostname} 2>/dev/null || true"
+    echo "    sudo lpadmin -x ${printer_name} 2>/dev/null || true"
+    echo ""
+    echo "    # Re-add with correct driver"
+    echo "    sudo lpadmin -p ${printer_name} \\"
+    echo "      -E -v ipps://${my_domain}:631/printers/${printer_name} \\"
+    echo "      -m everywhere"
+    echo ""
+    echo "    # Or specify driver manually if 'everywhere' doesn't work:"
+    echo "    # Find driver: lpinfo -m | grep -i brother"
+    echo "    # Then use: -m 'openprinting-ppds:...'"
+    echo ""
+    echo "    # Enable and test"
+    echo "    sudo cupsenable ${printer_name}"
+    echo "    echo 'Test from ${my_domain}' | lp -d ${printer_name}"
+    echo ""
+}
+
+# ---------- Common Issues ----------
+declare -A PRINTER_ISSUES=(
+    ["connection refused"]="CUPS may not be running. Run: sudo systemctl start cups"
+    ["client-error-forbidden"]="Authentication failed or access denied. Check CUPS permissions"
+    ["client-error-not-found"]="Printer URI wrong or printer offline. Verify with lpinfo -v"
+    ["client-error-busy"]="Printer is busy. Wait or cancel stuck jobs with: cancel -a"
+    ["printer not responding"]="Check physical connection, network, and power"
+    ["unable to connect"]="Network printer unreachable. Check IP and firewall rules"
+    ["ipp error"]="IPP protocol issue. Try: sudo systemctl restart cups"
+    ["timeout"]="Connection timeout. Check network path and printer availability"
+)
+
+check_common_issues() {
+    section "COMMON ISSUE DETECTION"
+
+    local found_issue=0
+
+    for issue in "${!PRINTER_ISSUES[@]}"; do
+        local resolution="${PRINTER_ISSUES[$issue]}"
+
+        local matches
+        if [[ -f "/var/log/cups/error_log" ]]; then
+            matches=$(grep -il "$issue" "/var/log/cups/error_log" 2>/dev/null || true)
+        fi
+
+        if [[ -n "$matches" ]]; then
+            found_issue=1
+            crit "$issue" "$resolution"
+        fi
+    done
+
+    [[ $found_issue -eq 0 ]] && ok "No common printer issues detected in logs"
+}
+
+# ---------- JSON Output ----------
+json_output() {
+    local elapsed
+    elapsed=$(($(date +%s) - START_TS))
+    printf '{"timestamp":"%s","hostname":"%s","since":"%s","warnings":%d,"critical":%d,"duration_s":%d}\n' \
+        "$(date -Iseconds)" "$HOSTNAME_SHORT" "$SINCE" "$WARNINGS" "$CRITICAL" "$elapsed"
+}
+
+# ---------- Print Job Management ----------
+manage_jobs() {
+    section "PRINT JOB MANAGEMENT"
+
+    if ! have lpstat; then
+        crit "lpstat not available" "Install cups-client package"
+        return
+    fi
+
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                         PRINT JOBS                                  │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    echo "  ACTIVE/QUEUED JOBS:"
+    echo "  ───────────────────"
+    local pending_jobs
+    pending_jobs=$(lpstat -W not-completed 2>/dev/null)
+    if [[ -n "$pending_jobs" ]]; then
+        echo "$pending_jobs" | while IFS= read -r line; do
+            echo "    $line"
+        done
+    else
+        ok "No pending jobs"
+    fi
+
+    echo ""
+    echo "  COMPLETED JOBS (recent 10):"
+    echo "  ─────────────────────────────"
+    local completed_jobs
+    completed_jobs=$(lpstat -W completed 2>/dev/null | tail -10)
+    if [[ -n "$completed_jobs" ]]; then
+        echo "$completed_jobs" | while IFS= read -r line; do
+            echo "    $line"
+        done
+    else
+        info "No recent completed jobs"
+    fi
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                      JOB CONTROL COMMANDS                            │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  Cancel a specific job:"
+    echo "    cancel JOB_ID"
+    echo "    # Example: cancel 123"
+    echo ""
+    echo "  Cancel all jobs for a printer:"
+    echo "    cancel -a PRINTER_NAME"
+    echo "    # Example: cancel -a HL-5370DW-series"
+    echo ""
+    echo "  Cancel ALL pending jobs:"
+    echo "    cancel -a"
+    echo ""
+    echo "  Hold a job (temporarily):"
+    echo "    sudo cups-hold JOB_ID"
+    echo ""
+    echo "  Release a held job:"
+    echo "    sudo cups-release JOB_ID"
+    echo ""
+    echo "  Move job to another printer:"
+    echo "    sudo cups-move JOB_ID DEST_PRINTER"
+    echo ""
+    echo "  Reprint a completed job:"
+    echo "    sudo cups-resend JOB_ID"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                      PRINTER CONTROL                               │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  Enable a printer (accept jobs):"
+    echo "    sudo cupsenable PRINTER_NAME"
+    echo ""
+    echo "  Disable a printer (reject new jobs):"
+    echo "    sudo cupsdisable PRINTER_NAME"
+    echo ""
+    echo "  Cancel all jobs AND disable printer:"
+    echo "    sudo cupsdisable -c PRINTER_NAME"
+    echo ""
+    echo "  Set printer as default:"
+    echo "    lpoptions -d PRINTER_NAME"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                      VIEW JOB DETAILS                               │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  lpstat -t                  # Full status with job info"
+    echo "  lpstat -W not-completed   # Pending jobs only"
+    echo "  lpstat -W completed       # Finished jobs"
+    echo "  lpq                        # Show print queue"
+    echo "  lpq -a                    # All queues"
+}
+
+# ---------- Send Poem Test Page ----------
+send_poem() {
+    section "PRINTING TEST POEM"
+
+    if ! have lp; then
+        crit "lp command not available" "Install cups-client package"
+        return
+    fi
+
+    local default_printer
+    default_printer=$(lpstat -d 2>/dev/null | awk '{print $NF}' || true)
+
+    if [[ -z "$default_printer" || "$default_printer" == "none" ]]; then
+        crit "No default printer configured"
+        info "Set one with: lpoptions -d PRINTER_NAME"
+        return
+    fi
+
+    echo "  Sending poetic test page to: $default_printer"
+    echo ""
+
+    # Gather real printer data
+    local printer_status
+    printer_status=$(lpstat -p "$default_printer" 2>/dev/null | head -1 || echo "unknown")
+    local cups_active
+    cups_active=$(systemctl is-active cups 2>/dev/null || echo "unknown")
+    local cups_port
+    cups_port=$(ss -tlnp 2>/dev/null | grep ":631" | head -1 | awk '{print $4}' || echo "not listening")
+    local pending_jobs
+    pending_jobs=$(lpstat -W not-completed 2>/dev/null | wc -l)
+    local printer_uri
+    printer_uri=$(lpstat -v 2>/dev/null | grep "$default_printer" | awk '{print $NF}' || echo "unknown")
+
+    local all_printers
+    all_printers=$(lpstat -a 2>/dev/null | awk '{print $1}' | head -5 | tr '\n' '|')
+
+    local local_ip
+    local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+
+    local poem
+    poem="
+================================================================================
+              PRINTERZ TEST PAGE - System Details
+================================================================================
+
+  Computer Name:    $(hostname)
+  Local IP:        $local_ip
+  Default Printer: $default_printer
+  Printer URI:     $printer_uri
+  Cups Status:     $cups_active
+  Cups Port:       $cups_port
+  Pending Jobs:    $pending_jobs
+  Available Printers: $(echo "$all_printers" | tr '|' ' ')
+
+================================================================================
+           A PRINT JOB FOR THE COSMOS - Generated by printerz
+================================================================================
+
+  There once was a packet called IP,       REALITY: Printer: $default_printer
+  That traveled the network with flip.        URI: $printer_uri
+  It routed and hopped,                       Status: $printer_status
+  Till the printer it stopped,              Cups: $cups_active on $cups_port
+
+  The user pressed print with hope,          REALITY: Pending jobs: $pending_jobs
+  Their document began to grope,             Hostname: $(hostname)
+  Through queues and spins,                   Kernel: $(uname -r | cut -d- -f1)
+  Till paper emerged with great scope.       Local IP: $local_ip
+
+  Oh router, dear switch, and hub,           REALITY: The universe runs on
+  You carry my bytes through the slub,       print jobs and cosmic dust.
+  Of cat6 and fiber,                         From chaos comes order,
+  Making data flow proper.                   And pages from pixels and trust.
+
+  We print because we believe,               REALITY: If you read this, IT WORKS!
+  That meaning is what we receive,           Your print pipeline is functional.
+  From electrons dancing,                     Paper from binary dance.
+  On paper, our thoughts conceive.           Another successful print instance!
+
+================================================================================
+  Printed: $(date) | Cups: $cups_active | Default: $default_printer
+================================================================================
+"
+
+    echo "$poem" | lp -d "$default_printer" 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        ok "Poem sent to $default_printer!"
+        echo ""
+        echo "  Check your printer output in a few seconds..."
+        echo "  Then verify with: lpstat -W not-completed"
+    else
+        crit "Failed to send poem"
+    fi
+}
+
+# ---------- Service Management ----------
+manage_services() {
+    section "CUPS SERVICE MANAGEMENT"
+
+    if ! have systemctl; then
+        warn "systemctl not available - cannot manage services"
+        info "On non-systemd systems, try: sudo /etc/init.d/cups restart"
+        return
+    fi
+
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    CUPS SERVICE STATUS                              │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    echo "  Main CUPS service:"
+    local cups_active cups_enabled
+    cups_active=$(systemctl is-active cups 2>/dev/null || echo "unknown")
+    cups_enabled=$(systemctl is-enabled cups 2>/dev/null || echo "unknown")
+    echo "    Active:  $cups_active"
+    echo "    Enabled: $cups_enabled"
+
+    echo ""
+    echo "  CUPS browser daemon (network discovery):"
+    local browsed_active
+    browsed_active=$(systemctl is-active cups-browsed 2>/dev/null || echo "unknown")
+    echo "    Active: $browsed_active"
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                   SERVICE CONTROL COMMANDS                         │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  START CUPS:"
+    echo "    sudo systemctl start cups"
+    echo ""
+    echo "  STOP CUPS:"
+    echo "    sudo systemctl stop cups"
+    echo ""
+    echo "  RESTART CUPS (recommended for most issues):"
+    echo "    sudo systemctl restart cups"
+    echo ""
+    echo "  RELOAD CUPS (reload config without restarting):"
+    echo "    sudo systemctl reload cups"
+    echo ""
+    echo "  ENABLE CUPS (start on boot):"
+    echo "    sudo systemctl enable cups"
+    echo ""
+    echo "  DISABLE CUPS (prevent start on boot):"
+    echo "    sudo systemctl disable cups"
+    echo ""
+    echo "  VIEW CUPS LOGS IN REAL-TIME:"
+    echo "    journalctl -u cups -f"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │              CUPS BROWSER DAEMON (cups-browsed)                    │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  Network printer discovery daemon. Enable if you want auto-discovery."
+    echo ""
+    echo "  Start:"
+    echo "    sudo systemctl start cups-browsed"
+    echo ""
+    echo "  Enable on boot:"
+    echo "    sudo systemctl enable cups-browsed"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                     ALTERNATIVE METHODS                             │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  Via CUPS web interface (runs on port 631):"
+    echo "    http://localhost:631"
+    echo ""
+    echo "  Direct cupsd command (if systemd not available):"
+    echo "    sudo cupsd -f                    # Run in foreground"
+    echo "    sudo killall cupsd               # Stop CUPS"
+    echo ""
+    echo "  On SysV init systems:"
+    echo "    sudo /etc/init.d/cups start"
+    echo "    sudo /etc/init.d/cups stop"
+    echo "    sudo /etc/init.d/cups restart"
+    echo ""
+    echo "  ┌────────────────────────────────────────────────────────────────────┐"
+    echo "  │                    TROUBLESHOOTING                                  │"
+    echo "  └────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  If CUPS won't start:"
+    echo "    sudo systemctl status cups      # Check error details"
+    echo "    sudo journalctl -u cups -n 50   # View recent logs"
+    echo "    cat /var/log/cups/error_log     # Direct error log"
+    echo ""
+    echo "  If printer not found after adding:"
+    echo "    sudo systemctl restart cups"
+    echo "    sudo systemctl restart cups-browsed"
+}
+
+# ---------- Detect Connection Type ----------
+detect_connection() {
+    local uri="$1"
+    case "$uri" in
+        usb://*)      echo "USB" ;;
+        ipp://*|ipps://*)  echo "Network (IPP)" ;;
+        socket://*)  echo "Network (JetDirect)" ;;
+        lpd://*)     echo "Network (LPD)" ;;
+        serial://*)   echo "Serial" ;;
+        bluetooth://*) echo "Bluetooth" ;;
+        dnssd://*|mdns://*) echo "Network (Discovery)" ;;
+        *)           echo "Unknown" ;;
+    esac
+}
+
+# ---------- Summary Header ----------
+print_summary_header() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local default_printer
+    default_printer=$(lpstat -d 2>/dev/null | awk '{print $NF}' || echo "none")
+    local cups_active
+    cups_active=$(systemctl is-active cups 2>/dev/null || echo "unknown")
+    local cups_port
+    cups_port=$(ss -tlnp 2>/dev/null | grep ":631" | head -1 | awk '{print $4}' || echo "not listening")
+    local local_ip
+    local_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+    local pending
+    pending=$(lpstat -W not-completed 2>/dev/null | wc -l)
+    local printer_count
+    printer_count=$(lpstat -a 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+
+    local printer_uri="unknown"
+    local connection_type="Unknown"
+    if [[ "$default_printer" != "none" ]]; then
+        printer_uri=$(lpstat -v 2>/dev/null | grep "$default_printer" | awk '{print $NF}' || echo "unknown")
+        connection_type=$(detect_connection "$printer_uri")
+    fi
+
+    printf "  %-15s %s\n" "Host:" "$HOSTNAME_SHORT ($local_ip)"
+    printf "  %-15s %s\n" "Cups:" "$cups_active on $cups_port"
+    printf "  %-15s %s\n" "Default Printer:" "$default_printer"
+    if [[ "$default_printer" != "none" ]]; then
+        printf "  %-15s %s\n" "Connection:" "$connection_type"
+        printf "  %-15s %s\n" "URI:" "$printer_uri"
+    fi
+    printf "  %-15s %s\n" "Pending Jobs:" "$pending"
+    printf "  %-15s %s\n" "Total Printers:" "$printer_count"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+}
+
+# ---------- Main ----------
+main() {
+
+    if [[ $MANUAL_MODE -eq 1 ]]; then
+        manual_testing
+        exit 0
+    fi
+
+    if [[ $USB_MODE -eq 1 ]]; then
+        scan_usb
+        exit 0
+    fi
+
+    if [[ $PORTS_MODE -eq 1 ]]; then
+        check_ports
+        exit 0
+    fi
+
+    if [[ $JOBS_MODE -eq 1 ]]; then
+        manage_jobs
+        exit 0
+    fi
+
+    if [[ $SERVICES_MODE -eq 1 ]]; then
+        manage_services
+        exit 0
+    fi
+
+    if [[ $POEM_MODE -eq 1 ]]; then
+        send_poem
+        exit 0
+    fi
+
+    if [[ $SHARING_MODE -eq 1 ]]; then
+        check_sharing
+        exit 0
+    fi
+
+    if [[ $FULL_LPSTAT -eq 1 ]]; then
+        full_lpstat
+        exit 0
+    fi
+
+    if [[ $TAIL_LINES -ne 50 ]] || [[ "${1:-}" == "--tail" ]]; then
+        tail_mode
+        exit 0
+    fi
+
+    check_cups_service
+    detect_printers
+    check_queues
+    check_ports
+    check_network
+
+    if [[ $DEEP_SCAN -eq 1 ]]; then
+        deep_log_scan
+    else
+        scan_cups_error_log
+        scan_journal
+    fi
+
+    check_common_issues
+
+    print_summary_header
+
+    section "VERDICT"
+    if (( CRITICAL > 0 )); then
+        echo "  CRITICAL: $CRITICAL critical, $WARNINGS warnings"
+    elif (( WARNINGS > 0 )); then
+        echo "  WARNING: $WARNINGS warnings"
+    else
+        echo "  HEALTHY: no issues detected"
+    fi
+
+    echo "  Scan completed in $(($(date +%s) - START_TS))s"
+    echo ""
+    echo "  Run './printerz --manual' for testing instructions"
+
+    if [[ "$JSON_OUT" == "1" ]]; then
+        json_output
+    fi
+
+    if (( CRITICAL > 0 )); then
+        exit 2
+    elif (( WARNINGS > 0 )); then
+        exit 1
+    fi
+    exit 0
+}
+
+# ---------- Individual scan functions for targeted runs ----------
+scan_cups_error_log() {
+    section "CUPS ERROR LOG (last 50 lines)"
+
+    if [[ -f "/var/log/cups/error_log" ]]; then
+        local log_errors
+        log_errors=$(tail -n 50 "/var/log/cups/error_log" 2>/dev/null | grep -iE "error|warn|fail|denied|timeout|refused" || true)
+
+        if [[ -n "$log_errors" ]]; then
+            echo "$log_errors" | head -20 | while IFS= read -r line; do
+                echo "    ✗ $line"
+            done
+        else
+            ok "No errors in CUPS error log"
+        fi
+    else
+        info "Cannot read /var/log/cups/error_log (may need sudo)"
+    fi
+}
+
+scan_journal() {
+    section "SYSTEMD JOURNAL (CUPS)"
+
+    if ! have journalctl; then
+        info "journalctl not available"
+        return
+    fi
+
+    local journal_errors
+    journal_errors=$(journalctl -u cups --since "$SINCE" --no-pager 2>/dev/null | grep -iE "error|fail|denied" | tail -20 || true)
+
+    if [[ -n "$journal_errors" ]]; then
+        echo "$journal_errors" | while IFS= read -r line; do
+            echo "    ✗ $line"
+        done
+    else
+        ok "No errors in CUPS journal"
+    fi
+}
+
+main

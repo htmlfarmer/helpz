@@ -1,0 +1,1069 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# sqlz - PostgreSQL cluster diagnostic
+# ----------------------------------------------------------------------------
+# Inspects cluster status, databases, connections, locks, long queries,
+# table/index sizes, bloat, vacuum health, cache hit ratios, replication,
+# and configuration. Highlights problems with colored severity icons.
+#
+# Usage:
+#   ./sqlz                            # Connect to local DB (peer auth as $USER)
+#   ./sqlz --db appdb               # Target a specific database
+#   ./sqlz --user postgres            # Connect as different user (sudo)
+#   ./sqlz --host db.example.com -p 5432
+#   ./sqlz --quick                    # Fast scan (top sections only)
+#   ./sqlz --no-color                 # Plain output
+#   ./sqlz --json                     # Machine-readable summary
+#   ./sqlz --sudo                     # Use sudo to read PG log files (postgres:adm)
+#
+# Requires: psql, pg_lsclusters (optional), sudo (for cross-user queries)
+# Exits 0 healthy, 1 warnings, 2 critical.
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+DB=""
+USER_OPT=""
+HOST_OPT=""
+PORT_OPT=""
+NO_COLOR=0
+JSON_OUT=0
+QUICK=0
+TOP_N=10
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+
+# Index-based parser for multi-word support
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --db=*)        DB="${arg#--db=}" ;;
+    --db|-d)       i=$((i+1)); DB="${ARGS[$i]:-}" ;;
+    --user|-U)     i=$((i+1)); USER_OPT="${ARGS[$i]:-}" ;;
+    --host|-h)     i=$((i+1)); HOST_OPT="${ARGS[$i]:-}" ;;
+    --port|-p)     i=$((i+1)); PORT_OPT="${ARGS[$i]:-5432}" ;;
+    --no-color)    NO_COLOR=1 ;;
+    --json)        JSON_OUT=1 ;;
+    --quick)       QUICK=1; TOP_N=5 ;;
+    --top=*)       TOP_N="${arg#--top=}" ;;
+    --top)         i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
+    --sudo)        USE_SUDO=1 ;;
+    --ai)          AI_VERDICT=1 ;;
+    --no-ai)       AI_VERDICT=0 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          sqlz — PostgreSQL Cluster Diagnostic                 ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects cluster status, databases, connections, locks, long queries,
+  table/index sizes, bloat, vacuum health, cache hit ratios, replication,
+  and configuration. Highlights problems with colored severity icons.
+
+USAGE
+  ./sqlz                            Connect to local DB (peer auth)
+  ./sqlz --db appdb               Target a specific database
+  ./sqlz --user postgres            Connect as different user (sudo)
+  ./sqlz --host db.example.com -p 5432
+  ./sqlz --quick                    Fast scan (top sections only)
+  ./sqlz --no-color                 Plain output
+  ./sqlz --json                     Machine-readable summary
+  ./sqlz --sudo                     Use sudo to read PG log files
+
+OPTIONS
+  --db=NAME       Target database
+  --user=USER     Connect as user (may need sudo)
+  --host=HOST     Remote host
+  --port=PORT     Port (default 5432)
+  --quick         Fast scan (fewer results per section)
+  --top[=N]       Top N results per section (default 10)
+  --sudo          Use sudo for cross-user log access
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  psql                               Interactive PostgreSQL shell
+  pg_stat_activity                   View in psql: SELECT * FROM pg_stat_activity;
+  pg_lsclusters                      List PostgreSQL clusters (Debian/Ubuntu)
+  pg_isready                         Check if server is accepting connections
+  sudo -u postgres psql              Connect as postgres user
+  SELECT pg_database_size(datname) FROM pg_database;
+                                     Database sizes
+
+WARNING → INVESTIGATION COMMANDS
+  Connections near max              →  SELECT count(*) FROM pg_stat_activity;  vs  SHOW max_connections;
+  Long-running queries              →  SELECT pid, now()-query_start, query FROM pg_stat_activity WHERE state='active' AND now()-query_start > interval '30s';
+  Blocking locks                    →  SELECT * FROM pg_locks WHERE NOT granted;
+  Low cache hit ratio (<95%)        →  SELECT datname, blks_hit, blks_read FROM pg_stat_database;
+  Table bloat                       →  SELECT relname, n_dead_tup, n_live_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;
+  Transaction ID wraparound risk    →  SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;
+  Replication lag                   →  SELECT * FROM pg_stat_replication;
+  Vacuum not running                →  SELECT relname, last_vacuum, last_autovacuum FROM pg_stat_user_tables;
+
+HELPEOF
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "sqlz" "JSON_OUT=$JSON_OUT QUICK=$QUICK" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Default port
+[[ -z "$PORT_OPT" ]] && PORT_OPT="5432"
+
+# ---------- Privilege detection ----------
+SUDO=""
+if [[ -n "$USER_OPT" ]] && [[ "$USER_OPT" != "$USER" ]] && [[ $EUID -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    SUDO="sudo -u $USER_OPT"
+  elif command -v sudo >/dev/null 2>&1 && [[ -t 0 ]]; then
+    if sudo -v 2>/dev/null; then
+      SUDO="sudo -u $USER_OPT"
+    fi
+  fi
+fi
+
+# ---------- Build psql connection args ----------
+PSQL_CONN=()
+[[ -n "$DB" ]]       && PSQL_CONN+=("-d" "$DB")
+[[ -n "$USER_OPT" ]] && PSQL_CONN+=("-U" "$USER_OPT")
+[[ -n "$HOST_OPT" ]] && PSQL_CONN+=("-h" "$HOST_OPT")
+[[ -n "$PORT_OPT" ]] && PSQL_CONN+=("-p" "$PORT_OPT")
+
+# Default to current user as DB if neither specified
+if [[ -z "$DB" ]] && [[ ${#PSQL_CONN[@]} -eq 0 || "${PSQL_CONN[*]}" != *"-d"* ]]; then
+  DB="$USER"
+  PSQL_CONN+=("-d" "$DB")
+fi
+
+# ---------- Verify psql is available and we can connect ----------
+if ! command -v psql >/dev/null 2>&1; then
+  echo "psql not found in PATH"
+  exit 2
+fi
+
+# Use arrays so quotes are preserved when expanding
+PSQL=(psql "${PSQL_CONN[@]}" -tAc --no-psqlrc -P pager=off)
+PSQL_PRETTY=(psql "${PSQL_CONN[@]}" --no-psqlrc -P pager=off)
+
+# Test connection
+TEST_CONN=$("${PSQL[@]}" -c "SELECT 1;" 2>&1)
+if [[ "$TEST_CONN" != "1" ]]; then
+  if [[ $JSON_OUT -eq 1 ]]; then
+    err_escaped="${TEST_CONN//\"/\\\"}"
+    err_escaped="${err_escaped//$'\n'/\\n}"
+    printf '{"timestamp":"%s","hostname":"%s","status":"connection_failed","error":"%s","critical":1,"warnings":0}\n' \
+      "$TIMESTAMP" "$HOSTNAME_SHORT" "$err_escaped"
+  else
+    printf "\033[31m\033[1m✗\033[0m \033[31mCannot connect:\033[0m %s\n" "$TEST_CONN" >&2
+  fi
+  exit 2
+fi
+
+# If JSON mode is enabled, suppress all stdout during data collection
+if [[ $JSON_OUT -eq 1 ]]; then
+  exec 3>&1
+  exec 1>/dev/null
+fi
+
+# ---------- Helpers ----------
+# Run SQL quietly
+sql() {
+  "${PSQL[@]}" -c "$1" 2>/dev/null
+}
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "${C_BOLD}${C_BLUE}"
+  cat << 'EOF'
+   ___ ___  _    ___ ____
+  / __/ _ \| |  / _ \___ \
+ | (_| (_) | |_| | | |__) |
+  \___\___/|____|_| |___/
+EOF
+  printf "${C_RESET}\n"
+  printf "${C_DIM}  PostgreSQL diagnostic — %s on %s  [db: ${C_RESET}${C_BOLD}%s${C_RESET}${C_DIM}]${C_RESET}\n\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT" "$DB"
+fi
+
+# ============================================================================
+# SECTION 1: Cluster overview
+# ============================================================================
+section "CLUSTER OVERVIEW"
+
+# Server version + uptime
+SERVER_VERSION=$(sql "SHOW server_version;")
+START_TIME=$(sql "SELECT pg_postmaster_start_time();")
+UPTIME_S=$(sql "SELECT EXTRACT(EPOCH FROM (now() - pg_postmaster_start_time()))::int;")
+PG_PORT=$(sql "SHOW port;")
+DATA_DIR=$(sql "SHOW data_directory;")
+MAX_CONN=$(sql "SHOW max_connections;")
+SHARED_BUFFERS=$(sql "SHOW shared_buffers;")
+EFFECTIVE_CACHE=$(sql "SHOW effective_cache_size;")
+
+info "Server:    ${C_BOLD}${C_CYAN}PostgreSQL $SERVER_VERSION${C_RESET}"
+info "Started:   ${C_DIM}$START_TIME${C_RESET}"
+if [[ -n "$UPTIME_S" ]]; then
+  uptime_d=$((UPTIME_S / 86400))
+  uptime_h=$((UPTIME_S / 3600 % 24))
+  uptime_m=$((UPTIME_S / 60 % 60))
+  info "Uptime:    ${C_BOLD}${uptime_d}d ${uptime_h}h ${uptime_m}m${C_RESET}"
+fi
+info "Port:      ${C_BOLD}$PG_PORT${C_RESET}  Data: ${C_DIM}$DATA_DIR${C_RESET}"
+info "Resources: shared_buffers=${C_BOLD}$SHARED_BUFFERS${C_RESET}  effective_cache=${C_BOLD}$EFFECTIVE_CACHE${C_RESET}  max_connections=${C_BOLD}$MAX_CONN${C_RESET}"
+
+# Cluster control info (if pg_lsclusters available)
+if command -v pg_lsclusters >/dev/null 2>&1; then
+  subsec "System cluster(s)"
+  pg_lsclusters 2>/dev/null | while IFS= read -r line; do
+    if [[ "$line" =~ ^Ver ]]; then
+      printf "  ${C_DIM}${line}${C_RESET}\n"
+    elif [[ "$line" =~ online ]]; then
+      printf "  ${C_GREEN}●${C_RESET} ${C_BOLD}${line}${C_RESET}\n"
+    elif [[ "$line" =~ down ]]; then
+      printf "  ${C_RED}○${C_RESET} ${C_DIM}${line}${C_RESET}\n"
+    else
+      printf "  ${line}\n"
+    fi
+  done
+fi
+
+# isready check
+subsec "Connection check"
+if command -v pg_isready >/dev/null 2>&1; then
+  READY=$(pg_isready ${HOST_OPT:+-h "$HOST_OPT"} ${PORT_OPT:+-p "$PORT_OPT"} 2>&1)
+  if [[ "$READY" == *"accepting"* ]]; then
+    ok "pg_isready: accepting connections"
+  else
+    crit "pg_isready: $READY"
+  fi
+fi
+
+# ============================================================================
+# SECTION 1.5: Log analysis
+# ============================================================================
+section "LOG ANALYSIS"
+
+# Discover log locations: pg_lsclusters + SHOW
+LOG_FILES=()
+if command -v pg_lsclusters >/dev/null 2>&1; then
+  PG_LOGS=$(pg_lsclusters -h 2>/dev/null | awk '/^Ver/ {next} {print $NF}' | grep -E '/var/log|log$|/\*' 2>/dev/null)
+  for logpath in $PG_LOGS; do
+    if [[ -n "$logpath" ]]; then
+      if [[ -r "$logpath" ]]; then
+        LOG_FILES+=("$logpath")
+      elif [[ "${USE_SUDO:-0}" == "1" ]]; then
+        # User requested sudo mode
+        LOG_FILES+=("sudo:$logpath")
+      fi
+    fi
+  done
+fi
+# Also check current cluster log
+SHOW_LOG=$(sql "SHOW log_directory;" 2>/dev/null)
+SHOW_LOGFILE=$(sql "SHOW log_filename;" 2>/dev/null)
+DATA_DIR=$(sql "SHOW data_directory;" 2>/dev/null)
+LOG_DEST="${DATA_DIR%/}/pg_log"
+# Try pg_log directory
+if [[ -d "$LOG_DEST" ]]; then
+  for f in "$LOG_DEST"/*.log; do
+    [[ -f "$f" ]] && LOG_FILES+=("$f")
+  done
+fi
+
+# Dedupe
+if [[ ${#LOG_FILES[@]} -gt 0 ]]; then
+  SORTED=($(printf '%s\n' "${LOG_FILES[@]}" | sort -u))
+  LOG_FILES=("${SORTED[@]}")
+fi
+
+if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
+  info "No PostgreSQL log files accessible"
+  info "Try: ${C_BOLD}sudo ./sqlz --sudo${C_RESET} or run as user in the ${C_CYAN}adm${C_RESET} group"
+else
+  TOTAL_ERRORS=0
+  TOTAL_WARNINGS=0
+  TOTAL_FATAL=0
+  TOTAL_PANIC=0
+  LOG_LINES=0
+
+  printf "  ${C_DIM}%-50s %8s %8s %8s %8s %8s${C_RESET}\n" \
+    "Log file" "errors" "warn" "fatal" "panic" "lines"
+  printf "  ${C_DIM}%-50s %8s %8s %8s %8s %8s${C_RESET}\n" \
+    "$(printf '%.s─' $(seq 1 50))" "------" "----" "-----" "-----" "-----"
+
+  for logfile in "${LOG_FILES[@]}"; do
+    # Strip sudo: prefix
+    if [[ "$logfile" == sudo:* ]]; then
+      real_log="${logfile#sudo:}"
+      reader() { sudo -n cat "$real_log"; }
+    else
+      reader() { cat "$logfile"; }
+    fi
+    # Get line count
+    LINES=$(reader | wc -l 2>/dev/null || echo 0)
+    # Count severity levels
+    ERRORS=$(reader 2>/dev/null | grep -ciE 'ERROR:' || echo 0)
+    WARNS=$(reader 2>/dev/null | grep -ciE 'WARNING:' || echo 0)
+    FATALS=$(reader 2>/dev/null | grep -ciE 'FATAL:' || echo 0)
+    PANICS=$(reader 2>/dev/null | grep -ciE 'PANIC:' || echo 0)
+
+    TOTAL_ERRORS=$((TOTAL_ERRORS + ERRORS))
+    TOTAL_WARNINGS=$((TOTAL_WARNINGS + WARNS))
+    TOTAL_FATAL=$((TOTAL_FATAL + FATALS))
+    TOTAL_PANIC=$((TOTAL_PANIC + PANICS))
+    TOTAL_LINES=$((TOTAL_LINES + LINES))
+
+    # Color the error count
+    ecolor="$C_DIM"
+    if (( ERRORS > 1000 )); then ecolor="$C_RED"
+    elif (( ERRORS > 100 )); then ecolor="$C_MAGENTA"
+    elif (( ERRORS > 0 )); then ecolor="$C_YELLOW"
+    fi
+    wcolor="$C_DIM"
+    (( WARNS > 100 )) && wcolor="$C_YELLOW"
+    fcolor="$C_DIM"
+    (( FATALS > 0 || PANICS > 0 )) && fcolor="$C_RED"
+
+    short=$(echo "$logfile" | sed 's|/var/log/postgresql/||; s|/var/lib/postgresql/[^/]*/main/pg_log/||')
+    [[ ${#short} -gt 50 ]] && short="...${short: -47}"
+    printf "  ${C_DIM}%-50s${C_RESET} ${ecolor}%8d${C_RESET} ${wcolor}%8d${C_RESET} ${fcolor}%8d${C_RESET} ${fcolor}%8d${C_RESET} ${C_DIM}%8d${C_RESET}\n" \
+      "$short" "$ERRORS" "$WARNS" "$FATALS" "$PANICS" "$LINES"
+  done
+
+  printf "\n"
+  if (( TOTAL_FATAL > 0 )); then
+    crit "${TOTAL_FATAL} FATAL errors across all logs"
+  fi
+  if (( TOTAL_PANIC > 0 )); then
+    crit "${TOTAL_PANIC} PANIC events across all logs (server crash/restart markers)"
+  fi
+  if (( TOTAL_ERRORS > 1000 )); then
+    crit "${TOTAL_ERRORS} ERROR events across all logs — review for systemic issues"
+  elif (( TOTAL_ERRORS > 0 )); then
+    warn "${TOTAL_ERRORS} ERROR events across all logs"
+  else
+    ok "No ERROR events in PostgreSQL logs"
+  fi
+  if (( TOTAL_WARNINGS > 100 )); then
+    warn "${TOTAL_WARNINGS} WARNING events across all logs"
+  elif (( TOTAL_WARNINGS > 0 )); then
+    info "${TOTAL_WARNINGS} WARNING events across all logs"
+  else
+    ok "No WARNING events in PostgreSQL logs"
+  fi
+
+  # Recent errors — last 5 ERROR lines from the most recent log
+  subsec "Recent ERROR events (last 5 from newest log)"
+  NEWEST_LOG="${LOG_FILES[${#LOG_FILES[@]}-1]}"
+  read_newest_log() {
+    if [[ "$NEWEST_LOG" == sudo:* ]]; then
+      sudo -n cat "${NEWEST_LOG#sudo:}" 2>/dev/null
+    else
+      cat "$NEWEST_LOG" 2>/dev/null
+    fi
+  }
+  RECENT=$(read_newest_log | grep -E 'ERROR:' | tail -5)
+  if [[ -n "$RECENT" ]]; then
+    while IFS= read -r line; do
+      # Trim long lines, color-code
+      disp=$(echo "$line" | cut -c1-200)
+      printf "  ${C_RED}!${C_RESET} ${C_DIM}%s${C_RESET}\n" "$disp"
+    done <<< "$RECENT"
+  else
+    info "No recent ERROR events"
+  fi
+
+  # Most common error patterns
+  subsec "Most common ERROR patterns"
+  PATTERNS=$(read_newest_log | grep -E 'ERROR:' \
+    | sed -E 's/^[0-9-]+ [0-9:]+(.[0-9]+)?[ ]+//' \
+    | sed -E 's/[0-9]+/N/g; s/"[^"]*"/"X"/g' \
+    | sort | uniq -c | sort -rn | head -5)
+  if [[ -n "$PATTERNS" ]]; then
+    while IFS= read -r line; do
+      count=$(echo "$line" | awk '{print $1}')
+      pattern=$(echo "$line" | cut -d' ' -f2- | cut -c1-120)
+      printf "  ${C_YELLOW}%5d${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$count" "$pattern"
+    done <<< "$PATTERNS"
+  else
+    info "No patterns to summarize"
+  fi
+
+  JSON_FIELDS+=("\"log_errors_total\":$TOTAL_ERRORS")
+  JSON_FIELDS+=("\"log_warnings_total\":$TOTAL_WARNINGS")
+  JSON_FIELDS+=("\"log_fatal_total\":$TOTAL_FATAL")
+  JSON_FIELDS+=("\"log_panic_total\":$TOTAL_PANIC")
+fi
+
+# ============================================================================
+# SECTION 2: Databases inventory
+# ============================================================================
+section "DATABASES"
+
+DB_HEADER=$(sql "SELECT json_build_object(
+  'name', datname, 'owner', datdba::regrole, 'size', pg_database_size(datname),
+  'conns', (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname),
+  'age_days', EXTRACT(DAY FROM (now() - datfrozenxid::timestamptz))
+) FROM pg_database d WHERE datistemplate = false ORDER BY pg_database_size(datname) DESC;")
+
+DB_COUNT=$(sql "SELECT count(*) FROM pg_database WHERE datistemplate = false;")
+DB_TOTAL_SIZE=$(sql "SELECT pg_size_pretty(sum(pg_database_size(datname))::bigint) FROM pg_database WHERE datistemplate = false;")
+info "User databases: ${C_BOLD}${C_CYAN}$DB_COUNT${C_RESET}  (cluster total: ${C_BOLD}${C_MAGENTA}$DB_TOTAL_SIZE${C_RESET})"
+
+# Get top N databases by size
+subsec "Top $TOP_N databases by size"
+MAX_DB_SIZE=$(sql "SELECT MAX(size)::bigint FROM (SELECT pg_database_size(datname) AS size FROM pg_database WHERE datistemplate = false) s;" 2>/dev/null)
+[[ -z "$MAX_DB_SIZE" || "$MAX_DB_SIZE" == "0" ]] && MAX_DB_SIZE=1
+
+printf "  ${C_BOLD}%-22s %-15s %12s %6s %10s   %s${C_RESET}\n" \
+  "Database" "Owner" "Size" "Conns" "XID Age" "Distribution"
+printf "  ${C_DIM}%-22s %-15s %12s %6s %10s   %s${C_RESET}\n" \
+  "----------------------" "----------" "----------" "-----" "---------" "------------"
+
+sql "SELECT datname, datdba::regrole, pg_database_size(datname),
+       (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname),
+       age(datfrozenxid)
+FROM pg_database d WHERE datistemplate = false
+ORDER BY pg_database_size(datname) DESC LIMIT $TOP_N;" 2>/dev/null | \
+while IFS='|' read -r dbname owner size_bytes conns xid_age; do
+  size=$([[ -n "$size_bytes" ]] && humansize "$size_bytes" || echo "0B")
+  pct=$(echo "scale=0; ${size_bytes:-0} * 100 / $MAX_DB_SIZE" | bc 2>/dev/null); pct=${pct:-0}
+  # Connection % of max
+  conn_pct=0
+  if [[ -n "$MAX_CONN" && "${MAX_CONN:-0}" -gt 0 ]]; then
+    conn_pct=$(echo "scale=0; ${conns:-0} * 100 / $MAX_CONN" | bc 2>/dev/null); conn_pct=${conn_pct:-0}
+  fi
+  conn_color="$C_GREEN"
+  (( conn_pct >= 50 )) && conn_color="$C_YELLOW"
+  (( conn_pct >= 80 )) && conn_color="$C_RED"
+  # XID age color
+  xid_color="$C_GREEN"
+  if [[ "${xid_age:-0}" =~ ^[0-9]+$ ]] && (( xid_age > 200000000 )); then
+    xid_color="$C_RED"
+  elif [[ "${xid_age:-0}" =~ ^[0-9]+$ ]] && (( xid_age > 100000000 )); then
+    xid_color="$C_YELLOW"
+  fi
+  printf "  ${C_BOLD}%-22s${C_RESET} ${C_CYAN}%-15s${C_RESET} ${C_MAGENTA}%12s${C_RESET} ${conn_color}%6s${C_RESET} ${xid_color}%10s${C_RESET}   %s\n" \
+    "$(trunc "$dbname" 22)" "$(trunc "$owner" 15)" "$size" "$conns" "$xid_age" "$(bar "$pct" 24)"
+done
+
+# Warn on transaction ID age
+WORST_XID=$(sql "SELECT MAX(age(datfrozenxid)) FROM pg_database;")
+if [[ "${WORST_XID:-0}" =~ ^[0-9]+$ ]]; then
+  if (( WORST_XID > 200000000 )); then
+    crit "Transaction ID age dangerously high ($WORST_XID) - wraparound imminent. Run VACUUM FREEZE on biggest tables NOW"
+  elif (( WORST_XID > 100000000 )); then
+    warn "Transaction ID age elevated ($WORST_XID) - schedule vacuum freeze"
+  fi
+fi
+
+# ============================================================================
+# SECTION 3: Connection stats
+# ============================================================================
+section "CONNECTIONS"
+
+CONN_MAX=$(sql "SHOW max_connections;")
+CONN_TOTAL=$(sql "SELECT count(*) FROM pg_stat_activity;")
+CONN_ACTIVE=$(sql "SELECT count(*) FROM pg_stat_activity WHERE state = 'active';")
+CONN_IDLE=$(sql "SELECT count(*) FROM pg_stat_activity WHERE state = 'idle';")
+CONN_IDLE_TX=$(sql "SELECT count(*) FROM pg_stat_activity WHERE state IN ('idle in transaction', 'idle in transaction (aborted)');")
+CONN_USAGE_PCT=$(echo "scale=1; $CONN_TOTAL * 100 / $CONN_MAX" | bc 2>/dev/null); CONN_USAGE_PCT=${CONN_USAGE_PCT:-0}
+
+info "Total: ${C_BOLD}${C_CYAN}$CONN_TOTAL${C_RESET} / ${C_BOLD}$CONN_MAX${C_RESET}  (${C_BOLD}$(printf '%.1f' "$CONN_USAGE_PCT")%${C_RESET})  ${C_DIM}$(bar "${CONN_USAGE_PCT%.*}" 20)${C_RESET}"
+info "Breakdown: active=${C_BOLD}${C_GREEN}$CONN_ACTIVE${C_RESET}  idle=${C_DIM}$CONN_IDLE${C_RESET}  idle-in-tx=${C_BOLD}${CONN_IDLE_TX}${C_RESET}"
+
+if (( CONN_IDLE_TX > 0 )); then
+  warn "$CONN_IDLE_TX idle-in-transaction connections - can block vacuum"
+fi
+if (( CONN_TOTAL * 100 / CONN_MAX >= 80 )); then
+  warn "Connection pool above 80% - approaching max_connections"
+fi
+
+subsec "By database"
+sql "SELECT datname, count(*) FROM pg_stat_activity WHERE datname IS NOT NULL GROUP BY datname ORDER BY 2 DESC LIMIT $TOP_N;" | \
+while IFS='|' read -r dbname count; do
+  pct=$(echo "scale=0; $count * 100 / $CONN_MAX" | bc 2>/dev/null); pct=${pct:-0}
+  printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%4d${C_RESET}   %s\n" "$dbname" "$count" "$(bar "$pct" 20)"
+done
+
+subsec "By user"
+sql "SELECT usename, count(*) FROM pg_stat_activity WHERE usename IS NOT NULL GROUP BY usename ORDER BY 2 DESC LIMIT $TOP_N;" | \
+while IFS='|' read -r user count; do
+  pct=$(echo "scale=0; $count * 100 / $CONN_MAX" | bc 2>/dev/null); pct=${pct:-0}
+  printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%4d${C_RESET}   %s\n" "$user" "$count" "$(bar "$pct" 20)"
+done
+
+subsec "By client address"
+sql "SELECT COALESCE(client_addr::text, 'local/socket') AS addr, count(*) FROM pg_stat_activity GROUP BY addr ORDER BY 2 DESC LIMIT $TOP_N;" | \
+while IFS='|' read -r addr count; do
+  pct=$(echo "scale=0; $count * 100 / $CONN_MAX" | bc 2>/dev/null); pct=${pct:-0}
+  printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%4d${C_RESET}   %s\n" "$(trunc "$addr" 22)" "$count" "$(bar "$pct" 20)"
+done
+
+# ============================================================================
+# SECTION 4: Long-running queries
+# ============================================================================
+section "LONG-RUNNING QUERIES"
+
+LONG_THRESH_S=30
+LONG_QUERIES=$(sql "SELECT pid, datname, usename, state,
+  EXTRACT(EPOCH FROM (now() - query_start))::int AS dur_s,
+  LEFT(query, 200)
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND query NOT LIKE '%pg_stat_activity%'
+  AND query_start IS NOT NULL
+  AND EXTRACT(EPOCH FROM (now() - query_start)) > $LONG_THRESH_S
+ORDER BY query_start LIMIT 10;")
+
+if [[ -z "$LONG_QUERIES" ]]; then
+  ok "No queries running > ${LONG_THRESH_S}s"
+else
+  warn "Queries running > ${LONG_THRESH_S}s:"
+  printf "  ${C_BOLD}%-7s %-15s %-15s %-9s %s${C_RESET}\n" "PID" "Database" "User" "Duration" "Query"
+  printf "  ${C_DIM}%-7s %-15s %-15s %-9s %s${C_RESET}\n" "-------" "----------" "----------" "---------" "-----"
+  while IFS='|' read -r pid dbname user state dur query; do
+    printf "  ${C_BOLD}%-7s${C_RESET} ${C_CYAN}%-15s${C_RESET} %-15s %b %s\n" \
+      "$pid" "$(trunc "$dbname" 15)" "$(trunc "$user" 15)" "$(dur_color "${dur:-0}")" "$(trunc "$query" 80)"
+  done <<< "$LONG_QUERIES"
+fi
+
+# ============================================================================
+# SECTION 5: Locks & blocking
+# ============================================================================
+section "LOCKS & BLOCKING"
+
+BLOCKERS=$(sql "SELECT count(DISTINCT blocking_locks.pid)
+FROM pg_locks blocking_locks
+JOIN pg_locks blocked_locks ON blocking_locks.locktype = blocked_locks.locktype
+  AND blocking_locks.relation = blocked_locks.relation
+  AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+  AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+  AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+  AND blocking_locks.pid != blocked_locks.pid
+JOIN pg_stat_activity blocked ON blocked.pid = blocked_locks.pid
+WHERE NOT blocked.granted;")
+
+if [[ "${BLOCKERS:-0}" -gt 0 ]]; then
+  warn "$BLOCKERS blocking lock chain(s) - queries waiting on others"
+  subsec "Lock chains"
+  sql "SELECT blocked.pid AS blocked_pid, blocked.usename, blocked.query AS blocked_query,
+        now() - blocked.query_start AS wait_time,
+        blocking.pid AS blocking_pid, blocking.usename AS blocking_user,
+        blocking.query AS blocking_query
+FROM pg_locks bl JOIN pg_stat_activity blocked ON blocked.pid = bl.pid AND NOT bl.granted
+JOIN pg_locks kl ON kl.locktype = bl.locktype AND kl.relation IS NOT DISTINCT FROM bl.relation
+  AND kl.page IS NOT DISTINCT FROM bl.page AND kl.tuple IS NOT DISTINCT FROM bl.tuple
+  AND kl.transactionid IS NOT DISTINCT FROM bl.transactionid AND kl.pid != bl.pid
+JOIN pg_stat_activity blocking ON blocking.pid = kl.pid
+WHERE bl.granted = false
+LIMIT 10;" | while IFS='|' read -r bpid buser bquery bwait bpuser bpquery; do
+    printf "  ${C_RED}PID %s${C_RESET} ${C_DIM}(%s) blocked by${C_RESET} ${C_YELLOW}PID %s${C_RESET} ${C_DIM}(%s)${C_RESET}\n" \
+      "$bpid" "$buser" "$bpuser" "$bpuser"
+    printf "    ${C_DIM}→ blocked:  %s${C_RESET}\n" "$(trunc "$bquery" 90)"
+    printf "    ${C_DIM}→ blocking: %s${C_RESET}\n" "$(trunc "$bpquery" 90)"
+  done
+else
+  ok "No blocking locks"
+fi
+
+LOCKS_TOTAL=$(sql "SELECT count(*) FROM pg_locks;")
+LOCKS_GRANTED=$(sql "SELECT count(*) FROM pg_locks WHERE granted = true;")
+LOCKS_WAITING=$((LOCKS_TOTAL - LOCKS_GRANTED))
+info "Total locks: ${C_BOLD}$LOCKS_TOTAL${C_RESET}  (granted: ${C_GREEN}$LOCKS_GRANTED${C_RESET}  waiting: ${C_YELLOW}$LOCKS_WAITING${C_RESET})"
+
+# ============================================================================
+# SECTION 6: Cache hit ratio (per database)
+# ============================================================================
+section "CACHE HIT RATIO"
+
+CHIT_HEADER=$(sql "SELECT datname, blks_read, blks_hit,
+  CASE WHEN (blks_read + blks_hit) = 0 THEN NULL
+       ELSE round(100.0 * blks_hit / (blks_read + blks_hit)::numeric, 2)
+  END AS hit_pct
+FROM pg_stat_database
+WHERE datname NOT IN ('template0', 'template1') AND datname IS NOT NULL
+ORDER BY blks_hit + blks_read DESC LIMIT $TOP_N;")
+
+if [[ -n "$CHIT_HEADER" ]]; then
+  printf "  ${C_BOLD}%-22s %15s %15s %10s   %s${C_RESET}\n" "Database" "Blocks Read" "Blocks Hit" "Hit %" "Bar"
+  printf "  ${C_DIM}%-22s %15s %15s %10s   %s${C_RESET}\n" "----------------------" "----------" "----------" "-------" "---"
+  while IFS='|' read -r dbname read hit pct; do
+    read_h=$(humansize "$((read * 8192))" 2>/dev/null)
+    hit_h=$(humansize "$((hit * 8192))" 2>/dev/null)
+    pctl=${pct%.*}
+    bar_color="$C_GREEN"
+    (( pctl < 95 )) && bar_color="$C_YELLOW"
+    (( pctl < 90 )) && bar_color="$C_MAGENTA"
+    (( pctl < 80 )) && bar_color="$C_RED"
+    printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%15s${C_RESET} ${C_CYAN}%15s${C_RESET} ${bar_color}%9s%%${C_RESET}   %s\n" \
+      "$(trunc "$dbname" 22)" "$read_h" "$hit_h" "$pct" "$(bar "$pctl" 20)"
+    if (( pctl < 90 )); then
+      warn "Cache hit ratio for $dbname is low ($pct%) - consider increasing shared_buffers"
+    fi
+  done <<< "$CHIT_HEADER"
+fi
+
+# ============================================================================
+# SECTION 7: Table sizes (in current database)
+# ============================================================================
+section "TABLE SIZES (db: ${C_DIM}$DB${C_RESET})"
+
+DB_SIZE=$(sql "SELECT pg_database_size(current_database());")
+DB_SIZE_H=$(humansize "$DB_SIZE")
+info "Database size: ${C_BOLD}${C_MAGENTA}$DB_SIZE_H${C_RESET}"
+
+MAX_TBL_SIZE=$(sql "SELECT MAX(pg_total_relation_size(oid)) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null)
+[[ -z "$MAX_TBL_SIZE" || "$MAX_TBL_SIZE" == "" ]] && MAX_TBL_SIZE=1
+
+subsec "Top $TOP_N tables (with indexes) in public schema"
+printf "  ${C_BOLD}%-35s %12s %12s   %s${C_RESET}\n" "Table" "Table Size" "Total Size" "Distribution"
+printf "  ${C_DIM}%-35s %12s %12s   %s${C_DIM}\n" "-----------------------------------" "----------" "----------" "------------"
+
+sql "SELECT schemaname || '.' || tablename,
+       pg_size_pretty(pg_relation_size(schemaname || '.' || tablename)),
+       pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)),
+       pg_total_relation_size(schemaname || '.' || tablename)::bigint
+FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY pg_total_relation_size(schemaname || '.' || tablename) DESC
+LIMIT $TOP_N;" 2>/dev/null | while IFS='|' read -r table tbl_size total_size total_bytes; do
+  pct=$(echo "scale=0; ${total_bytes:-0} * 100 / $MAX_TBL_SIZE" | bc 2>/dev/null); pct=${pct:-0}
+  printf "  ${C_BOLD}%-35s${C_RESET} ${C_MAGENTA}%12s${C_RESET} ${C_CYAN}%12s${C_RESET}   %s\n" \
+    "$(trunc "$table" 35)" "$tbl_size" "$total_size" "$(bar "$pct" 24)"
+done
+
+# ============================================================================
+# SECTION 8: Index health
+# ============================================================================
+section "INDEX HEALTH"
+
+# Index usage stats
+subsec "Index usage on top tables (idx_scan counts)"
+printf "  ${C_BOLD}%-35s %8s %8s %12s   %s${C_RESET}\n" "Table" "Idx Scans" "Seq Scans" "Rows/Seq" "Health"
+printf "  ${C_DIM}%-35s %8s %8s %12s   %s${C_RESET}\n" "-----------------------------------" "----" "----" "----" "------"
+
+sql "SELECT schemaname || '.' || relname,
+       COALESCE(idx_scan, 0),
+       COALESCE(seq_scan, 0),
+       CASE WHEN seq_scan = 0 THEN NULL
+            ELSE (seq_tup_read / seq_scan)::bigint END AS rows_per_seq,
+       pg_size_pretty(pg_relation_size(schemaname || '.' || relname))
+FROM pg_stat_user_tables
+ORDER BY COALESCE(seq_scan, 0) + COALESCE(idx_scan, 0) DESC
+LIMIT $TOP_N;" 2>/dev/null | while IFS='|' read -r table idx seq rows_per_seq tbl_size; do
+  health="OK"
+  health_color="$C_GREEN"
+  # Flag if seq scans >> idx scans on a sizable table
+  if [[ "${seq:-0}" -gt 100 && "${idx:-0}" -lt $((seq / 10)) ]]; then
+    health="HEAVY-SEQ"
+    health_color="$C_RED"
+  elif [[ "${seq:-0}" -gt 50 && "${idx:-0}" -lt $((seq / 2)) ]]; then
+    health="SEQ-biased"
+    health_color="$C_YELLOW"
+  fi
+  printf "  ${C_BOLD}%-35s${C_RESET} ${C_CYAN}%8s${C_RESET} ${C_DIM}%8s${C_RESET} ${C_DIM}%12s${C_RESET}   ${health_color}%-10s${C_RESET}\n" \
+    "$(trunc "$table" 35)" "$idx" "$seq" "${rows_per_seq:-0}" "$health"
+done
+
+# Unused indexes
+subsec "Unused indexes (idx_scan = 0, size > 1MB)"
+UNUSED_IDX=$(sql "SELECT schemaname || '.' || indexrelname, pg_size_pretty(pg_relation_size(indexrelid)), pg_relation_size(indexrelid)
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0 AND pg_relation_size(indexrelid) > 1024*1024
+ORDER BY pg_relation_size(indexrelid) DESC LIMIT 5;" 2>/dev/null)
+if [[ -n "$UNUSED_IDX" ]]; then
+  while IFS='|' read -r idx size bytes; do
+    printf "  ${C_DIM}%-50s${C_RESET} ${C_MAGENTA}%10s${C_RESET}  ${C_DIM}(consider DROP)${C_RESET}\n" "$(trunc "$idx" 50)" "$size"
+  done <<< "$UNUSED_IDX"
+  warn "Unused indexes waste space and slow writes. Drop the ones above."
+else
+  ok "No large unused indexes"
+fi
+
+# ============================================================================
+# SECTION 9: Vacuum / autovacuum health
+# ============================================================================
+section "VACUUM HEALTH"
+
+# Tables that haven't been vacuumed in a long time
+subsec "Tables not vacuumed recently"
+NEVER_VACUUMED=$(sql "SELECT count(*) FROM pg_stat_user_tables WHERE n_live_tup > 1000 AND (last_vacuum IS NULL AND last_autovacuum IS NULL);")
+OLDEST_VACUUM=$(sql "SELECT min(COALESCE(last_vacuum, last_autovacuum)) FROM pg_stat_user_tables WHERE n_live_tup > 100;")
+info "Tables never vacuumed: ${C_BOLD}${C_YELLOW}$NEVER_VACUUMED${C_RESET}"
+[[ -n "$OLDEST_VACUUM" && "$OLDEST_VACUUM" != "" ]] && info "Oldest vacuum: ${C_DIM}$OLDEST_VACUUM${C_RESET}" || info "Oldest vacuum: ${C_DIM}(none recorded)${C_RESET}"
+
+# Dead tuples (need vacuum)
+subsec "Tables with most dead tuples (need vacuum)"
+printf "  ${C_BOLD}%-35s %12s %12s %10s${C_RESET}\n" "Table" "Live Tuples" "Dead Tuples" "Dead %"
+printf "  ${C_DIM}%-35s %12s %12s %10s${C_RESET}\n" "-----------------------------------" "----------" "----------" "------"
+sql "SELECT schemaname || '.' || relname, n_live_tup, n_dead_tup,
+       CASE WHEN n_live_tup = 0 THEN 0
+            ELSE round(100.0 * n_dead_tup / GREATEST(n_live_tup, 1)::numeric, 1)
+       END AS dead_pct
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC LIMIT $TOP_N;" 2>/dev/null | while IFS='|' read -r table live dead pct; do
+  color="$C_GREEN"
+  if is_gt "${pct:-0}" 20; then color="$C_RED"
+  elif is_gt "${pct:-0}" 10; then color="$C_YELLOW"
+  fi
+  printf "  ${C_BOLD}%-35s${C_RESET} ${C_CYAN}%12s${C_RESET} ${color}%12s${C_RESET} ${color}%9s%%${C_RESET}\n" \
+    "$(trunc "$table" 35)" "$live" "$dead" "$pct"
+done
+
+# ============================================================================
+# SECTION 10: Replication
+# ============================================================================
+section "REPLICATION"
+
+REPL_ROLE=$(sql "SELECT pg_is_in_recovery();")
+if [[ "$REPL_ROLE" == "t" ]]; then
+  info "${C_MAGENTA}${C_BOLD}This server is a STANDBY / REPLICA${C_RESET}"
+  WAL_LAG=$(sql "SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::int;")
+  if [[ -n "$WAL_LAG" ]]; then
+    info "Replay lag: $(dur_color "$WAL_LAG") behind primary"
+    (( WAL_LAG > 60 )) && warn "WAL replay lag > 60s"
+  fi
+else
+  ok "This is the PRIMARY server"
+fi
+
+REPL_SLOTS=$(sql "SELECT slot_name, plugin, active, restart_lsn FROM pg_replication_slots;" 2>/dev/null)
+if [[ -n "$REPL_SLOTS" ]]; then
+  subsec "Replication slots"
+  printf "  ${C_BOLD}%-25s %-15s %-8s %s${C_RESET}\n" "Slot" "Plugin" "Active" "Restart LSN"
+  printf "  ${C_DIM}%-25s %-15s %-8s %s${C_RESET}\n" "-------------------------" "----------" "----" "----------"
+  while IFS='|' read -r slot plugin active lsn; do
+    active_color="$C_GREEN"
+    [[ "$active" != "t" ]] && active_color="$C_RED"
+    printf "  ${C_BOLD}%-25s${C_RESET} ${C_CYAN}%-15s${C_RESET} ${active_color}%-8s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+      "$(trunc "$slot" 25)" "$plugin" "$active" "$lsn"
+    [[ "$active" != "t" ]] && warn "Inactive replication slot '$slot' - WAL will accumulate, may fill disk"
+  done <<< "$REPL_SLOTS"
+else
+  info "No replication slots configured"
+fi
+
+# ============================================================================
+# SECTION 11: Configuration highlights
+# ============================================================================
+section "CONFIGURATION HIGHLIGHTS"
+
+CFG_VARS=(
+  "shared_buffers:Shared memory buffers"
+  "work_mem:Per-operation sort/hash memory"
+  "maintenance_work_mem:Maintenance operation memory"
+  "effective_cache_size:Planner's cache estimate"
+  "max_connections:Max concurrent connections"
+  "random_page_cost:Cost of random disk page"
+  "seq_page_cost:Cost of sequential disk page"
+  "checkpoint_timeout:Time between auto checkpoints"
+  "wal_buffers:WAL buffer size"
+  "default_statistics_target:Column statistics target"
+  "autovacuum:Autovacuum enabled?"
+  "autovacuum_max_workers:Autovacuum workers"
+  "log_min_duration_statement:Slow query log threshold"
+  "timezone:Server timezone"
+  "TimeZone:Session timezone (alias)"
+)
+
+for entry in "${CFG_VARS[@]}"; do
+  varname="${entry%%:*}"
+  desc="${entry#*:}"
+  val=$(sql "SHOW $varname;" 2>/dev/null)
+  [[ -z "$val" ]] && continue
+  printf "  ${C_DIM}%-30s${C_RESET} ${C_BOLD}%-15s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+    "$varname" "$val" "$desc"
+done
+
+# ---------- Security-relevant settings (depth fix) ----------
+# Most config-audits miss these entirely. PG defaults to password_encryption=md5
+# (weak) and many installs ship listen_addresses='*' (remote DB exposure risk).
+subsec "Security-relevant settings"
+SEC_VARS=(
+    "listen_addresses:Network interfaces PG listens on ('*' = all)"
+    "password_encryption:Password hash algorithm (md5 = WEAK)"
+    "ssl:SSL/TLS required (off = plaintext passwords on wire)"
+    "ssl_min_protocol_version:Minimum TLS version"
+    "log_connections:Log successful connections"
+    "log_failed_attempts:Log failed auth (PG14+)"
+    "log_statement:Which statements to log"
+    "shared_preload_libraries:Loaded modules"
+)
+for entry in "${SEC_VARS[@]}"; do
+    varname="${entry%%:*}"
+    desc="${entry#*:}"
+    val=$(sql "SHOW $varname;" 2>/dev/null)
+    [[ -z "$val" ]] && continue
+    printf "  ${C_DIM}%-30s${C_RESET} ${C_BOLD}%-18s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+        "$varname" "$val" "$desc"
+done
+
+# Severity checks
+LISTEN=$(sql "SHOW listen_addresses;" 2>/dev/null)
+if [[ "$LISTEN" == "*" || "$LISTEN" == "0.0.0.0" ]]; then
+    critf "pg_listen_all" "PostgreSQL listens on ALL interfaces ($LISTEN)" \
+        "Set listen_addresses = 'localhost' (or specific IP) in postgresql.conf unless this is a remote-DB server."
+fi
+PWD_ENC=$(sql "SHOW password_encryption;" 2>/dev/null)
+if [[ "$PWD_ENC" == "md5" ]]; then
+    critf "pg_md5_auth" "password_encryption = md5 (weak — GPU-crackable)" \
+        "Set password_encryption = scram-sha-256 in postgresql.conf and reset all passwords with \\password."
+fi
+SSL_ON=$(sql "SHOW ssl;" 2>/dev/null)
+if [[ "$SSL_ON" == "off" ]]; then
+    critf "pg_no_ssl" "SSL = off — passwords and data in cleartext on the wire" \
+        "Set ssl = on and configure ssl_cert_file/ssl_key_file. Use 'hostssl' lines in pg_hba.conf."
+fi
+MIN_PROTO=$(sql "SHOW ssl_min_protocol_version;" 2>/dev/null)
+if [[ "$MIN_PROTO" == "TLSv1" || "$MIN_PROTO" == "TLSv1.1" ]]; then
+    critf "pg_legacy_tls" "ssl_min_protocol_version = $MIN_PROTO (deprecated)" \
+        "Set ssl_min_protocol_version = 'TLSv1.2' (or 'TLSv1.3')."
+fi
+LOG_CONN=$(sql "SHOW log_connections;" 2>/dev/null)
+if [[ "$LOG_CONN" == "off" ]]; then
+    warn "log_connections = off — connection attempts not audited"
+    info "  Enable with: log_connections = on"
+fi
+LOG_FAIL=$(sql "SHOW log_failed_attempts;" 2>/dev/null)
+if [[ "$LOG_FAIL" == "off" ]]; then
+    warn "log_failed_attempts = off — auth failures not logged (PG14+)"
+    info "  Enable with: log_failed_attempts = on"
+fi
+
+# pg_hba.conf trust auth check (CRITICAL — trust = no password at all)
+HBA_FILE=$(sql "SHOW hba_file;" 2>/dev/null)
+if [[ -n "$HBA_FILE" && -r "$HBA_FILE" ]]; then
+    if grep -E '^[^#]*[[:space:]]trust[[:space:]]' "$HBA_FILE" 2>/dev/null | grep -vE '^[^#]*[[:space:]]trust[[:space:]]+(localhost|127\.|::1|samehost)' >/dev/null; then
+        critf "pg_trust_auth" "pg_hba.conf has 'trust' auth on non-localhost entries — anyone with network access can connect with NO password" \
+            "Change 'trust' to 'scram-sha-256' or 'md5' in $HBA_FILE and reload PG."
+    fi
+fi
+HBA_OK=0 HBA_TOTAL=0
+[[ -r "$HBA_FILE" ]] && {
+    HBA_TOTAL=$(grep -cE '^[a-z]' "$HBA_FILE" 2>/dev/null || echo 0)
+    HBA_TRUST_LCL=$(grep -E '^[^#]*[[:space:]]trust[[:space:]]+(127\.|::1|localhost|samehost)' "$HBA_FILE" 2>/dev/null | wc -l)
+    info "pg_hba.conf lines: ${C_BOLD}$HBA_TOTAL${C_RESET} ($HBA_TRUST_LCL trust-auth on localhost)"
+}
+
+# Recommendations on config
+subsec "Tuning tips"
+SHARED_BUF_BYTES=$(sql "SHOW shared_buffers;" | awk '
+{
+  val = $1
+  if (val ~ /MB$/) { sub(/MB/, "", val); print val * 1024 * 1024 }
+  else if (val ~ /GB$/) { sub(/GB/, "", val); print val * 1024 * 1024 * 1024 }
+  else if (val ~ /kB$/) { sub(/kB/, "", val); print val * 1024 }
+  else print val
+}')
+TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+TOTAL_MEM_BYTES=$((TOTAL_MEM_KB * 1024))
+
+if [[ -n "$SHARED_BUF_BYTES" ]] && [[ -n "$TOTAL_MEM_BYTES" ]] && (( TOTAL_MEM_BYTES > 0 )); then
+  PCT=$(echo "scale=1; $SHARED_BUF_BYTES * 100 / $TOTAL_MEM_BYTES" | bc 2>/dev/null)
+  if is_lt "${PCT:-0}" 10; then
+    warn "shared_buffers is ${PCT}% of RAM - typically recommend 25% for dedicated DB hosts"
+  else
+    ok "shared_buffers = ${PCT}% of RAM"
+  fi
+fi
+
+EFFECTIVE_BYTES=$(sql "SHOW effective_cache_size;" | awk '
+{
+  val = $1
+  if (val ~ /MB$/) { sub(/MB/, "", val); print val * 1024 * 1024 }
+  else if (val ~ /GB$/) { sub(/GB/, "", val); print val * 1024 * 1024 * 1024 }
+  else if (val ~ /kB$/) { sub(/kB/, "", val); print val * 1024 }
+  else if (val ~ /TB$/) { sub(/TB/, "", val); print val * 1024 * 1024 * 1024 * 1024 }
+  else print val
+}')
+if [[ -n "$EFFECTIVE_BYTES" ]] && [[ -n "$TOTAL_MEM_BYTES" ]] && (( TOTAL_MEM_BYTES > 0 )); then
+  PCT=$(echo "scale=0; $EFFECTIVE_BYTES * 100 / $TOTAL_MEM_BYTES" | bc 2>/dev/null)
+  if is_lt "${PCT:-0}" 50; then
+    warn "effective_cache_size is ${PCT}% of RAM - typically recommend 50-75%"
+  fi
+fi
+
+# ============================================================================
+# SECTION 12: pg_stat_statements (if installed)
+# ============================================================================
+if [[ $QUICK -eq 0 ]]; then
+  section "TOP QUERIES (pg_stat_statements)"
+  PSS=$(sql "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null)
+  if [[ -z "$PSS" ]]; then
+    info "${C_DIM}pg_stat_statements not installed - skipping. To enable, add to shared_preload_libraries and CREATE EXTENSION${C_RESET}"
+  else
+    info "${C_BOLD}Top $TOP_N slowest queries by total time${C_RESET}"
+    printf "  ${C_BOLD}%-12s %12s %8s %8s   %s${C_RESET}\n" "Total (ms)" "Calls" "Mean" "Max" "Query"
+    printf "  ${C_DIM}%-12s %12s %8s %8s   %s${C_RESET}\n" "------" "----" "----" "----" "-----"
+    sql "SELECT round((total_exec_time + total_plan_time)::numeric, 0)::bigint AS total,
+                calls,
+                round(((total_exec_time + total_plan_time) / GREATEST(calls, 1))::numeric, 1) AS mean_ms,
+                round(max_exec_time::numeric, 1) AS max_ms,
+                LEFT(query, 100)
+         FROM pg_stat_statements
+         WHERE calls > 0
+         ORDER BY (total_exec_time + total_plan_time) DESC
+         LIMIT $TOP_N;" 2>/dev/null | while IFS='|' read -r total calls mean max query; do
+      printf "  ${C_CYAN}%12s${C_RESET} ${C_DIM}%12s${C_RESET} %8s %8s   ${C_BOLD}%s${C_RESET}\n" \
+        "$total" "$calls" "$mean" "$max" "$(trunc "$query" 90)"
+    done
+  fi
+fi
+
+# ============================================================================
+# SECTION 13: Headline summary
+# ============================================================================
+section "DATABASE HEADLINE"
+
+DB_TOTAL_SIZE=$(sql "SELECT pg_size_pretty(sum(pg_database_size(datname))::bigint) FROM pg_database WHERE datistemplate = false;" 2>/dev/null)
+DB_COUNT=$(sql "SELECT count(*) FROM pg_database WHERE datistemplate = false;")
+TOT_TUPLES=$(sql "SELECT sum(n_live_tup) FROM pg_stat_user_tables;" 2>/dev/null)
+TOT_DEAD=$(sql "SELECT sum(n_dead_tup) FROM pg_stat_user_tables;" 2>/dev/null)
+
+printf "\n"
+BOX_W=64
+printf "  ${C_BOLD}${C_MAGENTA}╔%${BOX_W}s╗${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+
+# Build each line with proper padding
+line_visible() {
+  # Print the visible content + compute remaining padding
+  printf "%s%*s" "$1" $(( BOX_W - ${#1} )) ""
+}
+
+# Databases line
+DB_PAD3=$(printf '%3s' "$DB_COUNT")
+DB_VIS="   Databases:      ${DB_PAD3}  (cluster total $DB_TOTAL_SIZE)"
+DB_COLORED=$(printf "   ${C_BOLD}Databases:${C_RESET}      ${C_CYAN}${C_BOLD}%s${C_RESET}  (cluster total ${C_MAGENTA}${C_BOLD}%s${C_RESET})" "$DB_PAD3" "$DB_TOTAL_SIZE")
+DB_PAD=$(( BOX_W - ${#DB_VIS} ))
+[[ $DB_PAD -lt 0 ]] && DB_PAD=0
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${DB_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$DB_COLORED" ""
+
+# Connections line
+CPAD3=$(printf '%3s' "$CONN_TOTAL")
+CMX3=$(printf '%-3s' "$CONN_MAX")
+CONN_VIS="   Connections:    ${CPAD3} / ${CMX3}"
+CONN_COLORED=$(printf "   ${C_BOLD}Connections:${C_RESET}    ${C_CYAN}${C_BOLD}%s${C_RESET} / %s" "$CPAD3" "$CMX3")
+CONN_PAD=$(( BOX_W - ${#CONN_VIS} ))
+[[ $CONN_PAD -lt 0 ]] && CONN_PAD=0
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${CONN_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$CONN_COLORED" ""
+
+# Cache hit ratio
+AVG_CHIT=$(sql "SELECT round(avg(CASE WHEN (blks_read + blks_hit) = 0 THEN NULL ELSE 100.0 * blks_hit / (blks_read + blks_hit) END)::numeric, 1) FROM pg_stat_database WHERE datname NOT IN ('template0','template1') AND datname IS NOT NULL;" 2>/dev/null)
+chit_pctl=${AVG_CHIT%.*}
+chit_color="$C_GREEN"
+if [[ -n "$chit_pctl" ]]; then
+  (( chit_pctl < 95 )) && chit_color="$C_YELLOW"
+  (( chit_pctl < 90 )) && chit_color="$C_MAGENTA"
+  (( chit_pctl < 80 )) && chit_color="$C_RED"
+fi
+CHIT_PAD6=$(printf '%6s' "${AVG_CHIT:-N/A}")
+CHIT_VIS="   Avg cache hit:  ${CHIT_PAD6}%"
+CHIT_COLORED=$(printf "   ${C_BOLD}Avg cache hit:${C_RESET}  ${chit_color}${C_BOLD}%s%%${C_RESET}" "$CHIT_PAD6")
+CHIT_PAD=$(( BOX_W - ${#CHIT_VIS} ))
+[[ $CHIT_PAD -lt 0 ]] && CHIT_PAD=0
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${CHIT_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$CHIT_COLORED" ""
+
+# Dead tuples
+dead_pct=0
+if [[ -n "$TOT_TUPLES" ]] && [[ "$TOT_TUPLES" != "0" ]] && [[ -n "$TOT_DEAD" ]]; then
+  dead_pct=$(echo "scale=1; $TOT_DEAD * 100 / $TOT_TUPLES" | bc 2>/dev/null); dead_pct=${dead_pct:-0}
+fi
+dead_color="$C_GREEN"
+(( $(echo "$dead_pct > 10" | bc -l) )) && dead_color="$C_YELLOW"
+(( $(echo "$dead_pct > 20" | bc -l) )) && dead_color="$C_RED"
+DEAD_PAD6=$(printf '%6s' "$dead_pct")
+DEAD_VIS="   Dead tuples:    ${DEAD_PAD6}%  ($TOT_DEAD dead of $TOT_TUPLES live)"
+DEAD_COLORED=$(printf "   ${C_BOLD}Dead tuples:${C_RESET}    ${dead_color}${C_BOLD}%s%%${C_RESET}  (%s dead of %s live)" "$DEAD_PAD6" "$TOT_DEAD" "$TOT_TUPLES")
+DEAD_PAD=$(( BOX_W - ${#DEAD_VIS} ))
+[[ $DEAD_PAD -lt 0 ]] && DEAD_PAD=0
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${DEAD_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$DEAD_COLORED" ""
+
+printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}╚%${BOX_W}s╝${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+printf "\n"
+
+# ============================================================================
+# SECTION 14: Recommendations
+# ============================================================================
+section "RECOMMENDATIONS"
+
+REC_NUM=0
+rec() { REC_NUM=$((REC_NUM+1)); printf "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"; }
+
+if (( CRITICAL > 0 )); then
+  rec "${C_RED}${C_BOLD}Address critical issues immediately${C_RESET}"
+fi
+if (( WARNINGS > 3 )); then
+  rec "Many warnings - run ${C_BOLD}psql $DB -c \"VACUUM ANALYZE;\"${C_RESET} for general cleanup"
+fi
+[[ -n "$OLDEST_VACUUM" && "$OLDEST_VACUUM" != "" ]] || rec "Some tables have never been vacuumed - check autovacuum config"
+[[ "${BLOCKERS:-0}" -gt 0 ]] && rec "Kill long blockers with ${C_BOLD}SELECT pg_cancel_backend(pid), pg_terminate_backend(pid);${C_RESET}"
+[[ -z "$PSS" ]] && rec "Enable ${C_BOLD}pg_stat_statements${C_RESET} to track slow queries (add to shared_preload_libraries)"
+rec "Run ${C_BOLD}psql -d $DB -c \"SELECT pg_size_pretty(pg_database_size('$DB'));\"${C_RESET} for just-the-facts size"
+rec "Monitor cache hit ratio - target >99% on most databases"
+
+# ============================================================================
+# VERDICT
+# ============================================================================
+DURATION=$(($(date +%s) - START_TS))
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "\n${C_BOLD}${C_BLUE}━━━ VERDICT ━━━${C_RESET}\n"
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+    printf "  ${C_RED}Database needs attention - see recommendations above${C_RESET}\n"
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    printf "  ${C_YELLOW}Cluster usable but review warnings above${C_RESET}\n"
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    printf "  ${C_GREEN}Cluster looks solid${C_RESET}\n"
+  fi
+  printf "\n${C_DIM}Scan completed in ${DURATION}s at $(date '+%H:%M:%S')${C_RESET}\n"
+else
+  exec 1>&3
+  exec 3>&-
+  printf '{"timestamp":"%s","hostname":"%s","db":"%s","version":"%s","databases":%s,"connections":%s,"max_connections":%s,"cluster_size":"%s","warnings":%d,"critical":%d,"duration_s":%d}\n' \
+    "$TIMESTAMP" "$HOSTNAME_SHORT" "$DB" "$SERVER_VERSION" "$DB_COUNT" "$CONN_TOTAL" "$CONN_MAX" "$DB_TOTAL_SIZE" \
+    "$WARNINGS" "$CRITICAL" "$DURATION"
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "sqlz complete: db=$DB warnings=$WARNINGS critical=$CRITICAL duration_s=${DURATION:-0}" 2>/dev/null || true
+fi
+
+if (( CRITICAL > 0 )); then exit 2
+elif (( WARNINGS > 0 )); then exit 1
+else exit 0
+fi

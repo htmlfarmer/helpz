@@ -1,0 +1,11 @@
+/*.txt
+/*-reports/
+.xyzoservicesz-backups/
+.helpz_history
+ai.json
+.trustz/
+__pycache__/
+.pytest_cache/
+*.pcap
+*.pftrace
+*.tmp

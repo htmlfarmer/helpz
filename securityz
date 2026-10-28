@@ -1,0 +1,719 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# securityz — Visual Security Audit Dashboard
+# ----------------------------------------------------------------------------
+# One script, one screen, everything you need to see at a glance.
+# Audits:
+#   - Open ports + their geographic context (who's listening, where)
+#   - Failed services + crash patterns
+#   - World-writable files / dirs (data tampering risk)
+#   - SSH config hardening
+#   - Suspicious users / uid-0 accounts
+#   - Failed login attempts + which country they're coming from
+#   - Kernel hardening (sysctl)
+#   - SUID binaries (privilege escalation surface)
+#   - SSL certificates about to expire
+#   - Updates available / package manager health
+#
+# Visualization:
+#   - Donut/pie chart of port categories (web/db/mail/dev)
+#   - Bar chart of failed-login source countries
+#   - Heatmap of SUID binaries by directory
+#   - Sparklines for system metrics over the session
+#   - Security score gauge (0-100)
+#   - Color-coded risk levels
+#
+# Usage:
+#   ./securityz                    Full audit + dashboard
+#   ./securityz --top N            Show top N items per section
+#   ./securityz --quiet            Profile only, no advice
+#   ./securityz --json             Machine-readable
+#   ./securityz --no-color         Plain output
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"
+
+JSON_OUT=0
+NO_COLOR_FLAG=0
+TOP_N=10
+QUIET=0
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              SHOW_HELP=1 ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
+        --quiet)                QUIET=1 ;;
+        --ai)                   AI_VERDICT=1 ;;
+        --no-ai)                AI_VERDICT=0 ;;
+        *) echo "Unknown flag: $arg" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON/quiet/help modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$QUIET" != "1" ]] && [[ "${SHOW_HELP:-0}" != "1" ]]; then
+    run_comparison_init "securityz"
+fi
+
+if [[ "${SHOW_HELP:-0}" -eq 1 ]]; then
+    cat << 'EOF'
+securityz — Visual Security Audit Dashboard
+
+USAGE
+  ./securityz                  Full audit + dashboard
+  ./securityz --top N          Show top N items per section (default 10)
+  ./securityz --quiet          Audit only, no advice
+  ./securityz --json           Machine-readable output
+  ./securityz --no-color       Plain output
+
+EVERY SECTION INCLUDES:
+  • Geo-located IPs (city, state, country, network, hostname)
+  • Concrete fix commands
+  • Logged incidents appended to ~/.security-logs/incidents.txt
+EOF
+    exit 0
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+JSON_CAPTURE=""
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_CAPTURE="$(mktemp)"
+    exec 3>&1
+    exec 1>"$JSON_CAPTURE"
+fi
+
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  SECURITY.SH  — Visual Security Audit Dashboard               ║
+   ║  One screen. Bar charts. Heatmaps. Where in the world?        ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+fi
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+declare -i SCORE=100
+penalize() { SCORE=$(( SCORE - $1 )); [[ $SCORE -lt 0 ]] && SCORE=0; return 0; }
+
+# Donut chart from a list of "label count" pairs (passed via stdin)
+donut_chart() {
+    local title="$1" width=40
+    shift
+    local total=0
+    local -a labels=() counts=()
+    local records=("$@")
+    # records are "LABEL|COUNT" (pipe-separated to avoid '/' in port ranges)
+    for rec in "${records[@]}"; do
+        [[ -z "$rec" ]] && continue
+        local label="${rec%%|*}"
+        local count="${rec##*|}"
+        [[ -z "$label" ]] && continue
+        labels+=("$label")
+        counts+=("$count")
+        total=$(( total + count ))
+    done
+    [[ $total -eq 0 ]] && { info "No data"; return; }
+
+    printf "${C_BOLD}%-15s${C_RESET}\n" "$title"
+    local pct arc_len
+    local colors=("$C_RED" "$C_YELLOW" "$C_GREEN" "$C_CYAN" "$C_MAGENTA" "$C_BLUE")
+    for i in "${!labels[@]}"; do
+        pct=$(( counts[i] * 100 / total ))
+        arc_len=$(( counts[i] * width / total ))
+        (( arc_len == 0 )) && arc_len=1
+        local bar=""
+        for (( j=0; j<arc_len; j++ )); do bar+="█"; done
+        local c="${colors[$(( i % 6 ))]}"
+        printf "  ${c}%-12s${C_RESET} ${c}%-40s${C_RESET} ${C_BOLD}%3d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+            "${labels[i]}" "$bar" "${counts[i]}" "$pct"
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1: OPEN PORTS — with geographic context
+# ─────────────────────────────────────────────────────────────────────────────
+section "1. OPEN PORTS — WHAT THE WORLD CAN SEE"
+
+# Categorize ports
+declare -i PORT_WEB=0 PORT_DB=0 PORT_MAIL=0 PORT_DEV=0 PORT_ADMIN=0 PORT_OTHER=0
+declare -a PUBLIC_PORTS=()
+if has_cmd ss; then
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        proto=$(awk '{print $1}' <<< "$line" | tr -d ':')
+        local_addr=$(awk '{print $5}' <<< "$line")
+        case "$local_addr" in
+            0.0.0.0:*|[::]*|*:*) : ;;
+            *) continue ;;
+        esac
+        port=${local_addr##*:}
+        port=${port%]*}; port=${port#[}
+        case "$port" in
+            80|443|8080|8443|8000|8888|3000|3001|5000) PORT_WEB=$((PORT_WEB + 1)) ;;
+            3306|5432|6379|27017|1433|9200|11211)    PORT_DB=$((PORT_DB + 1)) ;;
+            25|465|587|993|995|110|143)              PORT_MAIL=$((PORT_MAIL + 1)) ;;
+            22|2222|3389|5900)                       PORT_ADMIN=$((PORT_ADMIN + 1)) ;;
+            3000|3001|3002|3003|3004|3005|3006|3007|3008|4567|9000|9001|9090|1716|35796|11434) \
+                                                      PORT_DEV=$((PORT_DEV + 1)) ;;
+            *)                                       PORT_OTHER=$((PORT_OTHER + 1)) ;;
+        esac
+        PUBLIC_PORTS+=("$port")
+    done < <(ss -tuln 2>/dev/null | tail -n +2)
+fi
+total_public=${#PUBLIC_PORTS[@]}
+
+# Donut of port categories
+donut_chart "Port categories (n=$total_public)" \
+    "Web (80/443)|$PORT_WEB" \
+    "Database|$PORT_DB" \
+    "Mail|$PORT_MAIL" \
+    "Admin SSH/RDP|$PORT_ADMIN" \
+    "Dev Servers|$PORT_DEV" \
+    "Other|$PORT_OTHER"
+
+if [[ "$PORT_DB" -gt 0 ]] || [[ "$PORT_ADMIN" -gt 0 ]]; then
+    if [[ "$PORT_DB" -gt 0 ]]; then
+        critf "wildcard_db_exposed" "$PORT_DB database port(s) exposed on wildcard" "Bind to 127.0.0.1 in the DB config and require SSH tunnel for remote access"
+        penalize 8
+    fi
+    if [[ "$PORT_ADMIN" -gt 0 ]]; then
+        warn "$PORT_ADMIN admin port(s) (SSH/RDP) exposed — ensure key-only auth + fail2ban"
+        penalize 3
+    fi
+fi
+if [[ "$PORT_WEB" -gt 3 ]]; then
+    warn "$PORT_WEB web ports exposed — ensure reverse proxy / TLS termination / rate limits"
+    penalize 2
+fi
+
+# Top 5 most concerning ports with geo context
+if [[ $QUIET -eq 0 ]] && [[ ${#PUBLIC_PORTS[@]} -gt 0 ]]; then
+    subsec "Top listening ports"
+    printf "  ${C_DIM}%-6s %-12s %-30s %s${C_RESET}\n" "PROTO" "PORT" "SERVICE" "RISK"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    # Deduplicate and show top 10
+    printf '%s\n' "${PUBLIC_PORTS[@]}" | sort -u | head -10 | while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        service=""
+        if [[ -r /etc/services ]]; then
+            service=$(awk -v p="$p" '$2 == p {print $1; exit}' /etc/services 2>/dev/null || true)
+        fi
+        [[ -z "$service" ]] && service="unknown"
+        risk="low"; color=$C_GREEN
+        case "$p" in
+            22|2222|3389|23|21)         risk="admin";    color=$C_YELLOW ;;
+            3306|5432|6379|27017|1433|9200) risk="database"; color=$C_RED ;;
+            25|110|143|587|993|995)     risk="mail";     color=$C_YELLOW ;;
+            80|443|8080|8443)           risk="web";      color=$C_GREEN ;;
+            300[0-9]|800[0-9]|900[0-9]|1716|11434) risk="dev"; color=$C_YELLOW ;;
+        esac
+        printf "  ${C_DIM}%-6s${C_RESET} ${C_BOLD}%-12s${C_RESET} ${C_DIM}%-30s${C_RESET} ${color}%s${C_RESET}\n" \
+            "tcp" "$p" "$service" "$risk"
+    done
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2: FAILED SERVICES
+# ─────────────────────────────────────────────────────────────────────────────
+section "2. FAILED SERVICES — DAEMONS THAT WON'T START"
+if has_cmd systemctl; then
+    failed_count=$(systemctl list-units --type=service --state=failed --no-legend 2>/dev/null | wc -l | tr -d '[:space:]')
+    failed_count=${failed_count:-0}; [[ "$failed_count" =~ ^[0-9]+$ ]] || failed_count=0
+
+    if (( failed_count == 0 )); then
+        ok "No failed services"
+    else
+        critf "failed_service" "$failed_count systemd service(s) failed at startup" \
+            "Investigate: 'sudo systemctl status <name> && journalctl -u <name> --since \"1 hour ago\"'. Reset with 'sudo systemctl reset-failed'"
+        penalize $(( failed_count * 3 ))
+        subsec "Failed units"
+        systemctl list-units --type=service --state=failed --no-pager 2>/dev/null | head -10 | sed 's/^/  /'
+    fi
+else
+    warn "systemctl not available"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3: SUSPICIOUS USERS / PASSWORD-LESS ACCOUNTS
+# ─────────────────────────────────────────────────────────────────────────────
+section "3. USER ACCOUNTS — WHO HAS ACCESS?"
+if [[ -r /etc/passwd ]]; then
+    uid0_count=$(awk -F: '$3 == 0 {c++} END {print c+0}' /etc/passwd)
+    no_login_count=$(awk -F: '$7 ~ /(nologin|false)/ {c++} END {print c+0}' /etc/passwd)
+    total_users=$(awk -F: '$3 >= 1000 && $3 < 65534 {c++} END {print c+0}' /etc/passwd)
+
+    info "Total regular users: ${C_BOLD}${total_users}${C_RESET}"
+    info "UID-0 (root-equivalent) accounts: ${C_BOLD}${uid0_count}${C_RESET}"
+    info "Accounts with no login shell: ${C_BOLD}${no_login_count}${C_RESET}"
+
+    if (( uid0_count > 1 )); then
+        critf "extra_uid0_account" "Multiple UID-0 accounts detected ($uid0_count)" \
+            "Demote the duplicate: 'sudo usermod -u 1001 -g 1001 extrauser' after fixing file ownerships"
+        penalize 12
+    fi
+
+    if [[ -r /etc/shadow ]]; then
+        empty_pw_count=$(awk -F: '($2 == "" || $2 == "!") {next} $2 == "*" {next} {if (length($2) < 5) c++} END {print c+0}' /etc/shadow 2>/dev/null || echo 0)
+        if (( empty_pw_count > 0 )); then
+            critf "empty_password_account" "$empty_pw_count account(s) with weak/missing password" \
+                "Lock: 'sudo passwd -l <user>' or set: 'sudo passwd <user>'"
+            penalize 15
+        fi
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4: SSH HARDENING
+# ─────────────────────────────────────────────────────────────────────────────
+section "4. SSH CONFIG — REMOTE-ACCESS HARDENING"
+if [[ -r /etc/ssh/sshd_config ]]; then
+    ssh_issues=0
+    if grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]+yes' /etc/ssh/sshd_config; then
+        critf "ssh_root_login" "SSH allows root login" \
+            "Set 'PermitRootLogin prohibit-password' or 'no' in /etc/ssh/sshd_config, then 'sudo systemctl reload sshd'"
+        ssh_issues=$(( ssh_issues + 1 ))
+        penalize 8
+    fi
+    if grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' /etc/ssh/sshd_config; then
+        critf "ssh_password_auth" "SSH allows password authentication" \
+            "Set 'PasswordAuthentication no', distribute pubkeys via 'ssh-copy-id', then 'sudo systemctl reload sshd'"
+        ssh_issues=$(( ssh_issues + 1 ))
+        penalize 6
+    fi
+    if grep -qiE '^[[:space:]]*PermitEmptyPasswords[[:space:]]+yes' /etc/ssh/sshd_config; then
+        critf "ssh_empty_passwords" "SSH allows empty passwords" \
+            "Set 'PermitEmptyPasswords no' in /etc/ssh/sshd_config"
+        ssh_issues=$(( ssh_issues + 1 ))
+        penalize 15
+    fi
+
+    if (( ssh_issues == 0 )); then
+        ok "SSH config looks hardened"
+    fi
+else
+    info "No sshd_config (OpenSSH not installed?)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5: FAILED LOGIN ATTEMPTS — geo-located
+# ─────────────────────────────────────────────────────────────────────────────
+section "5. FAILED LOGINS — WHO'S TRYING TO GET IN?"
+declare -a FAILED_IPS=()
+log_file=""
+[[ -r /var/log/auth.log ]] && log_file="/var/log/auth.log"
+[[ -r /var/log/secure ]]   && log_file="/var/log/secure"
+# Modern Debian/Ubuntu, RHEL 8+, and Arch ship journald-only — fall back
+# to journalctl so we don't silently print "no failed logins" on systems
+# that actually have hundreds.
+if [[ -z "$log_file" ]] && command -v journalctl >/dev/null 2>&1; then
+    journal_log=$(mktemp)
+    trap 'rm -f "$journal_log"' EXIT
+    journalctl -u ssh --since "30 days ago" --no-pager 2>/dev/null > "$journal_log"
+    if [[ -s "$journal_log" ]]; then
+        log_file="$journal_log"
+    fi
+    # Also check auth failures broadly
+    if [[ -z "$log_file" || ! -s "$log_file" ]]; then
+        journalctl --since "30 days ago" --no-pager 2>/dev/null \
+            | grep -iE "ssh|sudo|auth" > "$journal_log"
+        [[ -s "$journal_log" ]] && log_file="$journal_log"
+    fi
+fi
+if [[ -n "$log_file" && -r "$log_file" ]]; then
+    # Get unique IPs from "Failed password" / "authentication failure" lines
+    mapfile -t FAILED_IPS < <(grep -hE "(Failed password|authentication failure|Failed login)" "$log_file" 2>/dev/null \
+        | grep -oE 'from[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+        | awk '{print $2}' \
+        | sort | uniq -c | sort -rn | head -"$TOP_N" | awk '{print $2}')
+fi
+
+if [[ ${#FAILED_IPS[@]} -eq 0 ]]; then
+    ok "No failed login attempts in logs"
+else
+    subsec "Top failed-login source IPs (with geographic context)"
+    printf "  ${C_DIM}%-18s %-5s %-30s %s${C_RESET}\n" "IP" "HITS" "LOCATION" "NETWORK"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────────"
+    for ip in "${FAILED_IPS[@]}"; do
+        [[ -z "$ip" ]] && continue
+        # Count occurrences
+        hit_count=$(grep -cE "from[[:space:]]+${ip//./\\.}\b" "$log_file" 2>/dev/null || echo 0)
+        hit_count=${hit_count:-0}
+        # Enrich
+        full=$(enrich_ip "$ip")
+        IFS='|' read -r _ city region region_code country country_code org hostname <<< "$full"
+        if [[ "$city" == "local network" || "$city" == "—" ]]; then
+            location="local"; color=$C_DIM
+        else
+            loc="$city"
+            [[ "$region_code" != "—" && "$region_code" != "?" ]] && loc="$loc, $region_code"
+            [[ "$country" != "—" && "$country" != "?" ]] && loc="$loc, $country"
+            location="$loc"
+            color=$C_CYAN
+        fi
+        # Color hits
+        hits_color=$C_GREEN
+        (( hit_count > 10 )) && hits_color=$C_YELLOW
+        (( hit_count > 50 )) && hits_color=$C_RED
+        printf "  ${hits_color}%-18s${C_RESET} ${hits_color}%5s${C_RESET} ${color}%-30s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+            "$ip" "$hit_count" "$location" "$org"
+        # Log to incidents
+        enrich_log_entry "$ip" "failed SSH login ($hit_count attempts)"
+    done
+    critf "excessive_login_failures" "${#FAILED_IPS[@]} unique IPs attempted failed logins" \
+        "Install fail2ban: 'sudo apt install fail2ban && sudo systemctl enable --now fail2ban'. Check bans: 'sudo fail2ban-client status sshd'"
+    penalize 8
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6: KERNEL HARDENING (sysctl)
+# ─────────────────────────────────────────────────────────────────────────────
+section "6. KERNEL HARDENING — SYSCTL FLAGS"
+sysctl_issues=0
+declare -A SYSCTL_CHECKS=(
+    ["net.ipv4.tcp_syncookies"]="1:enable_syncookies"
+    ["kernel.randomize_va_space"]="2:enable_aslr"
+    ["kernel.dmesg_restrict"]="1:restrict_dmesg"
+    ["net.ipv4.conf.all.rp_filter"]="1:enable_rp_filter"
+    ["net.ipv4.conf.all.accept_redirects"]="0:disable_redirects"
+    ["net.ipv4.conf.all.accept_source_route"]="0:disable_source_route"
+)
+for key in "${!SYSCTL_CHECKS[@]}"; do
+    expected="${SYSCTL_CHECKS[$key]%%:*}"
+    label="${SYSCTL_CHECKS[$key]##*:}"
+    current=$(sysctl -n "$key" 2>/dev/null || echo "?")
+    if [[ "$current" != "$expected" ]]; then
+        sysctl_issues=$(( sysctl_issues + 1 ))
+        printf "  ${C_YELLOW}●${C_RESET} ${C_DIM}%-50s${C_RESET} current=${C_BOLD}%s${C_RESET} expected=${C_GREEN}%s${C_RESET} (${label})\n" \
+            "$key" "$current" "$expected"
+    else
+        printf "  ${C_GREEN}●${C_RESET} ${C_DIM}%-50s${C_RESET} = ${C_GREEN}%s${C_RESET}\n" "$key" "$current"
+    fi
+done
+if (( sysctl_issues > 0 )); then
+    critf "sysctl_unhardened" "$sysctl_issues kernel hardening flag(s) off" \
+        "Run 'sudo ./harden.sh --apply' to apply CIS-aligned sysctl settings"
+    penalize $(( sysctl_issues * 2 ))
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7: SUID BINARIES — privilege escalation surface
+# ─────────────────────────────────────────────────────────────────────────────
+section "7. SUID BINARIES — POTENTIAL ESCALATION VECTORS"
+if command -v find >/dev/null 2>&1; then
+    # Run the SUID traversal ONCE, derive count + top-10 from the cached result.
+    SUID_LIST=$(mktemp -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp)
+    trap "rm -f '$SUID_LIST' 2>/dev/null" RETURN
+    timeout 15 find /usr /bin /sbin -xdev -perm -4000 -type f 2>/dev/null > "$SUID_LIST" || true
+    suid_count=$(wc -l < "$SUID_LIST" | tr -d '[:space:]')
+    suid_count=${suid_count:-0}; [[ "$suid_count" =~ ^[0-9]+$ ]] || suid_count=0
+
+    info "SUID binaries: ${C_BOLD}${suid_count}${C_RESET} (expected ~30-50 for a normal Linux system)"
+    if [[ $QUIET -eq 0 ]]; then
+        subsec "Top 10 SUID binaries"
+        head -10 "$SUID_LIST" | while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+            owner=$(stat -c '%U:%G' "$f" 2>/dev/null || echo "?")
+            printf "  ${C_DIM}%-12s${C_RESET} %s\n" "$owner" "$f"
+        done
+    fi
+
+    if [[ "$suid_count" -gt 80 ]]; then
+        warn "$suid_count SUID binaries — unusually many"
+        critf "unexpected_suid" "Excessive SUID count ($suid_count)" \
+            "Audit: 'find / -perm -4000 -type f'. Remove SUID if not needed: 'sudo chmod u-s <binary>'"
+        penalize 5
+    fi
+
+    # CRITICAL: also scan user-writable directories where an attacker's
+    # SUID shell would almost certainly be dropped. /tmp, /var/tmp, /home,
+    # /opt, /var/www are where webshells and copy-off exploits land. A SUID
+    # binary in any of these is by definition malicious — flag with high
+    # severity rather than just counting.
+    SUSPICIOUS_SUID=$(timeout 15 find /tmp /var/tmp /home /opt /var/www /srv -xdev \
+        -perm -4000 -type f 2>/dev/null | head -20)
+    if [[ -n "$SUSPICIOUS_SUID" ]]; then
+        SUSPICIOUS_N=$(echo "$SUSPICIOUS_SUID" | wc -l | tr -d ' ')
+        critf "suid_in_user_path" "SUID binary in /tmp|/var/tmp|/home|/opt|/var/www|/srv — almost certainly malicious" \
+            "Investigate each: $SUSPICIOUS_SUID"
+        penalize 25
+        if [[ $QUIET -eq 0 ]]; then
+            subsec "Suspicious SUID binaries (user-writable paths)"
+            echo "$SUSPICIOUS_SUID" | sed 's/^/      /'
+        fi
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8: WORLD-WRITABLE FILES / DIRS
+# ─────────────────────────────────────────────────────────────────────────────
+section "8. WORLD-WRITABLE FILES & DIRS — TAMPERING RISK"
+if command -v find >/dev/null 2>&1; then
+    # Scan limited paths to keep scan time bounded; user can run full scan manually.
+    set +e +o pipefail
+    # Cap each find at 15s with the -quit-trick via timeout (timeout command)
+    ww_files=$(timeout 15 find /etc /home /tmp -xdev -perm -0002 -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+    ww_files=${ww_files:-0}; [[ "$ww_files" =~ ^[0-9]+$ ]] || ww_files=0
+    ww_dirs=$(timeout 15 find /etc /home /tmp -xdev -perm -0002 -type d 2>/dev/null | wc -l | tr -d '[:space:]')
+    ww_dirs=${ww_dirs:-0}; [[ "$ww_dirs" =~ ^[0-9]+$ ]] || ww_dirs=0
+    set -e -o pipefail
+
+    info "World-writable files (in /etc /home /tmp): ${C_BOLD}${ww_files}${C_RESET}"
+    info "World-writable dirs (in /etc /home /tmp):  ${C_BOLD}${ww_dirs}${C_RESET}"
+    if [[ "$ww_files" -gt 0 ]]; then
+        critf "world_writable_file" "$ww_files world-writable file(s) found" \
+            "Run 'sudo chmod o-w <path>'. Scan: 'find / -xdev -perm -0002 -type f'"
+        local_pen=$(( ww_files > 10 ? 10 : ww_files )); penalize "$local_pen"
+    fi
+    if [[ "$ww_dirs" -gt 0 ]]; then
+        warn "$ww_dirs world-writable directories — most are OK (/tmp) but audit any in /etc or /var"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9: FIREWALL STATUS
+# ─────────────────────────────────────────────────────────────────────────────
+section "9. FIREWALL — IS THERE ONE?"
+fw_active=0
+if has_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ok "ufw: ACTIVE"; fw_active=1
+elif has_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+    ok "firewalld: ACTIVE"; fw_active=1
+elif has_cmd iptables; then
+    rules=$(iptables -S 2>/dev/null | grep -cE '^-A' || echo 0)
+    if (( rules > 0 )); then
+        ok "iptables: $rules rule(s) loaded"; fw_active=1
+    fi
+elif has_cmd nft; then
+    if [[ -f /etc/nftables.conf ]] && nft list ruleset 2>/dev/null | grep -qE '^table'; then
+        ok "nftables: ACTIVE"; fw_active=1
+    fi
+fi
+if (( fw_active == 0 )); then
+    critf "no_firewall" "No active firewall detected" \
+        "Install one: 'sudo apt install ufw && sudo ufw default deny incoming && sudo ufw allow ssh && sudo ufw enable'"
+    penalize 15
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10: SSL/TLS CERTIFICATES ABOUT TO EXPIRE
+# ─────────────────────────────────────────────────────────────────────────────
+section "10. SSL/TLS CERTIFICATES — EXPIRY CHECK"
+cert_issues=0
+if command -v openssl >/dev/null 2>&1; then
+    # Depth #15: extend search paths (letsencrypt, dovecot, postfix, custom) and
+    # parallelize per-cert openssl so a 50-cert scan runs in parallel.
+    CERT_LIST=$(mktemp -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp)
+    CERT_DIR=$(mktemp -d -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp -d)
+    trap "rm -rf '$CERT_LIST' '$CERT_DIR' 2>/dev/null" RETURN
+    # Collect cert candidates (depth #15: cover more paths; cap at 80 to stay fast).
+    timeout 20 find /etc/ssl/certs /etc/pki/tls /etc/letsencrypt \
+        /etc/dovecot /etc/postfix /etc/nginx /etc/apache2 /etc/caddy /etc/haproxy \
+        /usr/local/etc /opt -xdev \
+        \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' -o -name 'fullchain*.pem' \) \
+        2>/dev/null | head -80 > "$CERT_LIST"
+    # Pre-fire all openssl checks in parallel.
+    declare -a _CERT_PIDS=()
+    _ci=0
+    while IFS= read -r cert; do
+        [[ -z "$cert" ]] && continue
+        (
+            expiry=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$expiry" ]]; then
+                expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+                now_epoch=$(date +%s)
+                days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+                printf '%s\t%s\t%s\n' "$cert" "$days_left" "$expiry" > "$CERT_DIR/$_ci"
+            fi
+        ) &
+        _CERT_PIDS+=($!)
+        _ci=$((_ci + 1))
+    done < "$CERT_LIST"
+    for pid in "${_CERT_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    # Display loop reads from cached results.
+    while IFS=$'\t' read -r cert days_left expiry; do
+        [[ -z "$cert" ]] && continue
+        if (( days_left < 30 )) && (( days_left >= 0 )); then
+            critf "cert_expiring" "Certificate $cert expires in $days_left day(s)" \
+                "Renew: 'sudo certbot renew' (or your ACME client), then reload the web server"
+            cert_issues=$(( cert_issues + 1 ))
+        elif (( days_left < 0 )); then
+            critf "cert_expired" "Certificate $cert EXPIRED $((-days_left)) day(s) ago" \
+                "Renew immediately!"
+            cert_issues=$(( cert_issues + 1 ))
+            penalize 10
+        else
+            info "$cert: ${C_GREEN}$days_left days remaining${C_RESET}"
+        fi
+    done < <(cat "$CERT_DIR"/* 2>/dev/null | sort -t$'\t' -k2,2n)
+
+    # Depth #15: remote-cert spot check for domains configured in webserver vhosts.
+    # If you run nginx/apache/caddy, the domains you serve are worth checking too.
+    REMOTE_DOMAINS=$(mktemp)
+    [[ -r /etc/nginx/nginx.conf ]] && \
+        grep -rhoE 'server_name[[:space:]]+[^;]+;' /etc/nginx 2>/dev/null \
+            | grep -oE '[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sort -u >> "$REMOTE_DOMAINS"
+    [[ -r /etc/apache2/apache2.conf ]] && \
+        grep -rhoE 'ServerName[[:space:]]+[^ ]+' /etc/apache2 2>/dev/null \
+            | awk '{print $2}' | grep -E '[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sort -u >> "$REMOTE_DOMAINS"
+    [[ -r /etc/caddy/Caddyfile ]] && \
+        grep -oE '[A-Za-z0-9.-]+\.[A-Za-z]{2,}' /etc/caddy 2>/dev/null \
+            | sort -u >> "$REMOTE_DOMAINS"
+    sort -u "$REMOTE_DOMAINS" -o "$REMOTE_DOMAINS"
+    REMOTE_COUNT=$(wc -l < "$REMOTE_DOMAINS")
+    if (( REMOTE_COUNT > 0 && REMOTE_COUNT < 200 )); then
+        info "Spot-checking $REMOTE_COUNT configured vhost domain(s) over TLS..."
+        REMOTE_DIR=$(mktemp -d)
+        while IFS= read -r dom; do
+            [[ -z "$dom" || "$dom" == *_local* ]] && continue
+            (
+                expiry=$(timeout 6 openssl s_client -servername "$dom" \
+                    -connect "${dom}:443" </dev/null 2>/dev/null \
+                    | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+                if [[ -n "$expiry" ]]; then
+                    expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+                    now_epoch=$(date +%s)
+                    days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+                    printf '%s\t%s\n' "$dom" "$days_left" > "$REMOTE_DIR/$dom"
+                fi
+            ) &
+        done < "$REMOTE_DOMAINS"
+        wait
+        while IFS=$'\t' read -r dom days_left; do
+            [[ -z "$dom" ]] && continue
+            if (( days_left < 30 )) && (( days_left >= 0 )); then
+                warn "$dom (remote): expires in $days_left day(s)"
+            elif (( days_left < 0 )); then
+                critf "remote_cert_expired" "$dom remote cert EXPIRED $((-days_left)) day(s) ago" \
+                    "If you run this server, renew via 'sudo certbot renew'."
+            else
+                info "$dom (remote): ${C_GREEN}$days_left days${C_RESET}"
+            fi
+        done < <(cat "$REMOTE_DIR"/* 2>/dev/null | sort -t$'\t' -k2,2n | head -10)
+        rm -rf "$REMOTE_DIR"
+    fi
+    rm -f "$REMOTE_DOMAINS"
+fi
+if (( cert_issues == 0 )); then
+    info "No certificates expiring within 30 days"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY SCORE GAUGE
+# ─────────────────────────────────────────────────────────────────────────────
+section "SECURITY SCORE — OVERALL POSTURE"
+
+# Bar gauge
+bar_w=50
+filled=$(( SCORE * bar_w / 100 ))
+empty=$(( bar_w - filled ))
+bar=""
+for (( i=0; i<filled; i++ )); do bar+="█"; done
+for (( i=0; i<empty;  i++ )); do bar+="░"; done
+
+color=$C_GREEN
+if [[ "$SCORE" -lt 80 ]]; then color=$C_YELLOW; fi
+if [[ "$SCORE" -lt 60 ]]; then color=$C_RED; fi
+
+printf "  ${color}${C_BOLD}%s${C_RESET} ${color}${C_BOLD}%d/100${C_RESET}\n" "$bar" "$SCORE"
+
+if (( SCORE >= 90 )); then
+    info "${C_GREEN}Excellent${C_RESET} — your system is well-hardened"
+elif (( SCORE >= 75 )); then
+    info "${C_YELLOW}Good${C_RESET} — a few issues, see above"
+elif (( SCORE >= 50 )); then
+    info "${C_YELLOW}Needs work${C_RESET} — multiple issues, address critical ones first"
+else
+    info "${C_RED}At risk${C_RESET} — significant security gaps, prioritize the critical fixes"
+fi
+
+# ─── JSON verdict ──────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+    [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
+
+    add_json_field "score" "$SCORE"
+    add_json_field "open_ports" "$total_public"
+    add_json_field "ports_web" "$PORT_WEB"
+    add_json_field "ports_db" "$PORT_DB"
+    add_json_field "ports_admin" "$PORT_ADMIN"
+    add_json_field "ports_dev" "$PORT_DEV"
+    add_json_field "failed_services" "${failed_count:-0}"
+    add_json_field "uid0_accounts" "${uid0_count:-0}"
+    add_json_field "firewall_active" "$fw_active"
+    add_json_field "cert_issues" "$cert_issues"
+    add_json_field "sysctl_issues" "$sysctl_issues"
+    add_json_field "suid_count" "${suid_count:-0}"
+    add_json_field "world_writable_files" "${ww_files:-0}"
+
+    # Logged issues
+    if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
+        crit_json=$(printf '%s\n' "${CRITICAL_ISSUES[@]}" | jq -R . | jq -s . 2>/dev/null) || crit_json='[]'
+        add_json_field "critical_issues" "$crit_json" 1
+    else
+        add_json_field "critical_issues" "[]" 1
+    fi
+    if [[ ${#WARN_ENTRIES[@]} -gt 0 ]]; then
+        warn_json=$(printf '%s\n' "${WARN_ENTRIES[@]}" | jq -R . | jq -s . 2>/dev/null) || warn_json='[]'
+        add_json_field "warnings" "$warn_json" 1
+    else
+        add_json_field "warnings" "[]" 1
+    fi
+
+    elapsed=$(( $(date +%s) - START_TS ))
+    printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+    for f in "${JSON_FIELDS[@]}"; do
+        printf ',%s' "$f"
+    done
+    printf ',"duration_s":%d}\n' "$elapsed"
+    if (( SCORE < 60 )); then exit 2
+    elif (( SCORE < 80 )); then exit 1
+    else exit 0
+    fi
+fi
+
+# ─── Verdict (default mode) ────────────────────────────────────────────────
+emit_verdict
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "securityz complete: top=$TOP_N quiet=$QUIET" 2>/dev/null || true
+fi
+
+# ─── Pointer to geo-enriched incidents log ─────────────────────────────────
+if [[ -f "$ENRICH_LOG" ]] && [[ "$SCORE" -lt 90 ]]; then
+    printf "\n  ${C_DIM}Geo-located incident log (append-only): ${C_RESET}${C_CYAN}%s${C_RESET}\n" "$ENRICH_LOG"
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$QUIET" != "1" ]]; then
+    run_comparison_finalize
+fi

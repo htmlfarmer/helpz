@@ -1,0 +1,6 @@
+{
+  "servers": [
+    { "name": "local-ollama", "host": "127.0.0.1", "type": "ollama", "port": 11434, "description": "Local Ollama server" },
+    { "name": "local-openai-compat", "host": "127.0.0.1", "type": "openai", "port": 8000, "description": "Local llama.cpp / vLLM server" }
+  ]
+}

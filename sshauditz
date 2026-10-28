@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# sshauditz — SSH Configuration & Authorized Keys Security Auditor
+# ----------------------------------------------------------------------------
+# Audits sshd server configuration (root login, password auth, ciphers),
+# inspects user .ssh directory permissions, checks private key secrecy,
+# and verifies authorized_keys for cryptographic strength and duplicates.
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+[[ -f "$SCRIPT_DIR/lib/common.sh" ]] && source "$SCRIPT_DIR/lib/common.sh"
+
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║       sshauditz — SSH Hardening & Key Security Auditor        ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Deep audit of SSH server configuration, cryptography, user .ssh permissions,
+  and authorized keys. Identifies weak key algorithms, exposed private keys,
+  permissive directory permissions, and insecure sshd settings.
+
+USAGE
+  ./sshauditz                      Run SSH audit
+  ./sshauditz --json               Machine-readable JSON output
+  ./sshauditz --no-color           Plain text output without ANSI colors
+  sudo ./sshauditz                 Audit including root and all user keys
+
+OPTIONS
+  --json        Output machine-readable JSON summary
+  --no-color    Disable colored terminal output
+  -h, --help    Show this help message
+
+CHECKS PERFORMED
+  1. SSH Daemon Config (PermitRootLogin, PasswordAuthentication, MaxAuthTries)
+  2. Cryptographic Algorithms (KEX, Ciphers, MACs - flags legacy MD5/3DES/CBC)
+  3. File Permissions (.ssh directory, authorized_keys, private key files)
+  4. Authorized Keys Strength (flags DSA, RSA < 2048-bit, praises Ed25519)
+  5. Account Cross-Key Analysis (detects shared keys across accounts)
+
+INVESTIGATION COMMANDS
+  sudo sshd -T                        Dump effective runtime SSH server configuration
+  ssh-keygen -l -f ~/.ssh/id_rsa.pub  Inspect key fingerprint and bit length
+  ssh-keygen -t ed25519 -C "user@box" Generate a modern, highly secure Ed25519 key
+
+HELPEOF
+    exit 0
+}
+
+# ---------- Parse Arguments ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1 ;;
+        --ai)        AI_VERDICT=1 ;;
+        --no-ai)     AI_VERDICT=0 ;;
+        -h|--help)   show_help ;;
+        *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+init_colors
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "sshauditz"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  SSH_AUDIT.SH — SSH Hardening & Key Auditor                   ║
+   ║  sshd_config · Keys · Perms · Crypto                          ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ─── Result trackers (used by donut chart at the end) ───────────────────────
+declare -i _DBG_PASS=0 _DBG_WARN=0 _DBG_FAIL=0
+_donut_off=0
+_ssh_donut_track() {
+    [[ $_donut_off -eq 1 ]] && return
+    local cmd="${BASH_COMMAND%% *}"
+    case "$cmd" in
+        ok)                  ((_DBG_PASS++)) ;;
+        warn|warnf)          ((_DBG_WARN++)) ;;
+        crit|critf|critf_)   ((_DBG_FAIL++)) ;;
+    esac
+}
+trap '_ssh_donut_track' DEBUG
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 3>&1
+    exec 1>/dev/null
+fi
+
+SUDO=""
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+fi
+
+heading "SSH HARDENING & KEY AUDITOR"
+info "Host: $HOSTNAME_SHORT | Timestamp: $TIMESTAMP"
+[[ -z "$SUDO" && $EUID -ne 0 ]] && info "Note: Run with sudo to audit root's keys and read /etc/ssh/sshd_config"
+
+# ---------- 1. SSH Server Configuration Audit ----------
+section "SSHD SERVER CONFIGURATION"
+
+SSHD_RUNNING=0
+if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+    SSHD_RUNNING=1
+    ok "SSH server daemon is active and running"
+elif command -v sshd >/dev/null 2>&1; then
+    info "sshd installed but not reported active by systemctl"
+else
+    info "sshd server binary not found on host"
+fi
+
+# Query effective config via sshd -T
+EFFECTIVE_CONFIG=""
+if command -v sshd >/dev/null 2>&1; then
+    EFFECTIVE_CONFIG=$($SUDO sshd -T 2>/dev/null || true)
+fi
+
+get_sshd_opt() {
+    local opt="$1" def="$2"
+    if [[ -n "$EFFECTIVE_CONFIG" ]]; then
+        awk -v o="${opt,,}" '$1==o {print $2; exit}' <<< "$EFFECTIVE_CONFIG"
+    elif [[ -f /etc/ssh/sshd_config ]]; then
+        local val
+        val=$(grep -iE "^[[:space:]]*$opt[[:space:]]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)
+        echo "${val:-$def}"
+    else
+        echo "$def"
+    fi
+}
+
+ROOT_LOGIN=$(get_sshd_opt "PermitRootLogin" "prohibit-password")
+PASS_AUTH=$(get_sshd_opt "PasswordAuthentication" "yes")
+EMPTY_PASS=$(get_sshd_opt "PermitEmptyPasswords" "no")
+MAX_AUTH=$(get_sshd_opt "MaxAuthTries" "6")
+X11_FWD=$(get_sshd_opt "X11Forwarding" "yes")
+PUBKEY_AUTH=$(get_sshd_opt "PubkeyAuthentication" "yes")
+
+subsec "Authentication Policies"
+
+if [[ "${ROOT_LOGIN,,}" == "no" ]]; then
+    ok "PermitRootLogin: no (Root login strictly disabled)"
+elif [[ "${ROOT_LOGIN,,}" == "prohibit-password" || "${ROOT_LOGIN,,}" == "without-password" ]]; then
+    ok "PermitRootLogin: $ROOT_LOGIN (Keys only, password prohibited)"
+else
+    critf "ssh_root_login" "PermitRootLogin: $ROOT_LOGIN (Root password login allowed!)" \
+        "Set 'PermitRootLogin prohibit-password' in /etc/ssh/sshd_config and 'sudo systemctl reload sshd'"
+fi
+
+if [[ "${PASS_AUTH,,}" == "no" ]]; then
+    ok "PasswordAuthentication: no (Enforcing SSH key authentication)"
+else
+    warnf "ssh_password_auth" "PasswordAuthentication: yes (Vulnerable to brute-force credential stuffing)" \
+        "Set 'PasswordAuthentication no' in sshd_config and distribute public keys via ssh-copy-id"
+fi
+
+if [[ "${EMPTY_PASS,,}" == "no" ]]; then
+    ok "PermitEmptyPasswords: no"
+else
+    critf "ssh_empty_passwords" "PermitEmptyPasswords: yes (Accounts without passwords can log in!)" \
+        "Set 'PermitEmptyPasswords no' in sshd_config and lock any passwordless accounts with 'sudo passwd -l <user>'"
+fi
+
+if [[ "${PUBKEY_AUTH,,}" == "yes" ]]; then
+    ok "PubkeyAuthentication: yes"
+else
+    warnf "ssh_pubkey_auth_disabled" "PubkeyAuthentication: no" \
+        "Set 'PubkeyAuthentication yes' in sshd_config and reload"
+fi
+
+if [[ "$MAX_AUTH" -le 4 ]]; then
+    ok "MaxAuthTries: $MAX_AUTH"
+else
+    info "MaxAuthTries: $MAX_AUTH (Recommended: 3 or 4 to slow brute-force)"
+fi
+
+if [[ "${X11_FWD,,}" == "no" ]]; then
+    ok "X11Forwarding: no"
+else
+    info "X11Forwarding: $X11_FWD"
+fi
+
+# ---------- 2. Cryptographic Hardening ----------
+subsec "Cipher & Key Exchange Hardening"
+if [[ -n "$EFFECTIVE_CONFIG" ]]; then
+    CIPHERS=$(get_sshd_opt "Ciphers" "")
+    KEX=$(get_sshd_opt "KexAlgorithms" "")
+    MACS=$(get_sshd_opt "MACs" "")
+
+    # Check for legacy CBC or weak ciphers
+    if [[ "$CIPHERS" =~ 3des || "$CIPHERS" =~ arcfour || "$CIPHERS" =~ blowfish || "$CIPHERS" =~ cast128 ]]; then
+        if [[ "$CIPHERS" =~ 3des ]]; then
+            critf "ssh_weak_cipher_3des" "Weak/broken SSH cipher 3des enabled: $CIPHERS" \
+                "Remove 3des from 'Ciphers' in sshd_config and use ChaCha20-Poly1305/AES-GCM"
+        elif [[ "$CIPHERS" =~ arcfour ]]; then
+            critf "ssh_weak_cipher_arcfour" "Weak/broken SSH cipher arcfour (RC4) enabled: $CIPHERS" \
+                "Remove arcfour from 'Ciphers' — RC4 is broken, use modern AEAD ciphers"
+        else
+            critf "ssh_weak_cipher_legacy" "Legacy weak SSH cipher enabled: $CIPHERS" \
+                "Replace legacy cipher with ChaCha20-Poly1305 or AES-GCM in sshd_config"
+        fi
+    elif [[ "$CIPHERS" =~ -cbc ]]; then
+        warnf "ssh_weak_cipher_cbc" "CBC-mode ciphers enabled (prefer ChaCha20-Poly1305 and AES-GCM): $CIPHERS" \
+            "Remove *-cbc entries from 'Ciphers' in sshd_config and prefer AEAD ciphers"
+    else
+        ok "Modern secure ciphers configured"
+    fi
+
+    # Check for weak MACs (MD5 or 96-bit)
+    if [[ "$MACS" =~ md5 || "$MACS" =~ 96 ]]; then
+        critf "ssh_weak_mac_md5" "Weak MAC algorithms detected (MD5/96-bit): $MACS" \
+            "Replace with 'hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com'"
+    else
+        ok "Cryptographic MAC algorithms appear strong"
+    fi
+else
+    info "sshd -T unreadable; skipping deep cipher suite inspection"
+fi
+
+# ---------- 3. User .ssh & Permissions Audit ----------
+section "USER .SSH DIRECTORIES & PERMISSIONS"
+
+declare -a SSH_DIRS=()
+[[ -d /root/.ssh ]] && SSH_DIRS+=("/root/.ssh")
+for d in /home/*/.ssh; do
+    [[ -d "$d" ]] && SSH_DIRS+=("$d")
+done
+
+TOTAL_KEYS_AUDITED=0
+WEAK_KEYS=0
+ED25519_KEYS=0
+RSA_KEYS=0
+PERM_ISSUES=0
+
+if [[ ${#SSH_DIRS[@]} -eq 0 ]]; then
+    info "No user .ssh directories discovered"
+else
+    for sdir in "${SSH_DIRS[@]}"; do
+        owner=$(stat -c '%U' "$sdir" 2>/dev/null || echo "unknown")
+        perms=$(stat -c '%a' "$sdir" 2>/dev/null || echo "unknown")
+        subsec "$sdir (User: $owner)"
+
+        # Check directory permissions (must be 700)
+        if [[ "$perms" == "700" ]]; then
+            ok "Directory permissions: $perms"
+        else
+            warnf "ssh_dir_perms" "$sdir permissions: $perms (Recommended: 700 drwx------)" \
+                "Run 'chmod 700 $sdir' for owner-only access"
+            PERM_ISSUES=$((PERM_ISSUES + 1))
+        fi
+
+        # Check private keys inside .ssh
+        for pkey in "$sdir"/id_* "$sdir"/*.pem "$sdir"/*.key; do
+            [[ -f "$pkey" ]] || continue
+            [[ "$pkey" == *.pub ]] && continue
+
+            kperms=$(stat -c '%a' "$pkey" 2>/dev/null || echo "unknown")
+            kbase=$(basename "$pkey")
+
+            # Check if group or other can read
+            if [[ "$kperms" == "600" || "$kperms" == "400" ]]; then
+                ok "Private key '$kbase' secure permissions: $kperms"
+            else
+                critf "ssh_private_key_perms" "Private key '$kbase' insecure permissions: $kperms (Must be 600 or 400!)" \
+                    "Run 'chmod 600 $pkey' (or 400) so only the owner can read it"
+                PERM_ISSUES=$((PERM_ISSUES + 1))
+            fi
+        done
+
+        # Check authorized_keys permissions and contents
+        AUTH_FILE="$sdir/authorized_keys"
+        if [[ -f "$AUTH_FILE" ]]; then
+            aperms=$(stat -c '%a' "$AUTH_FILE" 2>/dev/null || echo "unknown")
+            if [[ "$aperms" == "600" || "$aperms" == "644" ]]; then
+                ok "authorized_keys permissions: $aperms"
+            else
+                warnf "ssh_authorized_keys_perms" "authorized_keys permissions: $aperms (Recommended: 600)" \
+                    "Run 'chmod 600 $AUTH_FILE' so sshd accepts the file"
+                PERM_ISSUES=$((PERM_ISSUES + 1))
+            fi
+
+            # Parse keys
+            while IFS= read -r keyline; do
+                [[ -z "$keyline" || "$keyline" =~ ^# ]] && continue
+                TOTAL_KEYS_AUDITED=$((TOTAL_KEYS_AUDITED + 1))
+
+                ktype=$(awk '{print $1}' <<< "$keyline")
+                kcomment=$(awk '{$1=$2=""; print $0}' <<< "$keyline" | sed -e 's/^[[:space:]]*//')
+
+                case "$ktype" in
+                    ssh-ed25519)
+                        ED25519_KEYS=$((ED25519_KEYS + 1))
+                        ok "Key: Ed25519 (Gold Standard) - ${kcomment:-no-comment}"
+                        ;;
+                    ecdsa-sha2-*)
+                        ok "Key: ECDSA - ${kcomment:-no-comment}"
+                        ;;
+                    ssh-rsa)
+                        RSA_KEYS=$((RSA_KEYS + 1))
+                        # Inspect bit-length using ssh-keygen on temp file
+                        ktmp=$(mktemp)
+                        echo "$keyline" > "$ktmp"
+                        kinfo=$(ssh-keygen -l -f "$ktmp" 2>/dev/null || true)
+                        rm -f "$ktmp"
+                        bits=$(awk '{print $1}' <<< "$kinfo")
+                        if [[ "$bits" -ge 3072 ]] 2>/dev/null; then
+                            ok "Key: RSA ${bits}-bit (Strong) - ${kcomment:-no-comment}"
+                        elif [[ "$bits" -ge 2048 ]] 2>/dev/null; then
+                            info "Key: RSA ${bits}-bit (Acceptable) - ${kcomment:-no-comment}"
+                        else
+                            WEAK_KEYS=$((WEAK_KEYS + 1))
+                            critf "ssh_weak_rsa_key" "Key: RSA ${bits:-<2048}-bit WEAK key - ${kcomment:-no-comment}" \
+                                "Generate Ed25519 key: 'ssh-keygen -t ed25519', append to authorized_keys, remove old RSA"
+                        fi
+                        ;;
+                    ssh-dss)
+                        WEAK_KEYS=$((WEAK_KEYS + 1))
+                        critf "ssh_dsa_key" "Key: Deprecated DSA key (Legacy/Broken) - ${kcomment:-no-comment}" \
+                            "DSA is disabled in modern OpenSSH. Replace with Ed25519: 'ssh-keygen -t ed25519'"
+                        ;;
+                    *)
+                        info "Key: $ktype - ${kcomment:-no-comment}"
+                        ;;
+                esac
+            done < "$AUTH_FILE"
+        else
+            info "No authorized_keys file found in $sdir"
+        fi
+    done
+fi
+
+# ─── Client config scan (depth fix #3) ─────────────────────────────────────
+# Many users unknowingly enable ForwardAgent and accept-strict-hostkey=no in
+# their personal ssh client config — this leaks ssh-agent sockets to any host
+# they log into. Flag these so the user knows.
+subsec "Client config (~/.ssh/config)"
+for sdir in "${SSH_DIRS[@]}"; do
+    ccfile="$sdir/config"
+    [[ -f "$ccfile" ]] || continue
+    ccperms=$(stat -c '%a' "$ccfile" 2>/dev/null || echo "")
+    if [[ -n "$ccperms" && "$ccperms" != "600" && "$ccperms" != "644" ]]; then
+        warnf "ssh_config_perms" "~/.ssh/config in $sdir has weak perms: $ccperms" \
+            "Run 'chmod 600 $ccfile'"
+    fi
+    # ForwardAgent yes anywhere in config → agent-forwarding enabled
+    if grep -Eqi '^[[:space:]]*Host[[:space:]]+[*?]' "$ccfile" 2>/dev/null && \
+       grep -Eqi '^[[:space:]]*ForwardAgent[[:space:]]+yes' "$ccfile" 2>/dev/null; then
+        critf "ssh_forwardagent" "$ccfile: ForwardAgent yes with wildcard Host" \
+            "An attacker on any matching host can pivot using your ssh-agent socket. Restrict ForwardAgent to specific Hosts only."
+    elif grep -Eqi '^[[:space:]]*ForwardAgent[[:space:]]+yes' "$ccfile" 2>/dev/null; then
+        info "$ccfile: ForwardAgent enabled (verify this is intentional)"
+    fi
+    # StrictHostKeyChecking no
+    if grep -Eqi '^[[:space:]]*StrictHostKeyChecking[[:space:]]+no' "$ccfile" 2>/dev/null; then
+        warnf "ssh_strict_hostkey" "$ccfile: StrictHostKeyChecking no (MITM risk)" \
+            "Set StrictHostKeyChecking ask and pre-populate known_hosts."
+    fi
+    # Host-based auth
+    if grep -Eqi '^[[:space:]]*HostBasedAuthentication[[:space:]]+yes' "$ccfile" 2>/dev/null; then
+        critf "ssh_hostbased" "$ccfile: HostBasedAuthentication yes (rare, attack surface)" \
+            "Disable unless absolutely required."
+    fi
+    # PermitLocalCommand + wildcards
+    if grep -Eqi '^[[:space:]]*Host[[:space:]]+[*?]' "$ccfile" 2>/dev/null && \
+       grep -Eqi '^[[:space:]]*PermitLocalCommand[[:space:]]+yes' "$ccfile" 2>/dev/null; then
+        warnf "ssh_local_command" "$ccfile: PermitLocalCommand with wildcard Host" \
+            "Wildcard PermitLocalCommand can run arbitrary commands on every ssh login."
+    fi
+done
+
+# ---------- Recommendations ----------
+section "RECOMMENDATIONS"
+if [[ "${PASS_AUTH,,}" == "yes" ]]; then
+    emit "  ${C_YELLOW}• Disable password authentication in /etc/ssh/sshd_config: PasswordAuthentication no${C_RESET}\n"
+fi
+if [[ "${ROOT_LOGIN,,}" == "yes" ]]; then
+    emit "  ${C_RED}• Disallow root password login in /etc/ssh/sshd_config: PermitRootLogin prohibit-password${C_RESET}\n"
+fi
+if (( PERM_ISSUES > 0 )); then
+    emit "  ${C_YELLOW}• Fix SSH permissions: chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_*${C_RESET}\n"
+fi
+if (( WEAK_KEYS > 0 )); then
+    emit "  ${C_RED}• Replace obsolete DSA/weak RSA keys with modern Ed25519 keys: ssh-keygen -t ed25519${C_RESET}\n"
+fi
+emit "  ${C_DIM}• Test sshd config syntax before reload: sudo sshd -t${C_RESET}\n"
+
+# ─── Donut Chart: visualize PASS / WARN / FAIL counts ──────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    _donut_off=1; trap - DEBUG
+    printf "\n${C_BOLD}${C_CYAN}━━━ Check Results (donut chart) ━━━${C_RESET}\n"
+    _donut_render() {
+        local title="$1"; shift
+        local total=0
+        local -a labels=() counts=()
+        for rec in "$@"; do
+            [[ -z "$rec" ]] && continue
+            labels+=("${rec%%|*}")
+            counts+=("${rec##*|}")
+            total=$(( total + counts[-1] ))
+        done
+        [[ $total -eq 0 ]] && { printf "  ${C_DIM}No check data${C_RESET}\n"; return; }
+        printf "  ${C_BOLD}%-12s${C_RESET}\n" "$title"
+        local colors=("$C_GREEN" "$C_YELLOW" "$C_RED")
+        local i
+        for i in "${!labels[@]}"; do
+            local pct=$(( counts[i] * 100 / total ))
+            local arc_len=$(( counts[i] * 24 / total ))
+            (( arc_len == 0 )) && arc_len=1
+            local bar=""
+            for (( j=0; j<arc_len; j++ )); do bar+="█"; done
+            local c="${colors[$(( i % 3 ))]}"
+            printf "  ${c}%-10s${C_RESET} ${c}%-26s${C_RESET} ${C_BOLD}%3d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+                "${labels[i]}" "$bar" "${counts[i]}" "$pct"
+        done
+        printf "  ${C_DIM}total checks = %d${C_RESET}\n" "$total"
+    }
+    _donut_render "Check Results" \
+        "PASS|$_DBG_PASS" \
+        "WARN|$_DBG_WARN" \
+        "FAIL|$_DBG_FAIL"
+fi
+
+# JSON fields
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+fi
+
+add_json_field "sshd_active" "$SSHD_RUNNING" 1
+add_json_field "permit_root_login" "$ROOT_LOGIN" 0
+add_json_field "password_authentication" "$PASS_AUTH" 0
+add_json_field "empty_passwords" "$EMPTY_PASS" 0
+add_json_field "total_keys_audited" "$TOTAL_KEYS_AUDITED" 1
+add_json_field "ed25519_keys" "$ED25519_KEYS" 1
+add_json_field "rsa_keys" "$RSA_KEYS" 1
+add_json_field "weak_keys" "$WEAK_KEYS" 1
+add_json_field "permission_issues" "$PERM_ISSUES" 1
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+emit_verdict
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    _SSH_SUMMARY="keys_total=$TOTAL_KEYS_AUDITED ed25519=$ED25519_KEYS rsa=$RSA_KEYS weak=$WEAK_KEYS perm_issues=$PERM_ISSUES empty_pw=$EMPTY_PASS root_login_set=${PERMIT_ROOT_LOGIN:-?}"
+    ai_emit_verdict "top_issue" "$_SSH_SUMMARY" 2>/dev/null || true
+fi

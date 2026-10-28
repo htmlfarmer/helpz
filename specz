@@ -1,0 +1,1768 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# specz - Full hardware specification report
+# ----------------------------------------------------------------------------
+# Dumps every relevant hardware spec: system/chassis, motherboard, BIOS, CPU,
+# memory (DDR type, speed, slots, max capacity), GPU, storage, PCI bus,
+# network, Bluetooth, audio, USB, display, OS. Designed for selling a PC,
+# asking AI about compatibility, or planning upgrades.
+#
+# Usage:
+#   ./specz                 # full report
+#   ./specz --no-color      # plain output
+#   ./specz --json          # machine-readable summary
+#   ./specz --ai            # compact AI-friendly key:value dump
+#
+# Requires: (none — graceful degradation)
+# Optional: dmidecode (root for full data), lspci, lsusb, lscpu, lsblk,
+#           nvidia-smi, bluetoothctl, rfkill, edid-decode
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+NO_COLOR=0
+JSON_OUT=0
+AI_MODE=0
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+SCRIPT_VERSION="1.0.0"
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# Source verdict logging helper
+SCRIPT_DIR_SPECS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$SCRIPT_DIR_SPECS"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -f "$SCRIPT_DIR_SPECS/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_SPECS/lib/verdict_log.sh"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    --ai)         AI_MODE=1 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          specz — Full Hardware Specification Report          ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Dumps every relevant hardware spec for selling a PC, asking AI about
+  compatibility, or planning upgrades. Covers system, motherboard, BIOS,
+  CPU, memory (DDR type/speed/slots/max), GPU, storage, PCI bus, network,
+  Bluetooth, audio, USB, display, and OS.
+
+USAGE
+  ./specz                 Full report
+  ./specz --no-color      Plain output
+  ./specz --json          Machine-readable summary
+  ./specz --ai            Compact AI-friendly key:value dump
+
+OPTIONS
+  --no-color      Disable colors
+  --json          Output JSON summary
+  --ai            Compact key:value format for pasting to AI
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  sudo dmidecode -t system             System/chassis info
+  sudo dmidecode -t baseboard          Motherboard details
+  sudo dmidecode -t bios               BIOS/UEFI info
+  sudo dmidecode -t memory             Full RAM details (type, speed, max)
+  sudo dmidecode -t processor          CPU socket details
+  lscpu                                CPU overview
+  lspci -vv                            All PCI devices with link speeds
+  lsusb                                USB devices
+  lsblk -o NAME,SIZE,TYPE,MODEL        Block devices
+  nvidia-smi                           NVIDIA GPU status
+  bluetoothctl show                    Bluetooth adapter details
+  rfkill list                          Radio kill switches
+  cat /sys/class/drm/card*/edid        Monitor EDID data
+  hwinfo --short                       Broad hardware summary
+  inxi -Fxxxz                          Full system info (needs inxi)
+  neofetch                             System info one-liner
+
+HELPEOF
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+if [[ "$JSON_OUT" != "1" && "$AI_MODE" != "1" ]] && declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "specz"; fi
+
+# If JSON mode is enabled, suppress all stdout during data collection
+if [[ $JSON_OUT -eq 1 ]]; then
+  exec 3>&1
+  exec 1>/dev/null
+fi
+
+# ---------- Helpers ----------
+field() {
+  local label="$1" value="$2" color="${3:-$C_CYAN}"
+  [[ -z "$value" || "$value" == "Not Specified" || "$value" == "Unknown" || "$value" == "None" ]] && return
+  if [[ $AI_MODE -eq 1 ]]; then
+    printf "%s: %s\n" "$label" "$value"
+  else
+    printf "  ${C_DIM}%-22s${C_RESET} ${color}%s${C_RESET}\n" "$label" "$value"
+  fi
+}
+
+# dmidecode helper — needs root for most data
+dmi() {
+  local type="$1"
+  if has_cmd dmidecode; then
+    dmidecode -t "$type" 2>/dev/null
+  fi
+}
+
+dmi_field() {
+  local type="$1" key="$2"
+  dmi "$type" 2>/dev/null | grep -i "^ *${key}:" | head -1 | sed "s/^[^:]*:[[:space:]]*//"
+}
+
+# ---------- Banner ----------
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+  printf "${C_BOLD}${C_MAGENTA}"
+  cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  SPECS.SH — Full Hardware Specification Report                ║
+   ║  System · CPU · GPU · Storage · USB                           ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+  printf "${C_RESET}\n"
+  printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT"
+  if [[ $EUID -ne 0 ]]; then
+    printf "  ${C_YELLOW}${BOLD}⚡ Run with sudo for full memory/BIOS/chassis details${C_RESET}\n"
+  fi
+fi
+
+# ---------- Detect tools ----------
+HAVE_DMIDECODE=0; has_cmd dmidecode && HAVE_DMIDECODE=1
+HAVE_LSPCI=0; has_cmd lspci && HAVE_LSPCI=1
+HAVE_LSUSB=0; has_cmd lsusb && HAVE_LSUSB=1
+HAVE_LSCPU=0; has_cmd lscpu && HAVE_LSCPU=1
+HAVE_LSBLK=0; has_cmd lsblk && HAVE_LSBLK=1
+HAVE_NVIDIA=0; has_cmd nvidia-smi && HAVE_NVIDIA=1
+HAVE_BTCTL=0; has_cmd bluetoothctl && HAVE_BTCTL=1
+HAVE_RFKILL=0; has_cmd rfkill && HAVE_RFKILL=1
+HAVE_EDID=0; has_cmd edid-decode && HAVE_EDID=1
+
+# ============================================================================
+# SECTION 1: System / Chassis
+# ============================================================================
+section "SYSTEM / CHASSIS"
+
+SYS_MANUF=""
+SYS_PROD=""
+SYS_VER=""
+SYS_SERIAL=""
+SYS_SKU=""
+SYS_FAMILY=""
+CHAS_TYPE=""
+
+# Read from sysfs first (no root needed)
+DMI_SYS="/sys/devices/virtual/dmi/id"
+SYS_MANUF=$(cat "$DMI_SYS/sys_vendor" 2>/dev/null) || true
+SYS_PROD=$(cat "$DMI_SYS/product_name" 2>/dev/null) || true
+SYS_VER=$(cat "$DMI_SYS/product_version" 2>/dev/null) || true
+SYS_SERIAL=$(cat "$DMI_SYS/product_serial" 2>/dev/null) || true
+SYS_SKU=$(cat "$DMI_SYS/product_sku" 2>/dev/null) || true
+SYS_FAMILY=$(cat "$DMI_SYS/product_family" 2>/dev/null) || true
+CHAS_TYPE=$(cat "$DMI_SYS/chassis_type" 2>/dev/null) || true
+
+# Supplement with dmidecode if sysfs was empty (needs root)
+if [[ $HAVE_DMIDECODE -eq 1 ]]; then
+  [[ -z "$SYS_MANUF" ]]  && SYS_MANUF=$(dmi_field system "Manufacturer")
+  [[ -z "$SYS_PROD" ]]   && SYS_PROD=$(dmi_field system "Product Name")
+  [[ -z "$SYS_VER" ]]    && SYS_VER=$(dmi_field system "Version")
+  [[ -z "$SYS_SERIAL" ]] && SYS_SERIAL=$(dmi_field system "Serial Number")
+  [[ -z "$SYS_SKU" ]]    && SYS_SKU=$(dmi_field system "SKU Number")
+  [[ -z "$SYS_FAMILY" ]] && SYS_FAMILY=$(dmi_field system "Family")
+  if [[ -z "$CHAS_TYPE" ]]; then
+    CHAS_TYPE=$(dmi_field chassis "Type")
+  fi
+fi
+
+# Translate chassis type number to human label
+case "$CHAS_TYPE" in
+  1) CHAS_TYPE="Other" ;; 2) CHAS_TYPE="Unknown" ;; 3) CHAS_TYPE="Desktop" ;;
+  4) CHAS_TYPE="Low Profile Desktop" ;; 5) CHAS_TYPE="Pizza Box" ;;
+  6) CHAS_TYPE="Mini Tower" ;; 7) CHAS_TYPE="Tower" ;; 8) CHAS_TYPE="Portable" ;;
+  9) CHAS_TYPE="Laptop" ;; 10) CHAS_TYPE="Notebook" ;; 11) CHAS_TYPE="Hand Held" ;;
+  12) CHAS_TYPE="Docking Station" ;; 13) CHAS_TYPE="All in One" ;;
+  14) CHAS_TYPE="Sub Notebook" ;; 15) CHAS_TYPE="Space-saving" ;;
+  16) CHAS_TYPE="Lunch Box" ;; 17) CHAS_TYPE="Main Server Chassis" ;;
+  18) CHAS_TYPE="Expansion Chassis" ;; 19) CHAS_TYPE="SubChassis" ;;
+  20) CHAS_TYPE="Bus Expansion Chassis" ;; 21) CHAS_TYPE="Peripheral Chassis" ;;
+  22) CHAS_TYPE="RAID Chassis" ;; 23) CHAS_TYPE="Rack Mount Chassis" ;;
+  24) CHAS_TYPE="Sealed-case PC" ;; 25) CHAS_TYPE="Multi-system Chassis" ;;
+  26) CHAS_TYPE="Compact PCI" ;; 27) CHAS_TYPE="Advanced TCA" ;;
+  28) CHAS_TYPE="Blade" ;; 29) CHAS_TYPE="Blade Enclosure" ;;
+  30) CHAS_TYPE="Tablet" ;; 31) CHAS_TYPE="Convertible" ;; 32) CHAS_TYPE="Detachable" ;;
+  33) CHAS_TYPE="IoT Gateway" ;; 34) CHAS_TYPE="Embedded PC" ;;
+  35) CHAS_TYPE="Mini PC" ;; 36) CHAS_TYPE="Stick PC" ;;
+esac
+
+field "Manufacturer"     "$SYS_MANUF"
+field "Product Name"     "$SYS_PROD"    "$C_BOLD$C_CYAN"
+field "Version"          "$SYS_VER"
+field "Serial Number"    "$SYS_SERIAL"
+field "SKU"              "$SYS_SKU"
+field "Family"           "$SYS_FAMILY"
+field "Chassis Type"     "$CHAS_TYPE"
+
+# ============================================================================
+# SECTION 2: Motherboard / Baseboard
+# ============================================================================
+section "MOTHERBOARD"
+
+MB_MANUF=""
+MB_NAME=""
+MB_VER=""
+MB_SERIAL=""
+MB_ASSET=""
+
+# Read from sysfs first (no root needed)
+MB_MANUF=$(cat "$DMI_SYS/board_vendor" 2>/dev/null) || true
+MB_NAME=$(cat "$DMI_SYS/board_name" 2>/dev/null) || true
+MB_VER=$(cat "$DMI_SYS/board_version" 2>/dev/null) || true
+MB_SERIAL=$(cat "$DMI_SYS/board_serial" 2>/dev/null) || true
+MB_ASSET=$(cat "$DMI_SYS/board_asset_tag" 2>/dev/null) || true
+
+# Supplement with dmidecode if sysfs was empty
+if [[ $HAVE_DMIDECODE -eq 1 ]]; then
+  [[ -z "$MB_MANUF" ]]  && MB_MANUF=$(dmi_field baseboard "Manufacturer")
+  [[ -z "$MB_NAME" ]]   && MB_NAME=$(dmi_field baseboard "Product Name")
+  [[ -z "$MB_VER" ]]    && MB_VER=$(dmi_field baseboard "Version")
+  [[ -z "$MB_SERIAL" ]] && MB_SERIAL=$(dmi_field baseboard "Serial Number")
+  [[ -z "$MB_ASSET" ]]  && MB_ASSET=$(dmi_field baseboard "Asset Tag")
+fi
+
+field "Manufacturer"     "$MB_MANUF"
+field "Model"            "$MB_NAME"    "$C_BOLD$C_CYAN"
+field "Version"          "$MB_VER"
+field "Serial Number"    "$MB_SERIAL"
+field "Asset Tag"        "$MB_ASSET"
+
+JSON_FIELDS+=("\"mb_manuf\":\"${MB_MANUF:-}\"")
+JSON_FIELDS+=("\"mb_model\":\"${MB_NAME:-}\"")
+
+# ============================================================================
+# SECTION 3: BIOS / UEFI
+# ============================================================================
+section "BIOS / UEFI"
+
+BIOS_VENDOR=""
+BIOS_VER=""
+BIOS_DATE=""
+BIOS_REV=""
+BIOS_FW_REV=""
+
+# Read from sysfs first (no root needed)
+BIOS_VENDOR=$(cat "$DMI_SYS/bios_vendor" 2>/dev/null) || true
+BIOS_VER=$(cat "$DMI_SYS/bios_version" 2>/dev/null) || true
+BIOS_DATE=$(cat "$DMI_SYS/bios_date" 2>/dev/null) || true
+
+# Supplement with dmidecode if sysfs was empty
+if [[ $HAVE_DMIDECODE -eq 1 ]]; then
+  [[ -z "$BIOS_VENDOR" ]] && BIOS_VENDOR=$(dmi_field bios "Vendor")
+  [[ -z "$BIOS_VER" ]]    && BIOS_VER=$(dmi_field bios "Version")
+  [[ -z "$BIOS_DATE" ]]   && BIOS_DATE=$(dmi_field bios "Release Date")
+  [[ -z "$BIOS_REV" ]]    && BIOS_REV=$(dmi_field bios "BIOS Revision")
+  [[ -z "$BIOS_FW_REV" ]] && BIOS_FW_REV=$(dmi_field bios "Firmware Revision")
+fi
+
+field "Vendor"           "$BIOS_VENDOR"
+field "Version"          "$BIOS_VER"    "$C_BOLD$C_CYAN"
+field "Release Date"     "$BIOS_DATE"
+field "BIOS Revision"    "$BIOS_REV"
+field "Firmware Revision" "$BIOS_FW_REV"
+
+# UEFI vs Legacy
+if [[ -d /sys/firmware/efi ]]; then
+  ok "Boot mode: ${C_BOLD}UEFI${C_RESET}"
+  JSON_FIELDS+=("\"boot_mode\":\"uefi\"")
+else
+  info "Boot mode: ${C_BOLD}Legacy BIOS${C_RESET}"
+  JSON_FIELDS+=("\"boot_mode\":\"legacy\"")
+fi
+
+# Secure Boot
+if [[ -d /sys/firmware/efi ]]; then
+  SB=$(cat /sys/kernel/security/lockdown 2>/dev/null)
+  if [[ -r /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c ]]; then
+    SB_VAL=$(od --address-radix=none --format=u1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | awk '{print $NF}')
+    if [[ "$SB_VAL" == "1" ]]; then
+      ok "Secure Boot: ${C_GREEN}enabled${C_RESET}"
+      JSON_FIELDS+=("\"secure_boot\":\"enabled\"")
+    else
+      info "Secure Boot: ${C_YELLOW}disabled${C_RESET}"
+      JSON_FIELDS+=("\"secure_boot\":\"disabled\"")
+    fi
+  fi
+fi
+
+# ============================================================================
+# SECTION 4: CPU
+# ============================================================================
+section "CPU"
+
+if [[ $HAVE_LSCPU -eq 1 ]]; then
+  lscpu_field() {
+    lscpu 2>/dev/null | awk -F: -v k="$1" '{gsub(/^[ \t]+|[ \t]+$/, "", $1)} tolower($1) == tolower(k) {gsub(/^[ \t]+/, "", $2); print $2; exit}'
+  }
+
+  CPU_MODEL=$(lscpu_field "Model name")
+  CPU_VENDOR=$(lscpu_field "Vendor ID")
+  CPU_FAMILY=$(lscpu_field "CPU family")
+  CPU_STEPPING=$(lscpu_field "Stepping")
+  CPU_MICROCODE=$(lscpu_field "Microcode")
+  CPU_SOCKETS=$(lscpu_field "Socket(s)")
+  CPU_CORES=$(lscpu_field "Core(s) per socket")
+  CPU_THREADS=$(lscpu_field "Thread(s) per core")
+  CPU_CPUS=$(lscpu_field "CPU(s)")
+  CPU_MAX_MHZ=$(lscpu_field "CPU max MHz")
+  CPU_MIN_MHZ=$(lscpu_field "CPU min MHz")
+  CPU_ARCH=$(lscpu_field "Architecture")
+  CPU_L1D=$(lscpu_field "L1d cache")
+  CPU_L1I=$(lscpu_field "L1i cache")
+  CPU_L2=$(lscpu_field "L2 cache")
+  CPU_L3=$(lscpu_field "L3 cache")
+  CPU_VIRT=$(lscpu_field "Virtualization")
+  CPU_BOGO=$(lscpu_field "BogoMIPS")
+
+  field "Model"            "$CPU_MODEL"  "$C_BOLD$C_CYAN"
+  field "Vendor"           "$CPU_VENDOR"
+  field "Architecture"     "$CPU_ARCH"
+  field "Family/Stepping"  "${CPU_FAMILY:-?}/${CPU_STEPPING:-?}"
+  field "Microcode"        "$CPU_MICROCODE"
+  field "Sockets"          "$CPU_SOCKETS"
+  field "Cores per socket" "$CPU_CORES"
+  field "Threads per core" "$CPU_THREADS"
+  field "Logical CPUs"     "$CPU_CPUS"   "$C_BOLD"
+  field "Max MHz"          "$CPU_MAX_MHZ"
+  field "Min MHz"          "$CPU_MIN_MHZ"
+  field "BogoMIPS"         "$CPU_BOGO"
+  field "L1d / L1i cache"  "${CPU_L1D:-?} / ${CPU_L1I:-?}"
+  field "L2 cache"         "$CPU_L2"
+  field "L3 cache"         "$CPU_L3"    "$C_CYAN"
+  field "Virtualization"   "$CPU_VIRT"
+
+  JSON_FIELDS+=("\"cpu_model\":\"${CPU_MODEL:-}\"")
+  JSON_FIELDS+=("\"cpu_cores\":\"${CPU_CORES:-}\"")
+  JSON_FIELDS+=("\"cpu_threads\":\"${CPU_THREADS:-}\"")
+  JSON_FIELDS+=("\"cpu_cpus\":\"${CPU_CPUS:-}\"")
+else
+  if [[ -r /proc/cpuinfo ]]; then
+    CPU_MODEL=$(awk -F: '/model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)
+    field "Model" "$CPU_MODEL" "$C_BOLD$C_CYAN"
+  fi
+  crit "lscpu not found — install util-linux for full CPU info"
+fi
+
+# CPU temp (quick check)
+if has_cmd sensors; then
+  CPU_TEMP=$(sensors 2>/dev/null | awk '/Package id 0|Tctl|Core 0/ {for(i=1;i<=NF;i++) if($i ~ /^\+/) {gsub(/[+°C]/,"",$i); print $i; exit}}')
+  [[ -n "$CPU_TEMP" ]] && field "Current Temp" "${CPU_TEMP}°C"
+fi
+
+# ============================================================================
+# SECTION 5: Memory (RAM) — the big one for upgrades
+# ============================================================================
+section "MEMORY (RAM)"
+
+# Current usage overview
+if [[ -r /proc/meminfo ]]; then
+  MEMTOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  MEMTOTAL_MB=$((MEMTOTAL_KB / 1024))
+  MEMTOTAL_GB=$(echo "scale=1; $MEMTOTAL_MB / 1024" | bc 2>/dev/null)
+  field "Total Installed"  "${MEMTOTAL_GB} GB (${MEMTOTAL_MB} MB)" "$C_BOLD$C_GREEN"
+  JSON_FIELDS+=("\"ram_total_gb\":\"${MEMTOTAL_GB}\"")
+fi
+
+# dmidecode memory details (needs root for full data)
+if [[ $HAVE_DMIDECODE -eq 1 ]]; then
+  subsec "Physical Memory Array"
+
+  MAX_CAPACITY=$(dmi "memory" 2>/dev/null | awk '/Maximum Capacity/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+  NUM_DEVICES=$(dmi "memory" 2>/dev/null | awk '/Number Of Devices/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+  NUM_POPULATED=$(dmi "memory" 2>/dev/null | awk '/Populated/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+  MEM_ERR_CORR=$(dmi "memory" 2>/dev/null | awk '/Error Correction/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+
+  field "Max Capacity"       "$MAX_CAPACITY"  "$C_BOLD$C_GREEN"
+  field "Total Slots"        "$NUM_DEVICES"
+  field "Populated Slots"    "$NUM_POPULATED"
+  field "Error Correction"   "$MEM_ERR_CORR"
+
+  JSON_FIELDS+=("\"ram_max_capacity\":\"${MAX_CAPACITY:-}\"")
+  JSON_FIELDS+=("\"ram_slots_total\":\"${NUM_DEVICES:-}\"")
+  JSON_FIELDS+=("\"ram_slots_populated\":\"${NUM_POPULATED:-}\"")
+
+  subsec "Individual DIMMs"
+
+  DMI_MEM=$(dmi "memory" 2>/dev/null)
+  if [[ -n "$DMI_MEM" ]]; then
+    printf "  ${C_DIM}%-6s %-18s %-8s %-12s %-12s %-14s %-10s %-16s${C_RESET}\n" \
+      "Slot" "Size" "Type" "Speed" "Mfg Date" "Manufacturer" "Part Number" "Serial"
+    printf "  ${C_DIM}%-6s %-18s %-8s %-12s %-12s %-14s %-10s %-16s${C_RESET}\n" \
+      "------" "------------------" "--------" "------------" "------------" "--------------" "----------" "----------------"
+
+    IN_DEV=0
+    S_LOC="" S_SIZE="" S_TYPE="" S_SPEED="" S_MFG="" S_DATE="" S_PART="" S_SERIAL="" S_FORM=""
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^Memory\ Device ]]; then
+        if [[ $IN_DEV -eq 1 && -n "$S_SIZE" && "$S_SIZE" != *"No Module"* ]]; then
+          printf "  ${C_CYAN}%-6s${C_RESET} ${C_BOLD}%-18s${C_RESET} ${C_GREEN}%-8s${C_RESET} %-12s %-12s %-14s %-10s %-16s\n" \
+            "$(echo "$S_LOC" | cut -c1-6)" "$S_SIZE" "$S_TYPE" "$S_SPEED" "$S_DATE" \
+            "$(echo "$S_MFG" | cut -c1-14)" "$(echo "$S_PART" | cut -c1-10)" "$(echo "$S_SERIAL" | cut -c1-16)"
+        fi
+        IN_DEV=1
+        S_LOC=""; S_SIZE=""; S_TYPE=""; S_SPEED=""; S_MFG=""; S_DATE=""; S_PART=""; S_SERIAL=""; S_FORM=""
+      fi
+      case "$line" in
+        *Locator:*)
+          if [[ "$line" != *"Bank"* ]]; then
+            S_LOC=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+          fi ;;
+        *Size:*)          S_SIZE=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//') ;;
+        *Type:*)          [[ "$line" != *"Detail"* && "$line" != *"Error"* ]] && S_TYPE=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//') ;;
+        *Speed:*)         [[ "$line" != *"Configured"* ]] && S_SPEED=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//') ;;
+        *Manufacturer:*)  S_MFG=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//') ;;
+        *Date:*)          S_DATE=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//') ;;
+        *"Part Number"*)  S_PART=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//' | tr -d ' ') ;;
+        *"Serial Number"*) S_SERIAL=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//' | tr -d ' ') ;;
+        *"Form Factor"*)  S_FORM=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//') ;;
+      esac
+    done <<< "$DMI_MEM"
+    # Print last device
+    if [[ $IN_DEV -eq 1 && -n "$S_SIZE" && "$S_SIZE" != *"No Module"* ]]; then
+      printf "  ${C_CYAN}%-6s${C_RESET} ${C_BOLD}%-18s${C_RESET} ${C_GREEN}%-8s${C_RESET} %-12s %-12s %-14s %-10s %-16s\n" \
+        "$(echo "$S_LOC" | cut -c1-6)" "$S_SIZE" "$S_TYPE" "$S_SPEED" "$S_DATE" \
+        "$(echo "$S_MFG" | cut -c1-14)" "$(echo "$S_PART" | cut -c1-10)" "$(echo "$S_SERIAL" | cut -c1-16)"
+    fi
+  fi
+
+  # Configured speed (what it's actually running at)
+  CONF_SPEED=$(dmi "memory" 2>/dev/null | awk '/Configured Memory Speed/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+  [[ -n "$CONF_SPEED" ]] && field "Configured Speed" "$CONF_SPEED" "$C_BOLD$C_YELLOW"
+else
+  info "dmidecode not available or not root — run with ${C_BOLD}sudo${C_RESET} for DIMM details"
+  # Fallback: /proc/meminfo only
+  if [[ -r /proc/meminfo ]]; then
+    field "Total RAM" "$(humansize $((MEMTOTAL_KB * 1024)))" "$C_BOLD$C_GREEN"
+  fi
+fi
+
+# ============================================================================
+# SECTION 6: GPU / Display Adapter
+# ============================================================================
+section "GPU / DISPLAY ADAPTER"
+
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  GPU_LIST=$(lspci 2>/dev/null | grep -iE 'VGA|3D|Display')
+  if [[ -n "$GPU_LIST" ]]; then
+    GPU_COUNT=$(printf '%s\n' "$GPU_LIST" | wc -l)
+    info "Found ${C_BOLD}${GPU_COUNT}${C_RESET} GPU(s):"
+    while IFS= read -r line; do
+      printf "  ${C_GREEN}▸${C_RESET} %s\n" "$line"
+    done <<< "$GPU_LIST"
+    JSON_FIELDS+=("\"gpu_count\":$GPU_COUNT")
+  else
+    info "No GPU detected via lspci"
+  fi
+fi
+
+# NVIDIA detail
+if [[ $HAVE_NVIDIA -eq 1 ]]; then
+  subsec "NVIDIA Detail"
+  NVIDIA_INFO=$(nvidia-smi --query-gpu=name,driver_version,temperature.gpu,memory.total,memory.used,power.draw,clocks.current.graphics,clocks.current.memory --format=csv,noheader 2>/dev/null)
+  if [[ -n "$NVIDIA_INFO" ]]; then
+    while IFS=',' read -r name drv temp vram_tot vram_used power clk_gr clk_mem; do
+      name=$(echo "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      drv=$(echo "$drv" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      temp=$(echo "$temp" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      vram_tot=$(echo "$vram_tot" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      vram_used=$(echo "$vram_used" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      power=$(echo "$power" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+      field "GPU Name"     "$name"         "$C_BOLD$C_MAGENTA"
+      field "Driver"       "$drv"
+      field "Temperature"  "${temp}°C"
+      field "VRAM Total"   "$vram_tot"     "$C_BOLD$C_CYAN"
+      field "VRAM Used"    "$vram_used"
+      field "Power Draw"   "$power"
+    done <<< "$NVIDIA_INFO"
+  fi
+fi
+
+# PCIe link info for GPU
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  subsec "GPU PCIe Link"
+  GPU_VGA_LINE=$(lspci 2>/dev/null | grep -iE 'VGA|3D' | grep -iv 'Intel' | head -1)
+  [[ -z "$GPU_VGA_LINE" ]] && GPU_VGA_LINE=$(lspci 2>/dev/null | grep -iE 'VGA|3D|Display' | head -1)
+  GPU_BDF=$(echo "$GPU_VGA_LINE" | awk '{print $1}')
+  if [[ -n "$GPU_BDF" && -d "/sys/bus/pci/devices/0000:${GPU_BDF}" ]]; then
+    GPU_DIR="/sys/bus/pci/devices/0000:${GPU_BDF}"
+    GPU_CUR_SPEED=$(cat "$GPU_DIR/current_link_speed" 2>/dev/null)
+    GPU_CUR_WIDTH=$(cat "$GPU_DIR/current_link_width" 2>/dev/null)
+    GPU_MAX_SPEED=$(cat "$GPU_DIR/max_link_speed" 2>/dev/null)
+    GPU_MAX_WIDTH=$(cat "$GPU_DIR/max_link_width" 2>/dev/null)
+    [[ -n "$GPU_CUR_SPEED" ]] && field "Current Link" "${GPU_CUR_SPEED} x${GPU_CUR_WIDTH}"
+    [[ -n "$GPU_MAX_SPEED" ]] && field "Max Link"     "${GPU_MAX_SPEED} x${GPU_MAX_WIDTH}"
+    if [[ -n "$GPU_MAX_SPEED" && -n "$GPU_CUR_SPEED" && "$GPU_MAX_SPEED" != "$GPU_CUR_SPEED" ]]; then
+      warn "GPU running below max PCIe speed — check seating"
+    fi
+  fi
+fi
+
+# ============================================================================
+# SECTION 7: Storage
+# ============================================================================
+section "STORAGE"
+
+if [[ $HAVE_LSBLK -eq 1 ]]; then
+  TOTAL_DISK_CAP=0
+  printf "  ${C_DIM}%-14s %-8s %-10s %-12s %-40s${C_RESET}\n" \
+    "Device" "Type" "Size" "Rotational" "Model"
+  printf "  ${C_DIM}%-14s %-8s %-10s %-12s %-40s${C_RESET}\n" \
+    "--------------" "--------" "----------" "------------" "----------------------------------------"
+
+  for devdir in /sys/block/*; do
+    [[ -d "$devdir" ]] || continue
+    name=$(basename "$devdir")
+    [[ "$name" == loop* || "$name" == ram* ]] && continue
+    size_sectors=$(cat "$devdir/size" 2>/dev/null)
+    [[ -z "$size_sectors" || "$size_sectors" == "0" ]] && continue
+    size_bytes=$((size_sectors * 512))
+    TOTAL_DISK_CAP=$((TOTAL_DISK_CAP + size_bytes))
+
+    rot=$(cat "$devdir/queue/rotational" 2>/dev/null)
+    model=$(cat "$devdir/device/model" 2>/dev/null | sed 's/^ *//;s/ *$//')
+    vendor=$(cat "$devdir/device/vendor" 2>/dev/null | sed 's/^ *//;s/ *$//')
+
+    disk_type="HDD"
+    if [[ "$name" == nvme* ]] || [[ -d "$devdir/nvme" ]]; then
+      disk_type="NVMe SSD"
+    elif [[ "$rot" == "0" ]]; then
+      disk_type="SSD"
+    fi
+
+    removable=$(cat "$devdir/removable" 2>/dev/null)
+    [[ "$removable" == "1" ]] && disk_type="${disk_type} (removable)"
+
+    printf "  ${C_CYAN}%-14s${C_RESET} ${C_GREEN}%-8s${C_RESET} ${C_BOLD}%-10s${C_RESET} %-12s %s %s\n" \
+      "/dev/$name" "$disk_type" "$(humansize $size_bytes)" "rot=$rot" "$vendor" "$model"
+  done
+
+  field "Total Capacity" "$(humansize $TOTAL_DISK_CAP)" "$C_BOLD$C_GREEN"
+  JSON_FIELDS+=("\"storage_total_bytes\":$TOTAL_DISK_CAP")
+fi
+
+# ============================================================================
+# SECTION 8: PCI Bus Overview
+# ============================================================================
+section "PCI BUS"
+
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  TOTAL_PCI=$(lspci 2>/dev/null | wc -l)
+  field "Total Devices" "$TOTAL_PCI" "$C_BOLD"
+
+  subsec "Device Summary"
+  lspci 2>/dev/null | awk -F: '{print $2}' | awk '{
+    for(i=2;i<=NF;i++) printf "%s ", $i
+    print ""
+  }' | sed 's/^ //' | sort | uniq -c | sort -rn | head -12 | while read -r cnt desc; do
+    printf "  ${C_DIM}%3d×${C_RESET} %s\n" "$cnt" "$desc"
+  done
+
+  # PCIe generations present
+  subsec "PCIe Link Speeds"
+  FASTEST=""
+  for devdir in /sys/bus/pci/devices/*; do
+    [[ -d "$devdir" ]] || continue
+    [[ -r "$devdir/current_link_speed" ]] || continue
+    spd=$(cat "$devdir/current_link_speed" 2>/dev/null)
+    wid=$(cat "$devdir/current_link_width" 2>/dev/null)
+    [[ -z "$spd" || "$spd" == *"(not applicable)"* ]] && continue
+    bdf=$(basename "$devdir")
+    label=$(lspci -s "$bdf" 2>/dev/null | sed 's/^[^ ]* //')
+    printf "  ${C_DIM}%-10s${C_RESET} ${C_CYAN}%-14s${C_RESET} x%-3s %s\n" "$bdf" "$spd" "$wid" "$(echo "$label" | cut -c1-50)"
+  done 2>/dev/null | head -10
+else
+  info "lspci not available — install pciutils"
+fi
+
+# ============================================================================
+# SECTION 9: Network
+# ============================================================================
+section "NETWORK"
+
+subsec "Interfaces"
+if has_cmd ip; then
+  ip -br addr 2>/dev/null | while IFS= read -r line; do
+    name=$(printf '%s' "$line" | awk '{print $1}')
+    state=$(printf '%s' "$line" | awk '{print $2}')
+    addrs=$(printf '%s' "$line" | awk '{print $3}')
+    if [[ "$state" == "UP" ]]; then
+      printf "  ${C_GREEN}●${C_RESET} ${C_BOLD}%-16s${C_RESET} ${C_CYAN}%-10s${C_RESET} %s\n" "$name" "$state" "$addrs"
+    else
+      printf "  ${C_DIM}○ %-16s %-10s %s${C_RESET}\n" "$name" "$state" "$addrs"
+    fi
+  done
+fi
+
+# Ethernet detail
+subsec "Ethernet"
+ETH_SPEED=""
+for iface_dir in /sys/class/net/*; do
+  [[ -d "$iface_dir" ]] || continue
+  iface=$(basename "$iface_dir")
+  [[ "$iface" == lo* ]] && continue
+  [[ -r "$iface_dir/speed" ]] || continue
+  speed=$(cat "$iface_dir/speed" 2>/dev/null)
+  [[ -z "$speed" || "$speed" == "-1" ]] && continue
+  driver=""
+  if [[ -L "$iface_dir/device/driver" ]]; then
+    driver=$(basename "$(readlink "$iface_dir/device/driver" 2>/dev/null)" 2>/dev/null)
+  fi
+  mac=$(cat "$iface_dir/address" 2>/dev/null)
+  field "Interface"  "$iface"   "$C_BOLD$C_CYAN"
+  field "Speed"      "${speed} Mbps" "$C_GREEN"
+  field "Driver"     "$driver"
+  field "MAC"        "$mac"     "$C_DIM"
+  ETH_SPEED="$speed"
+done
+
+# Wi-Fi
+subsec "Wi-Fi"
+WIFI_IFACE=""
+for ndir in /sys/class/net/*; do
+  [[ -d "$ndir/wireless" ]] || continue
+  wifi_name=$(basename "$ndir")
+  WIFI_IFACE="$wifi_name"
+  freq=$(iw dev "$wifi_name" info 2>/dev/null | awk '/channel/ {print $2; exit}')
+  ssid=$(iw dev "$wifi_name" info 2>/dev/null | awk '/SSID/ {print $2; exit}')
+  txpower=$(iw dev "$wifi_name" info 2>/dev/null | awk '/txpower/ {print $2 " " $3; exit}')
+  field "Interface"  "$wifi_name"  "$C_BOLD$C_CYAN"
+  [[ -n "$ssid" ]]    && field "Connected SSID" "$ssid"     "$C_GREEN"
+  [[ -n "$freq" ]]    && field "Channel"        "$freq"
+  [[ -n "$txpower" ]] && field "TX Power"       "$txpower"
+done
+if [[ -z "$WIFI_IFACE" ]]; then
+  if [[ $HAVE_LSPCI -eq 1 ]]; then
+    WIFI_PCI=$(lspci 2>/dev/null | grep -iE 'network|wi-fi|wireless' | head -3)
+    if [[ -n "$WIFI_PCI" ]]; then
+      while IFS= read -r line; do
+        printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+      done <<< "$WIFI_PCI"
+    else
+      info "No Wi-Fi adapter detected"
+    fi
+  elif [[ $HAVE_LSUSB -eq 1 ]]; then
+    WIFI_USB=$(lsusb 2>/dev/null | grep -iE 'wi-fi|wireless|wlan|802\.11|rtl|ath|mt76|rtw' | head -3)
+    if [[ -n "$WIFI_USB" ]]; then
+      while IFS= read -r line; do
+        printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+      done <<< "$WIFI_USB"
+    else
+      info "No Wi-Fi adapter detected"
+    fi
+  fi
+fi
+
+# ============================================================================
+# SECTION 10: Bluetooth
+# ============================================================================
+section "BLUETOOTH"
+
+BT_FOUND=0
+if [[ $HAVE_BTCTL -eq 1 ]]; then
+  BT_INFO=$(bluetoothctl show 2>/dev/null)
+  if [[ -n "$BT_INFO" ]]; then
+    BT_FOUND=1
+    BT_NAME=$(echo "$BT_INFO" | awk '/Name:/ && !/Alias/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_ALIAS=$(echo "$BT_INFO" | awk '/Alias:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_ADDR=$(echo "$BT_INFO" | awk '/Address:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    [[ -z "$BT_ADDR" ]] && BT_ADDR=$(echo "$BT_INFO" | awk '/^Controller/ {print $2; exit}')
+    BT_POWERED=$(echo "$BT_INFO" | awk '/Powered:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_DISCOVERABLE=$(echo "$BT_INFO" | awk '/Discoverable:/ && !/Timeout/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_CLASS=$(echo "$BT_INFO" | awk '/Class:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_VERSION=$(echo "$BT_INFO" | awk '/HCI Version:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_REVISION=$(echo "$BT_INFO" | awk '/HCI Revision:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    BT_MANUF=$(echo "$BT_INFO" | awk '/Manufacturer:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+
+    field "Name"          "$BT_NAME"      "$C_BOLD$C_CYAN"
+    field "Address"       "$BT_ADDR"
+    field "Powered"       "$BT_POWERED"
+    field "Discoverable"  "$BT_DISCOVERABLE"
+    field "HCI Version"   "$BT_VERSION"   "$C_GREEN"
+    field "HCI Revision"  "$BT_REVISION"
+    field "Manufacturer"  "$BT_MANUF"
+    field "Class"         "$BT_CLASS"
+
+    JSON_FIELDS+=("\"bluetooth\":\"${BT_VERSION:-present}\"")
+  fi
+fi
+
+if [[ $BT_FOUND -eq 0 ]]; then
+  BT_PCI=""
+  BT_USB=""
+  [[ $HAVE_LSPCI -eq 1 ]] && BT_PCI=$(lspci 2>/dev/null | grep -i bluetooth)
+  [[ $HAVE_LSUSB -eq 1 ]] && BT_USB=$(lsusb 2>/dev/null | grep -i bluetooth)
+  if [[ -n "$BT_PCI" ]]; then
+    BT_FOUND=1
+    while IFS= read -r line; do
+      printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+    done <<< "$BT_PCI"
+    JSON_FIELDS+=("\"bluetooth\":\"detected via pci\"")
+  elif [[ -n "$BT_USB" ]]; then
+    BT_FOUND=1
+    while IFS= read -r line; do
+      printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+    done <<< "$BT_USB"
+    JSON_FIELDS+=("\"bluetooth\":\"detected via usb\"")
+  else
+    info "No Bluetooth adapter detected"
+  fi
+fi
+
+# rfkill status
+if [[ $HAVE_RFKILL -eq 1 ]]; then
+  subsec "Radio Kill Switches"
+  rfkill list 2>/dev/null | while IFS= read -r line; do
+    if [[ "$line" == *": Unblocked" ]]; then
+      printf "  ${C_GREEN}✓${C_RESET} %s\n" "$line"
+    elif [[ "$line" == *": Soft blocked"* ]] || [[ "$line" == *": Hard blocked"* ]]; then
+      printf "  ${C_RED}✗${C_RESET} %s\n" "$line"
+    else
+      printf "  ${C_BOLD}%s${C_RESET}\n" "$line"
+    fi
+  done
+fi
+
+# ============================================================================
+# SECTION 11: Audio
+# ============================================================================
+section "AUDIO"
+
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  AUDIO_PCI=$(lspci 2>/dev/null | grep -iE 'audio|multimedia|sound')
+  if [[ -n "$AUDIO_PCI" ]]; then
+    while IFS= read -r line; do
+      printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+    done <<< "$AUDIO_PCI"
+  else
+    info "No audio device detected via PCI"
+  fi
+fi
+
+if [[ -d /proc/asound ]]; then
+  subsec "ALSA Cards"
+  if [[ -r /proc/asound/cards ]]; then
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*[0-9] ]] && printf "  ${C_CYAN}%s${C_RESET}\n" "$(echo "$line" | sed 's/^[[:space:]]*//')"
+    done < /proc/asound/cards
+  fi
+fi
+
+# PulseAudio / PipeWire
+if has_cmd pactl; then
+  PA_SERVER=$(pactl info 2>/dev/null | awk '/^Server Name:/ {sub(/^[^:]*:[[:space:]]*/, ""); print}')
+  [[ -n "$PA_SERVER" ]] && field "Sound Server" "$PA_SERVER" "$C_BOLD"
+elif has_cmd pw-cli; then
+  field "Sound Server" "PipeWire" "$C_BOLD"
+fi
+
+# ============================================================================
+# SECTION 12: USB
+# ============================================================================
+section "USB"
+
+if [[ $HAVE_LSUSB -eq 1 ]]; then
+  USB_COUNT=$(lsusb 2>/dev/null | wc -l)
+  field "Total Devices" "$USB_COUNT" "$C_BOLD"
+
+  subsec "USB Controllers"
+  if [[ $HAVE_LSPCI -eq 1 ]]; then
+    lspci 2>/dev/null | grep -i 'USB' | while IFS= read -r line; do
+      printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+    done
+  fi
+
+  subsec "Connected Devices"
+  lsusb 2>/dev/null | while IFS= read -r line; do
+    printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+  done
+else
+  info "lsusb not available — install usbutils"
+fi
+
+# ============================================================================
+# SECTION 13: Display / Monitor
+# ============================================================================
+section "DISPLAY / MONITOR"
+
+if [[ -d /sys/class/drm ]]; then
+  MONITOR_FOUND=0
+  for card in /sys/class/drm/card*-*/; do
+    [[ -d "$card" ]] || continue
+    conn=$(basename "$card")
+    [[ "$conn" == *"-"* ]] || continue
+    status=$(cat "$card/status" 2>/dev/null)
+    if [[ "$status" == "connected" ]]; then
+      MONITOR_FOUND=1
+      edid_file="$card/edid"
+      if [[ -r "$edid_file" && -s "$edid_file" ]]; then
+        if [[ $HAVE_EDID -eq 1 ]]; then
+          EDID_OUT=$(edid-decode "$edid_file" 2>/dev/null)
+          MFG=$(echo "$EDID_OUT" | awk '/^  Manufacturer:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+          MODEL=$(echo "$EDID_OUT" | awk '/^  Product:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+          SIZE=$(echo "$EDID_OUT" | awk '/^  Display Size:/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+          RES=$(echo "$EDID_OUT" | awk '/^  Preferred mode/ || /Detailed Mode/ {getline; print; exit}')
+          field "Connector"  "$conn"   "$C_BOLD$C_CYAN"
+          [[ -n "$MFG" ]]  && field "Manufacturer" "$MFG"
+          [[ -n "$MODEL" ]] && field "Model"        "$MODEL"
+          [[ -n "$SIZE" ]]  && field "Size"         "$SIZE"  "$C_GREEN"
+        else
+          field "Connector"  "$conn"   "$C_BOLD$C_CYAN"
+          info "Install edid-decode for monitor details"
+        fi
+      else
+        field "Connector"  "$conn"   "$C_BOLD$C_CYAN"
+        info "No EDID data (display may be off or virtual)"
+      fi
+    fi
+  done
+  if [[ $MONITOR_FOUND -eq 0 ]]; then
+    info "No connected monitors detected (or display is off)"
+  fi
+fi
+
+# Resolution from xrandr if available
+if has_cmd xrandr && [[ -n "${DISPLAY:-}" ]]; then
+  subsec "Current Resolution (xrandr)"
+  xrandr --query 2>/dev/null | grep ' connected' | while IFS= read -r line; do
+    printf "  ${C_GREEN}▸${C_RESET} %s\n" "$line"
+  done
+fi
+
+# ============================================================================
+# SECTION 14: Operating System
+# ============================================================================
+section "OPERATING SYSTEM"
+
+if [[ -r /etc/os-release ]]; then
+  OS_NAME=$(. /etc/os-release && echo "$NAME")
+  OS_VER=$(. /etc/os-release && echo "$VERSION")
+  OS_ID=$(. /etc/os-release && echo "$ID")
+  OS_PRETTY=$(. /etc/os-release && echo "$PRETTY_NAME")
+  field "Distribution"   "$OS_NAME"    "$C_BOLD$C_CYAN"
+  field "Version"        "$OS_VER"
+  field "Pretty Name"    "$OS_PRETTY"
+  JSON_FIELDS+=("\"os\":\"${OS_PRETTY:-}\"")
+fi
+
+KERNEL=$(uname -r)
+field "Kernel"           "$KERNEL"     "$C_BOLD"
+field "Architecture"     "$(uname -m)"
+field "Hostname"         "$(hostname 2>/dev/null)"
+
+# Desktop environment
+if [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
+  field "Desktop"        "$XDG_CURRENT_DESKTOP"
+fi
+if [[ -n "${XDG_SESSION_TYPE:-}" ]]; then
+  field "Session Type"   "$XDG_SESSION_TYPE"
+fi
+
+# Uptime
+if [[ -r /proc/uptime ]]; then
+  UPTIME_S=$(awk '{print int($1)}' /proc/uptime)
+  UPTIME_D=$((UPTIME_S / 86400))
+  UPTIME_H=$(( (UPTIME_S % 86400) / 3600 ))
+  UPTIME_M=$(( (UPTIME_S % 3600) / 60 ))
+  field "Uptime"         "${UPTIME_D}d ${UPTIME_H}h ${UPTIME_M}m"
+fi
+
+# ============================================================================
+# SECTION 14.5: Power Consumption & Cost
+# ============================================================================
+section "POWER CONSUMPTION & COST"
+
+TOTAL_WATTS=0
+POWER_SOURCES=()
+ESTIMATED=0
+RAPL_READABLE=0
+
+# Try to read CPU power via Intel RAPL (needs root)
+RAPL_BASE="/sys/class/powercap"
+if [[ -d "$RAPL_BASE/intel-rapl:0" ]]; then
+  if [[ -r "$RAPL_BASE/intel-rapl:0/energy_uj" ]]; then
+    RAPL_READABLE=1
+  elif has_cmd sudo; then
+    if sudo -n true 2>/dev/null; then
+      RAPL_READABLE=2
+    elif [[ $JSON_OUT -eq 0 && -t 0 ]]; then
+      printf "  ${C_YELLOW}Enter sudo password for accurate CPU/DRAM power measurement (or press Ctrl+C/Enter to skip):${C_RESET}\n"
+      if sudo -v 2>/dev/null; then
+        RAPL_READABLE=2
+      fi
+    fi
+  fi
+  
+  if [[ $RAPL_READABLE -eq 1 ]]; then
+    read_energy() { cat "$RAPL_BASE/$1/energy_uj" 2>/dev/null || echo "0"; }
+    
+    PKG_E1=$(read_energy "intel-rapl:0")
+    CORE_E1=$(read_energy "intel-rapl:0:0")
+    UNCORE_E1=$(read_energy "intel-rapl:0:1")
+    DRAM_E1=$(read_energy "intel-rapl:0:2")
+    sleep 1
+    PKG_E2=$(read_energy "intel-rapl:0")
+    CORE_E2=$(read_energy "intel-rapl:0:0")
+    UNCORE_E2=$(read_energy "intel-rapl:0:1")
+    DRAM_E2=$(read_energy "intel-rapl:0:2")
+  elif [[ $RAPL_READABLE -eq 2 ]]; then
+    read_energy_sudo() { sudo cat "$RAPL_BASE/$1/energy_uj" 2>/dev/null || echo "0"; }
+    
+    PKG_E1=$(read_energy_sudo "intel-rapl:0")
+    CORE_E1=$(read_energy_sudo "intel-rapl:0:0")
+    UNCORE_E1=$(read_energy_sudo "intel-rapl:0:1")
+    DRAM_E1=$(read_energy_sudo "intel-rapl:0:2")
+    sleep 1
+    PKG_E2=$(read_energy_sudo "intel-rapl:0")
+    CORE_E2=$(read_energy_sudo "intel-rapl:0:0")
+    UNCORE_E2=$(read_energy_sudo "intel-rapl:0:1")
+    DRAM_E2=$(read_energy_sudo "intel-rapl:0:2")
+  fi
+  
+  if [[ $RAPL_READABLE -gt 0 ]]; then
+    calc_power() {
+      local e1="$1" e2="$2"
+      local delta=$((e2 - e1))
+      [[ $delta -lt 0 ]] && delta=$((delta + 262143328850))
+      echo "scale=2; $delta / 1000000" | bc 2>/dev/null
+    }
+    
+    PKG_W=$(calc_power "$PKG_E1" "$PKG_E2")
+    CORE_W=$(calc_power "$CORE_E1" "$CORE_E2")
+    UNCORE_W=$(calc_power "$UNCORE_E1" "$UNCORE_E2")
+    DRAM_W=$(calc_power "$DRAM_E1" "$DRAM_E2")
+    
+    if [[ -n "$PKG_W" && $(echo "$PKG_W > 0" | bc -l 2>/dev/null) == "1" ]]; then
+      CPU_TOTAL_W=$(echo "$PKG_W + $DRAM_W" | bc 2>/dev/null)
+      POWER_SOURCES+=("CPU Package: ${PKG_W}W (cores: ${CORE_W}W, uncore: ${UNCORE_W}W)")
+      [[ -n "$DRAM_W" && $(echo "$DRAM_W > 0" | bc -l 2>/dev/null) == "1" ]] && \
+        POWER_SOURCES+=("DRAM: ${DRAM_W}W")
+      TOTAL_WATTS=$(echo "$TOTAL_WATTS + $CPU_TOTAL_W" | bc 2>/dev/null)
+    fi
+  fi
+fi
+
+# Read hwmon sensors (motherboard, etc)
+for hwmon in /sys/class/hwmon/hwmon*; do
+  [[ -d "$hwmon" ]] || continue
+  hwmon_name=$(cat "$hwmon/name" 2>/dev/null || echo "unknown")
+  for pfile in "$hwmon"/power*_input; do
+    [[ -f "$pfile" ]] || continue
+    pw=$(cat "$pfile" 2>/dev/null)
+    [[ -z "$pw" || "$pw" == "0" ]] && continue
+    watts=$(echo "scale=2; $pw / 1000000" | bc 2>/dev/null)
+    [[ -z "$watts" ]] && continue
+    TOTAL_WATTS=$(echo "$TOTAL_WATTS + $watts" | bc 2>/dev/null)
+    POWER_SOURCES+=("$hwmon_name: ${watts}W")
+  done
+done
+
+# NVIDIA GPU power (always available if nvidia-smi present)
+GPU_POWER=""
+GPU_TDP=""
+if [[ $HAVE_NVIDIA -eq 1 ]]; then
+  GPU_POWER=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)
+  GPU_TDP=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -1)
+  if [[ -n "$GPU_POWER" && "$GPU_POWER" != "0" ]]; then
+    TOTAL_WATTS=$(echo "$TOTAL_WATTS + $GPU_POWER" | bc 2>/dev/null)
+    POWER_SOURCES+=("NVIDIA GPU: ${GPU_POWER}W (max TDP: ${GPU_TDP:-?}W)")
+  fi
+fi
+
+# Add estimates for components we can't measure (motherboard, storage, fans)
+# Only add if we have RAPL data (otherwise we're in full estimate mode)
+if [[ $RAPL_READABLE -gt 0 ]]; then
+  # Motherboard/chipset: ~18W baseline
+  MB_W=18
+  TOTAL_WATTS=$(echo "$TOTAL_WATTS + $MB_W" | bc 2>/dev/null)
+  POWER_SOURCES+=("Motherboard (est): ~${MB_W}W")
+  
+  # Storage: count drives
+  STORAGE_W=0
+  for devdir in /sys/block/*; do
+    [[ -d "$devdir" ]] || continue
+    name=$(basename "$devdir")
+    [[ "$name" == loop* || "$name" == ram* || "$name" == sr* ]] && continue
+    size_sectors=$(cat "$devdir/size" 2>/dev/null)
+    [[ -z "$size_sectors" || "$size_sectors" == "0" ]] && continue
+    rot=$(cat "$devdir/queue/rotational" 2>/dev/null)
+    if [[ "$name" == nvme* ]]; then
+      STORAGE_W=$((STORAGE_W + 5))
+    elif [[ "$rot" == "0" ]]; then
+      STORAGE_W=$((STORAGE_W + 3))
+    else
+      STORAGE_W=$((STORAGE_W + 7))
+    fi
+  done
+  if (( STORAGE_W > 0 )); then
+    TOTAL_WATTS=$(echo "$TOTAL_WATTS + $STORAGE_W" | bc 2>/dev/null)
+    POWER_SOURCES+=("Storage (est): ~${STORAGE_W}W")
+  fi
+  
+  # Fans/RGB/other: ~5W
+  OTHER_W=5
+  TOTAL_WATTS=$(echo "$TOTAL_WATTS + $OTHER_W" | bc 2>/dev/null)
+  POWER_SOURCES+=("Fans/Other (est): ~${OTHER_W}W")
+fi
+
+# If we couldn't measure CPU/DRAM, estimate based on component TDPs
+if [[ $RAPL_READABLE -eq 0 ]]; then
+  ESTIMATED=1
+  subsec "Estimated Power (no RAPL access)"
+  
+  # CPU TDP estimation based on model
+  CPU_TDP=65  # default
+  if [[ -n "$CPU_MODEL" ]]; then
+    case "$CPU_MODEL" in
+      *i9-14900*|*i9-13900*) CPU_TDP=125 ;;
+      *i9-12900*)            CPU_TDP=125 ;;
+      *i9-11900*)            CPU_TDP=125 ;;
+      *i9-10900*)            CPU_TDP=125 ;;
+      *i9-9900*)             CPU_TDP=125 ;;
+      *i7-14700*|*i7-13700*) CPU_TDP=125 ;;
+      *i7-12700*)            CPU_TDP=125 ;;
+      *i7-11700*)            CPU_TDP=125 ;;
+      *i7-10700*)            CPU_TDP=125 ;;
+      *i7-9700*)             CPU_TDP=95 ;;
+      *i7-8700*)             CPU_TDP=95 ;;
+      *i7-7700*)             CPU_TDP=91 ;;
+      *i7-6700*)             CPU_TDP=91 ;;
+      *i5-14600*|*i5-13600*) CPU_TDP=125 ;;
+      *i5-12600*)            CPU_TDP=125 ;;
+      *i5-11600*)            CPU_TDP=125 ;;
+      *i5-10600*)            CPU_TDP=125 ;;
+      *i5-9600*)             CPU_TDP=95 ;;
+      *i5-8600*)             CPU_TDP=95 ;;
+      *i5-7600*)             CPU_TDP=91 ;;
+      *i5-6600*)             CPU_TDP=91 ;;
+      *i3-*)                 CPU_TDP=65 ;;
+      *Ryzen*9*)             CPU_TDP=170 ;;
+      *Ryzen*7*)             CPU_TDP=105 ;;
+      *Ryzen*5*)             CPU_TDP=65 ;;
+      *Ryzen*3*)             CPU_TDP=65 ;;
+      *Xeon*)                CPU_TDP=150 ;;
+    esac
+  fi
+  # Idle CPU is ~20-30% of TDP
+  CPU_IDLE_W=$(echo "scale=0; $CPU_TDP * 0.25" | bc 2>/dev/null)
+  POWER_SOURCES+=("CPU (est): ~${CPU_IDLE_W}W idle / ${CPU_TDP}W TDP")
+  TOTAL_WATTS=$(echo "$TOTAL_WATTS + $CPU_IDLE_W" | bc 2>/dev/null)
+  
+  # DRAM: ~3W per stick (estimate 2 sticks if 16GB+, else 1)
+  if [[ -n "$MEMTOTAL_GB" ]]; then
+    MEM_GB_INT=${MEMTOTAL_GB%.*}
+    if (( MEM_GB_INT >= 32 )); then
+      DRAM_STICKS=4
+    elif (( MEM_GB_INT >= 16 )); then
+      DRAM_STICKS=2
+    else
+      DRAM_STICKS=1
+    fi
+    DRAM_W=$((DRAM_STICKS * 3))
+    POWER_SOURCES+=("DRAM (est): ~${DRAM_W}W (${DRAM_STICKS} sticks × 3W)")
+    TOTAL_WATTS=$(echo "$TOTAL_WATTS + $DRAM_W" | bc 2>/dev/null)
+  fi
+  
+  # Storage: SSD ~2-3W, HDD ~6-8W
+  STORAGE_W=0
+  for devdir in /sys/block/*; do
+    [[ -d "$devdir" ]] || continue
+    name=$(basename "$devdir")
+    [[ "$name" == loop* || "$name" == ram* || "$name" == sr* ]] && continue
+    size_sectors=$(cat "$devdir/size" 2>/dev/null)
+    [[ -z "$size_sectors" || "$size_sectors" == "0" ]] && continue
+    rot=$(cat "$devdir/queue/rotational" 2>/dev/null)
+    if [[ "$name" == nvme* ]]; then
+      STORAGE_W=$((STORAGE_W + 5))  # NVMe runs warmer
+    elif [[ "$rot" == "0" ]]; then
+      STORAGE_W=$((STORAGE_W + 3))  # SSD
+    else
+      STORAGE_W=$((STORAGE_W + 7))  # HDD
+    fi
+  done
+  if (( STORAGE_W > 0 )); then
+    POWER_SOURCES+=("Storage (est): ~${STORAGE_W}W")
+    TOTAL_WATTS=$(echo "$TOTAL_WATTS + $STORAGE_W" | bc 2>/dev/null)
+  fi
+  
+  # Motherboard baseline: ~15-20W
+  MB_W=18
+  POWER_SOURCES+=("Motherboard (est): ~${MB_W}W")
+  TOTAL_WATTS=$(echo "$TOTAL_WATTS + $MB_W" | bc 2>/dev/null)
+  
+  # Fans/RGB/other: ~5W estimate
+  OTHER_W=5
+  POWER_SOURCES+=("Fans/Other (est): ~${OTHER_W}W")
+  TOTAL_WATTS=$(echo "$TOTAL_WATTS + $OTHER_W" | bc 2>/dev/null)
+fi
+
+# Display power breakdown
+if [[ ${#POWER_SOURCES[@]} -gt 0 ]]; then
+  [[ $ESTIMATED -eq 0 ]] && subsec "Measured Power"
+  for ps in "${POWER_SOURCES[@]}"; do
+    printf "  ${C_DIM}·${C_RESET} %s\n" "$ps"
+  done
+fi
+
+# Display total
+if [[ $(echo "$TOTAL_WATTS > 0" | bc -l 2>/dev/null) == "1" ]]; then
+  if [[ $ESTIMATED -eq 1 ]]; then
+    field "Estimated Total" "${TOTAL_WATTS}W (idle)" "$C_BOLD$C_YELLOW"
+    # Also show max/under-load estimate
+    MAX_WATTS=0
+    MAX_WATTS=$(echo "$CPU_TDP + ${GPU_TDP:-0} + ${DRAM_W:-0} + ${STORAGE_W:-0} + ${MB_W:-0} + ${OTHER_W:-0}" | bc 2>/dev/null)
+    [[ -n "$MAX_WATTS" && $(echo "$MAX_WATTS > 0" | bc -l 2>/dev/null) == "1" ]] && \
+      field "Estimated Max Load" "${MAX_WATTS}W (full stress)" "$C_RED"
+  else
+    field "Total Power Draw" "${TOTAL_WATTS}W" "$C_BOLD$C_YELLOW"
+  fi
+  
+  # Calculate costs at $0.11/kWh
+  COST_PER_HOUR=$(echo "scale=4; ($TOTAL_WATTS / 1000) * 0.11" | bc 2>/dev/null)
+  COST_PER_DAY=$(echo "scale=2; $COST_PER_HOUR * 24" | bc 2>/dev/null)
+  COST_PER_MONTH=$(echo "scale=2; $COST_PER_DAY * 30" | bc 2>/dev/null)
+  COST_PER_YEAR=$(echo "scale=2; $COST_PER_DAY * 365" | bc 2>/dev/null)
+  
+  field "Cost per Hour"    "\$${COST_PER_HOUR}" "$C_GREEN"
+  field "Cost per Day"     "\$${COST_PER_DAY}" "$C_GREEN"
+  field "Cost per Month"   "\$${COST_PER_MONTH}" "$C_CYAN"
+  field "Cost per Year"    "\$${COST_PER_YEAR}" "$C_CYAN"
+  
+  JSON_FIELDS+=("\"power_watts\":\"${TOTAL_WATTS}\"")
+  JSON_FIELDS+=("\"power_estimated\":$ESTIMATED")
+  JSON_FIELDS+=("\"cost_per_day_usd\":\"${COST_PER_DAY}\"")
+else
+  info "No power data available"
+fi
+
+# ============================================================================
+# DEVICE CATEGORY SUMMARY
+# ============================================================================
+section "DEVICE CATEGORY SUMMARY"
+
+# Gather counts per category (best-effort from sysfs + tracked vars)
+COUNT_CPU="${CPU_CPUS:-0}"
+[[ -z "$CPU_CPUS" || "$CPU_CPUS" == "?" ]] && COUNT_CPU=0
+[[ "$COUNT_CPU" =~ ^[0-9]+$ ]] || COUNT_CPU=0
+
+# Memory devices: count populated DIMM slots if dmidecode was available;
+# otherwise count memory blocks reported by the kernel (one per ~128MB section).
+COUNT_MEM=0
+if [[ -n "${NUM_POPULATED:-}" ]]; then
+  COUNT_MEM=$(echo "$NUM_POPULATED" | grep -oE '[0-9]+' | head -1)
+  [[ -z "$COUNT_MEM" ]] && COUNT_MEM=0
+  [[ "$COUNT_MEM" =~ ^[0-9]+$ ]] || COUNT_MEM=0
+fi
+if (( COUNT_MEM == 0 )) && [[ -d /sys/devices/system/memory ]]; then
+  COUNT_MEM=$(find /sys/devices/system/memory -maxdepth 1 -type d -name 'memory[0-9]*' 2>/dev/null | wc -l)
+  # Memory blocks are per ~128MB section — collapse to a smaller-but-meaningful number
+  COUNT_MEM=$(( (COUNT_MEM + 7) / 8 ))
+fi
+
+COUNT_GPU=${GPU_COUNT:-0}
+[[ -z "$GPU_COUNT" ]] && COUNT_GPU=0
+
+# Storage block devices (excluding loop/ram/sr)
+COUNT_STORAGE=0
+for d in /sys/block/*; do
+  [[ -d "$d" ]] || continue
+  n=$(basename "$d")
+  [[ "$n" == loop* || "$n" == ram* || "$n" == sr* ]] && continue
+  COUNT_STORAGE=$((COUNT_STORAGE + 1))
+done
+
+# Network interfaces (excluding lo)
+COUNT_NET=0
+for d in /sys/class/net/*; do
+  [[ -d "$d" ]] || continue
+  n=$(basename "$d")
+  [[ "$n" == lo* ]] && continue
+  COUNT_NET=$((COUNT_NET + 1))
+done
+
+COUNT_USB=${USB_COUNT:-0}
+
+# Services / system daemons (top of inventory)
+COUNT_SVC=0
+if has_cmd systemctl; then
+  COUNT_SVC=$(systemctl list-unit-files --state=enabled --type=service --no-legend 2>/dev/null | wc -l)
+fi
+
+# Chrome / Chromium renderer count + tabs estimate (renderer ≈ 4 tabs/site-isolation).
+# Counts processes whose command line contains "--type=renderer" — portable across
+# google-chrome, chromium, chromium-browser, msedge.
+RENDERERS_TOTAL=0
+RENDERERS_BREAKDOWN=""
+if [[ -r /proc ]] && has_cmd ps; then
+  while IFS= read -r browser; do
+    [[ -z "$browser" ]] && continue
+    cnt=$(ps -eo args= 2>/dev/null | grep -c -- "--type=renderer" | head -1 || echo 0)
+    [[ -z "$cnt" || ! "$cnt" =~ ^[0-9]+$ ]] && cnt=0
+    if (( cnt > 0 )); then
+      tabs=$(( cnt / 4 ))
+      RENDERERS_BREAKDOWN+="${C_DIM}${browser}:${C_RESET} ${C_BOLD}${cnt}${C_RESET} renderers ≈ ${tabs} tabs (÷4 site-isolation)  "
+      RENDERERS_TOTAL=$((RENDERERS_TOTAL + cnt))
+    fi
+  done < <(ps -eo args= 2>/dev/null | grep -oE '/usr/(bin|lib)/?(google-)?(chrome|chromium|chromium-browser|msedge)' | sort -u)
+fi
+if (( RENDERERS_TOTAL > 0 )); then
+  printf "  ${C_DIM}Browser renderers (site-isolation heuristic: 1 tab ≈ 4 renderers):${C_RESET}\n"
+  printf "  %s\n" "$RENDERERS_BREAKDOWN"
+fi
+
+TOTAL_DEVICES=$(( COUNT_CPU + COUNT_MEM + COUNT_GPU + COUNT_STORAGE + COUNT_NET + COUNT_USB + COUNT_SVC ))
+[[ $TOTAL_DEVICES -eq 0 ]] && TOTAL_DEVICES=1
+
+printf "${C_BOLD}${C_CYAN}━━━ Devices per category (donut chart) ━━━${C_RESET}\n"
+printf "  ${C_DIM}%d enabled systemd services · %d renderers (Chrome/Chromium/Edge)${C_RESET}\n\n" "$COUNT_SVC" "$RENDERERS_TOTAL"
+
+donut_chart() {
+  local title="$1"
+  shift
+  local total=0; local -a labels=() counts=()
+  for rec in "$@"; do
+    [[ -z "$rec" ]] && continue
+    local lbl="${rec%%|*}" cnt="${rec##*|}"
+    labels+=("$lbl"); counts+=("$cnt"); total=$(( total + cnt ))
+  done
+  [[ $total -eq 0 ]] && { printf "  ${C_DIM}No data${C_RESET}\n"; return; }
+  printf "  ${C_BOLD}%-12s${C_RESET}\n" "$title"
+  local colors=("$C_CYAN" "$C_GREEN" "$C_MAGENTA" "$C_YELLOW" "$C_BLUE" "$C_RED" "$C_DIM")
+  local i
+  for i in "${!labels[@]}"; do
+    local pct=$(( counts[i] * 100 / total ))
+    local arc=$(( counts[i] * 22 / total )); (( arc == 0 )) && arc=1
+    local bar=""; for (( j=0; j<arc; j++ )); do bar+="█"; done
+    local c="${colors[$(( i % 7 ))]}"
+    printf "  ${c}%-12s${C_RESET} ${c}%-24s${C_RESET} ${C_BOLD}%3d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+      "${labels[i]}" "$bar" "${counts[i]}" "$pct"
+  done
+  printf "  ${C_DIM}total devices = %d${C_RESET}\n" "$total"
+}
+donut_chart "Categories" \
+  "CPU|${COUNT_CPU}" \
+  "Memory|${COUNT_MEM}" \
+  "GPU|${COUNT_GPU}" \
+  "Storage|${COUNT_STORAGE}" \
+  "Network|${COUNT_NET}" \
+  "USB|${COUNT_USB}" \
+  "Other|${COUNT_SVC}"
+
+# ─── Systemd services (top 8 by unit type) with ExecStart + FragmentPath ──
+if has_cmd systemctl; then
+  subsec "Top enabled systemd services (ExecStart · FragmentPath)"
+  printf "  ${C_DIM}%-32s %-44s %s${C_RESET}\n" "UNIT" "EXECSTART" "UNIT-FRAGMENT-PATH"
+  printf "  ${C_DIM}%-32s %-44s %s${C_RESET}\n" "--------------------------------" "--------------------------------------------" "----------------------------------------"
+  systemctl list-unit-files --state=enabled --type=service --no-legend 2>/dev/null \
+    | awk '{print $1}' | head -8 | while IFS= read -r unit; do
+      [[ -z "$unit" ]] && continue
+      esc=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null | sed 's/[{}\/]//g; s/^  *//; s/  *$//' | cut -c1-44)
+      fr=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null)
+      printf "  ${C_CYAN}%-32s${C_RESET} ${C_DIM}%-44s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+        "$(echo "$unit" | cut -c1-32)" "$esc" "$(echo "$fr" | cut -c1-60)"
+  done
+fi
+
+# ============================================================================
+# SECTION 15: Upgrade Recommendations
+# ============================================================================
+section "UPGRADE PATH"
+
+REC_NUM=0
+rec() {
+  REC_NUM=$((REC_NUM+1))
+  if [[ $AI_MODE -eq 1 ]]; then
+    printf "UPGRADE_%d: %s\n" "$REC_NUM" "$1"
+  else
+    printf "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"
+  fi
+}
+
+# Memory upgrade analysis
+if [[ $HAVE_DMIDECODE -eq 1 && -n "$MAX_CAPACITY" && -n "$NUM_DEVICES" && -n "$NUM_POPULATED" ]]; then
+  MAX_MB=$(echo "$MAX_CAPACITY" | grep -oE '[0-9]+' | head -1)
+  MAX_UNIT=$(echo "$MAX_CAPACITY" | grep -oiE 'GB|MB|TB' | head -1)
+  case "$MAX_UNIT" in
+    TB) MAX_MB=$((MAX_MB * 1024 * 1024)) ;;
+    GB) MAX_MB=$((MAX_MB * 1024)) ;;
+  esac
+  POP_NUM=$(echo "$NUM_POPULATED" | grep -oE '[0-9]+' | head -1)
+  TOT_NUM=$(echo "$NUM_DEVICES" | grep -oE '[0-9]+' | head -1)
+  FREE_SLOTS=$((TOT_NUM - POP_NUM))
+
+  if (( FREE_SLOTS > 0 )); then
+    rec "${C_GREEN}RAM:${C_RESET} ${C_BOLD}${FREE_SLOTS} free slot(s)${C_RESET} available — can add more memory (max total: ${MAX_CAPACITY})"
+  else
+    rec "${C_YELLOW}RAM:${C_RESET} All ${TOT_NUM} slots populated — must replace existing DIMMs to upgrade (max total: ${MAX_CAPACITY})"
+  fi
+
+  # Detect DDR type from first DIMM
+  DDR_TYPE=$(dmi "memory" 2>/dev/null | awk '/^[[:space:]]*Type:/ && !/Detail|Error/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+  if [[ -n "$DDR_TYPE" ]]; then
+    rec "Current memory type: ${C_BOLD}${DDR_TYPE}${C_RESET} — any new DIMMs must match this type"
+  fi
+fi
+
+# GPU upgrade
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  GPU_PCI_LINE=$(lspci 2>/dev/null | grep -iE 'VGA|3D' | grep -iv 'Intel' | head -1)
+  [[ -z "$GPU_PCI_LINE" ]] && GPU_PCI_LINE=$(lspci 2>/dev/null | grep -iE 'VGA|3D|Display' | head -1)
+  if [[ -n "$GPU_PCI_LINE" ]]; then
+    GPU_DESC=$(echo "$GPU_PCI_LINE" | sed 's/^[^ ]* //' | sed 's/.*controller: //')
+    rec "${C_MAGENTA}GPU:${C_RESET} Current: ${C_BOLD}${GPU_DESC}${C_RESET}"
+    if [[ -n "$GPU_BDF" && -d "/sys/bus/pci/devices/0000:${GPU_BDF}" ]]; then
+      GPU_MAX_SPD=$(cat "/sys/bus/pci/devices/0000:${GPU_BDF}/max_link_speed" 2>/dev/null)
+      GPU_MAX_WID=$(cat "/sys/bus/pci/devices/0000:${GPU_BDF}/max_link_width" 2>/dev/null)
+      if [[ -n "$GPU_MAX_SPD" && "$GPU_MAX_SPD" != "Unknown" ]]; then
+        rec "GPU slot: ${C_BOLD}${GPU_MAX_SPD} x${GPU_MAX_WID}${C_RESET} — PCIe is backward/forward compatible"
+      fi
+    fi
+    if [[ $HAVE_NVIDIA -eq 1 ]]; then
+      rec "For GPU upgrade: check PSU wattage, physical slot size, and power connector requirements"
+    fi
+  else
+    rec "${C_MAGENTA}GPU:${C_RESET} No discrete GPU — add a PCIe GPU if your motherboard has an x16 slot"
+  fi
+fi
+
+# Storage upgrade
+if [[ $HAVE_LSBLK -eq 1 ]]; then
+  HAS_NVME=0
+  HAS_SSD=0
+  HAS_HDD=0
+  for devdir in /sys/block/*; do
+    [[ -d "$devdir" ]] || continue
+    name=$(basename "$devdir")
+    [[ "$name" == loop* || "$name" == ram* || "$name" == sr* ]] && continue
+    size_sectors=$(cat "$devdir/size" 2>/dev/null)
+    [[ -z "$size_sectors" || "$size_sectors" == "0" ]] && continue
+    rot=$(cat "$devdir/queue/rotational" 2>/dev/null)
+    if [[ "$name" == nvme* ]]; then HAS_NVME=1
+    elif [[ "$rot" == "0" ]]; then HAS_SSD=1
+    else HAS_HDD=1; fi
+  done
+  if (( HAS_HDD )); then
+    rec "${C_GREEN}Storage:${C_RESET} HDD detected — upgrading to SSD/NVMe will dramatically improve performance"
+  elif (( HAS_SSD && ! HAS_NVME )); then
+    rec "${C_GREEN}Storage:${C_RESET} SSD detected — consider adding NVMe for even faster storage (check M.2 slot)"
+  elif (( HAS_NVME )); then
+    rec "${C_GREEN}Storage:${C_RESET} NVMe present — add more drives if M.2/SATA slots available"
+  fi
+fi
+
+# Network upgrade
+if [[ -z "$WIFI_IFACE" ]]; then
+  rec "${C_BLUE}Network:${C_RESET} No Wi-Fi — add a USB or PCIe Wi-Fi adapter for wireless"
+fi
+if [[ -n "$ETH_SPEED" ]] && (( ETH_SPEED < 1000 )); then
+  rec "${C_BLUE}Network:${C_RESET} Ethernet at ${ETH_SPEED} Mbps — upgrade NIC or cable for Gigabit"
+fi
+
+# Bluetooth
+if [[ $BT_FOUND -eq 0 ]]; then
+  rec "${C_BLUE}Bluetooth:${C_RESET} No Bluetooth detected — add a USB Bluetooth 5.x adapter"
+fi
+
+# General
+rec "${C_YELLOW}PSU:${C_RESET} Check your power supply wattage before adding GPU or drives"
+rec "${C_YELLOW}BIOS:${C_RESET} Update BIOS before major hardware changes for best compatibility"
+
+# ============================================================================
+# SECTION 16: Headline Box
+# ============================================================================
+section "SPECS HEADLINE"
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  BOX_W=68
+  printf "\n"
+  printf "  ${C_BOLD}${C_MAGENTA}╔%${BOX_W}s╗${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+
+  hline() {
+    local vis plain pad
+    vis="   $1"
+    plain=$(printf '%s' "$vis" | sed 's/\x1b\[[0-9;]*m//g')
+    pad=$(( BOX_W - ${#plain} )); (( pad < 0 )) && pad=0
+    printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${pad}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$vis"
+  }
+
+  hline "${C_BOLD}System:${C_RESET}    ${C_CYAN}${SYS_MANUF:-Unknown} ${SYS_PROD:-}${C_RESET}"
+  hline "${C_BOLD}Board:${C_RESET}     ${C_CYAN}${MB_MANUF:-Unknown} ${MB_NAME:-}${C_RESET}"
+  hline "${C_BOLD}CPU:${C_RESET}       ${C_CYAN}${CPU_MODEL:-Unknown}${C_RESET}  (${CPU_CPUS:-?} logical)"
+  hline "${C_BOLD}RAM:${C_RESET}       ${C_GREEN}${MEMTOTAL_GB:-?} GB${C_RESET}  ${C_DIM}${MAX_CAPACITY:-?} max${C_RESET}"
+  if [[ -n "$GPU_LIST" ]]; then
+    GPU_VGA=$(echo "$GPU_LIST" | grep -i 'VGA' | head -1)
+    [[ -z "$GPU_VGA" ]] && GPU_VGA=$(echo "$GPU_LIST" | head -1)
+    GPU_SHORT=$(echo "$GPU_VGA" | sed 's/^[^ ]* //' | sed 's/.*controller: //' | cut -c1-50)
+    hline "${C_BOLD}GPU:${C_RESET}       ${C_MAGENTA}${GPU_SHORT}${C_RESET}"
+  fi
+  hline "${C_BOLD}Storage:${C_RESET}   ${C_GREEN}$(humansize $TOTAL_DISK_CAP)${C_RESET} total"
+  hline "${C_BOLD}OS:${C_RESET}        ${OS_PRETTY:-Unknown}  ${C_DIM}(${KERNEL})${C_RESET}"
+
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+  printf "  ${C_BOLD}${C_MAGENTA}╚%${BOX_W}s╝${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "\n"
+fi
+
+# ============================================================================
+# SECTION 17: Copy-Paste Quick Reference Table
+# ============================================================================
+section "COPY-PASTE SPECS  (plain text — select and copy)"
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  # Gather all the details we need for the table
+  # CPU details
+  Q_CPU="$CPU_MODEL"
+  [[ -n "$CPU_CORES" && -n "$CPU_THREADS" && -n "$CPU_CPUS" ]] && \
+    Q_CPU+=" | ${CPU_CORES}C/${CPU_THREADS}T per core, ${CPU_CPUS} logical"
+  [[ -n "$CPU_MAX_MHZ" ]] && Q_CPU+=" | boost ${CPU_MAX_MHZ%.*} MHz"
+  [[ -n "$CPU_L3" ]] && Q_CPU+=" | L3 ${CPU_L3}"
+  [[ -n "$CPU_VIRT" ]] && Q_CPU+=" | $CPU_VIRT"
+
+  # RAM details
+  Q_RAM="${MEMTOTAL_GB:-?} GB total"
+  if [[ $HAVE_DMIDECODE -eq 1 ]]; then
+    [[ -n "$MAX_CAPACITY" ]] && Q_RAM+=" | max ${MAX_CAPACITY}"
+    [[ -n "$NUM_DEVICES" ]] && Q_RAM+=" | ${NUM_DEVICES} slots"
+    DDR_TYPE_Q=$(dmi "memory" 2>/dev/null | awk '/^[[:space:]]*Type:/ && !/Detail|Error/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    [[ -n "$DDR_TYPE_Q" ]] && Q_RAM+=" | $DDR_TYPE_Q"
+    [[ -n "$CONF_SPEED" ]] && Q_RAM+=" | running at $CONF_SPEED"
+    DDR_SPEED_Q=$(dmi "memory" 2>/dev/null | awk '/^[[:space:]]*Speed:/ && !/Configured/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    [[ -z "$CONF_SPEED" && -n "$DDR_SPEED_Q" ]] && Q_RAM+=" | $DDR_SPEED_Q"
+    DDR_VOLT=$(dmi "memory" 2>/dev/null | awk '/Configured Voltage/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    [[ -n "$DDR_VOLT" ]] && Q_RAM+=" | $DDR_VOLT"
+    DDR_FORM=$(dmi "memory" 2>/dev/null | awk '/Form Factor/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')
+    [[ -n "$DDR_FORM" ]] && Q_RAM+=" | $DDR_FORM"
+    [[ -n "$MEM_ERR_CORR" ]] && Q_RAM+=" | ECC: $MEM_ERR_CORR"
+  else
+    Q_RAM+=" | run with sudo for DDR type/speed/slots"
+  fi
+
+  # GPU details
+  Q_GPU=""
+  if [[ $HAVE_NVIDIA -eq 1 ]]; then
+    Q_GPU=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -1)
+    Q_GPU=$(echo "$Q_GPU" | sed 's/, / | /g')
+  fi
+  if [[ -z "$Q_GPU" && -n "$GPU_LIST" ]]; then
+    Q_GPU=$(echo "$GPU_LIST" | head -1 | sed 's/^[^ ]* //')
+  fi
+  # Re-resolve GPU BDF for copy-paste section (avoid variable clobber)
+  Q_GPU_BDF_LINE=$(lspci 2>/dev/null | grep -iE 'VGA|3D' | grep -iv 'Intel' | head -1)
+  [[ -z "$Q_GPU_BDF_LINE" ]] && Q_GPU_BDF_LINE=$(lspci 2>/dev/null | grep -iE 'VGA|3D|Display' | head -1)
+  Q_GPU_BDF=$(echo "$Q_GPU_BDF_LINE" | awk '{print $1}')
+  if [[ -n "$Q_GPU_BDF" && -d "/sys/bus/pci/devices/0000:${Q_GPU_BDF}" ]]; then
+    Q_GPUSPD_CUR=$(cat "/sys/bus/pci/devices/0000:${Q_GPU_BDF}/current_link_speed" 2>/dev/null)
+    Q_GPUSPD_WID=$(cat "/sys/bus/pci/devices/0000:${Q_GPU_BDF}/current_link_width" 2>/dev/null)
+    Q_GPUSPD_MAX=$(cat "/sys/bus/pci/devices/0000:${Q_GPU_BDF}/max_link_speed" 2>/dev/null)
+    Q_GPUSPD_MAXW=$(cat "/sys/bus/pci/devices/0000:${Q_GPU_BDF}/max_link_width" 2>/dev/null)
+    if [[ -n "$Q_GPUSPD_CUR" && "$Q_GPUSPD_CUR" != "Unknown" ]]; then
+      Q_GPU+=" | PCIe ${Q_GPUSPD_CUR} x${Q_GPUSPD_WID}"
+      if [[ -n "$Q_GPUSPD_MAX" && "$Q_GPUSPD_MAX" != "Unknown" ]]; then
+        Q_GPU+=" (slot max: ${Q_GPUSPD_MAX} x${Q_GPUSPD_MAXW})"
+      fi
+    fi
+  fi
+
+  # iGPU
+  Q_IGPU=""
+  IGPU_LINE=$(echo "$GPU_LIST" | grep -i 'Intel\|AMD\|Radeon\|UHD\|Iris' | head -1)
+  if [[ -n "$IGPU_LINE" ]]; then
+    Q_IGPU=$(echo "$IGPU_LINE" | sed 's/^[^ ]* //' | sed 's/.*controller: //')
+  fi
+
+  # Storage details
+  Q_STORAGE=""
+  for devdir in /sys/block/*; do
+    [[ -d "$devdir" ]] || continue
+    name=$(basename "$devdir")
+    [[ "$name" == loop* || "$name" == ram* || "$name" == sr* ]] && continue
+    size_sectors=$(cat "$devdir/size" 2>/dev/null)
+    [[ -z "$size_sectors" || "$size_sectors" == "0" ]] && continue
+    size_bytes=$((size_sectors * 512))
+    rot=$(cat "$devdir/queue/rotational" 2>/dev/null)
+    model=$(cat "$devdir/device/model" 2>/dev/null | sed 's/^ *//;s/ *$//')
+    vendor=$(cat "$devdir/device/vendor" 2>/dev/null | sed 's/^ *//;s/ *$//')
+    s_type="SSD"
+    s_proto="SATA"
+    if [[ "$name" == nvme* ]]; then
+      s_type="NVMe"
+      s_proto="PCIe NVMe"
+    elif [[ "$rot" == "0" ]]; then
+      s_type="SSD"
+      s_proto="SATA"
+    else
+      s_type="HDD"
+      s_proto="SATA"
+    fi
+    [[ -n "$Q_STORAGE" ]] && Q_STORAGE+=$'\n'
+    Q_STORAGE+="/dev/${name} | ${vendor} ${model} | $(humansize $size_bytes) ${s_type} | ${s_proto}"
+  done
+
+  # Network details
+  Q_NET=""
+  [[ -n "$ETH_SPEED" ]] && Q_NET+="Ethernet ${ETH_SPEED} Mbps"
+  ETH_DUPLEX=$(cat /sys/class/net/eno1/duplex 2>/dev/null)
+  [[ -n "$ETH_DUPLEX" ]] && Q_NET+=" | ${ETH_DUPLEX}"
+  [[ -n "$WIFI_IFACE" ]] && {
+    WIFI_DRIVER=""
+    [[ -L "/sys/class/net/${WIFI_IFACE}/device/driver" ]] && \
+      WIFI_DRIVER=$(basename "$(readlink "/sys/class/net/${WIFI_IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)
+    WIFI_BAND=$(iw dev "$WIFI_IFACE" info 2>/dev/null | awk '/width/ {print $2 " " $3; exit}')
+    Q_NET+=" | Wi-Fi: ${WIFI_IFACE}"
+    [[ -n "$WIFI_DRIVER" ]] && Q_NET+=" (${WIFI_DRIVER})"
+    [[ -n "$WIFI_BAND" ]] && Q_NET+=" | ${WIFI_BAND}"
+  }
+
+  # Bluetooth details
+  Q_BT="Not detected"
+  if [[ $BT_FOUND -eq 1 ]]; then
+    Q_BT="${BT_NAME:-adapter}"
+    [[ -n "$BT_VERSION" ]] && Q_BT+=" | HCI $BT_VERSION"
+    [[ -n "$BT_ADDR" ]] && Q_BT+=" | ${BT_ADDR}"
+  fi
+
+  # Audio details
+  Q_AUDIO=""
+  if [[ -r /proc/asound/cards ]]; then
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*[0-9] ]] || continue
+      card_info=$(echo "$line" | sed 's/^[[:space:]]*//')
+      [[ -n "$Q_AUDIO" ]] && Q_AUDIO+=$'\n'
+      Q_AUDIO+="$card_info"
+    done < /proc/asound/cards
+  fi
+  [[ -n "$PA_SERVER" ]] && Q_AUDIO+=" | Server: $PA_SERVER"
+
+  # Display details
+  Q_DISP=""
+  if has_cmd xrandr && [[ -n "${DISPLAY:-}" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == *" connected"* ]] || continue
+      disp_res=$(echo "$line" | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+' | head -1)
+      [[ -z "$disp_res" ]] && continue
+      disp_name=$(echo "$line" | awk '{print $1}')
+      disp_res=${disp_res%%+*}
+      disp_mm=$(echo "$line" | grep -oE '[0-9]+mm x [0-9]+mm' | head -1)
+      disp_diag=""
+      if [[ -n "$disp_mm" ]]; then
+        mm_w=$(echo "$disp_mm" | awk '{print $1}')
+        mm_h=$(echo "$disp_mm" | awk '{print $3}')
+        diag_mm=$(echo "scale=0; sqrt($mm_w * $mm_w + $mm_h * $mm_h)" | bc 2>/dev/null)
+        [[ -n "$diag_mm" ]] && disp_diag=" | $((diag_mm / 25))\" ($diag_mm mm)"
+      fi
+      [[ -n "$Q_DISP" ]] && Q_DISP+=$'\n'
+      Q_DISP+="${disp_name} | ${disp_res}${disp_diag}"
+    done <<< "$(xrandr --query 2>/dev/null)"
+  fi
+
+  # Motherboard / BIOS
+  Q_MB="${MB_MANUF:-Unknown} ${MB_NAME:-}"
+  [[ -n "$MB_VER" ]] && Q_MB+=" (rev ${MB_VER})"
+  [[ -n "$BIOS_VER" ]] && Q_MB+=" | BIOS ${BIOS_VER}"
+  [[ -n "$BIOS_DATE" ]] && Q_MB+=" (${BIOS_DATE})"
+  Q_MB+=" | $(if [[ -d /sys/firmware/efi ]]; then echo "UEFI"; else echo "Legacy BIOS"; fi)"
+
+  # USB controllers
+  Q_USB=""
+  if [[ $HAVE_LSPCI -eq 1 ]]; then
+    Q_USB=$(lspci 2>/dev/null | grep -i 'USB' | sed 's/^[^ ]* //' | head -3 | tr '\n' '|' | sed 's/|/ | /g; s/ | $//')
+  fi
+  [[ $HAVE_LSUSB -eq 1 ]] && Q_USB+=" | ${USB_COUNT:-0} devices connected"
+
+  # OS
+  Q_OS="${OS_PRETTY:-Unknown} | Kernel ${KERNEL} | $(uname -m)"
+
+  # Power
+  Q_POWER=""
+  if [[ $(echo "$TOTAL_WATTS > 0" | bc -l 2>/dev/null) == "1" ]]; then
+    if [[ $ESTIMATED -eq 1 ]]; then
+      Q_POWER="~${TOTAL_WATTS}W idle (est)"
+    else
+      Q_POWER="${TOTAL_WATTS}W draw"
+    fi
+    Q_POWER+=" | \$${COST_PER_DAY}/day / \$${COST_PER_MONTH}/month / \$${COST_PER_YEAR}/year"
+    [[ -n "$MAX_WATTS" && $(echo "$MAX_WATTS > 0" | bc -l 2>/dev/null) == "1" ]] && \
+      Q_POWER+=" / max ~${MAX_WATTS}W"
+  fi
+
+  # ─── Print the table ───
+  printf "\n"
+  printf "  ${C_BOLD}%-14s  %-42s  %s${C_RESET}\n" "COMPONENT" "SPEC" "PROTOCOL / SPEED / DETAILS"
+  printf "  ${C_DIM}%-14s  %-42s  %s${C_RESET}\n" "──────────────" "──────────────────────────────────────────" "────────────────────────────────────────────────"
+
+  # CPU
+  printf "  ${C_CYAN}%-14s${C_RESET}  %-42s  %s\n" "CPU" \
+    "$(echo "$Q_CPU" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+    "$(echo "$Q_CPU" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  # RAM
+  printf "  ${C_GREEN}%-14s${C_RESET}  %-42s  %s\n" "MEMORY (RAM)" \
+    "$(echo "$Q_RAM" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+    "$(echo "$Q_RAM" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  # GPU
+  if [[ -n "$Q_GPU" ]]; then
+    printf "  ${C_MAGENTA}%-14s${C_RESET}  %-42s  %s\n" "GPU" \
+      "$(echo "$Q_GPU" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+      "$(echo "$Q_GPU" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+  fi
+
+  # iGPU
+  if [[ -n "$Q_IGPU" ]]; then
+    printf "  ${C_DIM}%-14s${C_RESET}  %-42s  %s\n" "iGPU" \
+      "$(echo "$Q_IGPU" | cut -c1-42)" \
+      "Integrated (shares system RAM)"
+  fi
+
+  # Motherboard
+  printf "  ${C_CYAN}%-14s${C_RESET}  %-42s  %s\n" "MOTHERBOARD" \
+    "$(echo "$Q_MB" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+    "$(echo "$Q_MB" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  # Storage — may be multi-line
+  FIRST_STORE=1
+  while IFS= read -r sline; do
+    [[ -z "$sline" ]] && continue
+    if (( FIRST_STORE )); then
+      printf "  ${C_GREEN}%-14s${C_RESET}  %-42s  %s\n" "STORAGE" \
+        "$(echo "$sline" | awk -F'|' '{print $1 " " $2}' | sed 's/^ *//;s/ *$//' | cut -c1-42)" \
+        "$(echo "$sline" | awk -F'|' '{print $3 " | " $4}' | sed 's/^ *//;s/ *$//')"
+      FIRST_STORE=0
+    else
+      printf "  ${C_DIM}%-14s${C_RESET}  %-42s  %s\n" "" \
+        "$(echo "$sline" | awk -F'|' '{print $1 " " $2}' | sed 's/^ *//;s/ *$//' | cut -c1-42)" \
+        "$(echo "$sline" | awk -F'|' '{print $3 " | " $4}' | sed 's/^ *//;s/ *$//')"
+    fi
+  done <<< "$Q_STORAGE"
+
+  # Network
+  printf "  ${C_CYAN}%-14s${C_RESET}  %-42s  %s\n" "NETWORK" \
+    "$(echo "$Q_NET" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+    "$(echo "$Q_NET" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  # Bluetooth
+  printf "  ${C_BLUE}%-14s${C_RESET}  %-42s  %s\n" "BLUETOOTH" \
+    "$(echo "$Q_BT" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+    "$(echo "$Q_BT" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  # Audio
+  FIRST_AUD=1
+  while IFS= read -r aline; do
+    [[ -z "$aline" ]] && continue
+    if (( FIRST_AUD )); then
+      printf "  ${C_DIM}%-14s${C_RESET}  %-42s  %s\n" "AUDIO" \
+        "$(echo "$aline" | cut -c1-42)" \
+        "$(echo "$aline" | sed 's/.*]: //' | cut -c1-50)"
+      FIRST_AUD=0
+    else
+      printf "  ${C_DIM}%-14s${C_RESET}  %-42s  %s\n" "" \
+        "$(echo "$aline" | cut -c1-42)" \
+        "$(echo "$aline" | sed 's/.*]: //' | cut -c1-50)"
+    fi
+  done <<< "$Q_AUDIO"
+
+  # USB
+  printf "  ${C_CYAN}%-14s${C_RESET}  %-42s  %s\n" "USB" \
+    "$(echo "$Q_USB" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//' | cut -c1-42)" \
+    "$(echo "$Q_USB" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  # Display
+  FIRST_DISP=1
+  while IFS= read -r dline; do
+    [[ -z "$dline" ]] && continue
+    if (( FIRST_DISP )); then
+      printf "  ${C_MAGENTA}%-14s${C_RESET}  %-42s  %s\n" "DISPLAY" \
+        "$(echo "$dline" | awk -F'|' '{print $1}' | sed 's/^ *//;s/ *$//' | cut -c1-42)" \
+        "$(echo "$dline" | awk -F'|' '{print $2}' | sed 's/^ *//;s/ *$//')"
+      FIRST_DISP=0
+    else
+      printf "  ${C_DIM}%-14s${C_RESET}  %-42s  %s\n" "" \
+        "$(echo "$dline" | awk -F'|' '{print $1}' | sed 's/^ *//;s/ *$//' | cut -c1-42)" \
+        "$(echo "$dline" | awk -F'|' '{print $2}' | sed 's/^ *//;s/ *$//')"
+    fi
+  done <<< "$Q_DISP"
+
+  # Power
+  if [[ -n "$Q_POWER" ]]; then
+    printf "  ${C_YELLOW}%-14s${C_RESET}  %-42s  %s\n" "POWER" \
+      "$(echo "$Q_POWER" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+      "$(echo "$Q_POWER" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+  fi
+
+  # OS
+  printf "  ${C_DIM}%-14s${C_RESET}  %-42s  %s\n" "OPERATING SYS" \
+    "$(echo "$Q_OS" | cut -d'|' -f1 | sed 's/^ *//;s/ *$//')" \
+    "$(echo "$Q_OS" | cut -d'|' -f2- | sed 's/^ *//;s/ *$//' | tr '|' '/')"
+
+  printf "  ${C_DIM}%-14s  %-42s  %s${C_RESET}\n" "──────────────" "──────────────────────────────────────────" "────────────────────────────────────────────────"
+  printf "\n"
+fi
+
+# ============================================================================
+# VERDICT
+# ============================================================================
+section "VERDICT"
+END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
+
+if [[ $JSON_OUT -eq 1 ]]; then
+  exec 1>&3
+  exec 3>&-
+  printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+  for f in "${JSON_FIELDS[@]}"; do printf ',%s' "$f"; done
+  printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$ELAPSED"
+else
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNINGS${C_RESET}: %d warnings\n" "$WARNINGS"
+  else
+    printf "  ${C_GREEN}${C_BOLD}COMPLETE${C_RESET}: full spec report generated\n"
+  fi
+  printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+  echo ""
+  printf "  ${C_DIM}Tip: run with ${C_BOLD}sudo${C_RESET} for full memory/BIOS/chassis details${C_RESET}\n"
+  printf "  ${C_DIM}Tip: run with ${C_BOLD}--ai${C_RESET} for a compact key:value dump to paste into AI${C_RESET}\n"
+  # Display one-liner explanations for any critical/warning issues logged
+  show_verdict_one_liners
+fi
+
+if [[ "$JSON_OUT" != "1" ]] && declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null || true; fi
+
+echo ""
+if (( CRITICAL > 0 )); then exit 2
+elif (( WARNINGS > 0 )); then exit 1
+else exit 0
+fi

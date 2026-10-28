@@ -1,0 +1,1427 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# slowz - System slowness diagnostic tool
+# ----------------------------------------------------------------------------
+# Checks CPU, GPU, memory, disk I/O, network, browser state, services, recent
+# log errors, and probes suspicious processes. Prints a verdict + actionable
+# recommendations ranked by likely impact.
+#
+# Usage:
+#   ./slowz                  Full diagnostic
+#   ./slowz --quick          CPU + memory + top offenders only
+#   ./slowz --json           Emit machine-readable JSON summary
+#   ./slowz --no-color       Plain output (for piping / logs)
+#   ./slowz --save           Also append full report to reports/
+#   ./slowz --watch 5        Re-run every 5 seconds (Ctrl-C to stop)
+#
+# Exits 0 if healthy, 1 if warnings found, 2 if critical issues found.
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/common.sh" ]]; then
+  # shellcheck source=lib/common.sh
+  source "$SCRIPT_DIR/lib/common.sh"
+fi
+
+# ---------- Configuration ----------
+QUICK=0
+JSON_OUT=0
+NO_COLOR=${NO_COLOR:-0}
+SAVE=0
+WATCH=0
+REPORT_DIR="$SCRIPT_DIR/reports"
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+# Granular section selectors — when ANY is set, ONLY those sections run.
+# When none are set (the default), every section runs (full diagnostic).
+RUN_CPU=0
+RUN_MEMORY=0
+RUN_DISK=0
+RUN_NETWORK=0
+RUN_CRASH=0
+RUN_WEB=0
+RUN_BROWSER=0
+RUN_SUSPICIOUS=0
+RUN_GPU=0
+RUN_SERVICES=0
+SELECTED_SECTIONS=0
+# Source verdict logging helper
+SCRIPT_DIR_SLOW="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR_SLOW/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_SLOW/lib/verdict_log.sh"
+
+# Source run comparison helper
+[[ -f "$SCRIPT_DIR_SLOW/lib/run_comparison.sh" ]] && source "$SCRIPT_DIR_SLOW/lib/run_comparison.sh"
+
+START_TIME=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+SCRIPT_VERSION="1.0.0"
+declare -a ARGS=("$@")
+
+# Known-safe system daemons that legitimately run as root
+SYSTEM_DAEMON_RE='^(systemd|init|kthreadd|ksoftirqd|migration|kworker|rcu_|netns|khungtaskd|oom_reaper|writeback|kcompactd|kswapd|kblockd|watchdog|cron|crond|rsyslogd|dbus|dbus-daemon|sshd|NetworkManager|polkitd|polkit|wpa_supplicant|cupsd|cups-browsed|cups-|chronyd|firewalld|avahi|bluetoothd|gdm|gnome-|wayland|Xorg|pulseaudio|accounts-daemon|rtkit|udisksd|upowerd|thermald|bolt|colord|geoclue|power-profiles|snapd|unattended-upgrade|packagekit|switcheroo|gvfs|tracker|system76|videocoded|qemu-ga|libvirtd|caddy|nginx|apache2|httpd|mysqld|mariadbd|postgres|redis-server|mongod|docker|containerd|fail2ban|ssh-agent|chrony|systemd-|journald|logind|userdb|sshd|chronyd|irqbalance|mdadm_raid|dm-|cryptsetup|iproute|lvmetad|lvm|multipathd|zfs|zvol|spl|zpool|haveged|rngd|tpm2|pcscd|smartd|mdmonitor|snmpd|ntpd|ntpdate|openntpd|atop|systemd-timedated|systemd-hostnamed|systemd-localed|systemd-logind|systemd-userdbd|systemd-resolved|systemd-networkd|systemd-timesyncd|systemd-udevd|systemd-update-|systemd-machine|systemd-sleep|systemd-tmpfiles|systemd-cryptsetup|systemd-fsck|systemd-grow|systemd-make|systemd-quotacheck|systemd-remount|systemd-shutdown|systemd-sysctl|systemd-modules|systemd-binfmt|systemd-firstboot|systemd-hibernate|systemd-journal|systemd-rfkill|systemd-tpm2-setup|systemd-update-utmp|systemd-user-sessions|systemd-coredump|systemd-creds|systemd-exit|systemd-pstore|systemd-repart|systemd-sysext)$'
+
+# Printer-related units are noise unless someone plugs in a printer
+PRINTER_UNIT_RE='configure-printer@|cups\.service|cups\.socket|cups-browsed'
+
+for arg in "$@"; do
+  case "$arg" in
+    --quick)       QUICK=1 ;;
+    --json)        JSON_OUT=1 ;;
+    --no-color)    NO_COLOR=1 ;;
+    --save)        SAVE=1 ;;
+    --watch)       WATCH=1 ;;
+    # Granular section selectors — run ONLY the named section.
+    # When none are specified, all sections run.
+    --cpu)         RUN_CPU=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --memory)      RUN_MEMORY=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --disk)        RUN_DISK=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --network)     RUN_NETWORK=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --crash)       RUN_CRASH=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --web)         RUN_WEB=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --browser)     RUN_BROWSER=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --suspicious)  RUN_SUSPICIOUS=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --gpu)         RUN_GPU=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    --services)    RUN_SERVICES=1; SELECTED_SECTIONS=$((SELECTED_SECTIONS+1)) ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╭─────────────────────────────────────────────────────────────╮
+  │           slowz — System Slowness Diagnostic             │
+  ╰─────────────────────────────────────────────────────────────╯
+
+DESCRIPTION
+  Checks CPU, GPU, memory, disk I/O, network, browser state, services,
+  recent log errors, and probes suspicious processes. Prints a verdict
+  ranked by likely impact. Great first script to run when "something
+  feels slow."
+
+USAGE
+  ./slowz                  Full diagnostic (all sections)
+  ./slowz --quick          Fast triage (all sections, 1-line checks)
+  ./slowz --json           Emit machine-readable JSON summary
+  ./slowz --no-color       Plain output (for piping / logs)
+  ./slowz --save           Also append report to reports/
+  ./slowz --watch [N]      Re-run every N seconds (default 5)
+
+GRANULAR SECTION SELECTORS (run only what you need)
+  ./slowz --cpu            CPU load, throttling, temp, top consumers  (~1s)
+  ./slowz --memory         RAM, swap, OOM, top consumers               (~1s)
+  ./slowz --disk           Filesystems + I/O stats                     (~2s)
+  ./slowz --network        Connections, SYN flood, per-IP, bandwidth  (~2s)
+  ./slowz --crash          OOM kills, segfaults, kernel panic, MCE    (~2s)
+  ./slowz --web            nginx/apache/caddy status + attack IPs      (~3s)
+  ./slowz --browser        Chrome/Firefox process state                (~1s)
+  ./slowz --suspicious     Root-owned non-daemon processes             (~1s)
+  ./slowz --gpu            NVIDIA GPU utilization + temperature        (~1s)
+  ./slowz --services       Failed systemd units + recent errors        (~1s)
+
+  Combine multiple:  ./slowz --cpu --memory    (both, only those)
+
+TYPICAL EMERGENCY CHECKS
+  Site under attack?     ./slowz --web --network
+  System crashing?       ./slowz --crash --memory
+  Just feels slow?       ./slowz --quick
+  Which process is it?   ./slowz --cpu --suspicious
+
+ALTERNATIVE COMMANDS
+  top, htop, vmstat 1, iostat -dx 2, dstat, sudo iotop
+
+INVESTIGATION COMMANDS (also shown in recommendations when relevant)
+  Investigate PID           →  sudo ls -la /proc/<PID>/{exe,cwd}
+                              cat /proc/<PID>/status | grep -E "Threads|State"
+                              sudo iotop -p <PID>      (I/O vs CPU bound?)
+                              sudo strace -p <PID> -c  (syscall summary)
+                              sudo cat /proc/<PID>/wchan  (what kernel is it waiting on?)
+  Find process on a core    →  ps -eLo pid,pcpu,comm | grep -v " 0\." | sort -k2 -nr | head
+  CPU temperature           →  sensors  (lm-sensors package)
+  Throttling state          →  cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+  Failed units detail       →  systemctl status <unit>  |  journalctl -u <unit> -n 50
+  OOM history               →  sudo dmesg | grep -i oom  |  journalctl -k --grep="oom"
+  Drop page cache (free RAM)→  sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+  Bandwidth per interface   →  iftop -i <iface>  /  nethogs
+  Live web traffic          →  tail -f /var/log/nginx/access.log
+  Top IPs from access log   →  awk '{print $1}' /var/log/nginx/access.log | sort | uniq -c | sort -rn | head
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)"; exit 64 ;;
+  esac
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+init_colors
+
+# Initialize run comparison (skip for JSON, watch, or help modes)
+if [[ $JSON_OUT -eq 0 ]] && [[ $WATCH -eq 0 ]]; then
+    run_comparison_init "slowz"
+fi
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+# Color-coded percentage bar (delegates to lib/common.sh:bar)
+# Color-coded temperature inline
+tempc() {
+  local t=$1
+  local col
+  col=$(temp_color "$t")
+  emit "${col}${t}°C${C_RESET}"
+}
+
+# Print a row of two key/value pairs
+row2() {
+  printf "  ${C_DIM}%-14s${C_RESET} %s   ${C_DIM}%-14s${C_RESET} %s\n" "$1" "$2" "$3" "$4"
+}
+
+# Run a command silently, return its output
+silent() { timeout 5 "$@" 2>/dev/null; }
+
+# Get thread count for a PID
+pid_threads() {
+  awk '/^Threads:/ {print $2}' "/proc/$1/status" 2>/dev/null
+}
+
+# Get process etime
+pid_etime() {
+  ps -p "$1" -o etime= 2>/dev/null | tr -d ' '
+}
+
+# Get parent PID
+pid_ppid() {
+  awk '/^PPid:/ {print $2}' "/proc/$1/status" 2>/dev/null
+}
+
+# Get process state
+pid_state() {
+  awk '/^State:/ {print $2, $3}' "/proc/$1/status" 2>/dev/null
+}
+
+# Probe a PID — prints /proc details for inspection
+probe_pid() {
+  local pid=$1 label=${2:-""}
+  local exe cwd user threads ppid state etime cmd
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+  user=$(ps -p "$pid" -o user= 2>/dev/null | tr -d ' ')
+  threads=$(pid_threads "$pid")
+  ppid=$(pid_ppid "$pid")
+  state=$(pid_state "$pid")
+  etime=$(pid_etime "$pid")
+
+  # cmdline
+  if [[ -r "/proc/$pid/cmdline" ]]; then
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    cmd="${cmd:0:100}"
+  else
+    cmd="(unreadable)"
+  fi
+
+  [[ -n "$label" ]] && heading "$label  (PID $pid)"
+  [[ -n "$user"   ]] && printf "    ${C_DIM}user${C_RESET}     %s\n" "$user"
+  [[ -n "$threads" ]] && printf "    ${C_DIM}threads${C_RESET}  %s\n" "$threads"
+  [[ -n "$state"  ]] && printf "    ${C_DIM}state${C_RESET}    %s\n" "$state"
+  [[ -n "$etime"  ]] && printf "    ${C_DIM}uptime${C_RESET}   %s\n" "$etime"
+  [[ -n "$exe"    ]] && printf "    ${C_DIM}exe${C_RESET}      %s\n" "$exe"
+  [[ -n "$cwd" && "$cwd" != "/" ]] && printf "    ${C_DIM}cwd${C_RESET}      %s\n" "$cwd"
+  [[ -n "$ppid"   ]] && printf "    ${C_DIM}ppid${C_RESET}     %s\n" "$ppid"
+  [[ -n "$cmd"    ]] && printf "    ${C_DIM}cmd${C_RESET}      %s\n" "$cmd"
+}
+
+# Color a process row based on whether it's running as root or is suspicious
+process_color() {
+  local user=$1 comm=$2
+  if [[ "$user" == "root" ]] && ! [[ "$comm" =~ $SYSTEM_DAEMON_RE ]]; then
+    echo "$C_YELLOW"   # suspicious: root, not a known daemon
+  else
+    echo "$C_DIM"
+  fi
+}
+
+# Decide whether a section should run.
+# Usage: should_run SECTION_VAR && { ... section body ... }
+# When SELECTED_SECTIONS == 0, every section runs (full diagnostic default).
+# When SELECTED_SECTIONS > 0, only selected sections run.
+should_run() {
+  local flag_value=$1
+  if (( SELECTED_SECTIONS == 0 )); then return 0; fi
+  [[ $flag_value -eq 1 ]]
+}
+
+# ============================================================================
+# Banner
+# ============================================================================
+# In --json mode, redirect all stdout to a temp file BEFORE printing anything,
+# so the audit text doesn't contaminate the JSON output that callers parse.
+JSON_CAPTURE=""
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_CAPTURE="$(mktemp)"
+    exec 3>&1
+    exec 1>"$JSON_CAPTURE"
+fi
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "${C_BOLD}${C_MAGENTA}"
+  cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  SLOW.SH — System Slowness Diagnostic                        ║
+   ║  CPU · Memory · I/O · Network · Verdict                       ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+  printf "${C_RESET}\n"
+  printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+      "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ============================================================================
+# SECTION 1: System overview
+# ============================================================================
+section "SYSTEM OVERVIEW"
+
+info "Kernel:  $(uname -r)"
+info "Uptime:  $(uptime -p 2>/dev/null || uptime)"
+LOAD=$(cat /proc/loadavg)
+LOAD1=$(awk '{print int($1)}' <<<"$LOAD")
+info "Load:    $(awk '{print $1, $2, $3}' <<<"$LOAD")  (1m, 5m, 15m)"
+
+CPU_COUNT=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+info "CPUs:    $CPU_COUNT logical cores"
+
+TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+info "Memory:  ${TOTAL_MB} MB total"
+
+# Load verdict
+if (( LOAD1 > CPU_COUNT * 2 )); then
+  crit "Load $LOAD1 is >2× CPU count ($CPU_COUNT) — system is overloaded"
+elif (( LOAD1 > CPU_COUNT )); then
+  warn "Load $LOAD1 exceeds CPU count ($CPU_COUNT) — system is busy"
+else
+  ok "Load $LOAD1 is within CPU capacity"
+fi
+
+# ============================================================================
+# SECTION 2: CPU
+# ============================================================================
+if should_run "$RUN_CPU"; then
+section "CPU"
+subsec "Per-core utilization (1s sample)"
+
+# Cache sensors + mpstat output once for the whole CPU section to avoid repeat subshells.
+_SENSORS_OUT=""
+_MPSTAT_OUT=""
+if command -v sensors >/dev/null 2>&1; then
+  _SENSORS_OUT=$(sensors 2>/dev/null || true)
+fi
+if command -v mpstat >/dev/null 2>&1; then
+  _MPSTAT_OUT=$(mpstat -P ALL 1 1 2>/dev/null || true)
+fi
+
+if [[ -n "${_MPSTAT_OUT:-}" ]]; then
+  if [[ $JSON_OUT -eq 0 ]]; then
+    awk '
+      NF >= 3 && $3 == "CPU" { next }
+      /^[0-9].*PM.*all/ { printf "  %-6s %5.1f%% busy\n", $3, 100-$NF; next }
+      /^[0-9].*PM.*[0-9]/ {
+        pct = 100-$NF
+        col = ""
+        if (pct >= 95) col = "\033[31m"
+        else if (pct >= 70) col = "\033[33m"
+        else if (pct < 10) col = "\033[2m"
+        printf "  %s%-6s %5.1f%% busy\033[0m\n", col, $3, pct; next
+      }
+      /^Average:/ && $3 == "all" { printf "\n  %-6s %5.1f%% busy\n", "all", 100-$NF; next }
+    ' <<<"$_MPSTAT_OUT"
+  fi
+else
+  info "mpstat not available - showing instantaneous snapshot only"
+fi
+
+subsec "Frequency / throttling"
+HOT_CORE=""
+HOT_PCT=0
+if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]]; then
+  CUR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)
+  MIN=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 2>/dev/null)
+  MAX=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)
+  if [[ -n "$CUR" && -n "$MAX" ]] && (( MAX > 0 )); then
+    PCT=$(( CUR * 100 / MAX ))
+    info "CPU0 freq: $((CUR/1000)) MHz / $((MAX/1000)) MHz  $(bar $PCT)"
+    if (( PCT < 50 )); then
+      warn "CPU running below 50% of max — possible throttling or power-saving"
+    fi
+  fi
+fi
+
+PKG_TEMP=""
+if [[ -n "${_SENSORS_OUT:-}" ]]; then
+  TEMP=$(awk '/^Core [0-9]/ {print $3}' <<<"$_SENSORS_OUT" | head -1 | tr -d '+°C')
+  PKG_TEMP=$(awk '/^Package/ {print $4}' <<<"$_SENSORS_OUT" | head -1 | tr -d '+°C' | cut -d. -f1)
+  T=${PKG_TEMP:-$TEMP}
+  if [[ -n "$T" ]] && [[ "$T" =~ ^[0-9]+$ ]]; then
+    info "Package temp: $(tempc "$T")"
+    if (( T >= 90 )); then
+      crit "CPU temperature ${T}°C — THERMAL THROTTLING likely"
+      # Find hottest core to identify culprit (reuse cached mpstat output)
+      if [[ -n "${_MPSTAT_OUT:-}" ]]; then
+        HOT_INFO=$(awk '
+          /^[0-9]+.*PM.*[0-9]+$/ && $3 != "all" {
+            pct = 100-$NF
+            if (pct > maxpct) { maxpct = pct; maxcore = $3 }
+          }
+          END { printf "%s %.0f", maxcore, maxpct }' <<<"$_MPSTAT_OUT")
+        HOT_CORE=$(awk '{print $1}' <<<"$HOT_INFO")
+        HOT_PCT=$(awk '{print $2}' <<<"$HOT_INFO")
+        if [[ -n "$HOT_CORE" ]] && [[ "$HOT_PCT" =~ ^[0-9]+$ ]] && (( HOT_PCT >= 90 )); then
+          info "Hottest core: CPU${HOT_CORE} at ${HOT_PCT}% — checking who owns it..."
+        fi
+      fi
+    elif (( T >= 80 )); then
+      warn "CPU temperature ${T}°C — running hot, check cooling"
+    fi
+  fi
+fi
+
+subsec "Top CPU consumers (excluding kernel threads)"
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "  ${C_DIM}%-7s %5s %5s %7s  %-10s %s${C_RESET}\n" "PID" "CPU%" "MEM%" "RSS(MB)" "USER" "COMMAND"
+  ps -eo pid,pcpu,pmem,rss,user,comm --sort=-pcpu 2>/dev/null \
+    | awk -v sysd="$SYSTEM_DAEMON_RE" '
+        NR>1 && $5 !~ /^[kK]thread/ && $5 !~ /migration/ && $5 !~ /ksoftirq/ {
+          is_root = ($5 == "root")
+          is_sysd = ($6 ~ sysd)
+          flag = (is_root && !is_sysd) ? "⚠" : " "
+          printf "  %s%-7s %5s %5s %7s  %-10s %s\n", flag, $1, $2, $3, int($4/1024), $5, $6
+        }' \
+    | head -15
+  printf "  ${C_DIM}⚠ = running as root, not a known system daemon${C_RESET}\n"
+fi
+fi  # /RUN_CPU
+
+# ============================================================================
+# SECTION 3: Suspicious processes
+# ============================================================================
+if [[ $QUICK -eq 0 ]] && should_run "$RUN_SUSPICIOUS"; then
+  section "SUSPICIOUS PROCESSES"
+  info "Probes /proc for processes with unusual CPU, threads, or root ownership"
+
+  declare -a SUSPICIOUS_PIDS=()
+  declare -a SUSPICIOUS_REASONS=()
+
+  # Find non-system processes running as root that consume meaningful CPU
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pid=$(awk '{print $1}' <<<"$line")
+    user=$(awk '{print $2}' <<<"$line")
+    pcpu=$(awk '{print $3}' <<<"$line")
+    comm=$(awk '{print $4}' <<<"$line")
+    if [[ "$user" == "root" ]] && ! [[ "$comm" =~ $SYSTEM_DAEMON_RE ]] \
+       && [[ "$pcpu" =~ ^[0-9]+\.?[0-9]*$ ]] && (( $(echo "$pcpu > 5" | bc 2>/dev/null || echo 0) )); then
+      SUSPICIOUS_PIDS+=("$pid")
+      SUSPICIOUS_REASONS+=("root process using ${pcpu}% CPU")
+    fi
+  done < <(ps -eo pid,user,pcpu,comm --no-headers 2>/dev/null)
+
+  # Find processes with excessive thread counts
+  THREAD_WARN=$(( CPU_COUNT * 2 ))
+  THREAD_CRIT=$(( CPU_COUNT * 4 ))
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    threads=$(pid_threads "$pid")
+    [[ -z "$threads" ]] && continue
+    if (( threads > THREAD_CRIT )); then
+      SUSPICIOUS_PIDS+=("$pid")
+      SUSPICIOUS_REASONS+=("$threads threads on a $CPU_COUNT-core box")
+    elif (( threads > THREAD_WARN )); then
+      SUSPICIOUS_PIDS+=("$pid")
+      SUSPICIOUS_REASONS+=("$threads threads (>$THREAD_WARN threshold)")
+    fi
+  done < <(ps -eo pid --no-headers 2>/dev/null | head -200)
+
+  # Dedupe
+  if (( ${#SUSPICIOUS_PIDS[@]} > 0 )); then
+    declare -A SEEN=()
+    declare -a UNIQUE_PIDS=()
+    declare -a UNIQUE_REASONS=()
+    for i in "${!SUSPICIOUS_PIDS[@]}"; do
+      if [[ -z "${SEEN[${SUSPICIOUS_PIDS[$i]}]+x}" ]]; then
+        SEEN[${SUSPICIOUS_PIDS[$i]}]=1
+        UNIQUE_PIDS+=("${SUSPICIOUS_PIDS[$i]}")
+        UNIQUE_REASONS+=("${SUSPICIOUS_REASONS[$i]}")
+      fi
+    done
+
+    for i in "${!UNIQUE_PIDS[@]}"; do
+      pid="${UNIQUE_PIDS[$i]}"
+      reason="${UNIQUE_REASONS[$i]}"
+      # Verify the PID still exists
+      [[ ! -d "/proc/$pid" ]] && continue
+      warn "PID $pid — $reason"
+    done
+
+    info ""
+    info "Investigate any of these with:"
+    info "  sudo ls -la /proc/<PID>/{exe,cwd}        # verify the binary & working dir"
+    info "  cat /proc/<PID>/status | grep -E '^(Name|Threads|State)'"
+    info "  sudo iotop -p <PID>                       # I/O vs CPU bound?"
+    info "  sudo strace -p <PID> -c -e trace=all -f   # syscall summary"
+    info "  sudo kill -15 <PID>                       # graceful stop"
+  else
+    ok "No suspicious processes found"
+  fi
+fi
+
+# ============================================================================
+# SECTION 4: GPU (if not --quick)
+# ============================================================================
+if [[ $QUICK -eq 0 ]] && should_run "$RUN_GPU"; then
+  section "GPU"
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    subsec "NVIDIA GPUs"
+    while IFS=, read -r idx name gpu_util mem_util mem_used mem_total temp power; do
+      idx="${idx// /}"
+      gpu_util="${gpu_util// /}"; mem_util="${mem_util// /}"
+      mem_used="${mem_used// /}"; mem_total="${mem_total// /}"
+      temp="${temp// /}"; power="${power// /}"
+      [[ -z "$gpu_util" ]] && gpu_util=0
+      [[ -z "$mem_util" ]] && mem_util=0
+
+      emit "  GPU %s: %s\n" "$idx" "$name"
+      emit "    Util:   GPU %3s%%  Mem %3s%%  %s\n" "$gpu_util" "$mem_util" "$(bar "${gpu_util:-0}")"
+      emit "    VRAM:   %s / %s MB\n" "$mem_used" "$mem_total"
+      emit "    Temp:   %s   Power: %sW\n" "$(tempc "${temp:-0}")" "$power"
+
+      if [[ "$temp" =~ ^[0-9]+$ ]] && (( temp >= 85 )); then
+        crit "GPU $idx temp ${temp}°C — very hot"
+      fi
+      if [[ "$gpu_util" =~ ^[0-9]+$ ]] && (( gpu_util >= 95 )); then
+        warn "GPU $idx pegged at ${gpu_util}%"
+      fi
+    done < <(nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null)
+
+    subsec "Processes using GPU"
+    if [[ $JSON_OUT -eq 0 ]]; then
+      emit "  %-7s %-20s %s\n" "PID" "PROCESS" "VRAM"
+    fi
+    while IFS=, read -r pid name mem; do
+      pid="${pid// /}"; name="${name// /}"; mem="${mem// /}"
+      [[ -z "$pid" ]] && continue
+      emit "  %-7s %-20s %s MB\n" "$pid" "$name" "$mem"
+    done < <(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null)
+  else
+    info "No NVIDIA GPU detected or nvidia-smi not available"
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: Memory
+# ============================================================================
+if should_run "$RUN_MEMORY"; then
+section "MEMORY"
+
+MEM_TOTAL=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+MEM_AVAIL=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+USED_PCT=0
+if [[ -n "$MEM_TOTAL" && -n "$MEM_AVAIL" && "$MEM_TOTAL" -gt 0 ]]; then
+  MEM_USED=$(( MEM_TOTAL - MEM_AVAIL ))
+  USED_PCT=$(( MEM_USED * 100 / MEM_TOTAL ))
+  info "RAM: $((MEM_USED/1024)) MB / $((MEM_TOTAL/1024)) MB used (${USED_PCT}%)  $(bar $USED_PCT)"
+
+  if (( USED_PCT >= 95 )); then
+    crit "Memory is CRITICALLY low (${USED_PCT}% used, only $((MEM_AVAIL/1024)) MB available)"
+  elif (( USED_PCT >= 85 )); then
+    warn "Memory pressure is high (${USED_PCT}% used)"
+  else
+    ok "Memory usage normal (${USED_PCT}%)"
+  fi
+fi
+
+# Swap
+SWAP_TOTAL=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+SWAP_FREE=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
+SWAP_USED=0
+SWAP_TOTAL_MB=0
+SWAP_PCT=0
+if [[ -n "$SWAP_TOTAL" && "$SWAP_TOTAL" -gt 0 ]]; then
+  SWAP_USED_KB=$(( SWAP_TOTAL - SWAP_FREE ))
+  SWAP_PCT=$(( SWAP_USED_KB * 100 / SWAP_TOTAL ))
+  SWAP_USED=$(( SWAP_USED_KB / 1024 ))
+  SWAP_TOTAL_MB=$(( SWAP_TOTAL / 1024 ))
+  info "Swap: ${SWAP_USED} MB / ${SWAP_TOTAL_MB} MB used (${SWAP_PCT}%)  $(bar $SWAP_PCT)"
+
+  # Read PSI memory pressure here too — swap% alone is misleading.
+  # A system with 28Gi RAM available and 2.6Gi swapped is not "thrashing".
+  MEM_PSI_PCT=$(awk '$1=="some" { for (i=2;i<=NF;i++) if ($i ~ /^avg60=/) { split($i,a,"="); print a[2]+0; exit } }' /proc/pressure/memory 2>/dev/null)
+  MEM_PSI_PCT=${MEM_PSI_PCT%.*}; MEM_PSI_PCT=${MEM_PSI_PCT:-0}
+
+  if (( SWAP_PCT >= 80 )) && [[ "${MEM_PSI_PCT:-0}" -ge 5 ]]; then
+    crit "Swap is ${SWAP_PCT}% full AND memory PSI is ${MEM_PSI_PCT}% — system is genuinely thrashing, OOM imminent"
+  elif (( SWAP_PCT >= 80 )); then
+    info "Swap is ${SWAP_PCT}% full but memory pressure is low (${MEM_PSI_PCT}%) — pages are simply parked, not actively used"
+  elif (( SWAP_PCT >= 30 )) && [[ "${MEM_PSI_PCT:-0}" -ge 10 ]]; then
+    warn "Swap ${SWAP_PCT}% + memory PSI ${MEM_PSI_PCT}% — actively thrashing"
+  elif (( SWAP_USED > 100 )); then
+    info "Swap has ${SWAP_USED} MB parked pages but system is not under memory pressure (PSI ${MEM_PSI_PCT}%)"
+  fi
+else
+  info "No swap configured"
+fi
+
+# OOM killer history
+OOM_COUNT=0
+if command -v journalctl >/dev/null 2>&1; then
+  OOM_COUNT=$(journalctl -k --grep="Out of memory" --since "24 hours ago" -q 2>/dev/null | wc -l)
+  if (( OOM_COUNT > 0 )); then
+    crit "$OOM_COUNT OOM killer event(s) in the last 24 hours"
+  else
+    ok "No recent OOM kills"
+  fi
+fi
+
+subsec "Top memory consumers"
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "  ${C_DIM}%-7s %5s %5s %7s  %-10s %s${C_RESET}\n" "PID" "CPU%" "MEM%" "RSS(MB)" "USER" "COMMAND"
+  ps -eo pid,pcpu,pmem,rss,user,comm --sort=-rss 2>/dev/null \
+    | awk -v sysd="$SYSTEM_DAEMON_RE" '
+        NR>1 && $5 !~ /^[kK]thread/ {
+          is_root = ($5 == "root")
+          is_sysd = ($6 ~ sysd)
+          flag = (is_root && !is_sysd) ? "⚠" : " "
+          printf "  %s%-7s %5s %5s %7s  %-10s %s\n", flag, $1, $2, $3, int($4/1024), $5, $6
+        }' \
+    | head -10
+fi
+fi  # /RUN_MEMORY
+
+# ============================================================================
+# SECTION 6: Disk
+# ============================================================================
+if should_run "$RUN_DISK"; then
+section "DISK"
+
+subsec "Filesystem usage"
+while read -r fs size used avail pct target; do
+  pct_num=$(echo "$pct" | tr -d '%')
+  [[ -z "$pct_num" ]] && pct_num=0
+  emit "  %-30s %6s / %6s  %s  %s\n" \
+    "$(trunc "$target" 30)" "$used" "$size" "$(bar "$pct_num")" "$fs"
+  if (( pct_num >= 95 )); then
+    warn "Filesystem $target at ${pct} - almost full"
+  elif (( pct_num >= 90 )); then
+    warn "Filesystem $target at ${pct}"
+  fi
+done < <(df -h --output=source,size,used,avail,pcent,target 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev/')
+
+if [[ $QUICK -eq 0 ]] && command -v iostat >/dev/null 2>&1; then
+  subsec "I/O statistics (1 second sample)"
+  if [[ $JSON_OUT -eq 0 ]]; then
+    iostat -dx 1 2 2>/dev/null | tail -n +4 | awk '
+      NR==1 { next }
+      /^[ ]*Device/ { header=1; next }
+      header && NF >= 6 {
+        util = $NF + 0
+        col = ""
+        if (util > 80) col = "\033[31m"
+        else if (util > 50) col = "\033[33m"
+        printf "  %s%-12s r/s=%6.1f w/s=%6.1f rkB/s=%7.1f wkB/s=%7.1f await=%5.1fms util=%s%%\033[0m\n",
+          col, $1, $4, $5, $6, $7, $10, util
+      }' | head -10
+  fi
+fi
+fi  # /RUN_DISK
+
+# ============================================================================
+# SECTION 7: Network
+# ============================================================================
+if [[ $QUICK -eq 0 ]] && should_run "$RUN_NETWORK"; then
+  section "NETWORK"
+
+  subsec "Connection states"
+  if command -v ss >/dev/null 2>&1; then
+    count_conn() { ss -tan state "$1" 2>/dev/null | tail -n +2 | wc -l; }
+    ESTAB=$(count_conn established)
+    TW=$(count_conn time-wait)
+    CW=$(count_conn close-wait)
+    LISTEN=$(count_conn listening)
+    SYN_RCVD=$(count_conn syn-recv)
+    emit "  ${C_DIM}%-12s${C_RESET} %s\n" "ESTABLISHED" "$ESTAB"
+    emit "  ${C_DIM}%-12s${C_RESET} %s\n" "TIME-WAIT"   "$TW"
+    emit "  ${C_DIM}%-12s${C_RESET} %s\n" "CLOSE-WAIT"  "$CW"
+    emit "  ${C_DIM}%-12s${C_RESET} %s\n" "LISTEN"      "$LISTEN"
+    emit "  ${C_DIM}%-12s${C_RESET} %s\n" "SYN-RECV"    "$SYN_RCVD"
+    if (( CW > 50 )); then
+      warn "$CW connections in CLOSE-WAIT - apps not closing sockets"
+    fi
+    if (( TW > 1000 )); then
+      warn "$TW connections in TIME-WAIT - high connection churn"
+    fi
+    if (( SYN_RCVD > 100 )); then
+      crit "$SYN_RCVD connections in SYN-RECV — possible SYN FLOOD"
+      info "  Mitigate: ${C_CYAN}sudo sysctl -w net.ipv4.tcp_syncookies=1${C_RESET}"
+      info "           ${C_CYAN}sudo iptables -A INPUT -p tcp --syn -m limit --limit 1/s --limit-burst 3 -j ACCEPT${C_RESET}"
+    elif (( SYN_RCVD > 20 )); then
+      warn "$SYN_RCVD connections in SYN-RECV — elevated"
+    fi
+  fi
+
+  # NEW: per-IP connection analysis (DDoS detection)
+  subsec "Top source IPs by connection count (DDoS indicator)"
+  if command -v ss >/dev/null 2>&1; then
+    TOP_IPS=$(ss -tan state established 2>/dev/null \
+      | tail -n +2 \
+      | awk '{print $5}' | cut -d: -f1 \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|^[0-9a-fA-F:]+$' \
+      | sort | uniq -c | sort -rn | head -10)
+    if [[ -n "$TOP_IPS" ]]; then
+      while IFS= read -r line; do
+        COUNT=$(awk '{print $1}' <<< "$line")
+        IP=$(awk '{print $2}' <<< "$line")
+        if (( COUNT > 200 )); then
+          crit "  $IP — $COUNT established connections (possible flood)"
+        elif (( COUNT > 50 )); then
+          warn "  $IP — $COUNT established connections"
+        else
+          info "  $IP — $COUNT connections"
+        fi
+      done <<< "$TOP_IPS"
+    else
+      info "No established connections to analyze"
+    fi
+  fi
+
+  # NEW: per-interface bandwidth (current snapshot, no rate)
+  subsec "Interface bandwidth (bytes since boot — current snapshot)"
+  if [[ -r /proc/net/dev ]]; then
+    while IFS= read -r line; do
+      [[ "$line" =~ Inter- || "$line" =~ \|bytes ]] && continue
+      IFACE=$(awk '{print $1}' <<< "$line" | tr -d ':')
+      [[ "$IFACE" == "lo" ]] && continue
+      RX_BYTES=$(awk '{print $2}' <<< "$line")
+      TX_BYTES=$(awk '{print $10}' <<< "$line")
+      RX_MB=$((RX_BYTES / 1024 / 1024))
+      TX_MB=$((TX_BYTES / 1024 / 1024))
+      printf "  ${C_DIM}%-12s${C_RESET} RX: %10d MB   TX: %10d MB\n" "$IFACE" "$RX_MB" "$TX_MB"
+    done < /proc/net/dev
+    info "Live bandwidth: ${C_CYAN}iftop -i <iface>${C_RESET} or ${C_CYAN}sudo nethogs${C_RESET}"
+  fi
+
+  subsec "DNS resolution check"
+  for ns in "router:192.168.1.1" "cloudflare:1.1.1.1" "google:8.8.8.8"; do
+    name="${ns%%:*}"; ip="${ns##*:}"
+    t=$(dig @"$ip" news.google.com +time=2 +tries=1 +short 2>&1 | head -1)
+    [[ -n "$t" ]] && ok "DNS via $name ($ip): $t" || warn "DNS via $name ($ip) failed"
+  done
+fi
+
+# ============================================================================
+# SECTION 8: Browser
+# ============================================================================
+if should_run "$RUN_BROWSER"; then
+section "BROWSER STATE"
+
+CHROME_PROCS=$(pgrep -c chromium 2>/dev/null | head -1)
+CHROME_PROCS=${CHROME_PROCS:-0}
+FIREFOX_PROCS=$(pgrep -c firefox 2>/dev/null | head -1)
+FIREFOX_PROCS=${FIREFOX_PROCS:-0}
+
+if (( CHROME_PROCS > 0 )); then
+  info "Chromium processes: $CHROME_PROCS"
+  CHROME_STATS=$(ps -C chromium -o pcpu= -o rss= 2>/dev/null \
+    | awk '{cpu+=$1; rss+=$2; n++} END {printf "%d %.1f %d", cpu, rss/1024, n}')
+  CHROME_CPU=$(echo "$CHROME_STATS" | awk '{print $1}')
+  CHROME_RSS=$(echo "$CHROME_STATS" | awk '{printf "%.0f", $2}')
+  CHROME_N=$(echo "$CHROME_STATS" | awk '{print $3}')
+
+  info "Total Chrome CPU: ${CHROME_CPU}%   Memory: ${CHROME_RSS} MB across ${CHROME_N} processes"
+  # Count ONLY processes whose --type= flag is exactly 'renderer' (i.e., real tab processes).
+  # --type= also covers: gpu, network-service, storage-service, utility, audio-service,
+  # device-query-service, extension, sandbox-namespace-teardown. None of those are tabs.
+  RENDERERS=$(ps -eo args= 2>/dev/null | awk '{
+      for (i=1; i<=NF; i++) if ($i == "--type=renderer") { print; next }
+    }' | wc -l)
+  # Also classify other process roles for visibility
+  CHROMIUM_GPU=$(ps -eo args= 2>/dev/null | awk '{
+      for (i=1; i<=NF; i++) if ($i == "--type=gpu-process") { print; next }
+    }' | wc -l)
+  CHROMIUM_NET=$(ps -eo args= 2>/dev/null | awk '{
+      for (i=1; i<=NF; i++) if ($i == "--type=network-service") { print; next }
+    }' | wc -l)
+  CHROMIUM_EXT=$(ps -eo args= 2>/dev/null | awk '{
+      for (i=1; i<=NF; i++) if ($i == "--type=extension") { print; next }
+    }' | wc -l)
+  CHROMIUM_UTIL=$(ps -eo args= 2>/dev/null | awk '{
+      for (i=1; i<=NF; i++) {
+        v=$i
+        if (v == "--type=utility") { print; next }
+        if (v == "--type=storage-service") { print; next }
+        if (v == "--type=audio-service") { print; next }
+      }
+    }' | wc -l)
+
+  info "Tab renderers: ${C_BOLD}${RENDERERS}${C_RESET}  ·  GPU: ${CHROMIUM_GPU}  ·  Network: ${CHROMIUM_NET}  ·  Extensions: ${CHROMIUM_EXT}  ·  Utilities: ${CHROMIUM_UTIL}"
+  info "${C_DIM}Note: each tab can spawn 3–6 renderers (site isolation). 10 tabs ≈ 30-60 renderers.${C_RESET}"
+
+  # Heuristic threshold: renderers / 4 = estimated tabs.
+  # > 8 estimated tabs is already heavy for typical use
+  EST_TABS=$(( RENDERERS / 4 ))
+  if (( EST_TABS > 12 )); then
+    crit "≈${EST_TABS} Chrome tabs (${RENDERERS} renderer procs) — close some tabs to free memory"
+  elif (( EST_TABS > 7 )); then
+    warn "≈${EST_TABS} Chrome tabs (${RENDERERS} renderer procs)"
+  fi
+
+  if (( CHROME_RSS > 8192 )); then
+    crit "Chrome using ${CHROME_RSS} MB of RAM — consider restarting"
+  elif (( CHROME_RSS > 4096 )); then
+    warn "Chrome using ${CHROME_RSS} MB of RAM"
+  fi
+fi
+
+if (( FIREFOX_PROCS > 0 )); then
+  info "Firefox processes: $FIREFOX_PROCS"
+fi
+fi  # /RUN_BROWSER
+
+# ============================================================================
+# SECTION 9: Services & logs
+# ============================================================================
+if should_run "$RUN_SERVICES"; then
+section "SERVICES & LOGS"
+
+if command -v systemctl >/dev/null 2>&1; then
+  subsec "Failed systemd units"
+  FAILED_TOTAL=$(systemctl --failed --no-pager --no-legend 2>/dev/null | wc -l)
+  PRINTER_FAILS=$(systemctl --failed --no-pager --no-legend 2>/dev/null | grep -cE "$PRINTER_UNIT_RE" 2>/dev/null || echo 0)
+  REAL_FAILS=$(( FAILED_TOTAL - PRINTER_FAILS ))
+  if (( FAILED_TOTAL > 0 )); then
+    if (( REAL_FAILS > 0 )); then
+      crit "$REAL_FAILS non-printer failed unit(s) ($PRINTER_FAILS printer-related, expected):"
+      if [[ $JSON_OUT -eq 0 ]]; then
+        systemctl --failed --no-pager --no-legend 2>/dev/null \
+          | grep -vE "$PRINTER_UNIT_RE" \
+          | sed 's/^/    /'
+      fi
+    else
+      info "$FAILED_TOTAL failed units, but all are $PRINTER_FAILS printer-related (expected — no printers plugged in)"
+    fi
+  else
+    ok "No failed systemd units"
+  fi
+fi
+
+if command -v journalctl >/dev/null 2>&1; then
+  subsec "Recent errors (last 1 hour, errors only)"
+  ERR_COUNT=$(journalctl -p err --since "1 hour ago" --no-pager -q 2>/dev/null | wc -l)
+  if (( ERR_COUNT > 20 )); then
+    crit "$ERR_COUNT errors in last hour"
+  elif (( ERR_COUNT > 0 )); then
+    warn "$ERR_COUNT errors in last hour"
+  else
+    ok "No errors in last hour"
+  fi
+fi
+fi  # /RUN_SERVICES
+
+# ============================================================================
+# SECTION 10: Top offenders (only if CPU or Memory sections ran)
+# ============================================================================
+if should_run "$RUN_CPU" || should_run "$RUN_MEMORY"; then
+section "TOP OFFENDERS"
+# ============================================================================
+section "TOP OFFENDERS"
+if [[ $JSON_OUT -eq 0 ]]; then
+  subsec "Top 10 by CPU"
+  printf "  ${C_DIM}%-7s %-10s %5s %5s %7s  %s${C_RESET}\n" "PID" "USER" "CPU%" "MEM%" "RSS(MB)" "COMMAND"
+  ps -eo pid,user,pcpu,pmem,rss,comm --sort=-pcpu 2>/dev/null \
+    | awk -v sysd="$SYSTEM_DAEMON_RE" '
+        NR>1 {
+          is_root = ($2 == "root")
+          is_sysd = ($6 ~ sysd)
+          flag = (is_root && !is_sysd) ? "⚠" : " "
+          printf "  %s%-7s %-10s %5s %5s %7s  %s\n", flag, $1, $2, $3, $4, int($5/1024), $6
+        }' \
+    | head -10
+
+  subsec "Top 10 by Memory"
+  printf "  ${C_DIM}%-7s %-10s %5s %5s %7s  %s${C_RESET}\n" "PID" "USER" "CPU%" "MEM%" "RSS(MB)" "COMMAND"
+  ps -eo pid,user,pcpu,pmem,rss,comm --sort=-rss 2>/dev/null \
+    | awk -v sysd="$SYSTEM_DAEMON_RE" '
+        NR>1 {
+          is_root = ($2 == "root")
+          is_sysd = ($6 ~ sysd)
+          flag = (is_root && !is_sysd) ? "⚠" : " "
+          printf "  %s%-7s %-10s %5s %5s %7s  %s\n", flag, $1, $2, $3, $4, int($5/1024), $6
+        }' \
+    | head -10
+fi
+fi  # /RUN_CPU or RUN_MEMORY
+
+# ============================================================================
+# SECTION 11: Process probes (deep-dive on suspicious PIDs)
+# ============================================================================
+if [[ $QUICK -eq 0 ]] && [[ $JSON_OUT -eq 0 ]] && should_run "$RUN_SUSPICIOUS"; then
+  section "PROCESS PROBES"
+  info "Deep-dive on the top non-system CPU consumers"
+
+  # Pick the top 2 root-or-high-CPU PIDs that aren't system daemons
+  PROBE_LIST=$(ps -eo pid,user,pcpu,comm --no-headers 2>/dev/null \
+    | awk -v sysd="$SYSTEM_DAEMON_RE" '
+        $2 == "root" && !($4 ~ sysd) { print $1, $3; next }
+        { print $1, $3 }' \
+    | sort -k2 -gr \
+    | head -3 \
+    | awk '{print $1}')
+
+  if [[ -n "$PROBE_LIST" ]]; then
+    for pid in $PROBE_LIST; do
+      [[ ! -d "/proc/$pid" ]] && continue
+      probe_pid "$pid" "Top consumer"
+    done
+  else
+    info "No probes needed"
+  fi
+fi
+
+# ============================================================================
+# SECTION 11.5: CRASH DIAGNOSTICS (NEW — for "system is crashing" triage)
+# ============================================================================
+if should_run "$RUN_CRASH"; then
+section "CRASH DIAGNOSTICS — why is the system unstable?"
+info "Surfaces OOM kills, kernel panics, segfaults, MCE hardware errors"
+info "and recent service failures. Designed for fast triage during outages."
+
+# 1. OOM killer events
+subsec "OOM killer (last 24 hours)"
+OOM_COUNT=0
+if command -v journalctl >/dev/null 2>&1; then
+  OOM_LINES=$(journalctl -k --since "24 hours ago" --no-pager -q 2>/dev/null \
+    | grep -i "out of memory\|killed process" || true)
+  if [[ -n "$OOM_LINES" ]]; then
+    OOM_COUNT=$(wc -l <<< "$OOM_LINES")
+    crit "$OOM_COUNT OOM-kill event(s) in last 24 hours"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      printf "    ${C_DIM}%s${C_RESET}\n" "${line:0:120}"
+    done <<< "$OOM_LINES" | head -5
+    info "Full OOM context:"
+    info "  ${C_CYAN}sudo journalctl -k --since '24 hours ago' | grep -i 'out of memory' -B 5 -A 5${C_RESET}"
+    info "Likely fix: identify the process with: ${C_CYAN}ps aux --sort=-rss | head${C_RESET}"
+  else
+    ok "No OOM kills in last 24h"
+  fi
+fi
+
+# 2. Kernel panic / hard lockup
+subsec "Kernel panic / hard lockup (dmesg)"
+if [[ -r /dev/kmsg ]] || command -v journalctl >/dev/null 2>&1; then
+  PANIC=$(journalctl -k --no-pager -q --since "7 days ago" 2>/dev/null \
+    | grep -iE "kernel panic|hard LOCKUP|soft lockup|Oops:|BUG:|general protection fault" || true)
+  if [[ -n "$PANIC" ]]; then
+    PCNT=$(wc -l <<< "$PANIC")
+    crit "$PCNT kernel panic / lockup / fault event(s) in last 7 days"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      printf "    ${C_DIM}%s${C_RESET}\n" "${line:0:120}"
+    done <<< "$PANIC" | head -5
+    info "Inspect: ${C_CYAN}sudo journalctl -k --since '7 days ago' | grep -iE 'panic|lockup|oops|bug'${C_RESET}"
+  else
+    ok "No kernel panics / lockups in last 7 days"
+  fi
+fi
+
+# 3. User-space segfaults
+subsec "User-space segfaults (last 24h)"
+if command -v journalctl >/dev/null 2>&1; then
+  SEGF=$(journalctl --no-pager -q --since "24 hours ago" 2>/dev/null \
+    | grep -iE "segfault|segmentation fault|SIGSEGV" | head -10 || true)
+  if [[ -n "$SEGF" ]]; then
+    SCNT=$(wc -l <<< "$SEGF")
+    warn "$SCNT segfault event(s) — usually a buggy app or corrupted binary"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      printf "    ${C_DIM}%s${C_RESET}\n" "${line:0:120}"
+    done <<< "$SEGF" | head -5
+    info "Likely fix: update the offending package or check core dumps in /var/lib/systemd/coredump/"
+  else
+    ok "No user-space segfaults in last 24h"
+  fi
+fi
+
+# 4. Hardware errors / MCE
+subsec "Hardware errors (MCE / EDAC)"
+if command -v journalctl >/dev/null 2>&1; then
+  MCE=$(journalctl -k --no-pager -q --since "7 days ago" 2>/dev/null \
+    | grep -iE "machine check exception|mce:|hardware error|edac" || true)
+  if [[ -n "$MCE" ]]; then
+    MCNT=$(wc -l <<< "$MCE")
+    crit "$MCNT hardware error event(s) — possible CPU/RAM failure"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      printf "    ${C_DIM}%s${C_RESET}\n" "${line:0:120}"
+    done <<< "$MCE" | head -5
+    info "Action: run memtest86+ (RAM test) and check CPU temperatures"
+  else
+    ok "No MCE / hardware errors in last 7 days"
+  fi
+fi
+
+# 5. Failed systemd units (deeper than --services)
+subsec "Failed systemd units (immediate investigation)"
+if command -v systemctl >/dev/null 2>&1; then
+  FAILED_LIST=$(systemctl --failed --no-pager --no-legend 2>/dev/null | grep -vE "$PRINTER_UNIT_RE" || true)
+  if [[ -n "$FAILED_LIST" ]]; then
+    FCOUNT=$(wc -l <<< "$FAILED_LIST")
+    crit "$FCOUNT failed unit(s) (excluding printer-related noise):"
+    while IFS= read -r line; do
+      printf "    ${C_RED}%s${C_RESET}\n" "$line"
+    done <<< "$FAILED_LIST" | head -10
+    info "Reset failed state: ${C_CYAN}sudo systemctl reset-failed${C_RESET}"
+    info "Investigate one:    ${C_CYAN}systemctl status <name> && journalctl -u <name> -n 50${C_RESET}"
+  else
+    ok "No failed systemd units (after excluding printer noise)"
+  fi
+fi
+
+# 6. SMART / disk errors
+subsec "Disk SMART errors"
+if command -v smartctl >/dev/null 2>&1; then
+  for disk in /dev/sda /dev/nvme0n1 /dev/vda; do
+    [[ -b "$disk" ]] || continue
+    SMART=$(smartctl -H "$disk" 2>/dev/null | grep -i "result:" || true)
+    if [[ "$SMART" == *"FAILED"* ]]; then
+      crit "Disk $disk FAILED self-test — back up data NOW"
+    elif [[ -n "$SMART" ]]; then
+      info "Disk $disk: $(awk -F: '{print $2}' <<< "$SMART" | xargs)"
+    fi
+  done
+else
+  info "smartctl not installed (apt install smartmontools)"
+fi
+
+info ""
+info "QUICK ACTIONS for unstable system:"
+info "  ${C_CYAN}free -h${C_RESET}                  current RAM + swap"
+info "  ${C_CYAN}sudo dmesg | tail -100${C_RESET}    recent kernel events"
+info "  ${C_CYAN}sudo journalctl -p err -n 100${C_RESET}  recent errors"
+info "  ${C_CYAN}uptime; w${C_RESET}                who is logged in, load over time"
+fi  # /RUN_CRASH
+
+# ============================================================================
+# SECTION 11.7: WEB SERVER STATUS (NEW — for DDoS / 'site is under attack' triage)
+# ============================================================================
+if should_run "$RUN_WEB"; then
+section "WEB SERVER STATUS — is the site being attacked?"
+info "Auto-detects nginx, apache2, and caddy. Shows status, request rate,"
+info "top IPs in access logs, and recent errors."
+
+WEB_FOUND=0
+for svc in nginx apache2 caddy httpd; do
+  if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q "^${svc}.service"; then
+    WEB_FOUND=1
+    subsec "$svc"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      ok "$svc is RUNNING"
+    else
+      warn "$svc is NOT running — site is down"
+    fi
+    PID=$(systemctl show -p MainPID "$svc" --value 2>/dev/null)
+    if [[ -n "$PID" && "$PID" -gt 0 ]] && [[ -r "/proc/$PID/status" ]]; then
+      RSS=$(awk '/^VmRSS:/ {print int($2/1024)}' "/proc/$PID/status" 2>/dev/null)
+      THREADS=$(awk '/^Threads:/ {print $2}' "/proc/$PID/status" 2>/dev/null)
+      info "  PID: $PID   RSS: ${RSS} MB   Threads: ${THREADS:-?}"
+    fi
+    info "  Edit config: ${C_CYAN}sudo systemctl cat $svc${C_RESET} → shows the unit"
+  fi
+done
+
+if (( WEB_FOUND == 0 )); then
+  info "No nginx/apache2/caddy/httpd unit detected"
+fi
+
+# Detect access/error logs
+subsec "Web server logs"
+declare -A LOG_PATHS=(
+  [nginx]="[/var/log/nginx/access.log /var/log/nginx/access.log.1 /var/log/nginx/error.log]"
+  [apache]="[/var/log/apache2/access.log /var/log/apache2/access.log.1 /var/log/apache2/error.log]"
+  [caddy]="[/var/log/caddy/access.log /var/log/caddy/access.log.1]"
+)
+LOG_TOTAL_LINES=0
+for key in nginx apache caddy; do
+  log_files=${LOG_PATHS[$key]}
+  log_files=${log_files#[}; log_files=${log_files%]}
+  for log in $log_files; do
+    [[ -f "$log" ]] || continue
+    LINES=$(wc -l < "$log" 2>/dev/null)
+    LOG_TOTAL_LINES=$((LOG_TOTAL_LINES + LINES))
+    SIZE=$(du -h "$log" 2>/dev/null | awk '{print $1}')
+    info "  $log — $SIZE ($LINES lines)"
+  done
+done
+
+# Top IPs in nginx access logs (last 10k lines)
+subsec "Top source IPs in access logs (last 10k lines)"
+TOP_IPS=$( (
+  for log in /var/log/nginx/access.log /var/log/nginx/access.log.1 /var/log/apache2/access.log /var/log/apache2/access.log.1 /var/log/caddy/access.log /var/log/caddy/access.log.1; do
+    [[ -f "$log" ]] && tail -10000 "$log" 2>/dev/null
+  done
+) | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || $i ~ /^[0-9a-fA-F:]+:[0-9a-fA-F:]+$/) {print $i; break}}' \
+  | sort | uniq -c | sort -rn | head -15 )
+
+if [[ -n "$TOP_IPS" ]]; then
+  while IFS= read -r line; do
+    COUNT=$(awk '{print $1}' <<< "$line")
+    IP=$(awk '{print $2}' <<< "$line")
+    if (( COUNT > 5000 )); then
+      crit "  $IP — $COUNT requests (likely attack)"
+    elif (( COUNT > 500 )); then
+      warn "  $IP — $COUNT requests"
+    else
+      info "  $IP — $COUNT requests"
+    fi
+  done <<< "$TOP_IPS"
+  info ""
+  info "If a single IP dominates: ban it with:"
+  info "  ${C_CYAN}sudo ufw deny from <IP>${C_RESET}                # quick block"
+  info "  ${C_CYAN}sudo iptables -I INPUT -s <IP> -j DROP${C_RESET} # kernel-level block"
+  info "  ${C_CYAN}sudo fail2ban-client set <jail> banip <IP>${C_RESET}  # if fail2ban is running"
+else
+  ok "No access logs to analyze (or empty)"
+fi
+
+# Recent 4xx/5xx errors
+subsec "Recent 4xx/5xx responses (last 1k lines)"
+ERROR_LINES=$( (
+  for log in /var/log/nginx/access.log /var/log/nginx/access.log.1 /var/log/apache2/access.log /var/log/apache2/access.log.1 /var/log/caddy/access.log; do
+    [[ -f "$log" ]] && tail -1000 "$log" 2>/dev/null
+  done
+) | grep -E '" [4-5][0-9]{2} ' | head -15 )
+
+if [[ -n "$ERROR_LINES" ]]; then
+  ECNT=$(wc -l <<< "$ERROR_LINES")
+  if (( ECNT > 100 )); then
+    crit "$ECNT 4xx/5xx responses in last 1k lines (likely abuse)"
+  else
+    warn "$ECNT 4xx/5xx responses"
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf "    ${C_DIM}%s${C_RESET}\n" "${line:0:160}"
+  done <<< "$ERROR_LINES" | head -10
+else
+  ok "No recent 4xx/5xx errors"
+fi
+
+# Tail of error log
+subsec "Tail of error log (last 15 lines)"
+ERR_LOG=""
+for log in /var/log/nginx/error.log /var/log/apache2/error.log /var/log/caddy/error.log; do
+  [[ -f "$log" ]] && { ERR_LOG="$log"; break; }
+done
+if [[ -n "$ERR_LOG" ]]; then
+  tail -15 "$ERR_LOG" 2>/dev/null | while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf "    ${C_DIM}%s${C_RESET}\n" "${line:0:160}"
+  done
+else
+  info "No error log found"
+fi
+fi  # /RUN_WEB
+
+# ============================================================================
+# SECTION 12: Recommendations & Verdict
+# ============================================================================
+END_TIME=$(date +%s)
+DURATION=$(( END_TIME - START_TIME ))
+
+if [[ $JSON_OUT -eq 1 ]]; then
+  verdict="healthy"
+  (( CRITICAL > 0 )) && verdict="critical"
+  (( CRITICAL == 0 && WARNINGS > 0 )) && verdict="warning"
+
+  # Restore stdout so the JSON output goes to the caller (all.sh),
+  # and drop the captured audit text.
+  exec 1>&3
+  exec 3>&-
+  [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
+
+  cat << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "hostname": "$HOSTNAME_SHORT",
+  "uptime": "$(uptime -p 2>/dev/null || uptime)",
+  "load": [$(awk '{print $1, $2, $3}' /proc/loadavg | tr ' ' ',' | sed 's/,$//')],
+  "cpus": $CPU_COUNT,
+  "memory_total_mb": ${TOTAL_MB:-0},
+  "memory_used_pct": $USED_PCT,
+  "swap_used_mb": ${SWAP_USED:-0},
+  "swap_used_pct": $SWAP_PCT,
+  "oom_events": $OOM_COUNT,
+  "package_temp_c": "${PKG_TEMP:-}",
+  "hot_core": "${HOT_CORE:-}",
+  "hot_core_pct": $HOT_PCT,
+  "critical": $CRITICAL,
+  "warnings": $WARNINGS,
+  "verdict": "$verdict",
+  "duration_s": $DURATION
+}
+EOF
+  exit 0
+fi
+
+# ---------- PSI BOTTLENECK RANKING — what's actually slowing you down ----------
+section "PSI BOTTLENECK RANKING — WHAT'S ACTUALLY SLOWING YOU DOWN?"
+info "${C_DIM}Pressure Stall Information (PSI): percent of wall-clock time at least one task${C_RESET}"
+info "${C_DIM}was waiting on each subsystem. Higher % = the real bottleneck.${C_RESET}"
+echo ""
+
+psi_field() {
+    local file="$1" kind="$2" field="$3"
+    [[ -r "$file" ]] || { echo ""; return; }
+    awk -v k="$kind" -v f="$field" '$1==k { for (i=2; i<=NF; i++) if ($i ~ ("^"f"=")) { split($i,a,"="); print a[2]; exit } }' "$file"
+}
+psi_color() {
+    local v=${1%.*}
+    [[ -z "$v" || "$v" -lt 5 ]]  && { echo "$C_GREEN";  return; }
+    [[ "$v" -lt 15 ]]             && { echo "$C_YELLOW"; return; }
+    echo "$C_RED"
+}
+
+CPU_10=$(psi_field /proc/pressure/cpu    some avg10)
+IO_10=$(psi_field  /proc/pressure/io     some avg10)
+MEM_10=$(psi_field /proc/pressure/memory some avg10)
+CPU_60=$(psi_field /proc/pressure/cpu    some avg60); [[ -z "$CPU_60" ]] && CPU_60="$CPU_10"
+IO_60=$(psi_field  /proc/pressure/io     some avg60); [[ -z "$IO_60"  ]] && IO_60="$IO_10"
+MEM_60=$(psi_field /proc/pressure/memory some avg60); [[ -z "$MEM_60" ]] && MEM_60="$MEM_10"
+
+printf "  ${C_DIM}%-22s  %7s  %7s  %7s${C_RESET}\n" "SUBSYSTEM" "10s" "60s" "5m"
+printf "  ${C_DIM}──────────────────────────────────────────────────${C_RESET}\n"
+printf "  ${C_DIM}%-22s${C_RESET}  " "CPU pressure"
+c=$(psi_color "$CPU_10"); printf "${c}%7s${C_RESET}  " "${CPU_10:-—}%"
+c=$(psi_color "$CPU_60"); printf "${c}%7s${C_RESET}  " "${CPU_60:-—}%"
+c=$(psi_color "$CPU_60"); printf "${c}%7s${C_RESET}\n" "${CPU_60:-—}%"
+printf "  ${C_DIM}%-22s${C_RESET}  " "I/O pressure"
+c=$(psi_color "$IO_10"); printf "${c}%7s${C_RESET}  " "${IO_10:-—}%"
+c=$(psi_color "$IO_60"); printf "${c}%7s${C_RESET}  " "${IO_60:-—}%"
+c=$(psi_color "$IO_60"); printf "${c}%7s${C_RESET}\n" "${IO_60:-—}%"
+printf "  ${C_DIM}%-22s${C_RESET}  " "Memory pressure"
+c=$(psi_color "$MEM_10"); printf "${c}%7s${C_RESET}  " "${MEM_10:-—}%"
+c=$(psi_color "$MEM_60"); printf "${c}%7s${C_RESET}  " "${MEM_60:-—}%"
+c=$(psi_color "$MEM_60"); printf "${c}%7s${C_RESET}\n" "${MEM_60:-—}%"
+echo ""
+
+# Rank
+RANKING=$(awk -v cpu="${CPU_60:-0}" -v io="${IO_60:-0}" -v mem="${MEM_60:-0}" \
+    'BEGIN { printf "CPU %s\nIO  %s\nMEM %s\n", cpu+0, io+0, mem+0 }' | sort -k2 -nr)
+PRIMARY=$(head -1 <<< "$RANKING" | awk '{print $1}')
+PRIMARY_PCT=$(head -1 <<< "$RANKING" | awk '{print $2}')
+info "  ${C_BOLD}Primary bottleneck:${C_RESET} ${C_RED}${PRIMARY}${C_RESET} subsystem at ~${PRIMARY_PCT}% avg60"
+
+case "$PRIMARY" in
+    IO)
+        info "  ${C_DIM}Tasks are waiting on storage. The CPU is starving.${C_RESET}"
+        info "  ${C_DIM}Suspects: swap traffic, runaway log writes, DB writes, slow disk.${C_RESET}"
+        ;;
+    CPU)
+        info "  ${C_DIM}CPU is saturated. Tasks are waiting for compute.${C_RESET}"
+        info "  ${C_DIM}Suspects: runaway process, single-threaded workload, thermal throttle.${C_RESET}"
+        ;;
+    MEM)
+        info "  ${C_DIM}Tasks are waiting on memory pages. System is RAM-starved.${C_RESET}"
+        info "  ${C_DIM}Suspects: heavy process, leaky service, undersized RAM.${C_RESET}"
+        ;;
+esac
+echo ""
+
+# ---------- Smart Recommendations ----------
+section "RECOMMENDATIONS"
+rec_count=0
+rec_high=0
+rec_med=0
+rec_low=0
+
+# Helper to print a color-coded recommendation
+print_rec() {
+  local severity=$1   # "high", "med", "low"
+  local label=$2
+  local reason=$3
+  local cmd=$4
+  local color sym
+  case "$severity" in
+    high) color="$C_RED";    sym="▶▶"; rec_high=$((rec_high + 1)) ;;
+    med)  color="$C_YELLOW"; sym="▶";  rec_med=$((rec_med + 1))  ;;
+    low)  color="$C_DIM";    sym="·";  rec_low=$((rec_low + 1))  ;;
+  esac
+  emit "  ${color}${sym} ${C_BOLD}%s${C_RESET}  ${C_DIM}—${C_RESET} %s\n" "$label" "$reason"
+  [[ -n "$cmd" ]] && emit "    ${C_CYAN}\$ %s${C_RESET}\n" "$cmd"
+  rec_count=$((rec_count + 1))
+}
+
+# Override the swap-based warning: PSI is the real metric
+IO_PCT=${IO_60%.*}
+MEM_PCT=${MEM_60%.*}
+if [[ -n "$IO_PCT" && "$IO_PCT" -ge 15 ]]; then
+    print_rec "high" "Disk I/O pressure is ${IO_60}% — top wall-clock bottleneck" \
+        "Every second ~${IO_60}% of CPU time is wasted waiting on disk. No amount of CPU tuning fixes this." \
+        "Find the culprit: 'sudo iotop -aoP' or scan /proc/[0-9]*/io for biggest writers. Common causes: runaway logs in /var/log, swap activity, DB write storms, slow HDD on a busy workload."
+fi
+if [[ -n "$MEM_PCT" && "$MEM_PCT" -ge 10 ]]; then
+    print_rec "med" "Memory pressure is ${MEM_60}% — RAM is the bottleneck" \
+        "Tasks stall waiting for memory pages." \
+        "Identify top consumers: 'ps aux --sort=-%mem | head'. Stop heavy non-essential services. Long-term: lower vm.swappiness, add more RAM."
+fi
+
+# Build recommendations based on observed symptoms
+if [[ -n "$PKG_TEMP" ]] && (( PKG_TEMP >= 90 )); then
+  print_rec "high" "Thermal throttling" \
+    "Package at ${PKG_TEMP}°C — CPU is being pinned by something. Stop the process on the hottest core to recover boost clocks." \
+    "ps -eo pid,pcpu,comm --sort=-pcpu | head -5; sudo kill -15 <PID>"
+
+  if [[ -n "$HOT_CORE" ]]; then
+    print_rec "high" "Investigate core $HOT_CORE" \
+      "Core $HOT_CORE at ${HOT_PCT}% — likely culprit of thermal throttling" \
+      "ps -eLo pid,pcpu,comm | sort -k2 -gr | head"
+  fi
+fi
+
+# Only flag swap as a problem if PSI memory pressure confirms it
+PSI_MEM_PCT=$(awk '$1=="some" { for (i=2;i<=NF;i++) if ($i ~ /^avg60=/) { split($i,a,"="); print a[2]+0; exit } }' /proc/pressure/memory 2>/dev/null)
+PSI_MEM_PCT=${PSI_MEM_PCT%.*}; PSI_MEM_PCT=${PSI_MEM_PCT:-0}
+if (( SWAP_USED > 256 )) && [[ "${PSI_MEM_PCT:-0}" -ge 5 ]]; then
+  print_rec "high" "Swap + memory pressure" \
+    "${SWAP_USED} MB swapped AND memory PSI ${PSI_MEM_PCT}% — RAM is overcommitted and pages are actively churning." \
+    "Top RSS consumers: 'ps aux --sort=-rss | head -5'. Free RAM by stopping heavy services or 'sudo swapoff -a; sudo swapon -a' to evict parked pages."
+elif (( SWAP_USED > 256 )); then
+  info "  ${C_DIM}[skip]${C_RESET} ${SWAP_USED} MB parked in swap, but memory PSI is only ${PSI_MEM_PCT}% — pages are idle, not actively used"
+fi
+
+if (( LOAD1 > CPU_COUNT )); then
+  print_rec "med" "High load" \
+    "Load ${LOAD1} exceeds $CPU_COUNT cores. Check top CPU consumers and consider stopping non-essential work." \
+    "ps aux --sort=-%cpu | head"
+fi
+
+if (( USED_PCT >= 85 )); then
+  print_rec "med" "Memory pressure" \
+    "${USED_PCT}% RAM used. Close unused applications or browser tabs." \
+    "ps aux --sort=-%mem | head"
+fi
+
+if (( OOM_COUNT > 0 )); then
+  print_rec "high" "OOM kills" \
+    "$OOM_COUNT OOM event(s) in last 24h. Identify the leaked process and restart it with a memory limit." \
+    "sudo journalctl -k --since '24 hours ago' | grep -i 'out of memory' -B 5 -A 5"
+fi
+
+while read -r fs size used avail pct target; do
+  pct_num=$(echo "$pct" | tr -d '%')
+  if (( pct_num >= 90 )); then
+    print_rec "med" "Disk $target at ${pct}" \
+      "Almost full — find what's eating space and clean up." \
+      "sudo du -sh $target/* 2>/dev/null | sort -hr | head -10"
+  fi
+done < <(df -h --output=source,size,used,avail,pcent,target 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev/')
+
+# Root process heuristic — already surfaced in SUSPICIOUS PROCESSES, but
+# remind here with a generic command
+ROOT_NOND=$(ps -eo user,comm --no-headers 2>/dev/null \
+  | awk -v sysd="$SYSTEM_DAEMON_RE" '$1=="root" && !($2 ~ sysd) {print $2}' \
+  | sort -u | head -5 | wc -l)
+if (( ROOT_NOND > 0 )); then
+  print_rec "med" "Non-daemon root processes" \
+    "$ROOT_NOND non-system process(es) running as root. Verify they're legitimate." \
+    "ps -eo user,pid,comm | awk '\$1==\"root\"' | grep -vE 'systemd|init|kthread'"
+fi
+
+if (( rec_count == 0 )); then
+  ok "No specific actions recommended — system looks healthy"
+fi
+
+# Donut chart: recommendations by severity
+if (( rec_count > 0 )); then
+  subsec "Recommendations by severity"
+  R_TOTAL=$rec_count
+  R_PALETTE=("$C_RED" "$C_YELLOW" "$C_CYAN" "$C_GREEN")
+  R_LABELS=("High (act now)" "Medium (consider)" "Low (informational)")
+  R_COUNTS=("$rec_high" "$rec_med" "$rec_low")
+  printf "${C_BOLD}Recommendations (%d total):${C_RESET}\n" "$R_TOTAL"
+  for ri in 0 1 2; do
+    cnt=${R_COUNTS[$ri]}
+    (( cnt == 0 )) && continue
+    pct=$(( cnt * 100 / R_TOTAL ))
+    arc_len=$(( cnt * 20 / R_TOTAL ))
+    (( arc_len == 0 )) && arc_len=1
+    bar_s=""
+    for (( j=0; j<arc_len; j++ )); do bar_s+="█"; done
+    col="${R_PALETTE[$ri]}"
+    printf "  ${col}%-25s${C_RESET} ${col}%-20s${C_RESET} ${C_BOLD}%3d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+      "${R_LABELS[$ri]}" "$bar_s" "$cnt" "$pct"
+  done
+fi
+
+# ---------- Per-PID quick reference (for the busiest process) ----------
+section "QUICK REFERENCE"
+TOP_PID=$(ps -eo pid --no-headers --sort=-pcpu 2>/dev/null | head -1 | tr -d ' ')
+if [[ -n "$TOP_PID" ]]; then
+  info "Busiest PID right now: ${C_BOLD}$TOP_PID${C_RESET}"
+  info "Investigate it with:"
+  info "  ${C_CYAN}sudo ls -la /proc/$TOP_PID/exe /proc/$TOP_PID/cwd${C_RESET}        # binary + working dir"
+  info "  ${C_CYAN}cat /proc/$TOP_PID/status | grep -E 'Threads|State|VmRSS'${C_RESET}"
+  info "  ${C_CYAN}sudo iotop -p $TOP_PID${C_RESET}                                  # I/O vs CPU"
+  info "  ${C_CYAN}sudo strace -p $TOP_PID -c -f -e trace=network,file${C_RESET}     # syscall summary"
+  info "  ${C_CYAN}sudo kill -15 $TOP_PID${C_RESET}                                  # graceful stop"
+fi
+
+# ---------- Verdict ----------
+section "VERDICT"
+if (( CRITICAL > 0 )); then
+  printf "  ${C_RED}${C_BOLD}╭─ CRITICAL ─╮${C_RESET}  ${CRITICAL}${C_RED} critical, ${WARNINGS} warnings${C_RESET}\n"
+  printf "  ${C_RED}${C_BOLD}╰────────────╯${C_RESET}  ${C_RED}Action needed — see recommendations above${C_RESET}\n"
+  EXIT_CODE=2
+elif (( WARNINGS > 0 )); then
+  printf "  ${C_YELLOW}${C_BOLD}╭─ WARNING ─╮${C_RESET}  ${WARNINGS} warnings, no critical issues${C_RESET}\n"
+  printf "  ${C_YELLOW}${C_BOLD}╰───────────╯${C_RESET}  ${C_YELLOW}System usable but watch the flagged items${C_RESET}\n"
+  EXIT_CODE=1
+else
+  printf "  ${C_GREEN}${C_BOLD}╭─ HEALTHY ─╮${C_RESET}  no issues detected${C_RESET}\n"
+  printf "  ${C_GREEN}${C_BOLD}╰───────────╯${C_RESET}  ${C_GREEN}System looks good${C_RESET}\n"
+  EXIT_CODE=0
+fi
+printf "\n  ${C_DIM}Scan completed in ${DURATION}s at %s${C_RESET}\n\n" "$(date '+%H:%M:%S')"
+
+  # Display one-liner explanations for any critical/warning issues logged
+  show_verdict_one_liners
+
+# ---------- Watch mode ----------
+if (( WATCH > 0 )); then
+  trap 'exit 0' INT TERM
+  while true; do
+    sleep "$WATCH"
+    printf "\n${C_DIM}── refresh ──${C_RESET}\n"
+    START_TIME=$(date +%s)
+    exec "$0" "${ARGS[@]}"
+  done
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summarize" "Slowz diagnostic complete on $(hostname -s)" 2>/dev/null || true
+fi
+
+# ---------- Run comparison (skip for JSON/watch modes) ----------
+if [[ $JSON_OUT -eq 0 ]] && [[ $WATCH -eq 0 ]]; then
+    run_comparison_finalize
+fi
+
+exit "${EXIT_CODE:-0}"

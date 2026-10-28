@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# usbz - USB bus diagnostic
+# ----------------------------------------------------------------------------
+# Inspects USB hosts, devices, speeds, classes, drivers, descriptors, power.
+# Uses lsusb with /sys fallbacks (no sudo required).
+#
+# Usage:
+#   ./usbz                 # full probe
+#   ./usbz --no-color      # plain output
+#   ./usbz --json          # machine-readable summary
+#   ./usbz --bus N         # filter to a single bus
+#   ./usbz --vendor VID    # filter to a vendor hex ID (e.g. 046d)
+#
+# Requires: lsusb
+# Optional: bc
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+NO_COLOR=0
+JSON_OUT=0
+FILTER_BUS=""
+FILTER_VENDOR=""
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+SCRIPT_VERSION="1.0.0"
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --bus=*)     FILTER_BUS="${arg#--bus=}" ;;
+    --bus)       i=$((i+1)); FILTER_BUS="${ARGS[$i]:-}" ;;
+    --vendor=*)  FILTER_VENDOR="${arg#--vendor=}" ;;
+    --vendor)    i=$((i+1)); FILTER_VENDOR="${ARGS[$i]:-}" ;;
+    --no-color)  NO_COLOR=1 ;;
+    --json)      JSON_OUT=1 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          usbz — USB Bus Diagnostic                            ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects USB hosts, devices, speeds, classes, drivers, descriptors,
+  and power management. Uses lsusb with /sys fallbacks.
+
+USAGE
+  ./usbz                 Full probe
+  ./usbz --no-color      Plain output
+  ./usbz --json          Machine-readable summary
+  ./usbz --bus N         Filter to a single bus
+  ./usbz --vendor VID    Filter to a vendor hex ID (e.g. 046d)
+
+OPTIONS
+  --bus=N         Filter to a single USB bus number
+  --vendor=VID    Filter to a vendor hex ID (e.g. 046d)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  lsusb                            List all USB devices
+  lsusb -t                         USB device tree (with speeds)
+  lsusb -v                         Verbose device descriptors
+  usbview                          GUI USB viewer (apt install usbview)
+  cat /proc/bus/usb/devices        Raw USB device info
+  udevadm monitor --subsystem-match=usb
+                                   Watch USB attach/detach events live
+  sudo usbreset <bus>/<dev>        Reset a misbehaving USB device
+  sudo powertop --usb-tab          USB power consumption
+
+WARNING → INVESTIGATION COMMANDS
+  USB device not recognized         →  lsusb -v -d <VID>:<PID>
+  Device disconnecting randomly     →  sudo dmesg | grep -i usb | tail -20
+  USB power issues                  →  cat /sys/bus/usb/devices/*/power/runtime_status
+  Driver not bound                  →  sudo usb-devices  or  ls /sys/bus/usb/devices/
+
+HELPEOF
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "usbz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# ---------- Banner ----------
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  USB.SH — USB Bus Diagnostic                                  ║
+   ║  Hosts · Devices · Speeds · Drivers · Power                   ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# is_gt/is_lt/bar from common.sh
+
+# USB class code → label
+usb_class_label() {
+  case "$1" in
+    00) echo "Use class info in interface descriptor" ;;
+    01) echo "Audio" ;;
+    02) echo "CDC (Communications)" ;;
+    03) echo "HID (Human Interface)" ;;
+    05) echo "Physical" ;;
+    06) echo "Image" ;;
+    07) echo "Printer" ;;
+    08) echo "Mass Storage" ;;
+    09) echo "Hub" ;;
+    0a) echo "CDC Data" ;;
+    0b) echo "Smart Card" ;;
+    0d) echo "Content Security" ;;
+    0e) echo "Video" ;;
+    0f) echo "Personal Healthcare" ;;
+    10) echo "Audio/Video" ;;
+    11) echo "Billboard" ;;
+    12) echo "USB Type-C Bridge" ;;
+    dc) echo "Diagnostic Device" ;;
+    e0) echo "Wireless Controller" ;;
+    ef) echo "Miscellaneous" ;;
+    fe) echo "Application Specific" ;;
+    ff) echo "Vendor Specific" ;;
+    *)  echo "Class 0x$1" ;;
+  esac
+}
+
+# Speed code → label and Mbps
+speed_code() {
+  case "$1" in
+    "1.5")   echo "Low (1.5 Mbps)" ;;
+    "12")    echo "Full (12 Mbps)" ;;
+    "480")   echo "High (480 Mbps)" ;;
+    "5000")  echo "SuperSpeed (5 Gbps)" ;;
+    "10000") echo "SuperSpeed+ (10 Gbps)" ;;
+    "20000") echo "USB 3.2 (20 Gbps)" ;;
+    *)       echo "$1 Mbps" ;;
+  esac
+}
+
+speed_rank() {
+  case "$1" in
+    "1.5")   echo 1 ;;
+    "12")    echo 2 ;;
+    "480")   echo 3 ;;
+    "5000")  echo 4 ;;
+    "10000") echo 5 ;;
+    "20000") echo 6 ;;
+    *)       echo 0 ;;
+  esac
+}
+
+# ---------- Detect tools ----------
+HAVE_LSUSB=0; command -v lsusb >/dev/null 2>&1 && HAVE_LSUSB=1
+HAVE_BC=0;   command -v bc >/dev/null 2>&1 && HAVE_BC=1
+
+if [[ $HAVE_LSUSB -eq 0 ]]; then
+  crit "lsusb not installed (apt install usbutils)"
+  exit 1
+fi
+
+# ============================================================================
+# SECTION 1: USB Host Controllers (PCI-attached)
+# ============================================================================
+section "USB HOST CONTROLLERS"
+
+# Pull host controllers via lspci; label whether USB 2.0 (UHCI/EHCI) or USB 3.x (xHCI)
+HAVE_LSPCI=0; command -v lspci >/dev/null 2>&1 && HAVE_LSPCI=1
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  HC_LIST=$(lspci 2>/dev/null | grep -iE 'USB controller')
+  if [[ -n "$HC_LIST" ]]; then
+    HC_COUNT=$(printf '%s\n' "$HC_LIST" | wc -l)
+    info "Host controllers: ${C_BOLD}${HC_COUNT}${C_RESET}"
+    while IFS= read -r line; do
+      # Mark xHCI (USB 3.x) in green, others dim
+      if [[ "$line" == *xHCI* ]]; then
+        printf "  ${C_GREEN}·${C_RESET} %s\n" "$line"
+      else
+        printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+      fi
+    done <<< "$HC_LIST"
+    JSON_FIELDS+=("\"host_controllers\":$HC_COUNT")
+  else
+    warn "No USB host controllers detected via lspci"
+  fi
+fi
+
+# ============================================================================
+# SECTION 2: Device Tree (lsusb -t)
+# ============================================================================
+section "DEVICE TREE"
+
+TREE=$(lsusb -t 2>/dev/null)
+if [[ -n "$TREE" ]]; then
+  echo "$TREE" | while IFS= read -r line; do
+    # Highlight root hubs in cyan, port-speed in dim
+    if [[ "$line" == *"root_hub"* ]]; then
+      printf "  ${C_CYAN}%s${C_RESET}\n" "$line"
+    else
+      printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+    fi
+  done
+else
+  warn "Could not read USB tree (lsusb -t)"
+fi
+
+# ============================================================================
+# SECTION 3: Devices by Speed
+# ============================================================================
+section "DEVICES BY SPEED"
+
+# Build the device list (with optional filter)
+ALL_DEVICES=$(lsusb 2>/dev/null)
+TOTAL_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | wc -l)
+info "Total USB devices: ${C_BOLD}${TOTAL_DEVICES}${C_RESET}"
+JSON_FIELDS+=("\"total_devices\":$TOTAL_DEVICES")
+
+FILTERED_DEVICES="$ALL_DEVICES"
+if [[ -n "$FILTER_BUS" ]]; then
+  FILTERED_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | grep -E "^Bus ${FILTER_BUS}[ .]" || true)
+  info "Filter: bus=${C_CYAN}${FILTER_BUS}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | grep -c '^Bus' || echo 0) match(es)"
+fi
+if [[ -n "$FILTER_VENDOR" ]]; then
+  if [[ -n "$FILTER_BUS" ]]; then
+    FILTERED_DEVICES=$(printf '%s\n' "$FILTERED_DEVICES" | grep -iE "ID ${FILTER_VENDOR}:" || true)
+  else
+    FILTERED_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | grep -iE "ID ${FILTER_VENDOR}:" || true)
+  fi
+  info "Filter: vendor=${C_CYAN}${FILTER_VENDOR}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | grep -c '^Bus' || echo 0) match(es)"
+fi
+
+# For speed: lsusb -v gives bInterfaceClass on devices but speed on the tree. Combine.
+# Per-device query: for each "Bus N Device M" entry from `lsusb`, look it up in `lsusb -t`
+# Tree format example: "    |__ Port 1: Dev 2, If 0, Class=Vendor Specific Class, Driver=rtl8821au, 480M"
+# Easier: parse /sys/bus/usb/devices/*/speed (in Mbps) for the device, and cross-reference the label.
+SPEED_COUNTS=""
+declare -A SPEED_TOTAL
+
+for devdir in /sys/bus/usb/devices/*; do
+  [[ -d "$devdir" ]] || continue
+  [[ -r "$devdir/speed" ]] || continue
+  spd=$(cat "$devdir/speed" 2>/dev/null | tr -d '\n')
+  [[ -z "$spd" ]] && continue
+  # Only count devices (skip interfaces which have no speed file)
+  [[ -r "$devdir/devnum" ]] || continue
+
+  # Skip root hubs and interfaces (devices only)
+  devnum=$(cat "$devdir/devnum" 2>/dev/null | tr -d '\n')
+  busnum=$(cat "$devdir/busnum" 2>/dev/null | tr -d '\n')
+
+  # Optional filters
+  if [[ -n "$FILTER_BUS" && "$busnum" != "$FILTER_BUS" ]]; then
+    continue
+  fi
+
+  # Match vendor filter via idVendor
+  if [[ -n "$FILTER_VENDOR" ]]; then
+    vid=$(cat "$devdir/idVendor" 2>/dev/null | tr -d '\n')
+    if [[ "${vid,,}" != "${FILTER_VENDOR,,}" ]]; then
+      continue
+    fi
+  fi
+
+  SPEED_TOTAL[$spd]=$((${SPEED_TOTAL[$spd]:-0}+1))
+done
+
+if (( ${#SPEED_TOTAL[@]} > 0 )); then
+  # Sort keys as numbers
+  printf "  ${C_DIM}%-25s %6s${C_RESET}\n" "Speed class" "Count"
+  printf "  ${C_DIM}%-25s %6s${C_RESET}\n" "-------------------------" "------"
+  for key in $(echo "${!SPEED_TOTAL[@]}" | tr ' ' '\n' | sort -n); do
+    cnt=${SPEED_TOTAL[$key]}
+    label=$(speed_code "$key")
+    printf "  ${C_CYAN}%-25s${C_RESET} %6d\n" "$label" "$cnt"
+  done
+else
+  info "Could not enumerate speeds from /sys"
+fi
+
+# Determine fastest link seen
+FASTEST_SPEED_MBPS=0
+FASTEST_SPEED_NAME=""
+for key in "${!SPEED_TOTAL[@]}"; do
+  r=$(speed_rank "$key")
+  if (( r > FASTEST_SPEED_MBPS )); then
+    FASTEST_SPEED_MBPS=$r
+    FASTEST_SPEED_NAME=$(speed_code "$key")
+  fi
+done
+
+# ============================================================================
+# SECTION 4: Devices by Class
+# ============================================================================
+section "DEVICES BY CLASS"
+
+declare -A CLASS_TOTAL
+declare -A CLASS_FIRST_LABEL
+
+# Use /sys/class for interface classes
+for devdir in /sys/bus/usb/devices/*; do
+  [[ -d "$devdir" ]] || continue
+
+  busnum=$(cat "$devdir/busnum" 2>/dev/null | tr -d '\n')
+  [[ -z "$busnum" ]] && continue
+
+  # Optional filters
+  if [[ -n "$FILTER_BUS" && "$busnum" != "$FILTER_BUS" ]]; then
+    continue
+  fi
+  if [[ -n "$FILTER_VENDOR" ]]; then
+    vid=$(cat "$devdir/idVendor" 2>/dev/null | tr -d '\n')
+    if [[ "${vid,,}" != "${FILTER_VENDOR,,}" ]]; then
+      continue
+    fi
+  fi
+
+  # Determine class: try bDeviceClass first; for interfaces use bInterfaceClass
+  cls=""
+  if [[ -r "$devdir/bDeviceClass" ]]; then
+    cls=$(cat "$devdir/bDeviceClass" 2>/dev/null | tr -d '\n')
+  fi
+  if [[ -z "$cls" || "$cls" == "00" ]] && [[ -r "$devdir/bInterfaceClass" ]]; then
+    cls=$(cat "$devdir/bInterfaceClass" 2>/dev/null | tr -d '\n')
+  fi
+  [[ -z "$cls" ]] && continue
+  # 00 on device with non-zero on interface means "use interface class" — already handled above
+
+  CLASS_TOTAL[$cls]=$((${CLASS_TOTAL[$cls]:-0}+1))
+done
+
+if (( ${#CLASS_TOTAL[@]} > 0 )); then
+  printf "  ${C_DIM}%-30s %6s${C_RESET}\n" "Class" "Count"
+  printf "  ${C_DIM}%-30s %6s${C_RESET}\n" "------------------------------" "------"
+  # Sort by count descending
+  for key in $(for k in "${!CLASS_TOTAL[@]}"; do echo "${CLASS_TOTAL[$k]}|$k"; done | sort -t'|' -k1 -nr | head -10 | cut -d'|' -f2); do
+    cnt=${CLASS_TOTAL[$key]}
+    label=$(usb_class_label "$key")
+    printf "  ${C_CYAN}%-30s${C_RESET} %6d\n" "$label" "$cnt"
+  done
+else
+  info "Could not enumerate classes"
+fi
+
+# ============================================================================
+# SECTION 5: Device List (filtered)
+# ============================================================================
+section "DEVICE LIST"
+
+if [[ -n "$FILTERED_DEVICES" ]]; then
+  # Build a VID:PID -> (driver, sysfs-bind-path) lookup table from sysfs so
+  # the table can show the kernel driver in use and the bind-path (the
+  # /sys/bus/usb/devices/<dev> node userspace would write 'bind' to).
+  declare -A USB_BIND=()
+  for devdir in /sys/bus/usb/devices/*/; do
+    [[ -d "$devdir" ]] || continue
+    # Skip USB root hubs (they have no idVendor/idProduct)
+    [[ -r "$devdir/idVendor" ]] || continue
+    v=$(cat "$devdir/idVendor" 2>/dev/null | tr -d '\n')
+    p=$(cat "$devdir/idProduct" 2>/dev/null | tr -d '\n')
+    [[ -z "$v" || -z "$p" ]] && continue
+    key=$(printf '%s:%s' "$v" "$p")
+    drv=""
+    # 'driver' symlink points at /sys/bus/usb/drivers/<name> when bound
+    if [[ -L "$devdir/driver" ]]; then
+      drv=$(basename "$(readlink -f "$devdir/driver" 2>/dev/null)" 2>/dev/null)
+    fi
+    [[ -z "$drv" ]] && drv="(none)"
+    USB_BIND["$key"]="$drv|$devdir"
+  done
+
+  printf "  ${C_DIM}%-9s %-11s %-30s %-18s %s${C_RESET}\n" "Bus/Dev" "VID:PID" "Description" "DRIVER" "BIND-PATH"
+  printf "  ${C_DIM}%-9s %-11s %-30s %-18s %s${C_RESET}\n" "---------" "----------" "------------------------------" "------------------" "--------------------------------------"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Format: "Bus 001 Device 007: ID 0a12:0001 Cambridge Silicon Radio, Ltd Bluetooth Dongle (HCI mode)"
+    busdev=$(echo "$line" | awk '{print $2 "/" $4}' | tr -d ':')
+    vidpid=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="ID") {print $(i+1); exit}}')
+    descr=$(echo "$line" | sed -E 's/^Bus [0-9]+ Device [0-9]+: ID [0-9a-f]{4}:[0-9a-f]{4} //')
+    # Look up the driver / bind-path captured above
+    bind_entry="${USB_BIND[$vidpid]:-(none)|(unknown)}"
+    drv="${bind_entry%%|*}"
+    bind="${bind_entry#*|}"
+    printf "  ${C_CYAN}%-9s${C_RESET} %-11s ${C_DIM}%-30s${C_RESET} %-18s ${C_DIM}%s${C_RESET}\n" \
+      "$busdev" "$vidpid" "$(truncate "$descr" 28)" "$(truncate "$drv" 16)" "$(truncate "$bind" 80)"
+  done <<< "$FILTERED_DEVICES"
+else
+  info "No devices match filter"
+fi
+
+# ============================================================================
+# SECTION 5b: Class Distribution Bar Chart
+# ============================================================================
+if [[ ${JSON_OUT:-0} -eq 0 ]] && (( ${#CLASS_TOTAL[@]} > 0 )); then
+  printf "\n  ${C_BOLD}${C_CYAN}Devices by Class (bar chart)${C_RESET}\n"
+  # Build "count|label" rows from CLASS_TOTAL, sorted desc
+  _usb_class_rows=()
+  for k in "${!CLASS_TOTAL[@]}"; do
+    _usb_class_rows+=("${CLASS_TOTAL[$k]}|$(usb_class_label "$k")")
+  done
+  # Sort numeric desc
+  _usb_max=$(printf '%s\n' "${_usb_class_rows[@]}" | awk -F'|' '{print $1}' | sort -rn | head -1)
+  _usb_total=$(printf '%s\n' "${_usb_class_rows[@]}" | awk -F'|' '{s+=$1} END {print s+0}')
+  printf '%s\n' "${_usb_class_rows[@]}" | sort -t'|' -k1 -rn | head -10 | while IFS='|' read -r val label; do
+    [[ -z "$val" ]] && continue
+    pct=$(( val * 100 / (_usb_max > 0 ? _usb_max : 1) ))
+    _c="$C_GREEN"; (( pct >= 60 )) && _c="$C_YELLOW"; (( pct >= 85 )) && _c="$C_RED"
+    filled=$(( pct * 40 / 100 ))
+    bar=""; for (( j=0; j<filled; j++ )); do bar+="█"; done
+    printf "  %-25s ${_c}%-40s${C_RESET} %d (total %d)\n" "$label" "$bar" "$val" "$_usb_total"
+  done
+fi
+
+# ============================================================================
+# SECTION 6: Power Management
+# ============================================================================
+section "POWER MANAGEMENT"
+
+SUSPENDED=0
+UNPOWERED=0
+AUTO_SUSPEND_ENABLED=0
+TOTAL_PM=0
+
+for devdir in /sys/bus/usb/devices/*; do
+  [[ -d "$devdir" ]] || continue
+
+  busnum=$(cat "$devdir/busnum" 2>/dev/null | tr -d '\n')
+  [[ -z "$busnum" ]] && continue
+
+  # Optional filters
+  if [[ -n "$FILTER_BUS" && "$busnum" != "$FILTER_BUS" ]]; then
+    continue
+  fi
+  if [[ -n "$FILTER_VENDOR" ]]; then
+    vid=$(cat "$devdir/idVendor" 2>/dev/null | tr -d '\n')
+    if [[ "${vid,,}" != "${FILTER_VENDOR,,}" ]]; then
+      continue
+    fi
+  fi
+
+  TOTAL_PM=$((TOTAL_PM+1))
+
+  # Autosuspend
+  if [[ -r "$devdir/power/control" ]]; then
+    ctrl=$(cat "$devdir/power/control" 2>/dev/null | tr -d '\n')
+    [[ "$ctrl" == "auto" ]] && AUTO_SUSPEND_ENABLED=$((AUTO_SUSPEND_ENABLED+1))
+  fi
+
+  # Runtime status (suspended / active)
+  if [[ -r "$devdir/power/runtime_status" ]]; then
+    rt=$(cat "$devdir/power/runtime_status" 2>/dev/null | tr -d '\n')
+    [[ "$rt" == "suspended" ]] && SUSPENDED=$((SUSPENDED+1))
+  fi
+
+  # Powered?
+  # Some devices have a bmAttributes file with bit 5 indicating remote wakeup; for powered state
+  # use the existance of "authorized" attribute.
+done
+
+info "Devices inspected: ${TOTAL_PM}"
+info "Suspended (runtime):  ${C_CYAN}${SUSPENDED}${C_RESET}"
+info "Auto-suspend on:      ${C_CYAN}${AUTO_SUSPEND_ENABLED}${C_RESET}"
+
+# Warn if any device is unexpectedly suspended (could be a wireless issue)
+# Skip — suspending is normal for HID/peripherals.
+
+# ============================================================================
+# SECTION 7: Headline box
+# ============================================================================
+section "USB HEADLINE"
+
+H1="Buses:        $(lsusb 2>/dev/null | awk '{print $2}' | sort -u | wc -l)"
+H2="Devices:      $TOTAL_DEVICES total"
+H3="Fastest link: ${FASTEST_SPEED_NAME:-(unknown)}"
+H4="Suspended:    $SUSPENDED device(s)"
+H5="Hosts:        $(if [[ $HAVE_LSPCI -eq 1 ]]; then lspci 2>/dev/null | grep -ic 'USB controller'; else echo "(no lspci)"; fi)"
+
+widest=0
+for line in "$H1" "$H2" "$H3" "$H4" "$H5"; do
+  w=${#line}
+  (( w > widest )) && widest=$w
+done
+BOX_W=$(( widest + 4 ))
+[[ $BOX_W -lt 50 ]] && BOX_W=50
+[[ $BOX_W -gt 72 ]] && BOX_W=72
+
+TOP="╔$(printf '═%.0s' $(seq 1 $BOX_W))╗"
+BOT="╚$(printf '═%.0s' $(seq 1 $BOX_W))╝"
+
+printf "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$TOP"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H1"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H2"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H3"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H4"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H5"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$BOT"
+
+# ============================================================================
+# SECTION 7b: SECURITY FLAGS (BadUSB / HID-injection / unauthorized storage)
+# ============================================================================
+section "SECURITY FLAGS"
+
+# 1. USB storage module — if loaded, any USB stick can mount. Rubber-Ducky /
+#    malicious USB attacks land here. Flag with severity.
+if lsmod 2>/dev/null | grep -q '^usb_storage'; then
+    warn "usb-storage module loaded — any USB stick can auto-mount and execute autoruns"
+    info "  Disable: 'sudo modprobe -r usb_storage && echo 'blacklist usb_storage' | sudo tee /etc/modprobe.d/disable-usb-storage.conf'"
+else
+    ok "usb-storage module not loaded"
+fi
+
+# 2. HID-class devices currently attached (class 03 = Human Interface Device).
+#    A keyboard/mouse that appeared recently without you plugging one in is
+#    the BadUSB tell. We can't track history, but we can list them so the user
+#    can compare against expected devices.
+HID_COUNT=0
+HID_LIST=""
+for devdir in /sys/bus/usb/devices/*/; do
+    [[ -d "$devdir" ]] || continue
+    cls=$(cat "$devdir/bInterfaceClass" 2>/dev/null | head -1)
+    [[ "$cls" == "03" ]] || continue
+    [[ -r "$devdir/idVendor" ]] || continue
+    vid=$(cat "$devdir/idVendor" 2>/dev/null | tr -d '\n')
+    pid=$(cat "$devdir/idProduct" 2>/dev/null | tr -d '\n')
+    product=$(cat "$devdir/product" 2>/dev/null | tr -d '\n')
+    HID_LIST+="${vid}:${pid} ${product}"$'\n'
+    HID_COUNT=$((HID_COUNT + 1))
+done
+if (( HID_COUNT > 0 )); then
+    printf "  ${C_DIM}%-30s${C_RESET} %d\n" "HID devices attached:" "$HID_COUNT"
+    printf '%s' "$HID_LIST" | head -10 | sed 's/^/      /'
+    (( HID_COUNT > 10 )) && printf "      ${C_DIM}… and %d more${C_RESET}\n" $((HID_COUNT - 10))
+    info "Verify each HID device is one you actually plugged in (BadUSB = HID that types commands)"
+fi
+
+# 3. authorized_default policy — kernel-level USB auth. 0 = new devices need
+#    explicit authorization. 1 = auto-authorized.
+AUTH_POLICY=""
+for d in /sys/bus/usb/devices/usb*; do
+    [[ -r "$d/authorized_default" ]] || continue
+    AUTH_POLICY=$(cat "$d/authorized_default" 2>/dev/null | tr -d '\n')
+    break
+done
+if [[ -n "$AUTH_POLICY" ]]; then
+    if [[ "$AUTH_POLICY" == "0" ]]; then
+        ok "USB authorized_default = 0 (new devices require explicit auth)"
+    else
+        warn "USB authorized_default = $AUTH_POLICY (new devices auto-authorized)"
+        info "  Tighten: 'echo 0 | sudo tee /sys/bus/usb/devices/usb*/authorized_default'"
+    fi
+fi
+
+# 4. usbguard status (if installed)
+if command -v usbguard >/dev/null 2>&1; then
+    if systemctl is-active usbguard >/dev/null 2>&1; then
+        ok "usbguard is active — policy-based USB authorization in place"
+    else
+        warn "usbguard installed but NOT active — install rules without enforcement"
+    fi
+fi
+
+# 5. /dev/hidraw* present — these are raw HID nodes a malicious device or
+#    userland tool can read to sniff keystrokes. Flag if world-accessible.
+if compgen -G "/dev/hidraw*" >/dev/null; then
+    for hr in /dev/hidraw*; do
+        perms=$(stat -c '%a' "$hr" 2>/dev/null)
+        owner=$(stat -c '%U' "$hr" 2>/dev/null)
+        # hidraw should typically be 0600 root:root — anything more open is a finding.
+        if [[ "$perms" =~ ^[0-6][[:digit]][0-9]$ ]] && (( (8#$perms & 066) != 0 )); then
+            crit "$hr perms=$perms owner=$owner — world/group-readable HID device (keystroke sniff risk)"
+        fi
+    done
+fi
+
+# ============================================================================
+# SECTION 8: Recommendations & Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+
+rec() {
+  printf "  ${C_CYAN}#%d${C_RESET} → %s\n" "$1" "$2"
+}
+
+rec 1 "For details on a single device: lsusb -v -d <VID>:<PID>"
+rec 2 "Real-time attach/detach events: udevadm monitor --subsystem-match=usb"
+rec 3 "Reset a misbehaving device:    sudo usbreset <BUS>/<DEV>"
+rec 4 "For driver binding issues:      sudo usb-devices (or read /sys/kernel/debug/usb/devices)"
+rec 5 "Power consumption:              sudo powertop --usb-tab"
+
+if (( AUTO_SUSPEND_ENABLED == 0 && TOTAL_PM > 5 )); then
+  rec 6 "Consider enabling USB auto-suspend (echo auto > /sys/bus/usb/devices/N/power/control)"
+fi
+
+# ---------- Verdict ----------
+section "VERDICT"
+
+ELAPSED=$(( $(date +%s) - START_TS ))
+
+if (( CRITICAL > 0 )); then
+  printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical issue(s) found\n" "$CRITICAL"
+  EXIT=2
+elif (( WARNINGS > 0 )); then
+  printf "  ${C_YELLOW}${C_BOLD}WARNINGS${C_RESET}: %d warning(s)\n" "$WARNINGS"
+  EXIT=1
+else
+  printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+  EXIT=0
+fi
+
+printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+
+# ---------- JSON output ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+  printf '{"script":"usb","host":"%s","timestamp":"%s","total_devices":%d,"fastest_speed_mbps":%d,"suspended":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
+    "$HOSTNAME_SHORT" "$TIMESTAMP" "$TOTAL_DEVICES" "$FASTEST_SPEED_MBPS" "$SUSPENDED" "$WARNINGS" "$CRITICAL" "$EXIT"
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "usbz complete: total=$TOTAL_DEVICES fastest_mbps=$FASTEST_SPEED_MBPS suspended=$SUSPENDED warnings=$WARNINGS critical=$CRITICAL" 2>/dev/null || true
+fi
+
+exit $EXIT

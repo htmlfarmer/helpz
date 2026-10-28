@@ -1,0 +1,856 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# logz - System log scanner (errors & warnings)
+# ----------------------------------------------------------------------------
+# Checks systemd journal + traditional log files for errors, warnings, and
+# security-relevant events. Groups recurring messages so the noise becomes
+# actionable.
+#
+# Usage:
+#   ./logz                           # Interactive: choose time window
+#   ./logz --last 5min                # Last 5 minutes (shorthand)
+#   ./logz --last 30m                 # Last 30 minutes
+#   ./logz --last 2h                  # Last 2 hours
+#   ./logz --since "1 hour ago"      # Last hour
+#   ./logz --since "7 days ago"      # Last week
+#   ./logz --since "30 days ago"     # Last month
+#   ./logz --since ""                # Since boot
+#   ./logz --tail                    # Last 50 raw error lines
+#   ./logz --no-color                # Plain output
+#   ./logz --top 20                  # Top recurring messages (default 10)
+#   ./logz --json                    # Machine-readable summary
+#
+# --last accepts: NUM followed by unit suffix
+#   s/sec/second(s), m/min/minute(s), h/hour(s), d/day(s), w/week(s)
+#   e.g. --last 1min, --last 10min, --last 15, --last 30min, --last 90s, --last 2h
+#   bare numbers default to MINUTES: --last 10  ==  --last 10min
+#
+# Interactive (when run with no args in a terminal):
+#   1-5) last 1 / 5 / 10 / 15 / 30 minutes
+#   6-9) hour, 24h (default), 7d, 30d ...
+#   7) Custom journalctl time string
+#
+# Exits 0 if healthy, 1 warnings found, 2 critical issues found.
+# Works with or without sudo (graceful degradation).
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+SINCE_SET=0
+SINCE="24 hours ago"  # default if not specified
+TAIL_MODE=0
+NO_COLOR=0
+JSON_OUT=0
+TOP_N=10
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+SCRIPT_VERSION="1.0.0"
+
+# Convert --last VALUE into a journalctl-friendly "N unit ago" string.
+# Accepts: 5min, 30m, 2h, 90s, 1d, 1w (case-insensitive, pluralisation optional)
+parse_last() {
+  local raw="$1"
+  # Normalize: lowercase, strip 's' suffix on unit (handled by case below)
+  local v="${raw,,}"
+  # Bare number with no unit → minutes (so --last 10 just works)
+  if [[ "$v" =~ ^([0-9]+)$ ]]; then
+    echo "${v} minutes ago"
+    return 0
+  fi
+  # Extract number and unit
+  if [[ ! "$v" =~ ^([0-9]+)([a-z]+)$ ]]; then
+    echo ""
+    return 1
+  fi
+  local num="${BASH_REMATCH[1]}"
+  local unit="${BASH_REMATCH[2]}"
+
+  case "$unit" in
+    s|sec|secs|second|seconds)
+      echo "${num} seconds ago" ;;
+    m|min|mins|minute|minutes)
+      echo "${num} minutes ago" ;;
+    h|hr|hrs|hour|hours)
+      echo "${num} hours ago" ;;
+    d|day|days)
+      echo "${num} days ago" ;;
+    w|wk|wks|week|weeks)
+      echo "${num} weeks ago" ;;
+    *)
+      echo ""; return 1 ;;
+  esac
+}
+
+# Index-based parser so multi-word values (e.g. --since "7 days ago") work
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --since=*)   SINCE="${arg#--since=}"; SINCE_SET=1 ;;
+    --since)     i=$((i+1)); SINCE="${ARGS[$i]:-}"; SINCE_SET=1 ;;
+    --last=*)    _pv="$(parse_last "${arg#--last=}")" || _pv=""
+                 if [[ -z "$_pv" ]]; then printf "logz: bad --last value '%s' (try: 1min 10m 15min 30min 2h 7d)\n" "${arg#--last=}" >&2; exit 64; fi
+                 SINCE="$_pv"; SINCE_SET=1 ;;
+    --last)      i=$((i+1)); _pv="$(parse_last "${ARGS[$i]:-}")" || _pv=""
+                 if [[ -z "$_pv" ]]; then printf "logz: bad --last value '%s' (try: 1min 10m 15min 30min 2h 7d)\n" "${ARGS[$i]:-}" >&2; exit 64; fi
+                 SINCE="$_pv"; SINCE_SET=1 ;;
+    --tail)      TAIL_MODE=1 ;;
+    --no-color)  NO_COLOR=1 ;;
+    --json)      JSON_OUT=1 ;;
+    --top=*)     TOP_N="${arg#--top=}" ;;
+    --top)       i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          logz — System Log Scanner (Errors & Warnings)       ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Checks systemd journal + traditional log files for errors, warnings,
+  and security-relevant events. Groups recurring messages so the noise
+  becomes actionable.
+
+USAGE
+  ./logz                           Interactive: choose time window
+  ./logz --last 5min               Last 5 minutes
+  ./logz --last 30m                Last 30 minutes
+  ./logz --last 2h                 Last 2 hours
+  ./logz --since "1 hour ago"      Last hour
+  ./logz --since "7 days ago"      Last week
+  ./logz --tail                    Last 50 raw error lines
+  ./logz --no-color                Plain output
+  ./logz --top 20                  Top recurring messages (default 10)
+  ./logz --json                    Machine-readable summary
+
+OPTIONS
+  --since=TIME    Journalctl time string (e.g. "2 hours ago")
+  --last=DUR      Shorthand duration (5min, 30m, 2h, 1d, 1w)
+  --tail          Show last 50 raw error lines
+  --top[=N]       Top N recurring messages (default 10)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  journalctl -f                      Follow journal live
+  journalctl -p err --since "1h"     Errors in last hour
+  dmesg                              Kernel ring buffer
+  dmesg -T --follow                  Live kernel messages
+  tail -f /var/log/syslog            Follow syslog
+  less /var/log/auth.log             Browse auth log
+  journalctl -u <service>            Logs for a specific service
+
+WARNING → INVESTIGATION COMMANDS
+  OOM kill events                   →  sudo dmesg | grep -i oom  or  sudo journalctl -k | grep -i oom
+  SSH auth failures                 →  grep "Failed password" /var/log/auth.log | tail -20
+  Failed sudo attempts              →  grep "sudo.*authentication failure" /var/log/auth.log
+  Disk I/O errors                   →  sudo dmesg | grep -iE 'I/O error|ata.*failed'
+  Filesystem errors                 →  sudo dmesg | grep -iE 'ext4.*error|fs corruption'
+  Failed systemd units              →  systemctl --failed  and  journalctl -u <unit> --no-pager
+  SMART warnings                    →  sudo smartctl -a /dev/sdX
+  No space left events              →  df -h  and  du -sh /* | sort -rh | head
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "logz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+# ---------- Tool detection (cached) ----------
+HAVE_JOURNALCTL=0;  command -v journalctl >/dev/null 2>&1 && HAVE_JOURNALCTL=1
+HAVE_SYSTEMCTL=0;   command -v systemctl  >/dev/null 2>&1 && HAVE_SYSTEMCTL=1
+HAVE_DMESG=0;       command -v dmesg      >/dev/null 2>&1 && HAVE_DMESG=1
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# If --last was malformed, fail loud with a helpful hint
+if [[ $SINCE_SET -eq 1 && -z "$SINCE" ]]; then
+  echo "logz: --last expects a duration like 5min, 30m, 2h, 1d, 90s, 1w" >&2
+  exit 64
+fi
+
+# ---------- Interactive time window prompt ----------
+# Only ask if --since was NOT explicitly passed AND we have a TTY and not in JSON mode
+if [[ $SINCE_SET -eq 0 && $JSON_OUT -eq 0 ]]; then
+  if [[ -t 0 ]]; then
+    printf "${C_BOLD}Time window to scan:${C_RESET}\n"
+    printf "  ${C_CYAN}1)${C_RESET} Last 1 minute     ${C_CYAN}2)${C_RESET} Last 5 minutes     ${C_CYAN}3)${C_RESET} Last 10 minutes\n"
+    printf "  ${C_CYAN}4)${C_RESET} Last 15 minutes   ${C_CYAN}5)${C_RESET} Last 30 minutes  ${C_CYAN}6)${C_RESET} Last hour\n"
+    printf "  ${C_CYAN}7)${C_RESET} Last 24 hours   ${C_DIM}(default)${C_RESET}\n"
+    printf "  ${C_CYAN}8)${C_RESET} Last 7 days      ${C_CYAN}9)${C_RESET} Last 30 days\n"
+    printf "  ${C_CYAN}10)${C_RESET} Since boot      ${C_CYAN}11)${C_RESET} Custom journalctl time string\n"
+    printf "Choose [7]: "
+    read -r -t 30 CHOICE
+    case "${CHOICE:-7}" in
+      1) SINCE="1 minutes ago"; SINCE_SET=1 ;;
+      2) SINCE="5 minutes ago"; SINCE_SET=1 ;;
+      3) SINCE="10 minutes ago"; SINCE_SET=1 ;;
+      4) SINCE="15 minutes ago"; SINCE_SET=1 ;;
+      5) SINCE="30 minutes ago"; SINCE_SET=1 ;;
+      6) SINCE="1 hour ago"; SINCE_SET=1 ;;
+      7|"") SINCE="24 hours ago"; SINCE_SET=1 ;;
+      8) SINCE="7 days ago"; SINCE_SET=1 ;;
+      9) SINCE="30 days ago"; SINCE_SET=1 ;;
+      10) SINCE=""; SINCE_SET=1 ;;  # empty = since boot
+      11)
+        printf "Enter journalctl time string (e.g. '2 hours ago', '2026-08-01'): "
+        read -r -t 30 CUSTOM_SINCE
+        if [[ -z "$CUSTOM_SINCE" ]]; then
+          SINCE="24 hours ago"
+        else
+          SINCE="$CUSTOM_SINCE"
+        fi
+        SINCE_SET=1
+        ;;
+      *)
+        printf "  ${C_YELLOW}Invalid choice, using 24 hours${C_RESET}\n"
+        SINCE="24 hours ago"
+        SINCE_SET=1
+        ;;
+    esac
+  fi
+  # Non-interactive AND no --since: SINCE stays at default "24 hours ago"
+fi
+
+# If JSON mode is enabled, suppress all stdout during data collection
+if [[ $JSON_OUT -eq 1 ]]; then
+  exec 3>&1
+  exec 1>/dev/null
+fi
+
+# ---------- Helpers ----------
+WARNINGS=0
+CRITICAL=0
+
+# Source verdict logging helper
+SCRIPT_DIR_LOGS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR_LOGS/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_LOGS/lib/verdict_log.sh"
+
+# Safe count: returns 0 if grep finds nothing (instead of "0\n0" from || echo 0)
+count_grep() {
+  local pattern="$1"; shift
+  local result
+  result=$(grep -cE "$pattern" "$@" 2>/dev/null | head -1)
+  [[ -z "$result" ]] && result=0
+  printf "%s" "$result"
+}
+
+count_sudo_grep() {
+  local pattern="$1"; shift
+  local result
+  if [[ -n "$SUDO" ]]; then
+    result=$($SUDO grep -ciE "$pattern" "$@" 2>/dev/null | head -1)
+  else
+    result=$(grep -ciE "$pattern" "$@" 2>/dev/null | head -1)
+  fi
+  [[ -z "$result" ]] && result=0
+  printf "%s" "$result"
+}
+
+count_journal() {
+  local pattern="$1"
+  # Reuse cached journal output if available (set up below), else live-query.
+  if [[ -n "${JOURNAL_CACHE:-}" && -s "$JOURNAL_CACHE" ]]; then
+    grep -ciE "$pattern" "$JOURNAL_CACHE" 2>/dev/null | head -1
+  else
+    local cmd=()
+    [[ -n "$SUDO" ]] && cmd+=("$SUDO")
+    cmd+=(journalctl --no-pager -q)
+    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
+    "${cmd[@]}" 2>/dev/null | grep -ciE "$pattern" | head -1
+  fi
+}
+
+# Run a journalctl command respecting the SINCE setting
+run_journal() {
+  if [[ -n "${JOURNAL_CACHE:-}" && -s "$JOURNAL_CACHE" ]]; then
+    cat "$JOURNAL_CACHE"
+  else
+    local cmd=()
+    [[ -n "$SUDO" ]] && cmd+=("$SUDO")
+    cmd+=(journalctl --no-pager -q)
+    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
+    "${cmd[@]}" 2>/dev/null
+  fi
+}
+
+# Cache journal output ONCE for the whole run — turns 15+ sequential
+# journalctl invocations into one. Saves 5-15s on busy systems.
+JOURNAL_CACHE=""
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+    JOURNAL_CACHE=$(mktemp -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp)
+    trap "rm -f '$JOURNAL_CACHE' 2>/dev/null" RETURN
+    cmd=()
+    [[ -n "$SUDO" ]] && cmd+=("$SUDO")
+    cmd+=(journalctl --no-pager -q)
+    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
+    "${cmd[@]}" > "$JOURNAL_CACHE" 2>/dev/null || true
+fi
+
+START_TIME=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  LOGS.SH — System Log Scanner                                ║
+   ║  Errors · Warnings · Security Events · Trends                ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- Privilege check ----------
+section "PRIVILEGE"
+NEEDS_SUDO=true
+if [[ $EUID -eq 0 ]]; then
+  ok "Running as root - full access to all logs"
+  SUDO=""
+  NEEDS_SUDO=false
+elif sudo -n true 2>/dev/null; then
+  ok "sudo available (cached, no password needed)"
+  SUDO="sudo"
+  NEEDS_SUDO=false
+elif [[ $JSON_OUT -eq 0 ]] && { [[ -t 0 ]] || [[ -n "${SUDO_ASKPASS:-}" ]]; }; then
+  # Interactive session - try to prompt for password
+  if sudo -v 2>/dev/null; then
+    ok "sudo credentials accepted"
+    SUDO="sudo"
+    NEEDS_SUDO=false
+  else
+    warn "sudo password not provided - falling back to non-privileged mode"
+    SUDO=""
+  fi
+else
+  warn "sudo not available non-interactively - falling back to non-privileged mode"
+  warn "(some logs in /var/log may be unreadable)"
+  SUDO=""
+fi
+
+# Detect which log files we can read regardless of sudo
+ACCESSIBLE_LOGS=()
+INACCESSIBLE_LOGS=()
+for LOGFILE in /var/log/syslog /var/log/kern.log /var/log/daemon.log \
+               /var/log/user.log /var/log/messages /var/log/mail.log \
+               /var/log/debug /var/log/auth.log /var/log/dpkg.log \
+               /var/log/boot.log /var/log/Xorg.0.log; do
+  if [[ -r "$LOGFILE" ]]; then
+    ACCESSIBLE_LOGS+=("$LOGFILE")
+  elif [[ -f "$LOGFILE" ]]; then
+    INACCESSIBLE_LOGS+=("$LOGFILE")
+  fi
+done
+
+if [[ ${#INACCESSIBLE_LOGS[@]} -gt 0 ]]; then
+  info "${#ACCESSIBLE_LOGS[@]} logs readable, ${#INACCESSIBLE_LOGS[@]} need root/sudo"
+else
+  ok "All standard logs readable"
+fi
+
+if [[ -n "$SINCE" ]]; then
+  info "Time window: $SINCE"
+else
+  info "Time window: since boot"
+fi
+
+# ============================================================================
+# SECTION 1: Systemd journal summary
+# ============================================================================
+section "SYSTEMD JOURNAL SUMMARY"
+if [[ $HAVE_JOURNALCTL -ne 1 ]]; then
+  warn "journalctl not available"
+elif [[ -z "$SUDO" && $EUID -ne 0 ]]; then
+  info "(needs root/sudo to read system journal)"
+else
+  subsec "Priority counts in window"
+  for PRIO in emerg alert crit err warning; do
+    COUNT=$($SUDO journalctl ${SINCE:+--since "$SINCE"} -p "$PRIO" --no-pager -q 2>/dev/null | wc -l)
+    case "$PRIO" in
+      emerg|alert|crit|err)
+        if (( COUNT > 0 )); then
+          crit "$COUNT ${PRIO} messages"
+        else
+          ok "0 ${PRIO} messages"
+        fi
+        ;;
+      warning)
+        if (( COUNT > 50 )); then
+          warn "$COUNT warnings (high)"
+        elif (( COUNT > 0 )); then
+          info "$COUNT warnings"
+        else
+          ok "0 warnings"
+        fi
+        ;;
+    esac
+  done
+
+  subsec "Notice + info messages"
+  NCOUNT=$($SUDO journalctl ${SINCE:+--since "$SINCE"} -p notice --no-pager -q 2>/dev/null | wc -l)
+  info "$NCOUNT notice/info messages"
+fi
+
+# ============================================================================
+# SECTION 2: Critical events (OOM, panics, segfaults)
+# ============================================================================
+section "CRITICAL EVENTS"
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+  # OOM kills
+  OOM=$(count_journal "oom|out of memory|killed process")
+  if (( OOM > 0 )); then
+    crit "$OOM OOM-kill events - something is leaking memory"
+    run_journal | grep -iE "oom|killed process" \
+      | tail -5 \
+      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+  else
+    ok "No OOM kills"
+  fi
+
+  # Kernel panics
+  PANIC=$(count_journal "kernel panic|hardware error|machine check")
+  if (( PANIC > 0 )); then
+    crit "$PANIC kernel panic / hardware error events"
+  else
+    ok "No kernel panics"
+  fi
+
+  # Segfaults
+  SEGFAULT=$(count_journal "segfault|signal 11")
+  if (( SEGFAULT > 0 )); then
+    warn "$SEGFAULT segfault events"
+    run_journal | grep -iE "segfault|signal 11" \
+      | tail -3 \
+      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+  else
+    ok "No segfaults"
+  fi
+
+  # Hardware errors (mce, edac, etc.)
+  MCE=$(count_journal "machine check|mce:|edac|memory c")
+  if (( MCE > 0 )); then
+    crit "$MCE hardware/memory errors - check DIMMs and CPU"
+  else
+    ok "No MCE / hardware errors"
+  fi
+fi
+
+# ============================================================================
+# SECTION 3: Authentication & security
+# ============================================================================
+section "AUTHENTICATION & SECURITY"
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+  # Failed sudo
+  SUDO_FAIL=$(count_journal "sudo.*authentication failure|sudo.*incorrect password")
+  if (( SUDO_FAIL > 0 )); then
+    warn "$SUDO_FAIL failed sudo attempts"
+  else
+    ok "No failed sudo attempts"
+  fi
+
+  # SSH auth failures
+  SSH_FAIL=$(count_journal "sshd.*authentication failure|sshd.*failed password")
+  if (( SSH_FAIL > 0 )); then
+    crit "$SSH_FAIL SSH authentication failures - possible brute force"
+  else
+    ok "No SSH auth failures"
+  fi
+
+  # Other auth events
+  AUTH_FAIL=$(count_journal "authentication failure")
+  if (( AUTH_FAIL > SUDO_FAIL + SSH_FAIL )); then
+    EXTRA=$(( AUTH_FAIL - SUDO_FAIL - SSH_FAIL ))
+    warn "$EXTRA other authentication failures"
+  fi
+fi
+
+# Traditional auth.log
+if [[ -r /var/log/auth.log ]]; then
+  subsec "/var/log/auth.log (recent activity)"
+  AUTH_LOG_FAILS=$(count_sudo_grep "authentication failure|failed password|invalid user" /var/log/auth.log)
+  if (( AUTH_LOG_FAILS > 0 )); then
+    warn "$AUTH_LOG_FAILS auth.log failures (lifetime, not just window)"
+  else
+    ok "No auth.log failures"
+  fi
+fi
+
+# ============================================================================
+# SECTION 4: Service failures
+# ============================================================================
+section "SERVICE STATUS"
+if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
+  subsec "Currently failed systemd units"
+  # systemctl --failed output - strip ANSI, take only lines that look like unit names
+  FAILED_LIST=$(systemctl --failed --no-pager 2>/dev/null \
+                | sed 's/\x1b\[[0-9;]*m//g' \
+                | grep -oE '[a-zA-Z0-9_@.-]+\.(service|target|mount|swap|socket|path|timer|slice|scope)' \
+                | sort -u)
+  FAILED=$(echo -n "$FAILED_LIST" | grep -c '.' || echo 0)
+  if [[ -n "$FAILED_LIST" ]] && [[ "$FAILED" -gt 0 ]]; then
+    crit "$FAILED failed systemd units:"
+    echo "$FAILED_LIST" | head -10 | sed 's/^/    /'
+  else
+    ok "All systemd units healthy"
+  fi
+
+  subsec "Recently restarted/crashed services"
+  if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
+    $SUDO journalctl ${SINCE:+--since "$SINCE"} _SYSTEMD_UNIT="*.service" --no-pager -q 2>/dev/null \
+      | grep -E "Started|Stopped|Failed" \
+      | grep -E "Failed|stopped.*result=signal" \
+      | tail -10 \
+      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}' \
+      | head -10
+  else
+    info "(needs root/sudo for service crash history)"
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: Disk-related issues
+# ============================================================================
+section "DISK & FILESYSTEM EVENTS"
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+  # Disk errors
+  DISK_ERR=$(count_journal "i/o error|ata[0-9]+.*failed|medium error|sd.*error")
+  if (( DISK_ERR > 0 )); then
+    crit "$DISK_ERR disk I/O errors - check SMART health"
+  else
+    ok "No disk I/O errors"
+  fi
+
+  # Filesystem errors
+  FS_ERR=$(count_journal "ext4.*error|fs corruption|filesystem.*remounted|emergency read-only")
+  if (( FS_ERR > 0 )); then
+    crit "$FS_ERR filesystem errors"
+  else
+    ok "No filesystem errors"
+  fi
+
+  # SMARTD reports
+  SMART=$(count_journal "smartd.*WARNING|smartd.*FAILED")
+  if (( SMART > 0 )); then
+    crit "$SMART SMART health warnings"
+  else
+    ok "No SMART warnings"
+  fi
+
+  # Near-full disks
+  FULL=$(count_journal "no space left|disk full|ENOSPC")
+  if (( FULL > 0 )); then
+    crit "$FULL 'no space left' events"
+  else
+    ok "No ENOSPC errors"
+  fi
+fi
+
+# ============================================================================
+# SECTION 6: Network events
+# ============================================================================
+section "NETWORK EVENTS"
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+  # Link state changes
+  LINK=$(count_journal "link (is )?(up|down)|link becomes|carrier (lost|gained)")
+  if (( LINK > 0 )); then
+    info "$LINK link state changes (informational)"
+    [[ $LINK -gt 50 ]] && warn "Excessive link flapping ($LINK events)"
+  fi
+
+  # DHCP / IP issues
+  DHCP=$(count_journal "dhcp.*no offer|dhcpoffer|dhcpnak|address already in use")
+  if (( DHCP > 0 )); then
+    warn "$DHCP DHCP conflicts / issues"
+  fi
+
+  # DNS issues
+  DNS=$(count_journal "named.*error|systemd-resolved.*failed|connection timed out.*53")
+  if (( DNS > 0 )); then
+    warn "$DNS DNS-related errors"
+  fi
+fi
+
+# ============================================================================
+# SECTION 7: Traditional log files scan
+# ============================================================================
+section "TRADITIONAL LOG FILES"
+# Emit a tabular LOGFILE summary up front (with full absolute paths) so users
+# can see exactly which files are being inspected before the per-file scan.
+printf "  ${C_DIM}%-40s %-7s %8s %7s %7s${C_RESET}\n" "LOGFILE" "ACCESS" "SIZE" "ERRORS" "WARNINGS"
+printf "  ${C_DIM}%-40s %-7s %8s %7s %7s${C_RESET}\n" "----------------------------------------" "-------" "--------" "-------" "-------"
+for LOGFILE in /var/log/syslog /var/log/kern.log /var/log/daemon.log \
+               /var/log/user.log /var/log/messages /var/log/mail.log \
+               /var/log/debug /var/log/auth.log /var/log/dpkg.log \
+               /var/log/boot.log /var/log/Xorg.0.log; do
+  # Try non-sudo first, then sudo
+  READER=""
+  if [[ -r "$LOGFILE" ]]; then
+    READER=""
+  elif [[ -n "$SUDO" ]] && sudo -n test -r "$LOGFILE" 2>/dev/null; then
+    READER="$SUDO"
+  fi
+
+  if [[ -f "$LOGFILE" ]] && [[ -n "$READER" || -r "$LOGFILE" ]]; then
+    subsec "$LOGFILE"
+    SIZE=$(du -h "$LOGFILE" 2>/dev/null | awk '{print $1}')
+    LINES=$(wc -l < "$LOGFILE" 2>/dev/null)
+    if [[ -n "$READER" ]]; then ACCESS="sudo"; else ACCESS="user"; fi
+    # Count error/warning lines in tail (last 10k lines for speed)
+    ERR=$(count_grep "error|fail|emerg" <(tail -n 10000 "$LOGFILE" 2>/dev/null))
+    WRN=$(count_grep "warn" <(tail -n 10000 "$LOGFILE" 2>/dev/null))
+    printf "  ${C_CYAN}%-40s${C_RESET} ${C_DIM}%-7s${C_RESET} %8s %7s %7s\n" \
+      "$LOGFILE" "$ACCESS" "$SIZE" "$ERR" "$WRN"
+    info "Size: $SIZE, Lines: $LINES"
+    if (( LINES > 10000 )); then
+      info "Errors/Warnings from last 10k lines (sample of $LINES total)"
+    fi
+    printf "    %s errors, %s warnings in last %s lines\n" \
+      "$ERR" "$WRN" "$(( LINES > 10000 ? 10000 : LINES ))"
+  fi
+done
+
+# ============================================================================
+# SECTION 8: Application-specific logs
+# ============================================================================
+section "APPLICATION LOGS"
+
+# Helper for app log scanning
+scan_app_log() {
+  local f="$1"
+  local READER=""
+  if [[ -r "$f" ]]; then
+    READER=""
+  elif [[ -n "$SUDO" ]] && sudo -n test -r "$f" 2>/dev/null; then
+    READER="$SUDO"
+  else
+    return  # Can't read this file
+  fi
+  local ERR
+  ERR=$($READER grep -ciE "error|fail|emerg" "$f" 2>/dev/null | head -1)
+  [[ -z "$ERR" ]] && ERR=0
+  if (( ERR > 0 )); then
+    warn "$(basename "$f"): $ERR errors"
+  else
+    ok "$(basename "$f"): clean"
+  fi
+}
+
+# Caddy
+if [[ -d /var/log/caddy ]]; then
+  subsec "Caddy"
+  for f in /var/log/caddy/*.log; do
+    [[ -f "$f" ]] && scan_app_log "$f"
+  done
+fi
+
+# Apache
+if [[ -d /var/log/apache2 ]]; then
+  subsec "Apache"
+  for f in /var/log/apache2/*.log /var/log/apache2/*/*.log; do
+    [[ -f "$f" ]] && scan_app_log "$f"
+  done
+fi
+
+# Nginx
+if [[ -d /var/log/nginx ]]; then
+  subsec "Nginx"
+  for f in /var/log/nginx/*.log; do
+    [[ -f "$f" ]] && scan_app_log "$f"
+  done
+fi
+
+# Postgres
+if [[ -d /var/log/postgresql ]]; then
+  subsec "PostgreSQL"
+  for f in /var/log/postgresql/*.log; do
+    [[ -f "$f" ]] && scan_app_log "$f"
+  done
+fi
+
+# ============================================================================
+# SECTION 9: Top recurring messages (dedup + frequency)
+# ============================================================================
+section "TOP RECURRING MESSAGES (window: $SINCE)"
+RECURRING_ROWS=""
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+  info "Top $TOP_N unique messages by frequency (errors + warnings only)"
+  RECURRING_ROWS=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p warning --no-pager -q 2>/dev/null \
+    | awk '{
+      # Strip timestamp (first 3 fields: "Aug 27 10:30:15") and hostname
+      msg = ""
+      for (i=5; i<=NF; i++) msg = msg " " $i
+      # Strip process IDs and numbers that vary
+      gsub(/[0-9]+/, "N", msg)
+      gsub(/\[N+\]/, "[N]", msg)
+      print msg
+    }' \
+    | sort | uniq -c | sort -rn | head -"$TOP_N" \
+    | awk '{
+      count = $1
+      $1 = ""
+      msg = substr($0, 2)
+      if (length(msg) > 100) msg = substr(msg, 1, 100) "..."
+      printf "  %5d  %s\n", count, msg
+    }')
+  printf '%s\n' "$RECURRING_ROWS"
+
+  # Bar chart visualizing counts of top recurring messages
+  if [[ $JSON_OUT -eq 0 ]] && [[ -n "$RECURRING_ROWS" ]]; then
+    subsec "Distribution chart (most -> least frequent)"
+    local_chart_data=()
+    while IFS= read -r row; do
+      [[ -z "$row" ]] && continue
+      cnt=$(awk '{print $1}' <<< "$row")
+      lbl=$(awk '{print $2}' <<< "$row")
+      [[ -z "$lbl" ]] && lbl="?"
+      local_chart_data+=("$cnt $lbl")
+    done <<< "$RECURRING_ROWS"
+    local_max=0 local_total=0
+    for r in "${local_chart_data[@]}"; do
+      cnt=$(awk '{print $1}' <<< "$r")
+      (( cnt > local_max )) && local_max=$cnt
+      local_total=$(( local_total + cnt ))
+    done
+    printf "${C_BOLD}${C_CYAN}  Top items (bar chart, total=%d):${C_RESET}\n" "$local_total"
+    local_w=40
+    for r in "${local_chart_data[@]}"; do
+      cnt=$(awk '{print $1}' <<< "$r")
+      lbl=$(awk '{print $2}' <<< "$r")
+      pct=$(( cnt * 100 / (local_max > 0 ? local_max : 1) ))
+      col="$C_GREEN"; (( pct >= 60 )) && col="$C_YELLOW"; (( pct >= 85 )) && col="$C_RED"
+      filled=$(( pct * local_w / 100 ))
+      bar_s=""
+      for (( j=0; j<filled; j++ )); do bar_s+="█"; done
+      printf "  %-40s ${col}%-40s${C_RESET} %d\n" "${lbl:0:40}" "$bar_s" "$cnt"
+    done
+  fi
+fi
+
+# ============================================================================
+# SECTION 10: Recent log tail (errors only)
+# ============================================================================
+if [[ $TAIL_MODE -eq 1 ]]; then
+  section "RECENT ERROR LOG (last 50)"
+  if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+    ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p err --no-pager -q 2>/dev/null \
+      | tail -50 \
+      | awk '{
+        # Color timestamps dim, keep rest
+        printf "%s%s%s\n", "\033[2m", $0, "\033[0m"
+      }'
+  fi
+fi
+
+# ============================================================================
+# SECTION 11: Recommendations
+# ============================================================================
+section "RECOMMENDATIONS"
+
+REC_FILE=$(mktemp)
+{
+  if [[ ${#INACCESSIBLE_LOGS[@]} -gt 0 ]]; then
+    echo "• Re-run with sudo for full coverage: sudo $0"
+  fi
+  if (( CRITICAL > 0 )) && [[ -n "$FAILED_LIST" ]]; then
+    echo "• Address failed systemd units first: systemctl status <unit-name>"
+    echo "• Restart a failed unit: sudo systemctl restart <unit-name>"
+    echo "• View its logs: sudo journalctl -u <unit-name> --since '1 hour ago'"
+  fi
+  if (( WARNINGS > 5 )); then
+    echo "• High warning count - investigate recurring patterns in 'TOP RECURRING MESSAGES'"
+  fi
+  echo "• For full history: journalctl --since '7 days ago' | less"
+  echo "• Follow live errors: journalctl -p err -f"
+  echo "• To save this report: ./logz --no-color > ~/security/logs-$(date +%Y%m%d).txt"
+  if [[ -r /var/log/syslog ]] || [[ -r /var/log/kern.log ]]; then
+    echo "• Old logs may be in /var/log/*.gz (rotated). Check with: ls -lt /var/log/*.gz | head"
+  fi
+} > "$REC_FILE"
+
+sort -u "$REC_FILE" | sed 's/^/  /'
+rm -f "$REC_FILE"
+
+# ============================================================================
+# VERDICT
+# ============================================================================
+END_TIME=$(date +%s)
+DURATION=$(( END_TIME - START_TIME ))
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "\n${C_BOLD}${C_BLUE}━━━ VERDICT ━━━${C_RESET}\n"
+
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings found\n" "$CRITICAL" "$WARNINGS"
+    printf "  ${C_RED}Action needed - see recommendations${C_RESET}\n"
+    EXIT_CODE=2
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    printf "  ${C_YELLOW}System usable but review warnings above${C_RESET}\n"
+    EXIT_CODE=1
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    printf "  ${C_GREEN}Logs look clean${C_RESET}\n"
+    EXIT_CODE=0
+  fi
+
+  printf "\n${C_DIM}Scan completed in ${DURATION}s at $(date '+%H:%M:%S')${C_RESET}\n\n"
+
+  # Display one-liner explanations for any critical/warning issues logged
+  show_verdict_one_liners
+else
+  exec 1>&3
+  exec 3>&-
+  if (( CRITICAL > 0 )); then
+    EXIT_CODE=2
+    VERDICT="critical"
+  elif (( WARNINGS > 0 )); then
+    EXIT_CODE=1
+    VERDICT="warning"
+  else
+    EXIT_CODE=0
+    VERDICT="healthy"
+  fi
+  cat << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "hostname": "$HOSTNAME_SHORT",
+  "since": "$SINCE",
+  "critical": $CRITICAL,
+  "warnings": $WARNINGS,
+  "verdict": "$VERDICT",
+  "duration_s": $DURATION
+}
+EOF
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    _LOG_SUMMARY="since=$SINCE critical=$CRITICAL warnings=$WARNINGS verdict=$VERDICT duration=${DURATION}s"
+    ai_emit_verdict "top_issue" "$_LOG_SUMMARY" 2>/dev/null || true
+fi
+
+exit $EXIT_CODE

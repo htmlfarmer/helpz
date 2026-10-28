@@ -1,0 +1,825 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# cronz — Cron & Scheduled-Task Auditor / Controller
+# ----------------------------------------------------------------------------
+# Audits every scheduled task on the system:
+#   - /etc/crontab                  — system crontab
+#   - /etc/cron.d/                  — drop-in snippets
+#   - /etc/cron.{hourly,daily,...}/ — anacron-style scripts
+#   - /var/spool/cron/crontabs/     — per-user crontabs
+#   - /etc/anacrontab               — anacron config
+#   - systemd timers                — cron-equivalent units
+#
+# For each job shows: schedule, command, who runs it, last-run status,
+# the exact file that controls it, and any suspicious patterns.
+#
+# Modes:
+#   ./cronz                          Audit + display
+#   ./cronz --json                   Machine-readable JSON
+#   ./cronz --user USERNAME          Show that user's crontab
+#   ./cronz --show FILE              Print the contents of a cron file
+#   ./cronz --disable FILE           Comment out (backup → <file>.disabled)
+#   ./cronz --remove FILE            Move to backup dir (recoverable)
+#   ./cronz --disable-user USER      Disable a user's entire crontab
+#   ./cronz --recent [N=20]          N most recently modified cron files
+#
+# All mutating actions create backups in /var/backups/cron-sh/<ts>/
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR/lib/verdict_log.sh"
+
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          cronz — Cron & Scheduled-Task Controller            ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Audits every scheduled job on the system — system crontab, drop-ins,
+  periodic directories, per-user crontabs, anacron, and systemd timers.
+  For each job shows the schedule, command, run-as user, last run
+  status, the exact file controlling it, and any suspicious patterns.
+  Can disable, remove, or display individual jobs.
+
+USAGE
+  ./cronz                              Audit all cron & timer jobs
+  ./cronz --json                       Machine-readable JSON
+  ./cronz --user <name>                Show specific user's crontab
+  ./cronz --show <file>                Print the contents of a cron file
+  ./cronz --disable <file>             Comment out (with backup)
+  ./cronz --remove <file>              Move to backup (with backup)
+  ./cronz --disable-user <user>        Disable an entire user's crontab
+  ./cronz --recent [N=20]              Show N most recently changed
+  ./cronz --timers                     Show systemd timers only
+  ./cronz --user-cron-only            Only show per-user crontabs
+
+OPTIONS
+  --json              JSON output
+  --no-color          Disable ANSI colors
+  --user NAME         Filter/show specific user's crontab
+  --show FILE         Print file contents to stdout
+  --disable FILE      Comment out active lines (creates .disabled backup)
+  --remove FILE       Move file to /var/backups/cron-sh/ (recoverable)
+  --disable-user USER Disable a user's crontab (move to /var/backups/...)
+  --recent [N]        Show N most recently modified cron files
+  --timers            Show only systemd timers (equivalent to cron)
+  --user-cron-only    Show only /var/spool/cron/* user crontabs
+  -h, --help          Show this help
+
+CRON FILE HIERARCHY (priority → execution)
+  /etc/crontab                       System crontab (single file)
+  /etc/cron.d/                       Drop-in snippets (any name)
+  /etc/cron.hourly/                  Hourly scripts (run-parts)
+  /etc/cron.daily/                   Daily scripts
+  /etc/cron.weekly/                  Weekly scripts
+  /etc/cron.monthly/                 Monthly scripts
+  /etc/anacrontab                    Anacron config (laptop-friendly)
+  /var/spool/cron/crontabs/<user>    Per-user crontab (one file per user)
+
+SCHEDULE FIELD ORDER (Vixie cron, 5 fields + command)
+  ┌─ minute (0-59)
+  │ ┌─ hour (0-23)
+  │ │ ┌─ day of month (1-31)
+  │ │ │ ┌─ month (1-12)
+  │ │ │ │ ┌─ day of week (0-7, 0 and 7 = Sunday)
+  │ │ │ │ │
+  * * * * *  command-to-execute
+
+  Special strings:
+    @reboot    — once at startup
+    @yearly    — same as 0 0 1 1 *
+    @monthly   — same as 0 0 1 * *
+    @weekly    — same as 0 0 * * 0
+    @daily     — same as 0 0 * * *
+    @hourly    — same as 0 * * * *
+
+INVESTIGATION COMMANDS
+  crontab -l                          Your user's crontab
+  sudo crontab -u <user> -l           Another user's crontab
+  ls -la /etc/cron.d /etc/cron.*/     All system cron entries
+  systemctl list-timers --all         All systemd timers
+  systemctl cat <timer-name>.timer    The timer unit file
+  grep -rE 'curl|wget|nc|http' /etc/cron* /var/spool/cron  # suspect patterns
+  journalctl -u cron --since '1 day ago'  Recent cron activity
+
+WARNING → INVESTIGATION COMMANDS
+  Cron job running every minute    →  Check persistence: who added it? `stat <file>`
+  curl|bash in cron               →  Inspect URL, hash file, check server compromise
+  Job writing to /tmp or /dev/shm →  Likely malware staging area
+
+HELPEOF
+    exit 0
+}
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+JSON_OUT=0
+NO_COLOR_FLAG=0
+ACTION=""
+ACTION_TARGET=""
+ACTION_USER=""
+RECENT_N=20
+FILTER_USER=""
+ONLY_TIMERS=0
+ONLY_USER_CRON=0
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              show_help ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --user)                 i=$((i+1)); FILTER_USER="${ARGS[$i]:-}" ;;
+        --show)                 i=$((i+1)); ACTION="show";       ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --disable)              i=$((i+1)); ACTION="disable";    ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --remove)               i=$((i+1)); ACTION="remove";     ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --disable-user)         i=$((i+1)); ACTION="disable-user"; ACTION_USER="${ARGS[$i]:-}" ;;
+        --recent)               i=$((i+1)); RECENT_N="${ARGS[$i]:-20}" ;;
+        --recent=*)             RECENT_N="${arg#*=}" ;;
+        --timers)               ONLY_TIMERS=1 ;;
+        --user-cron-only)       ONLY_USER_CRON=1 ;;
+        --ai)                  AI_VERDICT=1 ;;
+        --no-ai)               AI_VERDICT=0 ;;
+        *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# ─── Colors ─────────────────────────────────────────────────────────────────
+if [[ -t 1 ]] && [[ $JSON_OUT -eq 0 ]] && [[ "${NO_COLOR:-0}" -eq 0 ]] && [[ $NO_COLOR_FLAG -eq 0 ]]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'; C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+    C_MAGENTA=""; C_CYAN=""
+fi
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "cronz"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  CRON.SH — Cron & Scheduled-Task Auditor                      ║
+   ║  Crontabs · Timers · Periodic Scripts                         ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ─── Privileges ────────────────────────────────────────────────────────────
+SUDO=""
+if [[ $EUID -eq 0 ]]; then SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO="sudo"
+fi
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+# truncate(): keep a string to max chars, appending an ellipsis when clipped.
+truncate() {
+    local s="$1" max="$2"
+    if (( ${#s} > max )); then
+        printf "%s…" "${s:0:$max-1}"
+    else
+        printf "%s" "$s"
+    fi
+}
+
+# resolve_cron_cmd(): take a cron command string and append the resolved
+# absolute path of its first word when it isn't already an absolute path.
+# e.g. "python3 /opt/x.py" -> "python3 /opt/x.py (->/usr/bin/python3)"
+resolve_cron_cmd() {
+    local cmd="$1"
+    local first resolved=""
+    # awk safely grabs the first whitespace-delimited token
+    first=$(awk '{print $1}' <<< "$cmd")
+    if [[ -n "$first" && "$first" != */* ]]; then
+        resolved=" (->$(command -v "$first" 2>/dev/null || echo "$first"))"
+    fi
+    printf "%s%s" "$cmd" "$resolved"
+}
+
+section() {
+    [[ $JSON_OUT -eq 1 ]] && return 0
+    printf "\n${C_BOLD}${C_CYAN}━━━ %s ━━━${C_RESET}\n" "$1"
+}
+subsec() {
+    [[ $JSON_OUT -eq 1 ]] && return 0
+    printf "  ${C_DIM}── %s ──${C_RESET}\n" "$1"
+}
+ok()    { [[ $JSON_OUT -eq 1 ]] && return 0; printf "  ${C_GREEN}✓${C_RESET} %s\n" "$1"; }
+info()  { [[ $JSON_OUT -eq 1 ]] && return 0; printf "  ${C_DIM}·${C_RESET} %s\n" "$1"; }
+warn()  { [[ $JSON_OUT -eq 1 ]] && return 0; printf "  ${C_YELLOW}!${C_RESET} %s\n" "$1"; }
+crit()  { [[ $JSON_OUT -eq 1 ]] && return 0; printf "  ${C_RED}✗${C_RESET} %s\n" "$1"; }
+
+# bar_chart(): render "<count> <label>" rows as a horizontal ASCII bar chart.
+# Usage: bar_chart "Title" "12 nightly-backup" "3 logrotate" ...
+# Silently does nothing in --json mode or when there is nothing to plot.
+bar_chart() {
+    [[ $JSON_OUT -eq 1 ]] && return 0
+    local title="$1"; shift
+    (( $# == 0 )) && return 0
+    local -a rows=("$@")
+    local max_val total row val label pct color filled bar j width=40
+    max_val=$(printf '%s\n' "${rows[@]}" | awk '{print $1}' | sort -rn | head -1)
+    total=$(printf '%s\n' "${rows[@]}" | awk '{s+=$1} END {print s+0}')
+    (( total == 0 )) && return 0
+    printf "\n  ${C_BOLD}${C_CYAN}%s (total=%s)${C_RESET}\n" "$title" "$total"
+    while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        val="${row%% *}"
+        label="${row#* }"
+        pct=$(( val * 100 / (max_val > 0 ? max_val : 1) ))
+        color="$C_GREEN"; (( pct >= 60 )) && color="$C_YELLOW"; (( pct >= 85 )) && color="$C_RED"
+        filled=$(( pct * width / 100 ))
+        (( filled == 0 && val > 0 )) && filled=1
+        bar=""
+        for (( j=0; j<filled; j++ )); do bar+="█"; done
+        for (( j=filled; j<width; j++ )); do bar+=" "; done
+        printf "    %-30s ${color}%s${C_RESET} %d\n" "${label:0:30}" "$bar" "$val"
+    done < <(printf '%s\n' "${rows[@]}" | sort -rn | head -10)
+}
+
+# ─── Backup infrastructure ─────────────────────────────────────────────────
+backup_path() {
+    local file="$1"
+    local ts bakdir="/var/backups/cron-sh"
+    ts=$(date +%Y%m%d-%H%M%S)
+    $SUDO mkdir -p "$bakdir/$ts" 2>/dev/null || mkdir -p "$bakdir/$ts" 2>/dev/null || true
+    echo "$bakdir/$ts/$(basename "$file")"
+}
+
+# ─── Action runner ─────────────────────────────────────────────────────────
+run_action() {
+    section "ACTION: $ACTION ${ACTION_TARGET:-$ACTION_USER}"
+
+    case "$ACTION" in
+        show)
+            local target="$ACTION_TARGET"
+            if [[ -z "$target" ]]; then crit "Missing file argument"; exit 64; fi
+            if [[ "$target" == "USER:"* ]]; then
+                local u="${target#USER:}"
+                $SUDO crontab -u "$u" -l 2>&1 | head -100
+            elif [[ -f "$target" ]]; then
+                cat "$target"
+            else
+                crit "Not a file or user crontab: $target"
+                exit 2
+            fi
+            ;;
+        disable)
+            local target="$ACTION_TARGET"
+            if [[ -z "$target" ]] || [[ ! -f "$target" ]]; then
+                crit "Missing or invalid file: $target"
+                exit 64
+            fi
+            local bak
+            bak=$(backup_path "$target")
+            $SUDO cp -a "$target" "$bak" 2>/dev/null || cp -a "$target" "$bak" || true
+            # Comment out non-blank, non-comment lines
+            $SUDO sed -i.bak -E 's/^([^#])/#DISABLED \1/' "$target" 2>/dev/null \
+                || sed -i.bak -E 's/^([^#])/#DISABLED \1/' "$target" 2>/dev/null || true
+            ok "Disabled: $target (active lines now prefixed with #DISABLED)"
+            info "Backup:   $bak"
+            info "Re-enable: $0 --show $target → manually uncomment"
+            ;;
+        remove)
+            local target="$ACTION_TARGET"
+            if [[ -z "$target" ]] || [[ ! -f "$target" ]]; then
+                crit "Missing or invalid file: $target"
+                exit 64
+            fi
+            local bak
+            bak=$(backup_path "$target")
+            $SUDO mv "$target" "$bak" 2>/dev/null || mv "$target" "$bak" || true
+            ok "Removed: $target → $bak"
+            warn "To restore: sudo cp $bak $target"
+            ;;
+        disable-user)
+            local u="$ACTION_USER"
+            if [[ -z "$u" ]]; then crit "Missing username"; exit 64; fi
+            # Find the user's crontab spool file
+            local ctab="/var/spool/cron/crontabs/$u"
+            if [[ ! -f "$ctab" ]]; then
+                crit "No crontab for user $u"
+                exit 2
+            fi
+            local bak
+            bak=$(backup_path "$ctab")
+            $SUDO cp -a "$ctab" "$bak" 2>/dev/null || cp -a "$ctab" "$bak" || true
+            $SUDO sed -i -E 's/^([^#])/#DISABLED \1/' "$ctab" 2>/dev/null \
+                || sed -i -E 's/^([^#])/#DISABLED \1/' "$ctab" 2>/dev/null || true
+            ok "Disabled crontab for user $u"
+            info "Backup:   $bak"
+            ;;
+    esac
+    exit 0
+}
+
+if [[ -n "$ACTION" ]]; then
+    run_action
+fi
+
+# ─── Filter handling ───────────────────────────────────────────────────────
+should_show_user() {
+    local u="$1"
+    [[ -z "$FILTER_USER" ]] && return 0
+    [[ "$u" == "$FILTER_USER" ]] && return 0
+    return 1
+}
+
+# ─── 1. /etc/crontab ───────────────────────────────────────────────────────
+audit_etc_crontab() {
+    section "/ETC/CRONTAB — System Crontab"
+    if [[ ! -f /etc/crontab ]]; then
+        info "No /etc/crontab file"
+        return
+    fi
+    local count=0
+    while IFS= read -r line; do
+        # Skip blanks and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Lines: schedule + user + command
+        local schedule user command cmd_full
+        schedule=$(awk '{print $1,$2,$3,$4,$5}' <<< "$line")
+        user=$(awk '{print $6}' <<< "$line")
+        command=$(awk '{for(i=7;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+        command="${command% }"
+        cmd_full=$(resolve_cron_cmd "$command")
+        count=$((count + 1))
+
+        printf "  ${C_BOLD}[line %d]${C_RESET} ${C_CYAN}%-15s${C_RESET} user=${C_MAGENTA}%-12s${C_RESET} cmd=${C_DIM}%s${C_RESET}\n" \
+            "$count" "$schedule" "$user" "$(truncate "$command" 60)"
+        printf "      ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
+        printf "      ${C_DIM}file: /etc/crontab (line %d)${C_RESET}\n" "$count"
+
+        # Suspicious pattern check
+        check_suspicious "$command" "/etc/crontab:$count"
+    done < /etc/crontab
+    info "Total active entries: $count"
+    info "Edit /etc/crontab with: sudo nano /etc/crontab"
+}
+
+# ─── 2. /etc/cron.d/ ──────────────────────────────────────────────────────
+audit_cron_d() {
+    section "/ETC/CRON.D/ — Drop-in Snippets"
+    if [[ ! -d /etc/cron.d ]]; then
+        info "/etc/cron.d not present"
+        return
+    fi
+    local files
+    files=$(find /etc/cron.d -maxdepth 1 -type f 2>/dev/null | sort)
+    if [[ -z "$files" ]]; then
+        info "No files in /etc/cron.d"
+        return
+    fi
+    local total_jobs=0
+    local -a chart_rows=()
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        subsec "File: $f"
+        # Check permissions — cron.d files must not be group/world-writable
+        local perms owner group_owner
+        perms=$(stat -c '%a' "$f" 2>/dev/null)
+        owner=$(stat -c '%U' "$f" 2>/dev/null)
+        group_owner=$(stat -c '%G' "$f" 2>/dev/null)
+        if [[ "$perms" =~ ^[0-6][0-7][0-7]$ ]] && (( (8#$perms & 022) == 0 )); then
+            ok "Permissions $perms ($owner:$group_owner) — cron.d requires no group/world write"
+        else
+            crit "Permissions $perms — cron.d files must NOT be group/world-writable!"
+            info "Cron will SILENTLY IGNORE this file until fixed. Run: sudo chmod 644 $f"
+        fi
+        # Owner must be root — non-root-owned cron.d file = critical persistence vector.
+        if [[ "$owner" != "root" ]]; then
+            critf "cron_d_owner" "$f owned by '$owner' (must be root) — arbitrary code execution as root on schedule" \
+                "Run 'sudo chown root:root $f'"
+        fi
+
+        local count=0
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*ENV ]] && continue  # environment variables
+            local schedule user command cmd_full
+            schedule=$(awk '{print $1,$2,$3,$4,$5}' <<< "$line")
+            user=$(awk '{print $6}' <<< "$line")
+            command=$(awk '{for(i=7;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+            command="${command% }"
+            cmd_full=$(resolve_cron_cmd "$command")
+            count=$((count + 1))
+            total_jobs=$((total_jobs + 1))
+            printf "    ${C_CYAN}%-15s${C_RESET} user=${C_MAGENTA}%-12s${C_RESET} cmd=${C_DIM}%s${C_RESET}\n" \
+                "$schedule" "$user" "$(truncate "$command" 60)"
+            printf "        ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
+            check_suspicious "$command" "$f:line-$count"
+        done < "$f"
+        if (( count == 0 )); then info "  (no active jobs)"; fi
+        chart_rows+=("$count $(basename "$f")")
+    done <<< "$files"
+    bar_chart "Jobs per /etc/cron.d file" "${chart_rows[@]}"
+    info "Total /etc/cron.d jobs: $total_jobs"
+}
+
+# ─── 3. /etc/cron.{hourly,daily,weekly,monthly}/ ─────────────────────────
+audit_periodic_dirs() {
+    section "/ETC/CRON.{HOURLY,DAILY,WEEKLY,MONTHLY}/ — Periodic Scripts"
+    local -a chart_rows=()
+    for dir in hourly daily weekly monthly; do
+        local d="/etc/cron.$dir"
+        if [[ ! -d "$d" ]]; then continue; fi
+        local files
+        files=$(find "$d" -maxdepth 1 -type f -o -type l 2>/dev/null | sort)
+        if [[ -z "$files" ]]; then
+            info "cron.$dir: (empty)"
+            continue
+        fi
+        subsec "cron.$dir (${C_DIM}$d${C_RESET})"
+        while IFS= read -r f; do
+            local perms owner
+            perms=$(stat -c '%a' "$f" 2>/dev/null)
+            owner=$(stat -c '%U' "$f" 2>/dev/null)
+            local runas="root"
+            # Many periodic scripts are run by root unless they have a setuid wrapper
+            local shebang
+            shebang=$(head -1 "$f" 2>/dev/null)
+            printf "  ${C_GREEN}%-32s${C_RESET} ${C_DIM}perms=%s owner=%s${C_RESET}\n" \
+                "$(basename "$f")" "$perms" "$owner"
+            printf "      ${C_DIM}shebang: %s${C_RESET}\n" "${shebang:0:80}"
+            # Owner check — periodic scripts MUST be root-owned; non-root = persistence.
+            if [[ "$owner" != "root" ]]; then
+                critf "periodic_cron_owner" "$f owned by '$owner' (must be root)" \
+                    "Run 'sudo chown root:root $f' to prevent unprivileged code running on schedule."
+            fi
+            # Perm check — periodic scripts MUST NOT be group/world-writable.
+            if [[ "$perms" =~ ^[0-6][0-7][0-7]$ ]] && (( (8#$perms & 022) != 0 )); then
+                crit "$f perms=$perms — group/world-writable periodic script"
+                info "Run: sudo chmod 755 $f"
+            fi
+            check_suspicious "$(cat "$f" 2>/dev/null | head -5)" "$f"
+        done <<< "$files"
+        chart_rows+=("$(grep -c . <<< "$files") cron.$dir")
+    done
+    bar_chart "Scripts per periodic directory" "${chart_rows[@]}"
+    info "Edit scripts in /etc/cron.{hourly,daily,weekly,monthly}/"
+    info "Cron runs them via run-parts — keep them executable and named without dots"
+}
+
+# ─── 4. Per-user crontabs ────────────────────────────────────────────────
+audit_user_crontabs() {
+    section "PER-USER CRONTABS — /var/spool/cron/crontabs/"
+    local spool="/var/spool/cron/crontabs"
+    if [[ ! -d "$spool" ]]; then
+        info "No crontab spool directory (crond not installed?)"
+        return
+    fi
+
+    local files
+    files=$(find "$spool" -maxdepth 1 -type f 2>/dev/null | sort)
+    if [[ -z "$files" ]]; then
+        info "No user crontabs"
+        return
+    fi
+
+    local -a chart_rows=()
+    while IFS= read -r f; do
+        local user
+        user=$(basename "$f")
+        if ! should_show_user "$user"; then continue; fi
+
+        local perms owner
+        perms=$(stat -c '%a' "$f" 2>/dev/null)
+        owner=$(stat -c '%U' "$f" 2>/dev/null)
+        if [[ "$perms" == "600" && "$owner" == "$user" ]]; then
+            ok "User: $user (perms=$perms owner=$owner)"
+        else
+            warn "User: $user (perms=$perms owner=$owner) — should be 600 and owned by $user"
+            info "  Fix: sudo chown $user:$user $f && sudo chmod 600 $f"
+        fi
+
+        local count=0
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            local schedule command cmd_full
+            schedule=$(awk '{print $1,$2,$3,$4,$5}' <<< "$line")
+            command=$(awk '{for(i=6;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+            command="${command% }"
+            cmd_full=$(resolve_cron_cmd "$command")
+            count=$((count + 1))
+            printf "    ${C_CYAN}%-15s${C_RESET} cmd=${C_DIM}%s${C_RESET}\n" \
+                "$schedule" "$(truncate "$command" 60)"
+            printf "      ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
+            check_suspicious "$command" "$f:line-$count"
+        done < "$f" 2>/dev/null
+
+        if [[ $EUID -ne 0 && "$user" != "$(whoami)" ]]; then
+            info "  (read as root for full visibility — re-run with sudo)"
+        fi
+        if (( count == 0 )); then info "  (empty crontab)"; fi
+        chart_rows+=("$count $user")
+    done <<< "$files"
+
+    bar_chart "Jobs per user crontab" "${chart_rows[@]}"
+    info "Per-user crontabs are owned by the user and mode 600"
+    info "Edit with: crontab -e (your user) or sudo crontab -u <user> -e"
+}
+
+# ─── 5. Anacron ──────────────────────────────────────────────────────────
+audit_anacron() {
+    section "ANACRON — /etc/anacrontab"
+    if [[ ! -f /etc/anacrontab ]]; then
+        info "No /etc/anacrontab (anacron not configured)"
+        return
+    fi
+    info "Anacron runs missed jobs after downtime (useful for laptops)"
+    local count=0
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        local period delay job_id command cmd_full
+        period=$(awk '{print $1}' <<< "$line")
+        delay=$(awk '{print $2}' <<< "$line")
+        job_id=$(awk '{print $3}' <<< "$line")
+        command=$(awk '{for(i=4;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+        command="${command% }"
+        cmd_full=$(resolve_cron_cmd "$command")
+        count=$((count + 1))
+        printf "  ${C_BOLD}[job %d]${C_RESET} period=${C_MAGENTA}%s${C_RESET} delay=${C_CYAN}%s${C_RESET} id=${C_YELLOW}%s${C_RESET}\n" \
+            "$count" "$period" "$delay" "$job_id"
+        printf "      ${C_DIM}cmd: %s${C_RESET}\n" "$(truncate "$command" 80)"
+        printf "      ${C_DIM}COMMAND: %s${C_RESET}\n" "$cmd_full"
+        check_suspicious "$command" "/etc/anacrontab:$count"
+    done < /etc/anacrontab
+    info "Total anacron jobs: $count"
+}
+
+# ─── 6. Systemd timers ──────────────────────────────────────────────────
+audit_systemd_timers() {
+    section "SYSTEMD TIMERS — Cron equivalent (unit files)"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        info "systemctl not available"
+        return
+    fi
+
+    # list-unit-files gives a stable 2-column format (name + state) that
+    # doesn't suffer from the variable-width pitfalls of list-timers.
+    local timer_units
+    timer_units=$(systemctl list-unit-files --type=timer --no-pager --no-legend 2>/dev/null \
+        | awk '{print $1}' | grep '\.timer$' | sort)
+    if [[ -z "$timer_units" ]]; then
+        info "No systemd timer unit files installed"
+        return
+    fi
+
+    printf "${C_DIM}  %-35s %-22s %-12s %s${C_RESET}\n" "TIMER" "NEXT RUN" "STATE" "UNIT FILE"
+    printf "  %s\n" "─────────────────────────────────────────────────────────────────────────────"
+
+    while IFS= read -r unit; do
+        [[ -z "$unit" ]] && continue
+        local timer_name="${unit%.timer}"
+        local next_run state unit_path
+        next_run=$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null)
+        [[ "$next_run" == "@0" || -z "$next_run" ]] && next_run="(inactive)"
+        # Convert monotonic / timestamp to human
+        if [[ "$next_run" =~ ^[0-9]+$ ]] && (( next_run > 0 )); then
+            next_run=$(date -d "@$((next_run / 1000000))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+        fi
+        state=$(systemctl show "$unit" -p UnitFileState --value 2>/dev/null)
+        unit_path=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null)
+        # Fallback to well-known paths
+        if [[ -z "$unit_path" || ! -f "$unit_path" ]]; then
+            for p in /usr/lib/systemd/system /etc/systemd/system /run/systemd/system; do
+                if [[ -f "$p/$unit" ]]; then unit_path="$p/$unit"; break; fi
+            done
+        fi
+
+        local state_color="$C_DIM"
+        case "$state" in
+            enabled|static) state_color="$C_GREEN" ;;
+            disabled)       state_color="$C_YELLOW" ;;
+            masked)         state_color="$C_RED" ;;
+        esac
+        printf "  ${C_CYAN}%-35s${C_RESET} %-22s ${state_color}%-12s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+            "$timer_name" "$next_run" "$state" "$unit_path"
+
+        # Show the corresponding service's ExecStart for visibility
+        if [[ -n "$unit_path" && -f "$unit_path" ]]; then
+            local svc="${timer_name}.service"
+            local svc_unit=""
+            for p in /usr/lib/systemd/system /etc/systemd/system /run/systemd/system; do
+                if [[ -f "$p/$svc" ]]; then svc_unit="$p/$svc"; break; fi
+            done
+            [[ -z "$svc_unit" ]] && svc_unit=$(systemctl show "$svc" -p FragmentPath --value 2>/dev/null)
+            if [[ -n "$svc_unit" && -f "$svc_unit" ]]; then
+                local exec_start
+                exec_start=$(grep -E '^[[:space:]]*ExecStart=' "$svc_unit" 2>/dev/null | head -1)
+                printf "      ${C_DIM}service: %s${C_RESET}\n" "$exec_start"
+                check_suspicious "$exec_start" "$timer_name.timer"
+            fi
+        fi
+    done <<< "$timer_units"
+    info "Inspect a timer: systemctl cat <name>.timer"
+    info "Disable:         sudo systemctl disable --now <name>.timer"
+    info "List all timers: systemctl list-timers --all"
+}
+
+# ─── Suspicious-pattern detection ────────────────────────────────────────
+SUSPECT_TOTAL=0
+check_suspicious() {
+    local cmd="$1"
+    local origin="$2"
+
+    # Combined check: run all patterns in a single awk pass (much faster than
+    # 8 separate grep -qE calls per cron line). Each pattern emits a tag;
+    # outer shell reads the tag and emits the right severity.
+    local hit
+    hit=$(awk -v IGNORECASE=1 '
+        BEGIN { lc = tolower(ARGV[1]) }
+        # 1. curl|wget piped to interpreter
+        /curl[[:space:]]+-[A-Za-z]*[kKsS].*[|][^|]*(bash|sh|python|perl|ruby|node)/ ||
+        /wget[[:space:]]+.*[|][^|]*(bash|sh|python|perl|ruby|node)/ { print "PIPE_SHELL"; }
+        # 2. netcat -e (reverse shell)
+        /(nc|ncat|netcat)[^|]*[[:space:]]-e/ { print "NC_E"; }
+        # 3. base64 / xxd piped to interpreter
+        /(base64|xxd).*[|][^|]*(bash|sh|python|perl)/ { print "B64_SHELL"; }
+        # 4. /tmp /dev/shm /var/tmp + write/exec
+        (/[/]tmp[/]|[/]dev[/]shm[/]|[/]var[/]tmp[/]/) &&
+        /[|>]|tee[[:space:]]|cp[[:space:]]|mv[[:space:]]|bash[[:space:]]|sh[[:space:]]|chmod[[:space:]]/ { print "TMP_STAGE"; }
+        # 5. chmod +x or 7xx perms
+        /chmod[[:space:]]+([+]x|[0-7]*7[0-7]*)/ { print "CHMOD_EXEC"; }
+        # 6. SSH key push
+        /(ssh-keyscan|ssh-copy-id)[^|]*&&.*authorized_keys/ { print "SSH_KEYPUSH"; }
+        # 7. crypto miner
+        /(minerd|xmr|monero|stratum|cryptonight|rigcp|minergate)/ { print "MINER"; }
+        # 8. python -c / perl -e / ruby -e (in-script execution, often obfuscated)
+        /(python|perl|ruby)[[:space:]]+-c/ ||
+        /(python|perl|ruby)[[:space:]]+-e/ { print "INLINE_SCRIPT"; }
+        # 9. eval $(...) / eval `...` (hidden command execution)
+        /eval[[:space:]]+[$][(]|[`]/ && /eval/ { print "EVAL_SUBSHELL"; }
+        # 10. setsid + networking (backgrounded reverse shell pattern)
+        /setsid[[:space:]]+.*(curl|wget|nc|ncat|bash|sh|python)/ { print "SETSID_NET"; }
+        # 11. raw outbound IP literal (no DNS hostname, often hardcoded C2)
+        /https?[:][\/][\/]([0-9]{1,3}[.]){3}[0-9]{1,3}/ ||
+        /https?[:][\/][\/][0-9a-f:]+[:][0-9]+/ { print "RAW_IP"; }
+        # 12. PowerShell reference (Windows malware, unusual on Linux but cheap check)
+        /(powershell|pwsh|wscript|cscript)[.]?(exe)?/i { print "PSHELL"; }
+        { exit }  # only first matching pattern per line
+    ' <<<"$cmd" 2>/dev/null)
+
+    case "$hit" in
+        PIPE_SHELL)
+            crit "[$origin] curl|wget piped to shell — supply-chain risk"
+            info "  Pattern: $(echo "$cmd" | grep -oE '(curl|wget)[^|]*\|[^ ]*' | head -1)"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        NC_E)
+            crit "[$origin] netcat -e (reverse shell pattern)"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        B64_SHELL)
+            crit "[$origin] base64/xxd payload to shell — obfuscation pattern"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        TMP_STAGE)
+            warn "[$origin] references /tmp|/dev/shm|/var/tmp — verify it's not malware staging"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        CHMOD_EXEC)
+            warn "[$origin] sets executable bit — verify it's a legitimate installer, not malware"
+            ;;
+        SSH_KEYPUSH)
+            warn "[$origin] pushes SSH keys — verify it's your own automation"
+            ;;
+        MINER)
+            crit "[$origin] crypto-miner pattern detected"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        INLINE_SCRIPT)
+            warn "[$origin] python/perl/ruby -c/-e (often obfuscated one-liner)"
+            ;;
+        EVAL_SUBSHELL)
+            crit "[$origin] eval \$(...) / eval \`...\` — hidden command execution"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        SETSID_NET)
+            crit "[$origin] setsid + networking tool (backgrounded shell pattern)"
+            SUSPECT_TOTAL=$((SUSPECT_TOTAL + 1))
+            ;;
+        RAW_IP)
+            warn "[$origin] connects to raw IP literal (no DNS name) — could be hardcoded C2"
+            ;;
+        PSHELL)
+            warn "[$origin] powershell reference (very unusual on Linux)"
+            ;;
+    esac
+}
+
+# ─── JSON-mode stdout capture ─────────────────────────────────────────────
+# In --json mode all human-readable audit text is discarded; only the final
+# JSON verdict line is printed to stdout. This makes the output safe to pipe
+# into jq or other parsers. Set this up BEFORE any output is produced.
+JSON_CAPTURE=""
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_CAPTURE="$(mktemp)"
+    exec 3>&1
+    exec 1>"$JSON_CAPTURE"
+fi
+
+# ─── Recently changed ─────────────────────────────────────────────────────
+section "MOST RECENTLY CHANGED CRON FILES (last $RECENT_N)"
+info "Use this to spot recently added cron jobs — likely persistence mechanism"
+printf "${C_DIM}  %-19s %s${C_RESET}\n" "MODIFIED" "FILE"
+printf "  %s\n" "─────────────────────────────────────────────────────────────────────────────"
+{
+    find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/crontab /etc/anacrontab /var/spool/cron -type f -printf '%T@ %p\n' 2>/dev/null
+} | sort -rn | head -"$RECENT_N" | while IFS=' ' read -r mtime path; do
+    [[ -z "$path" ]] && continue
+    age_color=$C_DIM
+    if [[ -n "$mtime" ]]; then
+        now=$(date +%s)
+        age_days=$(( (now - ${mtime%.*}) / 86400 ))
+        if (( age_days < 1 )); then age_color=$C_RED
+        elif (( age_days < 7 )); then age_color=$C_YELLOW; fi
+    fi
+    printf "  ${age_color}%-19s${C_RESET} %s\n" "$(date -d "@${mtime%.*}" '+%Y-%m-%d %H:%M' 2>/dev/null)" "$path"
+done
+
+# ─── Run audits (respecting filters) ─────────────────────────────────────
+if [[ $ONLY_USER_CRON -eq 1 ]]; then
+    audit_user_crontabs
+elif [[ $ONLY_TIMERS -eq 1 ]]; then
+    audit_systemd_timers
+else
+    audit_etc_crontab
+    audit_cron_d
+    audit_periodic_dirs
+    audit_user_crontabs
+    audit_anacron
+    audit_systemd_timers
+fi
+
+# ─── Verdict ─────────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 1 ]]; then
+    # Restore stdout, drop captured audit text, emit a single JSON verdict.
+    exec 1>&3
+    exec 3>&-
+    [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
+    printf '{"suspicious":%d,"status":"%s","exit_code":%d}\n' \
+        "$SUSPECT_TOTAL" \
+        "$( (( SUSPECT_TOTAL > 0 )) && echo critical || echo healthy )" \
+        "$( (( SUSPECT_TOTAL > 0 )) && echo 2 || echo 0 )"
+    (( SUSPECT_TOTAL > 0 )) && exit 2 || exit 0
+fi
+
+section "VERDICT"
+if (( SUSPECT_TOTAL > 0 )); then
+    crit "$SUSPECT_TOTAL suspicious cron pattern(s) detected — investigate immediately"
+elif [[ $ONLY_USER_CRON -eq 0 ]]; then
+    ok "Cron configuration looks clean"
+fi
+
+if (( SUSPECT_TOTAL > 0 )); then
+    log_verdict_crit "suspicious_cron" "$SUSPECT_TOTAL suspicious cron pattern(s) detected" \
+        "Audit each flag with: grep -nE 'curl|wget|base64' /etc/cron* /var/spool/cron/* — check origin and hashes"
+fi
+
+show_verdict_one_liners
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "cronz complete: suspect=$SUSPECT_TOTAL only_user=$ONLY_USER_CRON only_timers=$ONLY_TIMERS user=${FILTER_USER:-all}" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+if (( SUSPECT_TOTAL > 0 )); then exit 2
+else exit 0; fi

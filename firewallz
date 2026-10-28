@@ -1,0 +1,692 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# firewallz — Firewall Triage & Emergency Response
+# ----------------------------------------------------------------------------
+# When your web server is being hammered or a port you didn't know was open
+# is leaking data, this script tells you fast:
+#   - What firewall(s) are installed and what state they're in
+#   - What ports are publicly listening (the attack surface)
+#   - Who's hitting you RIGHT NOW — SYN flood, brute force, top talkers
+#   - Per-IP connection counts so you can spot the offender
+#   - Quick block / unblock commands for ufw, iptables, nftables, firewalld
+#
+# Modes:
+#   ./firewallz                  Full audit
+#   ./firewallz --emergency      Quick triage + ready-to-run block commands
+#   ./firewallz --watch [N]      Refresh stats every N seconds
+#   ./firewallz --json           Machine-readable output
+#   ./firewallz --no-color       Plain output
+#
+# Block actions (write to firewall rules, NEVER mutate without confirmation):
+#   ./firewallz --block-ip 1.2.3.4            Block an IP everywhere
+#   ./firewallz --unblock-ip 1.2.3.4          Remove the block
+#   ./firewallz --block-port 22               Block inbound on a port
+#   ./firewallz --unblock-port 22             Re-open a port
+#
+# All block actions create a backup under /var/backups/firewall-sh/<ts>/ and
+# require --yes to execute non-interactively. Without --yes, the script
+# prints the exact command it would run so you can paste it yourself.
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+
+# ─── CLI parsing ───────────────────────────────────────────────────────────
+SCRIPT_VERSION="1.0.0"
+JSON_OUT=0
+NO_COLOR_FLAG=0
+EMERGENCY=0
+WATCH_INTERVAL=0
+ACTION=""
+ACTION_TARGET=""
+YES=0
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              SHOW_HELP=1 ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --emergency)            EMERGENCY=1 ;;
+        --watch)                i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-5}" ;;
+        --block-ip)             i=$((i+1)); ACTION="block-ip";  ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --unblock-ip)           i=$((i+1)); ACTION="unblock-ip"; ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --block-port)           i=$((i+1)); ACTION="block-port"; ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --unblock-port)         i=$((i+1)); ACTION="unblock-port"; ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --yes|-y)               YES=1 ;;
+        --ai)                   AI_VERDICT=1 ;;
+        --no-ai)                AI_VERDICT=0 ;;
+        *) echo "Unknown flag: $arg (try --help)" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_init "firewallz"
+fi
+
+if [[ "${SHOW_HELP:-0}" -eq 1 ]]; then
+    cat << 'EOF'
+firewallz — Firewall Triage & Emergency Response
+
+USAGE
+  ./firewallz                       Full audit
+  ./firewallz --emergency           Quick triage (top attackers + ready commands)
+  ./firewallz --watch [N=5]         Refresh every N seconds
+  ./firewallz --block-ip <ip>       Block an IP everywhere
+  ./firewallz --unblock-ip <ip>     Remove the block
+  ./firewallz --block-port <port>   Block inbound on a port
+  ./firewallz --unblock-port <port> Re-open a port
+  ./firewallz --json                Machine-readable output
+  ./firewallz --no-color            Plain output
+  -y, --yes                           Execute mutations without confirmation
+
+WHAT IT CHECKS
+  • Installed firewalls (ufw, firewalld, nftables, iptables, opnsense/pf)
+  • Currently active firewall state and loaded rule count
+  • Publicly listening ports (the attack surface)
+  • Live connection counts per remote IP (top 20 talkers)
+  • SYN-RECV backlog (SYN flood indicator)
+  • Connections in TIME_WAIT (could exhaust port pool)
+  • Established connections to services under attack
+
+EMERGENCY TRIAGE
+  When run with --emergency, the script focuses on:
+   1. Are we under attack RIGHT NOW?
+   2. Who's the top offender?
+   3. The exact one-liner to ban them.
+
+BACKUPS
+  Every block action backs up the current ruleset to
+  /var/backups/firewall-sh/<timestamp>/ before mutating.
+
+EOF
+    exit 0
+fi
+
+# ─── Privilege probe ───────────────────────────────────────────────────────
+SUDO=""
+if [[ $EUID -eq 0 ]]; then SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO="sudo"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+print_banner() {
+    [[ $JSON_OUT -eq 1 ]] && return 0
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  FIREWALL.SH — Firewall Triage & Emergency Response           ║
+   ║  Active Rules · Exposure · Top Talkers · Block                ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+}
+
+# ─── Backup directory ──────────────────────────────────────────────────────
+BACKUP_DIR="/var/backups/firewall-sh"
+backup_rules() {
+    # Try privileged mkdir first; fall back to user-owned backup if no sudo.
+    local dest="$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)"
+    if [[ $EUID -eq 0 ]]; then
+        mkdir -p "$dest" 2>/dev/null || { printf "  ${C_YELLOW}!${C_RESET} Could not create backup dir %s (running as root)\n" "$dest" >&2; return 0; }
+    else
+        if [[ -n "$SUDO" ]]; then
+            $SUDO mkdir -p "$dest" 2>/dev/null || { printf "  ${C_DIM}Backup skipped (no write to %s)${C_RESET}\n" "$BACKUP_DIR" >&2; return 0; }
+        else
+            printf "  ${C_DIM}Backup skipped (no sudo — cannot write %s)${C_RESET}\n" "$BACKUP_DIR" >&2
+            return 0
+        fi
+    fi
+    if has_cmd iptables; then
+        [[ $EUID -eq 0 ]] && iptables-save > "$dest/iptables.rules" 2>/dev/null || \
+            $SUDO iptables-save > "$dest/iptables.rules" 2>/dev/null || true
+    fi
+    if has_cmd nft; then
+        [[ $EUID -eq 0 ]] && nft list ruleset > "$dest/nft.rules" 2>/dev/null || \
+            $SUDO nft list ruleset > "$dest/nft.rules" 2>/dev/null || true
+    fi
+    if has_cmd ufw; then
+        [[ $EUID -eq 0 ]] && ufw status verbose > "$dest/ufw.status" 2>/dev/null || \
+            $SUDO ufw status verbose > "$dest/ufw.status" 2>/dev/null || true
+    fi
+    printf "  ${C_DIM}Ruleset archived: %s${C_RESET}\n" "$dest"
+}
+
+# ============================================================================
+# JSON capture redirect (audit text → temp file, JSON verdict → real stdout)
+# ============================================================================
+JSON_CAPTURE=""
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_CAPTURE="$(mktemp)"
+    exec 3>&1
+    exec 1>"$JSON_CAPTURE"
+fi
+
+# In --emergency mode, redirect to a temp file too so we can print ONLY
+# the actionable section at the end (less noise in panic situations).
+EMERGENCY_OUT=""
+if [[ $EMERGENCY -eq 1 ]] && [[ $JSON_OUT -eq 0 ]]; then
+    EMERGENCY_OUT="$(mktemp)"
+    exec 4>&1
+    exec 1>"$EMERGENCY_OUT"
+fi
+
+print_banner
+
+# ============================================================================
+# SECTION 1: Installed firewalls
+# ============================================================================
+section "FIREWALLS INSTALLED — WHAT'S AT YOUR DISPOSAL"
+declare -a FW_AVAILABLE=()
+has_cmd ufw && { info "${C_GREEN}✓${C_RESET} ufw      (Uncomplicated Firewall — Debian/Ubuntu)"; FW_AVAILABLE+=("ufw"); }
+has_cmd firewall-cmd && { info "${C_GREEN}✓${C_RESET} firewalld (RHEL/Fedora/SUSE)"; FW_AVAILABLE+=("firewalld"); }
+has_cmd nft && { info "${C_GREEN}✓${C_RESET} nft       (nftables — modern netfilter)"; FW_AVAILABLE+=("nft"); }
+has_cmd iptables && { info "${C_GREEN}✓${C_RESET} iptables  (legacy netfilter)"; FW_AVAILABLE+=("iptables"); }
+has_cmd ip6tables && { info "${C_GREEN}✓${C_RESET} ip6tables (IPv6 legacy)"; FW_AVAILABLE+=("ip6tables"); }
+has_cmd pf && { info "${C_GREEN}✓${C_RESET} pf        (BSD/OpenBSD/pfSense)"; FW_AVAILABLE+=("pf"); }
+has_cmd opnsense-bootstrap && { info "${C_GREEN}✓${C_RESET} opnsense  (BSD-based router)"; FW_AVAILABLE+=("opnsense"); }
+if [[ ${#FW_AVAILABLE[@]} -eq 0 ]]; then
+    critf "no_firewall" "No firewall detected" "Install one: 'sudo apt install ufw && sudo ufw default deny incoming && sudo ufw allow ssh && sudo ufw enable' (Debian/Ubuntu) or 'sudo dnf install firewalld && sudo systemctl enable --now firewalld' (RHEL/Fedora)."
+fi
+
+# ============================================================================
+# SECTION 2: Active firewall state
+# ============================================================================
+section "ACTIVE FIREWALL STATE"
+# ufw
+if has_cmd ufw; then
+    # 'ufw status' needs root — an rc!=0 here means "unreadable", NOT "inactive".
+    ufw_status_raw=$(ufw status 2>/dev/null); ufw_rc=$?
+    if [[ $ufw_rc -ne 0 || "$ufw_status_raw" != Status:* ]] && command -v sudo >/dev/null 2>&1; then
+        _u=$(sudo -n ufw status 2>/dev/null) && [[ -n "$_u" ]] && ufw_status_raw="$_u"
+    fi
+    if grep -q "Status: active" <<< "$ufw_status_raw"; then
+        ufw_rule_count=$(awk '/^To\b/{c++} END{print c+0}' <<< "$ufw_status_raw")
+        ok "ufw: ACTIVE — ${C_BOLD}${ufw_rule_count}${C_RESET} rules loaded"
+    elif grep -q "Status: inactive" <<< "$ufw_status_raw"; then
+        critf "no_firewall" "ufw is installed but INACTIVE" "Enable: 'sudo ufw enable' (will prompt — first add 'sudo ufw allow ssh' to avoid lockout)."
+    else
+        enabled_conf=$(awk -F= '/^ENABLED/{print $2}' /etc/ufw/ufw.conf 2>/dev/null)
+        svc=$(systemctl is-active ufw 2>/dev/null || echo unknown)
+        if [[ "$enabled_conf" == "yes" && "$svc" == "active" ]]; then
+            ok "ufw: ACTIVE (per /etc/ufw/ufw.conf ENABLED=yes, service active) — rule details need 'sudo firewallz'"
+        elif [[ "$enabled_conf" == "yes" || "$svc" == "active" ]]; then
+            info "ufw: appears enabled (conf=${enabled_conf:-?}, service=${svc}) but state unreadable without sudo — run 'sudo firewallz' for the full audit"
+        else
+            critf "no_firewall" "ufw installed but INACTIVE (conf ENABLED=${enabled_conf:-no}, service=${svc})" "Enable: 'sudo ufw allow ssh && sudo ufw enable'."
+        fi
+    fi
+fi
+# firewalld
+if has_cmd firewall-cmd; then
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        ok "firewalld: ACTIVE — $(firewall-cmd --list-all 2>/dev/null | grep -c '^  ' || echo 0) zone rules"
+    else
+        warn "firewalld: installed but INACTIVE"
+    fi
+fi
+# nftables
+if has_cmd nft; then
+    if [[ -f /etc/nftables.conf ]] || systemctl is-active --quiet nftables 2>/dev/null; then
+        # unreadable ≠ empty: 'nft list ruleset' needs root, so only call the
+        # "ruleset is empty" wolf when we ACTUALLY read it (or via sudo -n).
+        nft_out=$(nft list ruleset 2>/dev/null); nft_rc=$?
+        if [[ $nft_rc -ne 0 && -z "$nft_out" ]] && command -v sudo >/dev/null 2>&1; then
+            nft_out=$(sudo -n nft list ruleset 2>/dev/null) && nft_rc=0
+        fi
+        if [[ $nft_rc -eq 0 ]]; then
+            nft_rule_count=$(grep -cE '^\s*(ip|ip6|inet)' <<< "$nft_out" || true)
+            if [[ "${nft_rule_count:-0}" -gt 0 ]]; then
+                ok "nftables: ACTIVE — ${C_BOLD}${nft_rule_count}${C_RESET} chains/rules"
+            else
+                warn "nftables: truly EMPTY ruleset (installed, configured, zero rules — traffic is wide open)"
+            fi
+        else
+            info "nftables present but ruleset needs root to read — run 'sudo firewallz' to verify"
+        fi
+    fi
+fi
+# iptables
+if has_cmd iptables; then
+    ipt_rule_count=$(iptables -S 2>/dev/null | grep -cE '^-A ' || echo 0)
+    if [[ "$ipt_rule_count" -gt 0 ]]; then
+        ok "iptables: ${C_BOLD}${ipt_rule_count}${C_RESET} rules loaded (IPv4)"
+    else
+        warn "iptables: rule set is empty"
+    fi
+fi
+
+# ============================================================================
+# SECTION 3: Publicly listening ports (the attack surface)
+# ============================================================================
+section "PUBLICLY LISTENING PORTS — THE ATTACK SURFACE"
+info "Anything listening on 0.0.0.0 or :: is reachable from the internet"
+printf "${C_DIM}  %-6s %-22s %-26s %-8s %s${C_RESET}\n" "PROTO" "ADDRESS" "PROCESS" "PORT" "SERVICE"
+printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────"
+public_count=0
+if has_cmd ss; then
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # ss -tulnp format: Netid  State   Recv-Q  Send-Q   Local Address:Port   Peer Address:Port   Process
+        proto=$(awk '{print $1}' <<< "$line" | tr -d ':')
+        local_addr=$(awk '{print $5}' <<< "$line")
+        # Match wildcard listeners
+        case "$local_addr" in
+            0.0.0.0:*|[::]*|*:*) : ;;
+            *) continue ;;
+        esac
+        port=${local_addr##*:}
+        # strip [] from IPv6
+        port=${port%]}; port=${port#[}
+        # Resolve process name
+        proc=$(awk '{print $7}' <<< "$line" | grep -oE '"[^"]+",pid=[0-9]+' || echo "")
+        proc_short="${proc%%,*}"
+        # Reverse DNS lookup for the service name (best effort)
+        svc=""
+        if [[ -r /etc/services ]]; then
+            svc=$(awk -v p="$port" '$2 ~ ("/" p "/") || $2 == p {print $1; exit}' /etc/services 2>/dev/null || true)
+        fi
+        [[ -z "$svc" ]] && svc="-"
+        public_count=$((public_count + 1))
+        # Color the row by risk
+        color=$C_DIM
+        case "$port" in
+            22|80|443|53|25|587|993|995|8080|8443) color=$C_GREEN ;;
+            21|23|111|135|139|445|1433|3306|3389|5432|6379|27017) color=$C_RED ;;
+            8000|9000|9090|9200|5601) color=$C_YELLOW ;;
+        esac
+        printf "  %-6s ${color}%-22s${C_RESET} %-26s ${C_BOLD}%-8s${C_RESET} %s\n" \
+            "$proto" "$local_addr" "${proc_short:-—}" "$port" "$svc"
+    done < <(ss -tulnp 2>/dev/null | tail -n +2 | head -50)
+elif has_cmd netstat; then
+    netstat -tulnp 2>/dev/null | tail -n +3 | head -30 | while IFS= read -r line; do
+        printf "  %s\n" "$line"
+    done
+fi
+if (( public_count == 0 )); then
+    ok "No wildcard listeners — nothing exposed"
+else
+    info "${C_BOLD}${public_count}${C_RESET} wildcard listener(s) reachable from the network"
+fi
+
+# ============================================================================
+# SECTION 4: Live connection state (the attack)
+# ============================================================================
+section "LIVE CONNECTIONS — WHO IS TALKING TO YOU RIGHT NOW"
+established=$(ss -tan state established 2>/dev/null | tail -n +2 | wc -l 2>/dev/null | tr -d '[:space:]' || echo 0)
+established=${established:-0}; [[ "$established" =~ ^[0-9]+$ ]] || established=0
+syn_recv=$(ss -tan state syn-recv 2>/dev/null | tail -n +2 | wc -l 2>/dev/null | tr -d '[:space:]' || echo 0)
+syn_recv=${syn_recv:-0}; [[ "$syn_recv" =~ ^[0-9]+$ ]] || syn_recv=0
+time_wait=$(ss -tan state time-wait 2>/dev/null | tail -n +2 | wc -l 2>/dev/null | tr -d '[:space:]' || echo 0)
+time_wait=${time_wait:-0}; [[ "$time_wait" =~ ^[0-9]+$ ]] || time_wait=0
+fin_wait=$(ss -tan state fin-wait-1,fin-wait-2 2>/dev/null | tail -n +2 | wc -l 2>/dev/null | tr -d '[:space:]' || echo 0)
+fin_wait=${fin_wait:-0}; [[ "$fin_wait" =~ ^[0-9]+$ ]] || fin_wait=0
+close_wait=$(ss -tan state close-wait 2>/dev/null | tail -n +2 | wc -l 2>/dev/null | tr -d '[:space:]' || echo 0)
+close_wait=${close_wait:-0}; [[ "$close_wait" =~ ^[0-9]+$ ]] || close_wait=0
+
+printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%5d${C_RESET}\n" "ESTABLISHED" "$established"
+syn_color=$C_GREEN
+(( syn_recv > 50 ))  && syn_color=$C_YELLOW
+(( syn_recv > 200 )) && syn_color=$C_RED
+printf "  ${C_DIM}%-22s${C_RESET} ${syn_color}%5d${C_RESET}" "SYN-RECV (backlog)" "$syn_recv"
+if (( syn_recv > 200 )); then
+    printf "  ${C_RED}${C_BOLD}⚠ POSSIBLE SYN FLOOD${C_RESET}"
+elif (( syn_recv > 50 )); then
+    printf "  ${C_YELLOW}! elevated${C_RESET}"
+fi
+printf "\n"
+printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%5d${C_RESET}\n" "TIME-WAIT" "$time_wait"
+printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%5d${C_RESET}\n" "FIN-WAIT" "$fin_wait"
+printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%5d${C_RESET}\n" "CLOSE-WAIT" "$close_wait"
+
+if (( syn_recv > 200 )); then
+    critf "syn_flood" "${syn_recv} sockets in SYN-RECV — SYN flood likely" "Enable SYN cookies: 'echo net.ipv4.tcp_syncookies=1 | sudo tee /etc/sysctl.d/99-syncookies.conf && sudo sysctl -p'. Lower synack retries: 'sudo sysctl -w net.ipv4.tcp_synack_retries=2'."
+fi
+if (( time_wait > 5000 )); then
+    warn "TIME-WAIT is high (${time_wait}) — port pool may exhaust"
+fi
+
+# Top talkers (remote IPs by connection count)
+subsec "TOP 20 REMOTE IPs BY CONNECTION COUNT"
+ss -tan state established 2>/dev/null \
+    | tail -n +2 \
+    | awk '{print $4}' \
+    | awk '
+        # IPv4:  a.b.c.d:port     → take field 1
+        # IPv6:  [2001:db8::1]:port → strip brackets, take field 1
+        # IPv4-mapped IPv6: [::ffff:a.b.c.d]:port → take bracketed content, strip ::ffff:
+        {
+          if ($0 ~ /^\[/) {
+            # bracketed IPv6
+            ip = $0
+            sub(/\]:[0-9]+$/, "", ip)
+            sub(/^\[/, "", ip)
+            # IPv4-mapped: ::ffff:1.2.3.4 → collapse to v4
+            if (ip ~ /^::ffff:/) {
+              sub(/^::ffff:/, "", ip)
+            }
+            print ip
+          } else {
+            # Plain IPv4 — first field
+            n = split($0, parts, ":")
+            print parts[1]
+          }
+        }
+    ' \
+    | sort | uniq -c | sort -rn | head -20 \
+    | while IFS= read -r line; do
+        count=$(awk '{print $1}' <<< "$line")
+        ip=$(awk '{print $2}' <<< "$line")
+        # Skip blank / local-loopback rows
+        [[ -z "$ip" || "$ip" == "0.0.0.0" || "$ip" == "::1" || "$ip" == "::" ]] && continue
+        bar_len=$(( count * 20 / 100 ))
+        (( bar_len > 20 )) && bar_len=20
+        (( bar_len == 0 )) && bar_len=1
+        bar=""
+        for (( i=0; i<bar_len; i++ )); do bar+="▌"; done
+        color=$C_GREEN
+        (( count > 50 ))  && color=$C_YELLOW
+        (( count > 100 )) && color=$C_RED
+        printf "  ${color}%-46s${C_RESET} ${color}%-21s${C_RESET} ${C_BOLD}%5d${C_RESET} conn  ${C_DIM}block: ${C_CYAN}./firewallz --block-ip %s --yes${C_RESET}\n" \
+            "$ip" "$bar" "$count" "$ip"
+    done
+
+# Top talkers to SPECIFIC ports (helps spot a single targeted service)
+subsec "TOP 10 LOCAL PORTS UNDER ATTACK"
+PORT_ROWS=$(ss -tan state established 2>/dev/null \
+    | tail -n +2 \
+    | awk '{print $3}' \
+    | awk '
+        {
+          n = split($0, parts, ":")
+          print parts[n]
+        }
+    ' \
+    | sort | uniq -c | sort -rn | head -10 || true)
+
+printf '%s\n' "$PORT_ROWS" \
+    | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        count=$(awk '{print $1}' <<< "$line")
+        port=$(awk '{print $2}' <<< "$line")
+        printf "  ${C_DIM}%-6s${C_RESET}  ${C_BOLD}%5d${C_RESET} active connections\n" "$port" "$count"
+    done
+
+# ─── Bar Chart: connections per local port ─────────────────────────────────
+if [[ -n "$PORT_ROWS" ]]; then
+    PORT_MAX=$(printf '%s\n' "$PORT_ROWS" | awk 'NR==1 {print $1}')
+    PORT_TOTAL=$(printf '%s\n' "$PORT_ROWS" | awk '{s+=$1} END {print s+0}')
+    if [[ -n "$PORT_MAX" ]] && (( PORT_MAX > 0 )); then
+        printf "\n  ${C_BOLD}${C_CYAN}Connections per port (bar chart, total=%s):${C_RESET}\n" "$PORT_TOTAL"
+        printf '%s\n' "$PORT_ROWS" | while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            cval=$(awk '{print $1}' <<< "$line")
+            clabel=$(awk '{print $2}' <<< "$line")
+            cpct=$(( cval * 100 / PORT_MAX ))
+            if   (( cpct >= 85 )); then ccolor="$C_RED"
+            elif (( cpct >= 60 )); then ccolor="$C_YELLOW"
+            else ccolor="$C_GREEN"
+            fi
+            cfilled=$(( cpct * 40 / 100 ))
+            cbar=""
+            for (( j=0; j<cfilled; j++ )); do cbar+="█"; done
+            for (( j=cfilled; j<40; j++ )); do cbar+=" "; done
+            printf "    ${C_DIM}port %-6s${C_RESET} ${ccolor}%s${C_RESET} ${C_BOLD}%5d${C_RESET}\n" \
+                "$clabel" "$cbar" "$cval"
+        done
+    fi
+fi
+
+# ============================================================================
+# SECTION 5: Per-interface counters — packets dropped / accepted
+# ============================================================================
+section "PACKET FLOW — WHAT YOUR FIREWALL IS ACTUALLY DOING"
+if [[ -r /proc/net/dev ]]; then
+    printf "${C_DIM}  %-12s %15s %15s %15s %15s${C_RESET}\n" \
+        "INTERFACE" "RX_BYTES" "RX_DROPPED" "TX_BYTES" "TX_DROPPED"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────"
+    awk 'NR>2 {
+        gsub(/:/, " ", $1);
+        iface=$1; rx_b=$2; rx_d=$4; tx_b=$10; tx_d=$12;
+        if (iface != "lo") printf "  %-12s %15d %15d %15d %15d\n", iface, rx_b, rx_d, tx_b, tx_d;
+    }' /proc/net/dev 2>/dev/null
+fi
+
+# ============================================================================
+# SECTION 6: Recent firewall log (kernel messages about dropped packets)
+# ============================================================================
+section "RECENT KERNEL FIREWALL LOGS"
+if has_cmd dmesg; then
+    # Wrap the whole pipeline so grep returning 0 (no matches) doesn't abort
+    # the script under `set -e -o pipefail`.
+    { dmesg --since="-5 minutes" 2>/dev/null \
+        | { grep -iE 'iptables|nftables|ufw|firewall|DROP|REJECT' || true; } \
+        | tail -15 | sed 's/^/  /'; } || true
+    dmesg_count=$( { dmesg --since="-5 minutes" 2>/dev/null | grep -ciE 'DROP|REJECT'; } || echo 0)
+    dmesg_count=${dmesg_count:-0}
+    [[ "$dmesg_count" =~ ^[0-9]+$ ]] || dmesg_count=0
+    info "${C_BOLD}${dmesg_count}${C_RESET} DROP/REJECT events in the last 5 minutes"
+else
+    info "dmesg unavailable (containerized?)"
+fi
+
+# ============================================================================
+# SECTION 7: Ready-to-run emergency commands
+# ============================================================================
+section "EMERGENCY COMMANDS — COPY/PASTE TO BAN AN OFFENDER"
+info "Replace 1.2.3.4 with the offender's IP from the top-talkers list above"
+cat << 'CBLOCK'
+  Block with ufw:
+    sudo ufw deny from 1.2.3.4
+    sudo ufw deny from 1.2.3.4 to any port 22
+
+  Block with iptables:
+    sudo iptables -I INPUT -s 1.2.3.4 -j DROP
+    sudo ip6tables -I INPUT -s 1.2.3.4 -j DROP
+
+  Block with nftables:
+    sudo nft add rule inet filter input ip saddr 1.2.3.4 counter drop
+
+  Or just let this script do it:
+    ./firewallz --block-ip 1.2.3.4 --yes
+CBLOCK
+
+# ============================================================================
+# Mutation actions (--block-ip, --block-port, etc.)
+# ============================================================================
+# Run actions BEFORE the verdict so the audit-then-act flow works without
+# emit_verdict's `exit` killing the action block.
+if [[ -n "$ACTION" ]]; then
+    printf "\n${C_BOLD}${C_RED}━━━ ACTION: %s %s ━━━${C_RESET}\n" "$ACTION" "$ACTION_TARGET"
+    backup_rules
+
+    case "$ACTION" in
+        block-ip)
+            ip="$ACTION_TARGET"
+            # Validate IP
+            if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && [[ ! "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+                crit "Invalid IP: $ip"
+                exit 64
+            fi
+            if [[ $YES -eq 1 ]]; then
+                local did_block=0
+                has_cmd ufw && { $SUDO ufw deny from "$ip" 2>&1 | sed 's/^/  /'; did_block=1; }
+                has_cmd iptables && { $SUDO iptables -I INPUT -s "$ip" -j DROP 2>&1 | sed 's/^/  /'; did_block=1; }
+                has_cmd ip6tables && { $SUDO ip6tables -I INPUT -s "$ip" -j DROP 2>&1 | sed 's/^/  /'; did_block=1; }
+                if has_cmd nft; then
+                    $SUDO nft add rule inet filter input ip saddr "$ip" counter drop 2>&1 | sed 's/^/  /'
+                    $SUDO nft add rule inet filter input ip6 saddr "$ip" counter drop 2>&1 | sed 's/^/  /'
+                    did_block=1
+                fi
+                if (( did_block )); then
+                    ok "Blocked $ip across ufw/iptables/nftables"
+                    log_verdict_crit "ip_blocked" "Blocked IP $ip via firewall" "Unblock: '$0 --unblock-ip $ip --yes'"
+                else
+                    crit "No firewall tool found — install ufw, iptables, or nftables"
+                fi
+            else
+                info "DRY RUN — pass --yes to execute on the active firewall(s):"
+                printf "  sudo ufw deny from %s\n" "$ip"
+                printf "  sudo iptables -I INPUT -s %s -j DROP\n" "$ip"
+                printf "  sudo ip6tables -I INPUT -s %s -j DROP\n" "$ip"
+                printf "  sudo nft add rule inet filter input ip saddr %s counter drop\n" "$ip"
+            fi
+            ;;
+        unblock-ip)
+            ip="$ACTION_TARGET"
+            if [[ $YES -eq 1 ]]; then
+                has_cmd ufw && $SUDO ufw delete deny from "$ip" 2>&1 | sed 's/^/  /'
+                has_cmd iptables && $SUDO iptables -D INPUT -s "$ip" -j DROP 2>&1 | sed 's/^/  /'
+                ok "Unblocked $ip"
+            else
+                info "DRY RUN — pass --yes to execute:"
+                has_cmd ufw && printf "  sudo ufw delete deny from %s\n" "$ip"
+                has_cmd iptables && printf "  sudo iptables -D INPUT -s %s -j DROP\n" "$ip"
+            fi
+            ;;
+        block-port)
+            port="$ACTION_TARGET"
+            [[ ! "$port" =~ ^[0-9]+$ ]] && { crit "Invalid port: $port"; exit 64; }
+            if [[ $YES -eq 1 ]]; then
+                has_cmd ufw && $SUDO ufw deny "$port" 2>&1 | sed 's/^/  /'
+                has_cmd iptables && $SUDO iptables -I INPUT -p tcp --dport "$port" -j DROP 2>&1 | sed 's/^/  /'
+                ok "Blocked TCP/$port"
+            else
+                info "DRY RUN — pass --yes to execute:"
+                has_cmd ufw && printf "  sudo ufw deny %s\n" "$port"
+                has_cmd iptables && printf "  sudo iptables -I INPUT -p tcp --dport %s -j DROP\n" "$port"
+            fi
+            ;;
+        unblock-port)
+            port="$ACTION_TARGET"
+            if [[ $YES -eq 1 ]]; then
+                has_cmd ufw && $SUDO ufw delete deny "$port" 2>&1 | sed 's/^/  /'
+                has_cmd iptables && $SUDO iptables -D INPUT -p tcp --dport "$port" -j DROP 2>&1 | sed 's/^/  /'
+                ok "Unblocked TCP/$port"
+            else
+                info "DRY RUN — pass --yes to execute:"
+                has_cmd ufw && printf "  sudo ufw delete deny %s\n" "$port"
+                has_cmd iptables && printf "  sudo iptables -D INPUT -p tcp --dport %s -j DROP\n" "$port"
+            fi
+            ;;
+    esac
+
+    # Watch loop after action — keep refreshing emergency triage
+    if [[ $WATCH_INTERVAL -gt 0 ]]; then
+        trap 'exit 0' INT TERM
+        while true; do
+            sleep "$WATCH_INTERVAL"
+            printf "\n${C_DIM}── refresh in ${WATCH_INTERVAL}s (Ctrl+C to stop) ──${C_RESET}\n"
+            exec "$0" --no-color --emergency
+        done
+    fi
+fi
+
+# ============================================================================
+# JSON verdict
+# ============================================================================
+if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+    [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
+
+    add_json_field "firewalls_installed" "$(IFS=,; echo "${FW_AVAILABLE[*]:-none}")"
+    add_json_field "public_listeners" "$public_count"
+    add_json_field "established" "$established"
+    add_json_field "syn_recv" "$syn_recv"
+    add_json_field "time_wait" "$time_wait"
+    add_json_field "syn_flood_suspected" "$( (( syn_recv > 200 )) && echo true || echo false )"
+    add_json_field "critical" "$CRITICAL"
+    add_json_field "warnings" "$WARNINGS"
+
+    # Emit JSON verdict directly (lib's emit_verdict exits with code 0 for JSON
+    # which loses the critical signal).
+    add_json_field "error_log" "$ERROR_LOG" 0
+    add_json_field "warning_log" "$WARNING_LOG" 0
+    if [[ ${#CRITICAL_ISSUES[@]} -gt 0 ]]; then
+        crit_json=$(printf '%s\n' "${CRITICAL_ISSUES[@]}" | jq -R . | jq -s . 2>/dev/null) || crit_json='[]'
+        add_json_field "critical_issues" "$crit_json" 1
+    else
+        add_json_field "critical_issues" "[]" 1
+    fi
+    if [[ ${#WARN_ENTRIES[@]} -gt 0 ]]; then
+        warn_json=$(printf '%s\n' "${WARN_ENTRIES[@]}" | jq -R . | jq -s . 2>/dev/null) || warn_json='[]'
+        add_json_field "warning_entries" "$warn_json" 1
+    else
+        add_json_field "warning_entries" "[]" 1
+    fi
+
+    json_elapsed=$(( $(date +%s) - START_TS ))
+    printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+    for f in "${JSON_FIELDS[@]}"; do
+        printf ',%s' "$f"
+    done
+    printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$json_elapsed"
+    if (( CRITICAL > 0 )); then exit 2
+    elif (( WARNINGS > 0 )); then exit 1
+    else exit 0
+    fi
+fi
+
+# In --emergency mode, restore stdout and print ONLY the actionable pieces
+if [[ -n "$EMERGENCY_OUT" && -f "$EMERGENCY_OUT" ]]; then
+    exec 1>&4
+    exec 4>&-
+
+    # Grep the actionable sections from the captured output
+    captured="$(cat "$EMERGENCY_OUT" 2>/dev/null || true)"
+    rm -f "$EMERGENCY_OUT"
+
+    printf "${C_BOLD}${C_RED}━━ EMERGENCY TRIAGE ━━${C_RESET}\n"
+    printf "${C_DIM}Filtered to actionable sections only.${C_RESET}\n\n"
+
+    # Extract top-talkers block
+    printf "${C_BOLD}${C_YELLOW}TOP REMOTE IPs:${C_RESET}\n"
+    printf "%s\n" "$captured" | awk '/TOP 20 REMOTE/{flag=1; next} /TOP 10 LOCAL PORTS/{flag=0} flag' | head -25
+    echo
+
+    printf "${C_BOLD}${C_YELLOW}PORTS UNDER ATTACK:${C_RESET}\n"
+    printf "%s\n" "$captured" | awk '/TOP 10 LOCAL PORTS/{flag=1; next} /^$/{if(flag)flag=0} flag' | head -15
+    echo
+
+    printf "${C_BOLD}${C_RED}READY-TO-RUN BLOCK COMMANDS:${C_RESET}\n"
+    printf '%s\n' "$captured" | awk '/EMERGENCY COMMANDS/{flag=1} flag'
+    exit 0
+fi
+
+# ─── Verdict (default audit mode) ──────────────────────────────────────────
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_finalize
+fi
+
+emit_verdict
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "firewallz complete: critical=${CRITICAL:-0} warnings=${WARNINGS:-0} action=${ACTION:-audit}" 2>/dev/null || true
+fi

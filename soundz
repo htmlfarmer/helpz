@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# soundz - Audio stack diagnostic: cards, mixers, server routing, "why silent"
+# ----------------------------------------------------------------------------
+# Walks ALSA (cards, codecs, mixer mute/volume), the sound server on top
+# (PipeWire or PulseAudio: default sink, per-stream volumes, port chosen),
+# user/group permissions on /dev/snd, kernel probes & firmware from dmesg,
+# and ends with a ranked "why can't I hear anything" checklist with exact
+# commands — unmute, set card, switch profile, restart the server.
+#
+# Usage:
+#   ./soundz                      Full diagnosis
+#   ./soundz --fixme            # also RUN the safe fixes (unmute + 80% volume)
+#   ./soundz --json             Machine-readable summary
+#   ./soundz --no-color         Plain output
+#
+# Requires: /proc/asound; optional: amixer, aplay, wpctl, pactl, dmesg
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+if [[ "$JSON_OUT" -eq 0 ]] && declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "soundz"; fi
+
+FIXME=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fixme)  FIXME=1 ;;
+        --json)   JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,22p' "$0"; exit 0 ;;
+        *) echo "soundz: unknown option $1 (try --help)" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+if [[ "$JSON_OUT" -eq 1 ]]; then exec 5>&1 >/dev/null; fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+SUDO=""; [[ $EUID -ne 0 ]] && have sudo && SUDO="sudo"
+
+emit "\n  ${C_BOLD}${C_BLUE}╔═══════════════════════════════════════════════════════════════╗
+  ║  SOUNDZ — audio stack diagnosis · \"why can't I hear anything\" ║
+  ╚═══════════════════════════════════════════════════════════════╝${C_RESET}\n"
+
+# ─── 1. sound chips ────────────────────────────────────────────────────────
+section "1 · SOUND CHIPS (ALSA cards)"
+cards_found=0
+while IFS= read -r cnum; do
+    [[ "$cnum" =~ ^[0-9]+$ ]] || continue
+    cname=$(cat "/proc/asound/card${cnum}/id" 2>/dev/null || echo "?")
+    driver="?"
+    [[ -e "/sys/class/sound/card${cnum}/device/driver" ]] && driver=$(basename "$(readlink -f "/sys/class/sound/card${cnum}/device/driver")")
+    printf "  ${C_GREEN}✓${C_RESET} card%s %-12s driver ${C_BOLD}%s${C_RESET}\n" "$cnum" "$cname" "$driver"
+    cards_found=$((cards_found+1))
+done < <(grep -E '^[[:space:]]*[0-9]+ \[' /proc/asound/cards 2>/dev/null | awk '{print $1}')
+if (( cards_found == 0 )); then
+    [[ -r /proc/asound/cards ]] && grep -q "no soundcards" /proc/asound/cards
+    critf "NoAudioHW" "no ALSA sound cards detected" "driverz --net shows missing audio firmware; sudo dmesg | grep -iE 'snd|azx|sof'"
+else
+    add_json_field audio_cards "$cards_found" 1
+fi
+
+# ─── 2. mixers (the #1 'silent' cause) ─────────────────────────────────────
+section "2 · MIXER STATE (mutes & volume — the classic silent culprit)"
+if have amixer; then
+    mutes=0
+    for c in /proc/asound/card[0-9]*/id; do
+        [[ -r "$c" ]] || continue
+        cid=$(grep -oE 'card[0-9]+' "$c" | grep -o '[0-9]+')
+        out=$(amixer -c "$cid" scontents 2>/dev/null)
+        [[ -z "$out" ]] && continue
+        while IFS= read -r line; do
+            case "$line" in
+                *"Mono:"*|"* Playback Simple"*) : ;;
+            esac
+            if grep -q '\[off\]' <<< "$line" && grep -qiE 'Master|Headphone|Speaker' <<< "$line"; then
+                mutes=$((mutes+1))
+                printf "  ${C_RED}✗${C_RESET} card%s %s\n" "$cid" "$(sed 's/^  //' <<< "$line")"
+                if [[ "$FIXME" -eq 1 ]]; then
+                    ctl=$(sed -E "s/^ *([A-Za-z0-9 ()-]+) Playback.*/\1/" <<< "$line" | sed 's/[[:space:]]*$//')
+                    $SUDO amixer -c "$cid" sset "$ctl" 80% unmute >/dev/null 2>&1 && printf "      ${C_GREEN}fixed:${C_RESET} unmuted + set 80%%\n" || printf "      ${C_YELLOW}needs root:${C_RESET} sudo amixer -c %s sset '%s' 80%% unmute\n" "$cid" "$ctl"
+                else
+                    warnf "MutedControl" "card%s control is MUTED: $(sed -E 's/ +/ /g;s/^ //' <<< "${line%%\[*}")" "amixer -c $cid sset <control> unmute 80%   (or: soundz --fixme)"
+                fi
+            fi
+        done <<< "$out"
+    done
+    (( mutes == 0 )) && ok "no Master/Headphone/Speaker switches are muted"
+    add_json_field muted_controls "$mutes" 1
+else
+    info "amixer not installed (alsa-utils) — mixer state unknown"
+    suggest_tool soundz "apt install alsa-utils for mixer visibility"
+fi
+
+# ─── 3. sound server routing ───────────────────────────────────────────────
+section "3 · SOUND SERVER (PipeWire / PulseAudio)"
+SERVER="none"
+if have wpctl; then
+    SERVER="pipewire"
+    def=$(wpctl status 2>/dev/null | awk '/Sinks:/{f=1} f&&/\*/{print; exit}' | tr -d '│├└─' | sed 's/^ *\* *//;s/  */ /g')
+    info "default sink: ${C_BOLD}${def:-NONE SELECTED}${C_RESET}"
+    vol=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
+    if [[ -n "$vol" ]]; then
+        printf "  ${C_DIM}%s${C_RESET}\n" "$vol"
+        grep -q MUTED <<< "$vol" && { warnf "SinkMuted" "default output is MUTTED at the server level" "wpctl set-mute @DEFAULT_AUDIO_SINK@ 0"; }
+        v=$(grep -oE 'Volume: [0-9.]+' <<< "$vol" | awk '{print $2*100+0}')
+        [[ -n "$v" ]] && (( v < 20 )) && warnf "SinkLow" "default output volume only ${v}%" "wpctl set-volume @DEFAULT_AUDIO_SINK@ 70%"
+    fi
+elif have pactl; then
+    SERVER="pulseaudio"
+    def=$(pactl get-default-sink 2>/dev/null)
+    info "default sink: ${C_BOLD}${def:-none}${C_RESET}"
+    [[ -n "$def" ]] && pactl list sinks 2>/dev/null | awk -v d="$def" '$0 ~ ("Name: <"d)">{f=1} f&&/Mute:/{print; if($2=="yes") m=1} f&&/Volume:/{print; exit} END{exit !m}' | sed 's/^/      /'
+    pactl list sinks 2>/dev/null | grep -q "Mute: yes" && warnf "SinkMuted" "a sink is muted server-side" "pactl set-sink-mute @DEFAULT_SINK@ 0"
+else
+    info "no wpctl/pactl found — bare ALSA (or server not running)"
+fi
+add_json_field sound_server "$SERVER"
+
+# ─── 4. permissions & processes ────────────────────────────────────────────
+section "4 · ACCESS & WHO'S USING AUDIO"
+if [[ -e /dev/snd/controlC0 ]]; then
+    groups_of=$(id -nG)
+    grep -qw audio <<< "$groups_of" && ok "you are in the 'audio' group" \
+        || warnf "AudioGroup" "user '$(id -un)' not in audio group" "sudo usermod -aG audio $(id -un)  (re-login; needed only for raw ALSA access)"
+fi
+if have fuser && [[ -n "$SUDO" ]]; then
+    pids=$(timeout 5 $SUDO fuser /dev/snd/* 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | sort -u | head -8)
+    if [[ -n "$pids" ]]; then
+        info "processes holding audio:"
+        for p in $pids; do
+            printf "      pid %-7s %s\n" "$p" "$(ps -p "$p" -o comm= 2>/dev/null || echo '?')"
+        done
+    fi
+fi
+
+# ─── 5. kernel probes & firmware ───────────────────────────────────────────
+section "5 · KERNEL PROBES & FIRMWARE"
+KLOG=$(dmesg 2>/dev/null || sudo -n dmesg 2>/dev/null || true)
+if [[ -z "$KLOG" ]]; then
+    info "kernel log needs sudo — run 'sudo ./soundz' for probe/firmware detail"
+else
+    fails=$(grep -icE 'snd.*(fail|error)|sof.*error|azx.*fail|no firmware' <<< "$KLOG")
+    if (( fails > 0 )); then
+        warnf "AudioKernel" "$fails audio-related kernel error line(s)" "sudo dmesg | grep -iE 'snd|sof' | tail -20"
+        grep -iE 'snd.*(fail|error)|sof.*error' <<< "$KLOG" | tail -4 | sed 's/^/      /'
+    else
+        ok "no audio driver errors in this boot"
+    fi
+    grep -qi 'sof-audio\|snd_sof' <<< "$KLOG" && ! ls /lib/firmware/intel/sof* >/dev/null 2>&1 && \
+        { warnf "SofFirmware" "SoF audio detected but firmware missing" "sudo apt install firmware-sof-signed"; suggest_tool driverz "SoF firmware package missing"; }
+fi
+
+# ─── 6. the no-sound checklist ─────────────────────────────────────────────
+section "6 · IF STILL SILENT — RANKED CHECKLIST"
+printf "  ${C_DIM}1)${C_RESET} physical: speakers plugged/powered, cable to the RIGHT jack (green=out)\n"
+printf "  ${C_DIM}2)${C_RESET} mixer mute (section 2) → ${C_CYAN}soundz --fixme${C_RESET} applies unmute+80%% for you\n"
+printf "  ${C_DIM}3)${C_RESET} wrong output selected → ${C_CYAN}wpctl set-default <id>${C_RESET} (ids in section 3)\n"
+printf "  ${C_DIM}4)${C_RESET} wrong profile (HDMI vs speakers) → pavucontrol 'Configuration' tab or ${C_CYAN}wpctl inspect${C_RESET}\n"
+printf "  ${C_DIM}5)${C_RESET} per-app volume: app muted in the mixer while system is fine (pavucontrol 'Playback')\n"
+printf "  ${C_DIM}6)${C_RESET} server hiccup → ${C_CYAN}systemctl --user restart pipewire pipewire-pulse${C_RESET} (or pulseaudio -k)\n"
+printf "  ${C_DIM}7)${C_RESET} driver/firmware → ${C_CYAN}driverz --video${C_RESET} adjacent: ${C_CYAN}driverz --net${C_RESET} + sudo dmesg | grep snd\n"
+printf "  ${C_DIM}8)${C_RESET} test raw path: ${C_CYAN}aplay -D hw:0,0 /usr/share/sounds/alsa/Front_Center.wav${C_RESET} works but apps don't → server routing (3-6)\n"
+
+if [[ "$FIXME" -eq 1 ]]; then kz_hist_note=""; fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then exec 1>&5 5>&-; fi
+if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then run_comparison_finalize 2>/dev/null || true; fi
+emit_verdict

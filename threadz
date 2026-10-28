@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# threadz — System Thread Activity & Deep Kernel Thread Analysis
+# ----------------------------------------------------------------------------
+# Studies every thread on the system: state, CPU, RSS, affinity, command,
+# scheduling policy, I/O, IRQ-bound work, and ties back to geographic context
+# for any remote process owner when relevant.
+#
+# Visual style:
+#   - Heatmap of thread states (R/S/D/Z/T/W/etc) per process
+#   - Bar chart of top CPU-hogging processes with thread counts
+#   - Donut of IRQ/soft-irq distribution per CPU
+#   - Per-thread CPU% sparkline-like table (sorted)
+#   - Sched stats gauge (runqueue load, ctx-switches/sec)
+#   - Rainbow color coding by state
+#
+# Usage:
+#   ./threadz                  Full audit
+#   ./threadz --top N          Show top N processes (default 15)
+#   ./threadz --pid <pid>      Focus on one process tree
+#   ./threadz --json           Machine-readable
+#   ./threadz --no-color       Plain output
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+JSON_OUT=0
+NO_COLOR_FLAG=0
+TOP_N=15
+FOCUS_PID=""
+QUIET=0
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              SHOW_HELP=1 ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-15}" ;;
+        --pid)                  i=$((i+1)); FOCUS_PID="${ARGS[$i]:-}" ;;
+        --quiet)                QUIET=1 ;;
+        --ai)                   AI_VERDICT=1 ;;
+        --no-ai)                AI_VERDICT=0 ;;
+        *) echo "Unknown flag: $arg" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "threadz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+if [[ "${SHOW_HELP:-0}" -eq 1 ]]; then
+    cat << 'EOF'
+threadz — System Thread Activity Audit
+
+USAGE
+  ./threadz                  Full audit + visualizations
+  ./threadz --top N          Show top N processes (default 15)
+  ./threadz --pid <pid>      Focus on one process and its threads
+  ./threadz --quiet          Skip detail listings
+  ./threadz --json           Machine-readable
+  ./threadz --no-color       Plain output
+
+SECTIONS
+  1. Realm snapshot                Host + kernel info
+  2. Thread state distribution     R/S/D/Z/T heatmap
+  3. Top processes (by CPU%)      Sorted table with threads each
+  4. Top threads (by CPU%)         Per-thread focus
+  5. Scheduling policy breakdown    CFS/RR/FIFO/BATCH/IDLE
+  6. IRQ / soft-irq distribution  Who handles hardware
+  7. Run queue + load average     Sched stats
+  8. Zombie / dead processes      Cleanup opportunities
+  9. Per-CPU load sparkline
+EOF
+    exit 0
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  THREADS.SH  — Kernel Thread Activity Deep Dive               ║
+   ║  Heatmaps · State Distribution · IRQ Map · Sched Policy     ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+fi
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+state_color() {
+    # Map kernel state char (or sched policy) to color code.
+    local s="$1"
+    case "$s" in
+        R) echo "$C_RED" ;;          # running — hot
+        D) echo "$C_MAGENTA" ;;      # uninterruptible sleep — typically IO
+        S) echo "$C_CYAN" ;;         # sleeping
+        Z) echo "$C_YELLOW" ;;       # zombie
+        T) echo "$C_BLUE" ;;         # stopped
+        I) echo "$C_DIM" ;;          # idle
+        *) echo "$C_RESET" ;;
+    esac
+}
+
+policy_color() {
+    case "$1" in
+        SCHED_FIFO|FF)  echo "$C_RED" ;;
+        SCHED_RR|RR)    echo "$C_MAGENTA" ;;
+        SCHED_OTHER|CFS|TS) echo "$C_CYAN" ;;
+        SCHED_BATCH|BATCH) echo "$C_DIM" ;;
+        SCHED_IDLE|IDLE) echo "$C_BLUE" ;;
+        *) echo "$C_RESET" ;;
+    esac
+}
+
+# Donut from record list of "LABEL|COUNT" strings
+donut_chart() {
+    local title="$1" width=40
+    shift
+    local total=0
+    local -a labels=() counts=()
+    for rec in "$@"; do
+        [[ -z "$rec" ]] && continue
+        local label="${rec%%|*}"
+        local count="${rec##*|}"
+        [[ -z "$label" ]] && continue
+        labels+=("$label")
+        counts+=("$count")
+        total=$(( total + count ))
+    done
+    [[ $total -eq 0 ]] && { info "No data"; return 0; }
+
+    printf "${C_BOLD}%s${C_RESET}\n" "$title"
+    local colors=("$C_RED" "$C_YELLOW" "$C_GREEN" "$C_CYAN" "$C_MAGENTA" "$C_BLUE")
+    local i
+    for i in "${!labels[@]}"; do
+        local pct=$(( counts[i] * 100 / total ))
+        local arc_len=$(( counts[i] * width / total ))
+        [[ $arc_len -eq 0 ]] && arc_len=1
+        local bar=""
+        local j
+        for (( j=0; j<arc_len; j++ )); do bar+="█"; done
+        local c="${colors[$(( i % 6 ))]}"
+        printf "  ${c}%-14s${C_RESET} ${c}%-40s${C_RESET} ${C_BOLD}%4d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+            "${labels[i]}" "$bar" "${counts[i]}" "$pct"
+    done
+}
+
+# Heatmap grid: tag → histogram of values
+heatmap() {
+    local title="$1" key_col="$2" max="$3"
+    # arg 4.. are input rows as "value"
+    shift 3
+    printf "${C_BOLD}%s${C_RESET} (heat scale ░▒▓█)\n" "$title"
+    # bins
+    local -a bins=(0 0 0 0 0 0 0 0)
+    local v
+    for v in "$@"; do
+        [[ -z "$v" ]] && continue
+        local idx=$(( v * 8 / max ))
+        [[ $idx -ge 8 ]] && idx=7
+        [[ $idx -lt 0 ]] && idx=0
+        bins[idx]=$(( bins[idx] + 1 ))
+    done
+    local glyphs=(░ ▒ ▓ █)
+    local i
+    for i in 0 1 2 3 4 5 6 7; do
+        local bar=""
+        local w=$(( bins[i] / 2 ))
+        [[ $w -eq 0 ]] && w=1
+        local j
+        for (( j=0; j<w; j++ )); do
+            if [[ $i -lt 2 ]]; then bar+="${glyphs[0]}"
+            elif [[ $i -lt 4 ]]; then bar+="${glyphs[1]}"
+            elif [[ $i -lt 6 ]]; then bar+="${glyphs[2]}"
+            else bar+="${glyphs[3]}"
+            fi
+        done
+        printf "  ${C_DIM}%-12s${C_RESET} ${C_CYAN}%s${C_RESET} ${C_BOLD}%d${C_RESET}\n" \
+            "${key_col}-$i" "$bar" "${bins[i]}"
+    done
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 1: REALM SNAPSHOT
+# ───────────────────────────────────────────────────────────────────────────
+section "1. REALM SNAPSHOT"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Host:" "$HOSTNAME_SHORT"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Kernel:" "$(uname -r)"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Arch:"   "$(uname -m)"
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Uptime:" "$(uptime -p 2>/dev/null || uptime)"
+if [[ -r /proc/cpuinfo ]]; then
+    cpu_model=$(awk -F': ' '/^model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "?")
+    printf "  ${C_DIM}%-16s${C_RESET} %s\n" "CPU model:" "$cpu_model"
+fi
+if [[ -r /proc/stat ]]; then
+    cpus_online=$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || echo 0)
+    printf "  ${C_DIM}%-16s${C_RESET} %s\n" "CPUs online:" "$cpus_online"
+fi
+total_threads=$(awk 'BEGIN{c=0} {c++} END{print c}' /proc/*/stat 2>/dev/null | tail -1 || echo 0)
+printf "  ${C_DIM}%-16s${C_RESET} %s\n" "Total threads:" "$total_threads"
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 2: THREAD STATE DISTRIBUTION
+# ───────────────────────────────────────────────────────────────────────────
+section "2. THREAD STATE DISTRIBUTION — WHAT ARE THEY DOING?"
+declare -A STATES=( ["R"]=0 ["S"]=0 ["D"]=0 ["Z"]=0 ["T"]=0 ["I"]=0 ["X"]=0 )
+state_input=()
+# Use ps to enumerate threads efficiently
+if has_cmd ps; then
+    # Build a flat list of state chars
+    while IFS= read -r state_char; do
+        [[ -z "$state_char" ]] && continue
+        state_input+=("$state_char")
+        STATES[$state_char]=$((${STATES[$state_char]:-0} + 1))
+    done < <(ps -eLo stat= 2>/dev/null | tr -d '[:space:]' | head -1 | awk '{gsub(/[+<>]/,""); print substr($0,1,1)}' 2>/dev/null || true)
+fi
+
+# Fallback: parse /proc/*/stat directly
+if [[ ${#state_input[@]} -eq 0 ]]; then
+    while IFS= read -r line; do
+        # /proc/PID/stat: "PID (comm) S PPID ..."  → state field is $3
+        state_char=$(awk '{print $3}' <<< "$line" | head -c1)
+        [[ -z "$state_char" ]] && continue
+        state_input+=("$state_char")
+        STATES[$state_char]=$((${STATES[$state_char]:-0} + 1))
+    done < <(for d in /proc/[0-9]*; do awk '{print}' "$d/stat" 2>/dev/null; done)
+fi
+
+total=${#state_input[@]}
+if [[ $total -eq 0 ]]; then
+    warn "Could not enumerate threads"
+else
+    info "Threads observed: ${C_BOLD}${total}${C_RESET}"
+    # Donut
+    donut_chart "Thread states (n=$total)" \
+        "Running R|${STATES[R]:-0}" \
+        "Sleeping S|${STATES[S]:-0}" \
+        "Disk-Sleep D|${STATES[D]:-0}" \
+        "Zombie Z|${STATES[Z]:-0}" \
+        "Stopped T|${STATES[T]:-0}" \
+        "Idle I|${STATES[I]:-0}" \
+        "Dead X|${STATES[X]:-0}"
+
+    # Risks
+    if [[ ${STATES[D]:-0} -gt 10 ]]; then
+        warn "${STATES[D]} thread(s) in D-state (uninterruptible) — I/O saturation"
+    fi
+    if [[ ${STATES[Z]:-0} -gt 0 ]]; then
+        critf "zombie_threads" "${STATES[Z]} zombie process(es)" "Parents haven't reaped exit status. Investigate parent and consider 'ps -o pid,ppid,stat,comm -ax | grep Z'"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 3: TOP PROCESSES BY CPU% (with thread counts)
+# ───────────────────────────────────────────────────────────────────────────
+section "3. TOP PROCESSES — CPU ACTIVITY WITH THREAD COUNTS"
+if has_cmd ps; then
+    subsec "Top $TOP_N processes by CPU%"
+    printf "  ${C_DIM}%-7s %-7s %-7s %-7s %-6s %-6s %-22s %s${C_RESET}\n" \
+        "PID" "CPU%" "THR" "RSS" "NI" "STAT" "USER" "COMMAND"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────────────────"
+    ps -eo pid,pcpu,nlwp,rss,ni,stat,user:22,comm --sort=-pcpu 2>/dev/null | head -n $((TOP_N + 1)) | tail -n +2 \
+    | while IFS= read -r line; do
+        pid=$(awk '{print $1}' <<< "$line")
+        cpu=$(awk '{print $2}' <<< "$line")
+        thr=$(awk '{print $3}' <<< "$line")
+        rss=$(( $(awk '{print $4}' <<< "$line") / 1024 ))
+        ni=$(awk '{print $5}' <<< "$line")
+        stat=$(awk '{print $6}' <<< "$line")
+        user=$(awk '{print $7}' <<< "$line")
+        comm=$(awk '{for(i=8;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+        color=$C_RESET
+        cpu_int=${cpu%.*}
+        if [[ "$cpu_int" =~ ^[0-9]+$ ]] && [[ $cpu_int -gt 50 ]]; then
+            color=$C_RED
+        elif [[ "$cpu_int" =~ ^[0-9]+$ ]] && [[ $cpu_int -gt 20 ]]; then
+            color=$C_YELLOW
+        fi
+        # State colorize the STAT
+        stat_color=$(state_color "${stat:0:1}")
+        printf "  ${color}%-7s${C_RESET} ${color}%-7s${C_RESET} %-7s ${C_DIM}%-6s${C_RESET} %-6s ${stat_color}%-6s${C_RESET} ${C_CYAN}%-22s${C_RESET} %s\n" \
+            "$pid" "$cpu" "$thr" "${rss}M" "$ni" "$stat" "$user" "$comm"
+    done || true
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 4: TOP THREADS BY CPU% (vs. parent process)
+# ───────────────────────────────────────────────────────────────────────────
+section "4. TOP THREADS — INDIVIDUAL THREAD CPU%"
+if has_cmd ps; then
+    subsec "Top $TOP_N threads by CPU% (LWP / TGID columns)"
+    printf "  ${C_DIM}%-7s %-7s %-7s %-6s %-22s %s${C_RESET}\n" \
+        "LWP" "TGID" "CPU%" "PRI" "POLICY" "COMMAND"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────"
+    set +e +o pipefail
+    ps -eLo pid,tgid,pcpu,pri,policy,comm --sort=-pcpu 2>/dev/null | head -n $((TOP_N + 1)) | tail -n +2 \
+    | while IFS= read -r line; do
+        lwp=$(awk '{print $1}' <<< "$line")
+        tgid=$(awk '{print $2}' <<< "$line")
+        cpu=$(awk '{print $3}' <<< "$line")
+        pri=$(awk '{print $4}' <<< "$line")
+        pol=$(awk '{print $5}' <<< "$line")
+        comm=$(awk '{for(i=6;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+        cpu_int=${cpu%.*}
+        color=$C_RESET
+        if [[ "$cpu_int" =~ ^[0-9]+$ ]] && [[ $cpu_int -gt 50 ]]; then
+            color=$C_RED
+        elif [[ "$cpu_int" =~ ^[0-9]+$ ]] && [[ $cpu_int -gt 20 ]]; then
+            color=$C_YELLOW
+        fi
+        pol_color=$(policy_color "$pol")
+        printf "  ${color}%-7s${C_RESET} ${C_DIM}%-7s${C_RESET} ${color}%-7s${C_RESET} %-6s ${pol_color}%-22s${C_RESET} %s\n" \
+            "$lwp" "$tgid" "$cpu" "$pri" "$pol" "$comm"
+    done || true
+    set -e -o pipefail
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 5: SCHEDULING POLICY BREAKDOWN
+# ───────────────────────────────────────────────────────────────────────────
+section "5. SCHEDULING POLICIES — WHO GETS REAL-TIME?"
+if has_cmd ps; then
+    declare -A POL=( ["CFS"]=0 ["FIFO"]=0 ["RR"]=0 ["BATCH"]=0 ["IDLE"]=0 ["?"]=0 )
+    set +e +o pipefail
+    ps -eLo policy= 2>/dev/null | tr -d '[:space:]' | while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        case "$p" in
+            SCHED_NORMAL|TS|CFS|0) echo "CFS" ;;
+            SCHED_FIFO|FIFO|FF|1) echo "FIFO" ;;
+            SCHED_RR|RR|2) echo "RR" ;;
+            SCHED_BATCH|BATCH|3) echo "BATCH" ;;
+            SCHED_IDLE|IDLE|5) echo "IDLE" ;;
+            *) echo "?" ;;
+        esac
+    done | sort | uniq -c | sort -rn > /tmp/threads_pol_$$
+    set -e -o pipefail
+
+    if [[ -s /tmp/threads_pol_$$ ]]; then
+        policy_args=()
+        while IFS= read -r row; do
+            count=$(awk '{print $1}' <<< "$row")
+            label=$(awk '{for(i=2;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$row" | sed 's/ *$//')
+            policy_args+=("$label|$count")
+        done < /tmp/threads_pol_$$
+        if [[ ${#policy_args[@]} -gt 0 ]]; then
+            donut_chart "Scheduling policies" "${policy_args[@]}"
+        fi
+        rt_users=0
+        for arg in "${policy_args[@]}"; do
+            label="${arg%%|*}"
+            count="${arg##*|}"
+            case "$label" in
+                FIFO|RR) rt_users=$(( rt_users + count )) ;;
+            esac
+        done
+        if [[ $rt_users -gt 10 ]]; then
+            warn "$rt_users threads in real-time schedulers (FIFO/RR) — verify they're audio/multimedia"
+        fi
+    fi
+    rm -f /tmp/threads_pol_$$
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 6: IRQ / SOFTIRQ DISTRIBUTION (per CPU)
+# ───────────────────────────────────────────────────────────────────────────
+section "6. INTERRUPTS — WHO HANDLES HARDWARE?"
+if [[ -r /proc/interrupts ]]; then
+    subsec "Top interrupt sources by count"
+    printf "  ${C_DIM}%-12s %10s %s${C_RESET}\n" "IRQ" "COUNT" "DEVICE"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────"
+    # Skip CPU columns by reading pre-aggregated first column
+    awk 'NR > 1 && NF >= 2 {
+        # Find count in the FIRST numeric field after the colon
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /:$/) {
+                irq = substr($i, 1, length($i) - 1)
+                # Sum total counts (CPU columns may be removed by -q)
+                total = 0
+                for (j = i + 1; j <= NF; j++) {
+                    if ($j ~ /^[0-9]+,?[0-9]*[kKmM]*$/) {
+                        n = $j
+                        gsub(/[km]+/, "", n)
+                        if (tolower($j) ~ /k$/) n *= 1000
+                        if (tolower($j) ~ /m$/) n *= 1000000
+                        total += n
+                    } else break
+                }
+                # Device label is last non-blank field
+                dev = $NF
+                print irq " " total " " dev
+                break
+            }
+        }
+    }' /proc/interrupts 2>/dev/null | sort -k2 -nr | head -10 \
+    | while IFS= read -r line; do
+        irq=$(awk '{print $1}' <<< "$line")
+        count=$(awk '{print $2}' <<< "$line" | numfmt --to=iec --suffix= 2>/dev/null || awk '{print $2}' <<< "$line")
+        dev=$(awk '{for(i=3;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line" | sed 's/ *$//')
+        printf "  ${C_CYAN}%-12s${C_RESET} ${C_BOLD}%10s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$irq" "$count" "$dev"
+    done || true
+
+    subsec "Softirq totals (/proc/softirqs)"
+    if [[ -r /proc/softirqs ]]; then
+        printf "  ${C_DIM}%-22s %10s %s${C_RESET}\n" "SOFTIRQ" "TOTAL" "%  OF CPU"
+        printf "  %s\n" "────────────────────────────────────────────────────────────────────"
+        awk 'NR > 1 {
+            label = $1; sub(/:$/, "", label)
+            total = 0
+            for (i = 2; i <= NF; i++) total += $i
+            print label " " total
+        }' /proc/softirqs 2>/dev/null | sort -k2 -nr | head -10 \
+        | while IFS= read -r row; do
+            label=$(awk '{print $1}' <<< "$row")
+            total=$(awk '{print $2}' <<< "$row")
+            cnt_label=$(numfmt --to=iec --suffix= "$total" 2>/dev/null || echo "$total")
+            printf "  ${C_MAGENTA}%-22s${C_RESET} ${C_BOLD}%10s${C_RESET}\n" "$label" "$cnt_label"
+        done || true
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 7: RUN QUEUE / CTX-SWITCHES / LOAD AVERAGE
+# ───────────────────────────────────────────────────────────────────────────
+section "7. SCHED STATS — RUN QUEUE, CTX SWITCHES, LOAD"
+if [[ -r /proc/stat ]]; then
+    # Look at "procs_running" and "procs_blocked"
+    running=$(awk '/^procs_running/ {print $2}' /proc/stat 2>/dev/null)
+    blocked=$(awk '/^procs_blocked/ {print $2}' /proc/stat 2>/dev/null)
+    running=${running:-0}; blocked=${blocked:-0}
+    info "Threads on run queue now: ${C_BOLD}${running}${C_RESET}"
+    info "Threads blocked (I/O etc): ${C_BOLD}${blocked}${C_RESET}"
+
+    if [[ "$running" =~ ^[0-9]+$ ]] && [[ $running -gt 0 ]] && command -v nproc >/dev/null 2>&1; then
+        nproc_n=$(nproc 2>/dev/null)
+        [[ -z "$nproc_n" || "$nproc_n" == "0" ]] && nproc_n=1
+        if [[ $running -gt $(( nproc_n * 2 )) ]]; then
+            critf "runqueue_saturated" "Run queue of $running > 2× CPU count ($nproc_n)" \
+                "Saturation. Check 'top -H', look for spinning threads. Review nice/priority if user jobs compete with system."
+        fi
+    fi
+fi
+
+# /proc/loadavg
+if [[ -r /proc/loadavg ]]; then
+    set +e
+    loadavg=$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null)
+    set -e
+    load1=$(awk '{print $1}' <<< "$loadavg")
+    load5=$(awk '{print $2}' <<< "$loadavg")
+    load15=$(awk '{print $3}' <<< "$loadavg")
+    info "Loadavg: 1m=${C_BOLD}$load1${C_RESET}  5m=${C_BOLD}$load5${C_RESET}  15m=${C_BOLD}$load15${C_RESET}"
+    if command -v nproc >/dev/null 2>&1; then
+        nproc_n=$(nproc)
+        is_overload=$(awk -v l="$load1" -v n="$nproc_n" 'BEGIN {print (l > n) ? 1 : 0}')
+        if [[ "$is_overload" == "1" ]]; then
+            warn "1-min load ($load1) exceeds CPU count ($nproc_n) — system is heavily loaded"
+        fi
+    fi
+fi
+
+# Context switches (cumulative)
+if [[ -r /proc/stat ]]; then
+    set +e
+    ctxt=$(awk '/^ctxt / {print $2}' /proc/stat 2>/dev/null)
+    set -e
+    ctxt=${ctxt:-0}
+    info "Total context switches since boot: ${C_BOLD}$(numfmt --to=iec --suffix= "$ctxt" 2>/dev/null || echo "$ctxt")${C_RESET}"
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 8: ZOMBIE INSPECTION
+# ───────────────────────────────────────────────────────────────────────────
+section "8. ZOMBIES — CLEANUP OPPORTUNITIES"
+set +e
+zombies=$(ps -eo pid,ppid,stat,user,comm --sort=-pid 2>/dev/null | awk '$3 ~ /^Z/' | head -10 || true)
+zombie_count=$(printf '%s\n' "$zombies" | grep -c . || echo 0)
+zombie_count=${zombie_count:-0}
+set -e
+if [[ "$zombie_count" -eq 0 || -z "$zombies" ]]; then
+    ok "No zombies"
+else
+    if [[ "$zombie_count" -gt 0 ]]; then
+        critf "zombie_threads" "$zombie_count zombie process(es)" \
+            "Send SIGCHLD to the parent: 'kill -s SIGCHLD <ppid>'. If parent ignores, identify via 'ps -o ppid,comm,pgrp -p <pid>'"
+    fi
+    printf "  ${C_DIM}%-7s %-7s %-12s %-12s %s${C_RESET}\n" "PID" "PPID" "USER" "STAT" "COMMAND"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────"
+    printf '%s\n' "$zombies" | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        pid=$(awk '{print $1}' <<< "$line")
+        ppid=$(awk '{print $2}' <<< "$line")
+        stat=$(awk '{print $3}' <<< "$line")
+        user=$(awk '{print $4}' <<< "$line")
+        comm=$(awk '{for(i=5;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line")
+        printf "  ${C_YELLOW}%-7s${C_RESET} ${C_DIM}%-7s${C_RESET} ${C_CYAN}%-12s${C_RESET} ${C_MAGENTA}%-12s${C_RESET} %s\n" \
+            "$pid" "$ppid" "$user" "$stat" "$comm"
+    done || true
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 9: PER-CPU LOAD SPARKLINE (/proc/stat deltas would be perfect,
+# but we sample now and show field distribution)
+# ───────────────────────────────────────────────────────────────────────────
+section "9. PER-CPU LOAD — HEATMAP OF CPU TIME FIELDS"
+if [[ -r /proc/stat ]]; then
+    subsec "Sample of per-CPU ticks (snapshot)"
+    printf "  ${C_DIM}%-6s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s${C_RESET}\n" \
+        "CPU" "user" "nice" "system" "idle" "iowait" "irq" "softirq" "steal" "guest" "guest_nice"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────"
+    awk '/^cpu[0-9]/ {
+        printf "%-6s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s\n",
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+    }' /proc/stat 2>/dev/null | head -16 | while IFS= read -r line; do
+        cpu=$(awk '{print $1}' <<< "$line")
+        user=$(awk '{print $2}' <<< "$line")
+        idle=$(awk '{print $5}' <<< "$line")
+        # Calculate busy% by comparing each CPU's ticks vs idle.
+        # Heuristic: busy% = 100 * (1 - idle/total)
+        total=0
+        for field in $(awk '{$1=""; print}' <<< "$line"); do
+            [[ "$field" =~ ^[0-9]+$ ]] && total=$(( total + field ))
+        done
+        busy_pct=0
+        if [[ $total -gt 0 ]]; then busy_pct=$(( (total - idle) * 100 / total )); fi
+        color=$C_GREEN
+        [[ $busy_pct -gt 50 ]] && color=$C_YELLOW
+        [[ $busy_pct -gt 80 ]] && color=$C_RED
+        printf "  ${C_BOLD}%-6s${C_RESET} ${color}(%2d%% busy)${C_RESET}\n" "$cpu" "$busy_pct"
+    done || true
+
+    # Heatmap of CPU busy percentages
+    cpu_busy_values=()
+    while IFS= read -r line; do
+        cpu=$(awk '{print $1}' <<< "$line")
+        idle=$(awk '{print $5}' <<< "$line")
+        total=0
+        for field in $(awk '{$1=""; print}' <<< "$line"); do
+            [[ "$field" =~ ^[0-9]+$ ]] && total=$(( total + field ))
+        done
+        if [[ $total -gt 0 ]]; then
+            cpu_busy_values+=( $(( (total - idle) * 100 / total )) )
+        fi
+    done < <(awk '/^cpu[0-9]/' /proc/stat 2>/dev/null)
+    if [[ ${#cpu_busy_values[@]} -gt 0 ]]; then
+        max=100
+        # if all <100 use 100 as max
+        heatmap "Per-CPU busy% heatmap" "cpu_busy%" "$max" "${cpu_busy_values[@]}"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 10: FOCUS-PID VIEW (if --pid provided)
+# ───────────────────────────────────────────────────────────────────────────
+if [[ -n "$FOCUS_PID" ]]; then
+    section "10. FOCUSED VIEW: PID $FOCUS_PID"
+    if [[ -r "/proc/$FOCUS_PID/stat" ]]; then
+        info "Threads under PID $FOCUS_PID:"
+        printf "  ${C_DIM}%-7s %-7s %-7s %-6s %-22s %s${C_RESET}\n" "LWP" "STAT" "CPU%" "PRI" "POLICY" "COMMAND"
+        printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+        # Collect tasks first, then process in parallel — replaces 6 awks/thread.
+        declare -a _T_TIDS=()
+        for d in /proc/$FOCUS_PID/task/[0-9]*; do
+            [[ -r "$d/stat" ]] || continue
+            _T_TIDS+=("$(basename "$d")")
+        done
+        _T_TMP=$(mktemp -d -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp -d)
+        trap "rm -rf '$_T_TMP' 2>/dev/null" RETURN
+        declare -a _T_PIDS=()
+        declare -a _T_IDX=()
+        _ti=0
+        for tid in "${_T_TIDS[@]}"; do
+            (
+                line=$(ps -o pid,stat,pcpu,pri,policy,comm -p "$tid" 2>/dev/null | tail -1)
+                [[ -z "$line" ]] && exit 0
+                printf '%s\n' "$line" > "$_T_TMP/$_ti"
+            ) &
+            _T_PIDS+=($!)
+            _T_IDX+=("$_ti")
+            _ti=$((_ti + 1))
+        done
+        for pid in "${_T_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+        _ti=0
+        for tid in "${_T_TIDS[@]}"; do
+            line=$(cat "$_T_TMP/$_ti" 2>/dev/null)
+            _ti=$((_ti + 1))
+            [[ -z "$line" ]] && continue
+            # Single awk pass for all fields (was 6 separate awk subshells).
+            IFS=$'\t' read -r tpid stat cpu pri pol comm <<<"$(awk '{
+                printf "%s\t%s\t%s\t%s\t%s\t", $1, $2, $3, $4, $5
+                for (i=6; i<=NF; i++) printf "%s ", $i
+                print ""
+            }' <<<"$line" | sed 's/ *$//')"
+            stat_color=$(state_color "${stat:0:1}")
+            pol_color=$(policy_color "$pol")
+            printf "  ${C_BOLD}%-7s${C_RESET} ${stat_color}%-7s${C_RESET} %-7s %-6s ${pol_color}%-22s${C_RESET} %s\n" \
+                "$tpid" "$stat" "$cpu" "$pri" "$pol" "$comm"
+        done
+    else
+        warn "PID $FOCUS_PID is not visible /proc (need sudo or invalid PID)"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# VERDICT
+# ───────────────────────────────────────────────────────────────────────────
+emit_verdict
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    _TZ_SUMMARY="procs=${PROCS_SHOWN:-0} threads_total=${TOTAL_THREADS:-0} critical=${CRITICAL:-0} warnings=${WARNINGS:-0} focus_pid=${FOCUS_PID:-none}"
+    ai_emit_verdict "top_issue" "$_TZ_SUMMARY" 2>/dev/null || true
+fi

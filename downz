@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# downz — Why is this site down or slow?
+#
+# A focused diagnostic that walks the network stack from the outside in and
+# identifies which layer is the cause of an outage or slowdown:
+#
+#   1. Local network health         — can we reach the internet at all?
+#   2. DNS resolution                — does the hostname resolve? to what?
+#                                    propagation across public resolvers
+#   3. ICMP reachability             — can we ping the resolved IP?
+#   4. TCP three-way handshake       — can we open a port at all?
+#   5. TLS handshake                 — does the cert negotiate OK?
+#   6. HTTP request                  — does the server reply?
+#                                    timing breakdown (DNS/TCP/TLS/TTFB/total)
+#                                    redirect chain with per-hop timing
+#   7. Response code mapping         — 200/3xx/4xx/5xx categorized
+#   8. Cloud / CDN edge check        — is the origin behind a CDN? is the
+#                                    edge caching the failure?
+#   9. Server headers                — server, via, age, x-cache hints
+#  10. Common-cause heuristics       — Origin/Cert/DNS/CDN/NW verdict
+#
+# Usage:
+#   ./downz example.com
+#   ./downz https://example.com/some/path
+#   ./downz example.com --port 8443
+#   ./downz example.com --samples 5
+#   ./downz example.com --json
+#
+# Requires: curl (required). Optional: dig, ping, openssl, traceroute, whois,
+# jq (for JSON). Missing optional tools gracefully skipped.
+# ============================================================================
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ---------- Args ----------
+URL=""
+PORT=443
+SAMPLES=3
+JSON_OUT=0
+# Confine reports to the suite directory per project security policy.
+OUTDIR="${SCRIPT_DIR}/downz-reports"
+TIMEOUT=10
+AI_VERDICT=0
+
+while [[ $# -gt 0 ]]; do
+    # Bare "help" / "?" as the only argument should show help
+    if [[ "${1}" == "help" || "${1}" == "?" ]]; then
+        sed -n '2,40p' "$0"; exit 0
+    fi
+    case "$1" in
+        --port)    PORT="$2"; shift 2 ;;
+        --samples) SAMPLES="$2"; shift 2 ;;
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        --json)    JSON_OUT=1; shift ;;
+        --outdir)  OUTDIR="$2"; shift 2 ;;
+        --no-color) NO_COLOR=1; shift ;;
+        --ai)      AI_VERDICT=1; shift ;;
+        --no-ai)   AI_VERDICT=0; shift ;;
+        -h|--help)
+            sed -n '2,40p' "$0"; exit 0 ;;
+        --) shift; break ;;
+        -*) printf "Unknown flag: %s\n" "$1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$URL" ]]; then URL="$1"; fi
+            shift ;;
+    esac
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "downz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+if [[ -z "$URL" ]]; then
+    printf "Usage: %s URL [options]\n" "$0" >&2
+    sed -n '32,40p' "$0" >&2
+    exit 2
+fi
+
+# Normalize URL
+if [[ "$URL" != http* ]]; then
+    URL="https://$URL"
+fi
+URL_HOST=$(echo "$URL" | sed -E 's|^https?://||; s|/.*$||; s|:.*$||')
+URL_PATH=$(echo "$URL" | sed -E 's|^https?://[^/]*||')
+[[ -z "$URL_PATH" ]] && URL_PATH="/"
+URL_SCHEME=$(echo "$URL" | grep -oE '^https?://' | sed 's|://||')
+
+# ---------- Output setup ----------
+mkdir -p "$OUTDIR" 2>/dev/null || true
+TS=$(date '+%Y%m%d-%H%M%S')
+SAFE_HOST=$(echo "$URL_HOST" | tr '/' '_')
+REPORT="$OUTDIR/${SAFE_HOST}-${TS}.txt"
+exec > >(tee "$REPORT") 2>&1
+
+# ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Format milliseconds nicely
+fmt_ms() {
+    awk -v ms="$1" 'BEGIN {
+        if (ms >= 1000) printf "%.2fs", ms/1000
+        else            printf "%.0fms", ms
+    }'
+}
+
+# Compute stats from a list of values (one per line)
+stats() {
+    awk '
+    BEGIN { n=0; sum=0 }
+    { vals[n++]=$1; sum+=$1 }
+    END {
+        if (n==0) { print "n=0"; exit }
+        # sort
+        for(i=0;i<n-1;i++) for(j=i+1;j<n;j++) if(vals[i]>vals[j]) { t=vals[i]; vals[i]=vals[j]; vals[j]=t }
+        mn=vals[0]; mx=vals[n-1]
+        med=vals[int(n/2)]
+        avg=sum/n
+        # stddev
+        ssq=0
+        for(i=0;i<n;i++) ssq+=(vals[i]-avg)*(vals[i]-avg)
+        sd=sqrt(ssq/n)
+        printf "min=%.0fms med=%.0fms avg=%.0fms max=%.0fms σ=%.0fms n=%d", mn, med, avg, mx, sd, n
+    }'
+}
+
+# ---------- Banner ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "╔═══════════════════════════════════════════════════════════════╗\n"
+printf "║  DOWN.SH  — Why is this site down or slow?                   ║\n"
+printf "║  Network · DNS · TCP · TLS · HTTP · Edge · Origin            ║\n"
+printf "╚═══════════════════════════════════════════════════════════════╝\n"
+printf "${C_RESET}\n"
+printf "${C_DIM}URL: %s   Time: %s   Report: %s${C_RESET}\n" \
+    "$URL" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$REPORT"
+echo
+
+VERDICT_SCORE=100
+declare -a VERDICT_NOTES=()
+OVERALL=""
+
+# ---------- 1. Local network health ----------
+printf "${C_BOLD}  ── 1. LOCAL NETWORK ──${C_RESET}\n"
+if have ping; then
+    PING_RTT=$(ping -c1 -W3 8.8.8.8 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+    if [[ -n "$PING_RTT" ]]; then
+        printf "    ${C_GREEN}✓${C_RESET} Internet reachable (ping 8.8.8.8 = %sms)\n" "$PING_RTT"
+    else
+        printf "    ${C_RED}✗${C_RESET} ${C_RED}cannot reach the internet at all${C_RESET}\n"
+        VERDICT_SCORE=$((VERDICT_SCORE - 50))
+        VERDICT_NOTES+=("LOCAL NETWORK DOWN — check WiFi/Ethernet/VPN")
+    fi
+else
+    printf "    ${C_DIM}(ping not installed — skipping)${C_RESET}\n"
+fi
+echo
+
+# ---------- 2. DNS resolution ----------
+printf "${C_BOLD}  ── 2. DNS RESOLUTION ──${C_RESET}\n"
+DNS_OK=0
+declare -a RESOLVED_IPS=()
+if have dig; then
+    # Local resolver
+    LOCAL_RESULT=$(dig +short "$URL_HOST" A 2>/dev/null | head -3)
+    if [[ -n "$LOCAL_RESULT" ]]; then
+        DNS_OK=1
+        printf "    ${C_GREEN}✓${C_RESET} Local resolver (192.168.1.1):\n"
+        echo "$LOCAL_RESULT" | sed 's/^/        ↳ /'
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && RESOLVED_IPS+=("$ip")
+        done <<< "$LOCAL_RESULT"
+    else
+        printf "    ${C_RED}✗${C_RESET} local resolver returned no A records\n"
+    fi
+    # Public resolvers
+    for R in 1.1.1.1 8.8.8.8 9.9.9.9; do
+        R_RSLT=$(dig +short +time=2 +tries=1 "@$R" "$URL_HOST" A 2>/dev/null | head -3 | tr '\n' ' ')
+        if [[ -n "$R_RSLT" ]]; then
+            printf "    ${C_GREEN}✓${C_RESET} @%-8s — %s\n" "$R" "$R_RSLT"
+        else
+            printf "    ${C_RED}✗${C_RESET} @%-8s — no response\n" "$R"
+        fi
+    done
+    # AAAA check
+    AAAA_RSLT=$(dig +short "$URL_HOST" AAAA 2>/dev/null | head -2)
+    [[ -n "$AAAA_RSLT" ]] && printf "    ${C_DIM}AAAA: %s${C_RESET}\n" "$(echo "$AAAA_RSLT" | tr '\n' ' ')"
+else
+    printf "    ${C_DIM}(dig not installed — using getent)${C_RESET}\n"
+    HOSTS_RESULT=$(getent hosts "$URL_HOST" 2>/dev/null | head -3 | awk '{print $1}')
+    if [[ -n "$HOSTS_RESULT" ]]; then
+        DNS_OK=1
+        echo "$HOSTS_RESULT" | sed 's/^/        ↳ /'
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && RESOLVED_IPS+=("$ip")
+        done <<< "$HOSTS_RESULT"
+    else
+        printf "    ${C_RED}✗${C_RESET} getent returned no IPs\n"
+    fi
+fi
+
+if [[ $DNS_OK -eq 0 ]]; then
+    VERDICT_SCORE=$((VERDICT_SCORE - 60))
+    VERDICT_NOTES+=("DNS BROKEN — domain does not resolve, site is unreachable")
+fi
+echo
+
+# ---------- 3. ICMP reachability to origin ----------
+printf "${C_BOLD}  ── 3. ICMP REACHABILITY ──${C_RESET}\n"
+if have ping && [[ ${#RESOLVED_IPS[@]} -gt 0 ]]; then
+    for ip in "${RESOLVED_IPS[@]}"; do
+        PING_RTT=$(ping -c1 -W3 "$ip" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+        if [[ -n "$PING_RTT" ]]; then
+            printf "    ${C_GREEN}✓${C_RESET} %-20s rtt=%sms\n" "$ip" "$PING_RTT"
+        else
+            printf "    ${C_YELLOW}!${C_RESET} %-20s unreachable / blocked (ICMP)\n" "$ip"
+            # Many edge networks block ICMP — this is normal
+        fi
+    done
+else
+    printf "    ${C_DIM}(no IPs to ping, or ping not installed)${C_RESET}\n"
+fi
+echo
+
+# ---------- 4. TCP three-way handshake ----------
+printf "${C_BOLD}  ── 4. TCP HANDSHAKE ──${C_RESET}\n"
+if [[ ${#RESOLVED_IPS[@]} -gt 0 ]]; then
+    TEST_IP="${RESOLVED_IPS[0]}"
+    if have bash && [[ -n "$TEST_IP" ]]; then
+        # Pure bash /dev/tcp probe
+        START_T=$(date +%s%3N 2>/dev/null || date +%s)
+        if timeout 5 bash -c "exec 3<>/dev/tcp/$TEST_IP/$PORT" 2>/dev/null; then
+            END_T=$(date +%s%3N 2>/dev/null || date +%s)
+            TCP_MS=$((END_T - START_T))
+            printf "    ${C_GREEN}✓${C_RESET} TCP open on %s:%d  (%sms)\n" \
+                "$TEST_IP" "$PORT" "$TCP_MS"
+        else
+            printf "    ${C_RED}✗${C_RESET} TCP closed or filtered on %s:%d\n" "$TEST_IP" "$PORT"
+            VERDICT_SCORE=$((VERDICT_SCORE - 30))
+            VERDICT_NOTES+=("TCP BLOCKED on port $PORT — firewall/security-group/edge issue")
+        fi
+    else
+        printf "    ${C_DIM}(bash /dev/tcp probe skipped — no resolved IP)${C_RESET}\n"
+    fi
+else
+    printf "    ${C_DIM}(no IPs to test TCP)${C_RESET}\n"
+fi
+echo
+
+# ---------- 5. TLS handshake ----------
+printf "${C_BOLD}  ── 5. TLS HANDSHAKE ──${C_RESET}\n"
+if [[ "$URL_SCHEME" == "https" ]] && have openssl; then
+    TLS_OUT=$(timeout "$TIMEOUT" openssl s_client -connect "${URL_HOST}:${PORT}" \
+        -servername "$URL_HOST" </dev/null 2>&1)
+    if echo "$TLS_OUT" | grep -qE '^subject='; then
+        SUBJECT=$(echo "$TLS_OUT" | grep -E '^subject=' | head -1 | sed 's/^subject=//')
+        ISSUER=$(echo "$TLS_OUT" | grep -E '^issuer=' | head -1 | sed 's/^issuer=//')
+        # "New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384"
+        CONN_LINE=$(echo "$TLS_OUT" | grep -E 'New,.*Cipher' | head -1)
+        PROTO=$(echo "$CONN_LINE" | grep -oE 'TLSv[0-9.]+' | head -1)
+        CIPHER=$(echo "$CONN_LINE" | grep -oE 'Cipher is [^,\r]+' | head -1 | sed 's/^Cipher is //')
+        # notBefore/notAfter require x509 parser
+        CERT_DATES=$(echo "$TLS_OUT" | openssl x509 -noout -dates 2>/dev/null)
+        NOT_BEFORE=$(echo "$CERT_DATES" | grep '^notBefore=' | head -1 | sed 's/^notBefore=//')
+        NOT_AFTER=$(echo "$CERT_DATES" | grep '^notAfter=' | head -1 | sed 's/^notAfter=//')
+        printf "    ${C_GREEN}✓${C_RESET} TLS handshake OK\n"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Protocol:"  "$PROTO"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Cipher:"    "$CIPHER"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Subject:"   "$SUBJECT"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Issuer:"    "$ISSUER"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Valid from:" "$NOT_BEFORE"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Valid until:" "$NOT_AFTER"
+        # Expiry check
+        NB_EPOCH=$(date -d "$NOT_BEFORE" +%s 2>/dev/null || echo 0)
+        NA_EPOCH=$(date -d "$NOT_AFTER" +%s 2>/dev/null || echo 0)
+        NOW_EPOCH=$(date +%s)
+        if [[ "$NA_EPOCH" -gt 0 ]]; then
+            DAYS_LEFT=$(( (NA_EPOCH - NOW_EPOCH) / 86400 ))
+            if [[ "$DAYS_LEFT" -lt 0 ]]; then
+                printf "      ${C_RED}✗${C_RESET} ${C_RED}CERTIFICATE EXPIRED %d days ago${C_RESET}\n" $((-DAYS_LEFT))
+                VERDICT_SCORE=$((VERDICT_SCORE - 50))
+                VERDICT_NOTES+=("CERT EXPIRED — renew immediately")
+            elif [[ "$DAYS_LEFT" -lt 7 ]]; then
+                printf "      ${C_RED}!${C_RESET} expires in %d days — renew NOW\n" "$DAYS_LEFT"
+                VERDICT_SCORE=$((VERDICT_SCORE - 20))
+                VERDICT_NOTES+=("CERT expires in $DAYS_LEFT days")
+            elif [[ "$DAYS_LEFT" -lt 30 ]]; then
+                printf "      ${C_YELLOW}!${C_RESET} expires in %d days\n" "$DAYS_LEFT"
+            else
+                printf "      ${C_GREEN}✓${C_RESET} valid for %d more days\n" "$DAYS_LEFT"
+            fi
+        fi
+    else
+        printf "    ${C_RED}✗${C_RESET} TLS handshake failed\n"
+        echo "$TLS_OUT" | tail -5 | sed 's/^/      /'
+        VERDICT_SCORE=$((VERDICT_SCORE - 40))
+        VERDICT_NOTES+=("TLS HANDSHAKE FAILED — cert issue or protocol mismatch")
+    fi
+elif [[ "$URL_SCHEME" == "http" ]]; then
+    printf "    ${C_DIM}(HTTPS not used — TLS check skipped)${C_RESET}\n"
+else
+    printf "    ${C_DIM}(openssl not installed — TLS check skipped)${C_RESET}\n"
+fi
+echo
+
+# ---------- 6. HTTP request with timing breakdown ----------
+printf "${C_BOLD}  ── 6. HTTP REQUEST TIMING ──${C_RESET}\n"
+declare -a S_DNS=() S_CONN=() S_TLS=() S_TTFB=() S_TOTAL=() S_CODE=() S_SIZE=()
+CURL_BASE=(curl -sS -L --max-redirs 5 --max-time "$TIMEOUT" -A "downz/1.0 (+diagnostic)")
+
+for sample in $(seq 1 "$SAMPLES"); do
+    OUT=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}|%{time_dns}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{size_download}|%{num_redirects}|%{remote_ip}|%{redirect_url}' \
+        "$URL" 2>/dev/null)
+    if [[ -z "$OUT" ]]; then
+        S_CODE+=("000")
+        continue
+    fi
+    IFS='|' read -r CODE DNS CONN TLS TTFB TOT SZ RDR RIP RURL <<< "$OUT"
+    S_CODE+=("$CODE")
+    # Convert seconds to ms
+    S_DNS+=("$(awk -v s="$DNS"  'BEGIN{printf "%.0f", s*1000}')")
+    S_CONN+=("$(awk -v s="$CONN" 'BEGIN{printf "%.0f", s*1000}')")
+    S_TLS+=("$(awk -v s="$TLS"  'BEGIN{printf "%.0f", s*1000}')")
+    S_TTFB+=("$(awk -v s="$TTFB" 'BEGIN{printf "%.0f", s*1000}')")
+    S_TOTAL+=("$(awk -v s="$TOT"  'BEGIN{printf "%.0f", s*1000}')")
+    S_SIZE+=("$SZ")
+    LAST_RIP="$RIP"
+done
+
+if [[ ${#S_CODE[@]} -gt 0 ]]; then
+    # Status code summary
+    UNIQUE_CODES=$(printf '%s\n' "${S_CODE[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
+    FINAL_CODE="${S_CODE[-1]}"
+    case "$FINAL_CODE" in
+        200|201|204|301|302|304)
+            printf "    ${C_GREEN}✓${C_RESET} HTTP %s — site reachable\n" "$FINAL_CODE" ;;
+        301|302|307|308)  printf "    ${C_GREEN}✓${C_RESET} HTTP %s — redirect (final URL via curl -L)\n" "$FINAL_CODE" ;;
+        401|403)          printf "    ${C_YELLOW}!${C_RESET} HTTP %s — auth required (server is up)\n" "$FINAL_CODE" ;;
+        404)              printf "    ${C_YELLOW}!${C_RESET} HTTP %s — path not found\n" "$FINAL_CODE" ;;
+        5*)               printf "    ${C_RED}✗${C_RESET} HTTP %s — ${C_RED}server error${C_RESET}\n" "$FINAL_CODE"
+                          VERDICT_SCORE=$((VERDICT_SCORE - 30))
+                          VERDICT_NOTES+=("SERVER ERROR ($FINAL_CODE) — origin app is failing") ;;
+        000)              printf "    ${C_RED}✗${C_RESET} HTTP 000 — ${C_RED}connection failed / timeout${C_RESET}\n"
+                          VERDICT_SCORE=$((VERDICT_SCORE - 40))
+                          VERDICT_NOTES+=("CONNECTION FAILED — no HTTP response") ;;
+        *)                printf "    ${C_YELLOW}!${C_RESET} HTTP %s\n" "$FINAL_CODE" ;;
+    esac
+    echo
+    printf "    ${C_DIM}Origin IP:${C_RESET}  %s\n" "${LAST_RIP:-?}"
+
+    # Timing stats
+    echo
+    printf "    ${C_DIM}Per-stage timing (%d samples, min/median/avg/max/σ):${C_RESET}\n" "$SAMPLES"
+    if [[ ${#S_DNS[@]} -gt 0 ]]; then
+        DNS_STATS=$(printf '%s\n' "${S_DNS[@]}" | stats)
+        CONN_STATS=$(printf '%s\n' "${S_CONN[@]}" | stats)
+        TLS_STATS=$(printf '%s\n' "${S_TLS[@]}" | stats)
+        TTFB_STATS=$(printf '%s\n' "${S_TTFB[@]}" | stats)
+        TOT_STATS=$(printf '%s\n' "${S_TOTAL[@]}" | stats)
+        printf "      ${C_DIM}%-10s${C_RESET} %s\n" "DNS:"     "$DNS_STATS"
+        printf "      ${C_DIM}%-10s${C_RESET} %s\n" "TCP:"     "$CONN_STATS"
+        printf "      ${C_DIM}%-10s${C_RESET} %s\n" "TLS:"     "$TLS_STATS"
+        printf "      ${C_DIM}%-10s${C_RESET} %s\n" "TTFB:"    "$TTFB_STATS"
+        printf "      ${C_DIM}%-10s${C_RESET} %s\n" "Total:"   "$TOT_STATS"
+        # Heuristic: where's the slowness?
+        DNS_AVG=$(printf '%s\n' "${S_DNS[@]}" | awk '{s+=$1;n++}END{printf "%.0f",s/n}')
+        CONN_AVG=$(printf '%s\n' "${S_CONN[@]}" | awk '{s+=$1;n++}END{printf "%.0f",s/n}')
+        TLS_AVG=$(printf '%s\n' "${S_TLS[@]}" | awk '{s+=$1;n++}END{printf "%.0f",s/n}')
+        TTFB_AVG=$(printf '%s\n' "${S_TTFB[@]}" | awk '{s+=$1;n++}END{printf "%.0f",s/n}')
+        SLOWEST=""
+        SLOWEST_VAL=0
+        [[ "$DNS_AVG"  -gt "$SLOWEST_VAL" ]] && { SLOWEST="DNS";  SLOWEST_VAL="$DNS_AVG";  }
+        [[ "$CONN_AVG" -gt "$SLOWEST_VAL" ]] && { SLOWEST="TCP";  SLOWEST_VAL="$CONN_AVG"; }
+        [[ "$TLS_AVG"  -gt "$SLOWEST_VAL" ]] && { SLOWEST="TLS";  SLOWEST_VAL="$TLS_AVG";  }
+        [[ "$TTFB_AVG" -gt "$SLOWEST_VAL" ]] && { SLOWEST="TTFB"; SLOWEST_VAL="$TTFB_AVG"; }
+        if [[ "$SLOWEST_VAL" -gt 200 ]]; then
+            printf "    ${C_YELLOW}!${C_RESET} Slowest stage: ${C_BOLD}%s${C_RESET} (%sms avg)\n" "$SLOWEST" "$SLOWEST_VAL"
+            case "$SLOWEST" in
+                DNS)  VERDICT_NOTES+=("SLOW DNS — check resolver or DNS provider") ;;
+                TCP)  VERDICT_NOTES+=("SLOW TCP — network congestion or far origin") ;;
+                TLS)  VERDICT_NOTES+=("SLOW TLS — cryptographic handshake delay") ;;
+                TTFB) VERDICT_NOTES+=("SLOW TTFB — server-side processing is the bottleneck") ;;
+            esac
+        fi
+    fi
+else
+    printf "    ${C_RED}✗${C_RESET} ${C_RED}no HTTP response at all${C_RESET}\n"
+fi
+echo
+
+# ---------- 7. Redirect chain ----------
+printf "${C_BOLD}  ── 7. REDIRECT CHAIN ──${C_RESET}\n"
+REDIRECTS=$("${CURL_BASE[@]}" -o /dev/null -w '%{redirect_url}|%{num_redirects}|%{http_code}|%{remote_ip}' "$URL" 2>/dev/null)
+N_RDR=$(echo "$REDIRECTS" | cut -d'|' -f2)
+if [[ "${N_RDR:-0}" -gt 0 ]]; then
+    printf "    ${C_DIM}Hops followed:${C_RESET} %s\n" "$N_RDR"
+    # Verbose to see each hop
+    CHAIN_OUT=$("${CURL_BASE[@]}" -sv -o /dev/null "$URL" 2>&1 \
+        | grep -E '^[<>] (HTTP/|Location:)' | head -$((N_RDR * 2 + 2)))
+    echo "$CHAIN_OUT" | sed 's/^/      /'
+else
+    printf "    ${C_DIM}(no redirects — direct response)${C_RESET}\n"
+fi
+echo
+
+# ---------- 8. CDN / edge cache check ----------
+printf "${C_BOLD}  ── 8. CDN / EDGE ──${C_RESET}\n"
+HEADERS=$("${CURL_BASE[@]}" -sI "$URL" 2>/dev/null)
+if [[ -n "$HEADERS" ]]; then
+    SERVER=$(echo "$HEADERS" | grep -i '^server:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    CF_RAY=$(echo "$HEADERS" | grep -i '^cf-ray:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    CF_CACHE=$(echo "$HEADERS" | grep -i '^cf-cache-status:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    AGE=$(echo "$HEADERS" | grep -i '^age:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    VIA=$(echo "$HEADERS" | grep -i '^via:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    X_CACHE=$(echo "$HEADERS" | grep -i '^x-cache:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    X_SERVED=$(echo "$HEADERS" | grep -i '^x-served-by:' | head -1 | cut -d: -f2- | tr -d '\r' | xargs)
+    X_VERCEL=$(echo "$HEADERS" | grep -i '^x-vercel-' | head -1 | cut -d: -f2- | xargs)
+    X_AMZ=$(echo "$HEADERS" | grep -i '^x-amz-' | head -1 | cut -d: -f2- | xargs)
+    CDN_NAME="—"
+    [[ -n "$CF_RAY" ]]   && CDN_NAME="${C_CYAN}Cloudflare${C_RESET} (cf-ray=$CF_RAY)"
+    [[ -n "$X_VERCEL" ]] && CDN_NAME="${C_CYAN}Vercel${C_RESET}"
+    [[ -n "$X_AMZ" ]]    && CDN_NAME="${C_CYAN}AWS CloudFront${C_RESET}"
+    [[ -n "$X_CACHE" ]]  && [[ -z "$CDN_NAME" || "$CDN_NAME" == "—" ]] && \
+        CDN_NAME="${C_CYAN}Generic cache${C_RESET} (X-Cache=$X_CACHE)"
+    printf "    ${C_DIM}%-22s${C_RESET} %b\n" "Server:"      "${SERVER:-—}"
+    printf "    ${C_DIM}%-22s${C_RESET} %b\n" "CDN / edge:"  "$CDN_NAME"
+    [[ -n "$AGE" ]]    && printf "    ${C_DIM}%-22s${C_RESET} %s seconds\n" "Cache age:"  "$AGE"
+    [[ -n "$VIA" ]]    && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Via:"        "$VIA"
+    [[ -n "$X_CACHE" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "X-Cache:"   "$X_CACHE"
+    [[ -n "$X_SERVED" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s\n" "X-Served-By:" "$X_SERVED"
+else
+    printf "    ${C_RED}✗${C_RESET} HEAD request failed\n"
+fi
+echo
+
+# ---------- 9. Final verdict ----------
+printf "${C_BOLD}  ── 9. VERDICT ──${C_RESET}\n"
+if [[ "$VERDICT_SCORE" -ge 90 ]]; then
+    OVERALL="${C_GREEN}PASS${C_RESET}"
+    printf "    %b   Score: ${C_GREEN}%d/100${C_RESET}\n" "$OVERALL" "$VERDICT_SCORE"
+elif [[ "$VERDICT_SCORE" -ge 50 ]]; then
+    OVERALL="${C_YELLOW}SLOW / DEGRADED${C_RESET}"
+    printf "    %b   Score: ${C_YELLOW}%d/100${C_RESET}\n" "$OVERALL" "$VERDICT_SCORE"
+else
+    OVERALL="${C_RED}DOWN${C_RESET}"
+    printf "    %b   Score: ${C_RED}%d/100${C_RESET}\n" "$OVERALL" "$VERDICT_SCORE"
+fi
+if [[ ${#VERDICT_NOTES[@]} -gt 0 ]]; then
+    echo
+    printf "    ${C_DIM}Likely causes (ranked):${C_RESET}\n"
+    for n in "${VERDICT_NOTES[@]}"; do
+        printf "      ${C_YELLOW}●${C_RESET} %s\n" "$n"
+    done
+fi
+echo
+
+# ---------- 10. Remediation checklist ----------
+printf "${C_BOLD}  ── 10. REMEDIATION CHECKLIST ──${C_RESET}\n"
+cat <<'EOF'
+    □  Refresh local DNS cache     : sudo systemd-resolve --flush-caches
+                                    (or: sudo dscacheutil -flushcache on macOS)
+    □  Try a different resolver    : dig @1.1.1.1 <host> +short
+    □  Test from another network   : phone hotspot, VPN
+    □  Check CDN status page       : cloudflarestatus.com / status.aws.amazon.com
+    □  Check registrar / DNS       : DNS provider's dashboard for the zone
+    □  Verify origin is up         : curl -I http://<origin-ip>/  (bypass CDN)
+    □  Check certificate expiry    : openssl s_client -connect <host>:443
+    □  Inspect logs at the edge    : Cloudflare Analytics, Vercel logs, etc.
+    □  Check upstream health       : curl from origin's local network
+    □  Roll back recent deploys    : if origin recently changed, revert
+EOF
+echo
+
+# ---------- Summary ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "━━━ DOWNZ COMPLETE ━━━\n"
+printf "${C_RESET}"
+printf "Report: %s\n" "$REPORT"
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+    _DZ_SUMMARY="url=$URL http_code=${FINAL_CODE:-?} verdict=${VERDICT:-?} score=${VERDICT_SCORE:-?} resolved_n=${#RESOLVED_IPS[@]} notes_n=${#VERDICT_NOTES[@]}"
+    ai_emit_verdict "top_issue" "$_DZ_SUMMARY" 2>/dev/null || true
+fi
+
+# ---------- Optional JSON dump ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_REPORT="$OUTDIR/${SAFE_HOST}-${TS}.json"
+    cat > "$JSON_REPORT" <<EOF
+{
+  "url": "$URL",
+  "timestamp": "$(date -Iseconds)",
+  "verdict": "$(echo -e "$OVERALL" | sed 's/\x1b\[[0-9;]*m//g')",
+  "score": $VERDICT_SCORE,
+  "final_http_code": "$FINAL_CODE",
+  "origin_ip": "${LAST_RIP:-}",
+  "resolved_ips": [$(printf '"%s",' "${RESOLVED_IPS[@]}" | sed 's/,$//')],
+  "notes": [$(printf '"%s",' "${VERDICT_NOTES[@]}" | sed 's/,$//')]
+}
+EOF
+    printf "JSON:   %s\n" "$JSON_REPORT"
+fi

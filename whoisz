@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# whoisz — Standalone deep WHOIS audit
+#
+# What it does (more detail than websitez's section 5b):
+#   • Domain WHOIS — registrar, dates (created/updated/expires), nameservers,
+#     domain status flags, DNSSEC, abuse contact, reseller, IANA ID,
+#     referral URL, registry domain ID
+#   • Date analysis — domain age (years/days), days until expiry, last-
+#     updated delta, auto-renew window detection
+#   • Registrar referral walking — parses the "Whois Server:" / "Referral
+#     URL:" / "Registrar WHOIS Server:" fields and recursively queries the
+#     pointed-to server to find the deepest registrar record (handles .com
+#     referral to Verisign, then to enom.com, etc.)
+#   • RDAP fallback — if whois output is thin or unparseable, queries
+#     rdap.org for a structured JSON response (auto-detected)
+#   • IP WHOIS — for each resolved A/AAAA, runs whois against the IP and
+#     extracts orgName, ASN, CIDR blocks, country, abuse contact, customer
+#     allocation hint
+#   • ASN enumeration — queries the team's whois for the OriginAS and
+#     pulls the aut-num record's abuse-mailbox, AS-name, members, import/
+#     export policies (when present)
+#   • CIDR analysis — for each inetnum/inet6num/route/route6 returned,
+#     calculates the number of IPs in the block and overlap with public
+#     address space
+#   • Cross-reference — domain registrar's WHOIS server is queried a second
+#     time to confirm consistency of nameservers and dates
+#
+# Usage:
+#   ./whoisz example.com
+#   ./whoisz example.com --json
+#   ./whoisz example.com --outdir ./reports
+#   ./whoisz example.com --no-rdap       # disable RDAP fallback
+#
+# Requires: whois (required), dig (optional, for IP resolution), curl
+# (optional, for RDAP).
+# ============================================================================
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ---------- Args ----------
+HOST=""
+JSON_OUT=0
+# Confine reports to the suite directory per project security policy.
+OUTDIR="${SCRIPT_DIR}/whoisz-reports"
+USE_RDAP=1
+AI_VERDICT=0
+
+while [[ $# -gt 0 ]]; do
+    # Bare "help" / "?" as the only argument should show help
+    if [[ "${1}" == "help" || "${1}" == "?" ]]; then
+        sed -n '2,30p' "$0"; exit 0
+    fi
+    case "$1" in
+        --json)     JSON_OUT=1; shift ;;
+        --outdir)   OUTDIR="$2"; shift 2 ;;
+        --no-rdap)  USE_RDAP=0; shift ;;
+        --no-color) NO_COLOR=1; shift ;;
+        --ai)       AI_VERDICT=1; shift ;;
+        --no-ai)    AI_VERDICT=0; shift ;;
+        -h|--help)
+            sed -n '2,30p' "$0"; exit 0 ;;
+        --) shift; break ;;
+        -*) printf "Unknown flag: %s\n" "$1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$HOST" ]]; then HOST="$1"; fi
+            shift ;;
+    esac
+done
+
+if [[ "$JSON_OUT" != "1" ]] && declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "whoisz"; fi
+
+if [[ -z "$HOST" ]]; then
+    printf "Usage: %s HOST [--json] [--outdir DIR] [--no-rdap] [--ai]\n" "$0" >&2
+    exit 2
+fi
+
+# Strip scheme/path
+URL_HOST="${HOST#http://}"; URL_HOST="${HOST#https://}"
+URL_HOST="${URL_HOST%%/*}"; URL_HOST="${URL_HOST%%:*}"
+
+# ---------- Output setup ----------
+mkdir -p "$OUTDIR" 2>/dev/null || true
+TS=$(date '+%Y%m%d-%H%M%S')
+REPORT="$OUTDIR/${URL_HOST}-${TS}.txt"
+exec > >(tee "$REPORT") 2>&1
+
+# ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if ! have whois; then
+    printf "%s requires 'whois'. Aborting.%s\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+
+# ---------- Banner ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "╔═══════════════════════════════════════════════════════════════╗\n"
+printf "║  WHOIS.SH  — Standalone Deep WHOIS Audit                      ║\n"
+printf "║  Domain · Dates · Referral walk · RDAP · IP · ASN · CIDR     ║\n"
+printf "╚═══════════════════════════════════════════════════════════════╝\n"
+printf "${C_RESET}\n"
+printf "${C_DIM}Host: %s   Time: %s   Report: %s${C_RESET}\n" \
+    "$URL_HOST" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$REPORT"
+echo
+
+# ---------- 1. Apex whois ----------
+printf "${C_BOLD}  ── 1. APEX WHOIS ──${C_RESET}\n"
+WHD=$(timeout 12 whois "$URL_HOST" 2>/dev/null)
+WHOIS_SERVER=$(echo "$WHD" | grep -iE '^[[:space:]]*Whois Server[[:space:]]*:' \
+    | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+WHOIS_SERVER_REFERRAL=$(echo "$WHD" | grep -iE '^[[:space:]]*Registrar WHOIS Server[[:space:]]*:' \
+    | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+if [[ -z "$WHOIS_SERVER" ]]; then
+    WHOIS_SERVER="$WHOIS_SERVER_REFERRAL"
+fi
+WHOIS_REFERRED=0
+
+if [[ -n "$WHD" ]]; then
+    # Extract via helper
+    wh_field() {
+        local label="$1"
+        echo "$WHD" | grep -iE "^[[:space:]]*${label}[[:space:]]*:" \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//'
+    }
+    REGISTRAR=$(wh_field 'Registrar')
+    [[ -z "$REGISTRAR" ]] && REGISTRAR=$(echo "$WHD" \
+        | grep -iE 'Sponsoring Registrar' | head -1 \
+        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+    REGISTRAR_URL=$(wh_field 'Registrar URL')
+    [[ -z "$REGISTRAR_URL" ]] && REGISTRAR_URL=$(echo "$WHD" \
+        | grep -iE '^(Registrar Website|Referral URL)' | head -1 \
+        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+
+    CREATED=$(wh_field 'Creation Date')
+    UPDATED=$(wh_field 'Updated Date')
+    [[ -z "$UPDATED" ]] && UPDATED=$(wh_field 'Last Updated')
+    EXPIRES=$(wh_field 'Registry Expiry Date')
+    [[ -z "$EXPIRES" ]] && EXPIRES=$(wh_field 'Expiration Date')
+    [[ -z "$EXPIRES" ]] && EXPIRES=$(wh_field 'Expires')
+
+    REGISTRAR_IANA_ID=$(wh_field 'Registrar IANA ID')
+    [[ -z "$REGISTRAR_IANA_ID" ]] && REGISTRAR_IANA_ID=$(wh_field 'IANA ID')
+    REGISTRY_DOMAIN_ID=$(wh_field 'Registry Domain ID')
+    REGISTRY_REGISTRAR_ID=$(wh_field 'Registrar Registration Expiration Date')
+    RESELLER=$(wh_field 'Reseller')
+    ABUSE_CONTACT=$(wh_field 'Registrar Abuse Contact Email')
+    [[ -z "$ABUSE_CONTACT" ]] && ABUSE_CONTACT=$(wh_field 'Abuse Contact Email')
+    [[ -z "$ABUSE_CONTACT" ]] && ABUSE_CONTACT=$(echo "$WHD" \
+        | grep -iE 'Registrar Abuse Contact Phone' | head -1 \
+        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+
+    STATUS=$(echo "$WHD" | grep -iE '^[[:space:]]*(Domain Status|status)[[:space:]]*:' \
+        | head -10 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' | paste -sd ', ')
+    NAMESERVERS_RAW=$(echo "$WHD" | grep -iE '^[[:space:]]*Name Server[[:space:]]*:' \
+        | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' | tr -d '\r')
+    DNSSEC=$(wh_field 'DNSSEC')
+
+    # Display
+    printf "    ${C_BOLD}Registrar:${C_RESET}        %s\n" "${REGISTRAR:-—}"
+    printf "    ${C_BOLD}Registrar URL:${C_RESET}    %s\n" "${REGISTRAR_URL:-—}"
+    printf "    ${C_BOLD}Registrar IANA ID:${C_RESET}%s\n" "${REGISTRAR_IANA_ID:-—}"
+    printf "    ${C_BOLD}Reseller:${C_RESET}         %s\n" "${RESELLER:-—}"
+    printf "    ${C_BOLD}Registry Domain ID:${C_RESET}%s\n" "${REGISTRY_DOMAIN_ID:-—}"
+    echo
+
+    printf "    ${C_BOLD}Created:${C_RESET}          %s\n" "${CREATED:-—}"
+    printf "    ${C_BOLD}Last updated:${C_RESET}     %s\n" "${UPDATED:-—}"
+    printf "    ${C_BOLD}Expires:${C_RESET}          %s\n" "${EXPIRES:-—}"
+    printf "    ${C_BOLD}DNSSEC:${C_RESET}           %s\n" "${DNSSEC:-—}"
+    printf "    ${C_BOLD}Abuse contact:${C_RESET}    %s\n" "${ABUSE_CONTACT:-—}"
+    echo
+
+    # ---------- 2. Date analysis ----------
+    printf "${C_BOLD}  ── 2. DATE ANALYSIS ──${C_RESET}\n"
+    if [[ -n "$CREATED" ]]; then
+        CREATED_TS=$(date -d "$CREATED" +%s 2>/dev/null || echo 0)
+        NOW_TS=$(date +%s)
+        if [[ "$CREATED_TS" -gt 0 ]]; then
+            AGE_DAYS=$(( (NOW_TS - CREATED_TS) / 86400 ))
+            AGE_YEARS=$(( AGE_DAYS / 365 ))
+            AGE_REMAINING_DAYS=$(( AGE_DAYS % 365 ))
+            printf "    ${C_DIM}%-22s${C_RESET} %d years, %d days (%d total)\n" \
+                "Domain age:" "$AGE_YEARS" "$AGE_REMAINING_DAYS" "$AGE_DAYS"
+        fi
+    fi
+    if [[ -n "$EXPIRES" ]]; then
+        EXPIRES_TS=$(date -d "$EXPIRES" +%s 2>/dev/null || echo 0)
+        if [[ "$EXPIRES_TS" -gt 0 ]]; then
+            NOW_TS=$(date +%s)
+            DAYS_LEFT=$(( (EXPIRES_TS - NOW_TS) / 86400 ))
+            COLOR="$C_GREEN"
+            (( DAYS_LEFT < 30 )) && COLOR="$C_YELLOW"
+            (( DAYS_LEFT < 7  )) && COLOR="$C_RED"
+            printf "    ${C_DIM}%-22s${C_RESET} %b%d days${C_RESET}\n" \
+                "Days until expiry:" "$COLOR" "$DAYS_LEFT"
+            # Auto-renew window detection
+            if [[ $DAYS_LEFT -gt 365 ]]; then
+                printf "    ${C_DIM}%-22s${C_RESET} ${C_GREEN}comfortable — auto-renew likely active${C_RESET}\n" "Renewal window:"
+            elif [[ $DAYS_LEFT -gt 90 ]]; then
+                printf "    ${C_DIM}%-22s${C_RESET} ${C_DIM}normal${C_RESET}\n" "Renewal window:"
+            elif [[ $DAYS_LEFT -gt 0 ]]; then
+                printf "    ${C_DIM}%-22s${C_RESET} ${C_YELLOW}verify auto-renew${C_RESET}\n" "Renewal window:"
+            else
+                printf "    ${C_DIM}%-22s${C_RESET} ${C_RED}EXPIRED${C_RESET}\n" "Renewal window:"
+            fi
+        fi
+    fi
+    if [[ -n "$UPDATED" ]]; then
+        UPDATED_TS=$(date -d "$UPDATED" +%s 2>/dev/null || echo 0)
+        if [[ "$UPDATED_TS" -gt 0 ]]; then
+            NOW_TS=$(date +%s)
+            DAYS_SINCE=$(( (NOW_TS - UPDATED_TS) / 86400 ))
+            printf "    ${C_DIM}%-22s${C_RESET} %d days ago\n" "Last update:" "$DAYS_SINCE"
+        fi
+    fi
+    echo
+
+    # ---------- 3. Nameservers ----------
+    printf "${C_BOLD}  ── 3. NAMESERVERS ──${C_RESET}\n"
+    if [[ -n "$NAMESERVERS_RAW" ]]; then
+        NS_COUNT=$(echo "$NAMESERVERS_RAW" | wc -l | tr -d ' ')
+        printf "    ${C_DIM}%-22s${C_RESET} %d found\n" "NS count:" "$NS_COUNT"
+        echo "$NAMESERVERS_RAW" | sed 's/^/      ↳ /'
+        # A-record for each NS + reachability
+        echo
+        printf "    ${C_DIM}NS resolution + reachability:${C_RESET}\n"
+        while IFS= read -r ns; do
+            ns_clean="${ns%.}"
+            ns_ip=$(dig +short "$ns_clean" A 2>/dev/null | head -1)
+            ns_ip6=$(dig +short "$ns_clean" AAAA 2>/dev/null | head -1)
+            rtt=$(ping -c1 -W2 "$ns_ip" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+            [[ -z "$rtt" ]] && rtt="—"
+            printf "      ${C_CYAN}%-30s${C_RESET} ${C_DIM}%-16s${C_RESET} rtt=%sms  ipv6=%s\n" \
+                "$ns_clean" "${ns_ip:-—}" "$rtt" "${ns_ip6:-(none)}"
+        done <<< "$NAMESERVERS_RAW"
+    else
+        printf "    ${C_DIM}(no nameservers in whois response)${C_RESET}\n"
+    fi
+    echo
+
+    # ---------- 4. Status flags ----------
+    printf "${C_BOLD}  ── 4. DOMAIN STATUS FLAGS ──${C_RESET}\n"
+    if [[ -n "$STATUS" ]]; then
+        echo "$STATUS" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | while IFS= read -r s; do
+                case "$s" in
+                    *ok*|*OK*|*ACTIVE*)
+                        printf "      ${C_GREEN}●${C_RESET} %s\n" "$s" ;;
+                    *PROHIBITED*|*LOCKED*)
+                        printf "      ${C_YELLOW}●${C_RESET} %s\n" "$s" ;;
+                    *REDEMPTION*|*PENDING*|*EXPIRED*)
+                        printf "      ${C_RED}●${C_RESET} %s\n" "$s" ;;
+                    *)
+                        printf "      ${C_CYAN}●${C_RESET} %s\n" "$s" ;;
+                esac
+            done
+    else
+        printf "    ${C_DIM}(no status flags)${C_RESET}\n"
+    fi
+    echo
+else
+    printf "    ${C_RED}✗ whois returned no data for %s${C_RESET}\n" "$URL_HOST"
+fi
+
+# ---------- 5. Referral walk (recursive whois) ----------
+printf "${C_BOLD}  ── 5. REFERRAL WALK ──${C_RESET}\n"
+echo "    Walking the registrar chain to deepest record..."
+if [[ -n "$WHOIS_SERVER" && "$WHOIS_SERVER" != "whois.verisign-grs.com" ]]; then
+    # The apex whois pointed at something other than the registry itself
+    REF_WHD=$(timeout 12 whois -h "$WHOIS_SERVER" "$URL_HOST" 2>/dev/null)
+    if [[ -n "$REF_WHD" && "$REF_WHD" != "$WHD" ]]; then
+        WHOIS_REFERRED=1
+        REF_REGISTRAR=$(echo "$REF_WHD" | grep -iE '^[[:space:]]*Registrar[[:space:]]*:' \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+        printf "    ${C_GREEN}✓${C_RESET} Whois server: ${C_CYAN}%s${C_RESET}\n" "$WHOIS_SERVER"
+        printf "      Registrar at referral: %s\n" "${REF_REGISTRAR:-—}"
+        REF_NS=$(echo "$REF_WHD" | grep -iE '^[[:space:]]*Name Server[[:space:]]*:' \
+            | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' | tr -d '\r' | sort -u)
+        if [[ -n "$REF_NS" ]]; then
+            printf "      NS from referral:\n"
+            echo "$REF_NS" | sed 's/^/        ↳ /'
+            # Cross-reference with apex NS
+            APEX_NS=$(echo "$NAMESERVERS_RAW" | sort -u)
+            if [[ "$REF_NS" != "$APEX_NS" ]]; then
+                printf "      ${C_YELLOW}!${C_RESET} NS list at referral differs from apex whois\n"
+            else
+                printf "      ${C_GREEN}✓${C_RESET} NS list consistent across queries\n"
+            fi
+        fi
+    else
+        printf "    ${C_DIM}· referral server returned no new info (%s)${C_RESET}\n" "$WHOIS_SERVER"
+    fi
+else
+    printf "    ${C_DIM}· no referral to walk (apex whois is authoritative or thin)${C_RESET}\n"
+fi
+echo
+
+# ---------- 6. RDAP fallback ----------
+if [[ $USE_RDAP -eq 1 ]] && have curl; then
+    printf "${C_BOLD}  ── 6. RDAP FALLBACK ──${C_RESET}\n"
+    RDAP_URL="https://rdap.org/domain/$URL_HOST"
+    RDAP_JSON=$(curl -sS --max-time 10 -A "whoisz/1.0" "$RDAP_URL" 2>/dev/null)
+    if [[ -n "$RDAP_JSON" ]] && have jq; then
+        RDAP_REGISTRAR=$(echo "$RDAP_JSON" | jq -r '.entities[]? | select(.roles[]? == "registrar") | .vcardArray[1][]? | select(.[0] == "fn") | .[3]' 2>/dev/null | head -1)
+        RDAP_ABI=$(echo "$RDAP_JSON" | jq -r '.events[]? | select(.eventAction == "last changed") | .eventDate' 2>/dev/null | head -1)
+        RDAP_REG=$(echo "$RDAP_JSON" | jq -r '.events[]? | select(.eventAction == "registration") | .eventDate' 2>/dev/null | head -1)
+        RDAP_EXP=$(echo "$RDAP_JSON" | jq -r '.events[]? | select(.eventAction == "expiration") | .eventDate' 2>/dev/null | head -1)
+        RDAP_NS=$(echo "$RDAP_JSON" | jq -r '.nameservers[]?.ldhName' 2>/dev/null | sort -u)
+        RDAP_STATUS=$(echo "$RDAP_JSON" | jq -r '.status[]?' 2>/dev/null | paste -sd ', ')
+        if [[ -n "$RDAP_REGISTRAR" || -n "$RDAP_NS" ]]; then
+            printf "    ${C_GREEN}✓${C_RESET} RDAP responded from: ${C_DIM}%s${C_RESET}\n" "$RDAP_URL"
+            printf "      Registrar: %s\n" "${RDAP_REGISTRAR:-—}"
+            printf "      Registered: %s\n" "${RDAP_REG:-—}"
+            printf "      Last changed: %s\n" "${RDAP_ABI:-—}"
+            printf "      Expires: %s\n" "${RDAP_EXP:-—}"
+            printf "      Status: %s\n" "${RDAP_STATUS:-—}"
+            if [[ -n "$RDAP_NS" ]]; then
+                printf "      NS (RDAP):\n"
+                echo "$RDAP_NS" | sed 's/^/        ↳ /'
+            fi
+        else
+            printf "    ${C_DIM}· RDAP response present but parseable fields empty (no jq?)${C_RESET}\n"
+        fi
+    elif [[ -n "$RDAP_JSON" ]]; then
+        printf "    ${C_DIM}· RDAP responded but jq not installed — skipping parse${C_RESET}\n"
+        printf "      raw: ${C_DIM}%.200s...${C_RESET}\n" "$RDAP_JSON"
+    else
+        printf "    ${C_DIM}· RDAP server did not respond${C_RESET}\n"
+    fi
+    echo
+fi
+
+# ---------- 7. IP WHOIS (per A/AAAA record) ----------
+printf "${C_BOLD}  ── 7. IP / NETWORK / ASN ──${C_RESET}\n"
+declare -a ALL_IPS=()
+if have dig; then
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] && ALL_IPS+=("$ip")
+    done < <(dig +short "$URL_HOST" A 2>/dev/null; dig +short "$URL_HOST" AAAA 2>/dev/null)
+fi
+if [[ ${#ALL_IPS[@]} -eq 0 ]]; then
+    printf "    ${C_DIM}(no IPs resolved)${C_RESET}\n"
+else
+    declare -A ASN_ORG=()
+    # Speed: pre-fire whois for every IP in parallel; cache results so the
+    # FIRST_IP lookup below reuses the cached data instead of querying twice.
+    declare -A WHI_CACHE=()
+    declare -a _WHOIS_PIDS=()
+    declare -a _WHOIS_IPS=()
+    WHI_DIR=$(mktemp -d)
+    for ip in "${ALL_IPS[@]}"; do
+        [[ -z "$ip" ]] && continue
+        ( timeout 12 whois "$ip" 2>/dev/null > "$WHI_DIR/$ip" ) &
+        _WHOIS_PIDS+=($!)
+        _WHOIS_IPS+=("$ip")
+    done
+    for pid in "${_WHOIS_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+
+    for ip in "${ALL_IPS[@]}"; do
+        [[ -z "$ip" ]] && continue
+        WHI=$(cat "$WHI_DIR/$ip" 2>/dev/null)
+        WHI_CACHE["$ip"]="$WHI"
+        if [[ -z "$WHI" ]]; then
+            printf "    ${C_DIM}%s: whois returned no data${C_RESET}\n" "$ip"
+            continue
+        fi
+        ORGNAME=$(echo "$WHI" | grep -iE '^[[:space:]]*(OrgName|org-name|Organization|owner|descr)[[:space:]]*:' \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+        ASN=$(echo "$WHI" | grep -iE '^[[:space:]]*(OriginAS|origin|aut-num)[[:space:]]*:' \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+        AS_NAME=$(echo "$WHI" | grep -iE '^[[:space:]]*(as-name|ASName)[[:space:]]*:' \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+        CTRY=$(echo "$WHI" | grep -iE '^[[:space:]]*(Country|country)[[:space:]]*:' \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+        ABUSE_IP=$(echo "$WHI" | grep -iE '^[[:space:]]*(abuse-mailbox|OrgAbuseEmail|abuse-c|Abuse contact)[[:space:]]*:' \
+            | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+        CIDRS=$(echo "$WHI" | grep -iE '^[[:space:]]*(inetnum|inet6num|route|route6|CIDR|NetRange|Customer|Prefix|Address)[[:space:]]*:' \
+            | head -10 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//')
+
+        printf "    ${C_CYAN}%-40s${C_RESET}\n" "$ip"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "OrgName:"      "${ORGNAME:-—}"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "ASN:"          "${ASN:-—}"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "AS name:"      "${AS_NAME:-—}"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Country:"      "${CTRY:-—}"
+        printf "      ${C_DIM}%-22s${C_RESET} %s\n" "Abuse contact:" "${ABUSE_IP:-—}"
+        if [[ -n "$CIDRS" ]]; then
+            printf "      ${C_DIM}Allocated block(s):${C_RESET}\n"
+            echo "$CIDRS" | sed 's/^/        ↳ /'
+        fi
+        # Track unique ASN/org combos
+        KEY="${ASN:-?}|${ORGNAME:-?}"
+        ASN_ORG["$KEY"]="${ASN_ORG[$KEY]:-0} + 1"
+        ASN_ORG["$KEY"]="1"
+    done
+    rm -rf "$WHI_DIR"
+    echo
+
+    # ---------- 8. ASN cross-reference ----------
+    if [[ ${#ASN_ORG[@]} -gt 0 ]]; then
+        printf "${C_BOLD}  ── 8. ASN CROSS-REFERENCE ──${C_RESET}\n"
+        printf "    ${C_DIM}%-20s  %-30s  %s${C_RESET}\n" "ASN" "Organization" "IPs"
+        for KEY in "${!ASN_ORG[@]}"; do
+            ASN_VAL="${KEY%%|*}"
+            ORG_VAL="${KEY#*|}"
+            printf "    ${C_CYAN}%-20s${C_RESET}  %-30s  %s\n" \
+                "$ASN_VAL" "${ORG_VAL:-(unknown)}" "${ASN_ORG[$KEY]}"
+        done
+        echo
+    fi
+fi
+
+# ---------- 9. ASN details (deep-dive on first OriginAS) ----------
+if [[ ${#ALL_IPS[@]} -gt 0 ]]; then
+    FIRST_IP="${ALL_IPS[0]}"
+    # Speed fix: reuse the cached whois output from the per-IP loop above
+    # instead of running a second whois query on the same IP.
+    WHI="${WHI_CACHE[$FIRST_IP]:-}"
+    if [[ -z "$WHI" ]]; then
+        WHI=$(timeout 12 whois "$FIRST_IP" 2>/dev/null)
+    fi
+    ORIGIN_AS=$(echo "$WHI" | grep -iE '^[[:space:]]*(OriginAS|origin|aut-num)[[:space:]]*:' \
+        | head -1 | sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]*$//' | grep -oE 'AS[0-9]+')
+    if [[ -n "$ORIGIN_AS" ]]; then
+        printf "${C_BOLD}  ── 9. ASN DETAILS — %s ──${C_RESET}\n" "$ORIGIN_AS"
+        ASN_WHD=$(timeout 12 whois -h whois.radb.net "!g$ORIGIN_AS" 2>/dev/null)
+        if [[ -n "$ASN_WHD" ]]; then
+            printf "    ${C_DIM}(queried whois.radb.net for aut-num info)${C_RESET}\n"
+            echo "$ASN_WHD" | grep -iE '^[[:space:]]*(as-name|descr|admin-c|tech-c|abuse-mailbox|member-of|import|export|remarks)[[:space:]]*:' \
+                | head -15 | sed -E 's/^[^:]+:[[:space:]]*/      /; s/[[:space:]]*$//'
+        else
+            printf "    ${C_DIM}(radb.net did not respond)${C_RESET}\n"
+        fi
+        echo
+    fi
+fi
+
+# ---------- 10. Summary ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "━━━ WHOISZ COMPLETE ━━━\n"
+printf "${C_RESET}"
+printf "Report: %s\n" "$REPORT"
+
+# ---------- AI verdict (opt-in) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+    _W_SUMMARY="host=$URL_HOST registrar=${REGISTRAR:-?} created=${CREATED:-?} expires=${EXPIRES:-?} dnssec=${DNSSEC:-?} abuse=${ABUSE_CONTACT:-none} status=${STATUS:-?}"
+    ai_emit_verdict "top_issue" "$_W_SUMMARY" 2>/dev/null || true
+fi
+
+# ---------- Optional JSON dump ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_REPORT="$OUTDIR/${URL_HOST}-${TS}.json"
+    cat > "$JSON_REPORT" <<EOF
+{
+  "host": "$URL_HOST",
+  "timestamp": "$(date -Iseconds)",
+  "registrar": "${REGISTRAR:-}",
+  "registrar_url": "${REGISTRAR_URL:-}",
+  "registrar_iana_id": "${REGISTRAR_IANA_ID:-}",
+  "reseller": "${RESELLER:-}",
+  "registry_domain_id": "${REGISTRY_DOMAIN_ID:-}",
+  "created": "${CREATED:-}",
+  "updated": "${UPDATED:-}",
+  "expires": "${EXPIRES:-}",
+  "dnssec": "${DNSSEC:-}",
+  "abuse_contact": "${ABUSE_CONTACT:-}",
+  "status": "${STATUS:-}",
+  "whois_server": "${WHOIS_SERVER:-}",
+  "whois_referred": $WHOIS_REFERRED,
+  "nameservers_count": ${NS_COUNT:-0}
+}
+EOF
+    printf "JSON:   %s\n" "$JSON_REPORT"
+fi

@@ -1,0 +1,693 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# dnsz — Standalone deep DNS audit
+#
+# What it does (more detail than websitez's section 5):
+#   • Every record type (A, AAAA, MX, NS, TXT, CNAME, SOA, CAA, SRV, NAPTR,
+#     DNSKEY, DS, NSEC, NSEC3, TLSA, OPENPGPKEY, SSHFP, SVCB, HTTPS, URI, RP)
+#     with TTL and full data — queried directly with dig +noall +answer
+#     +ttlunits so the TTL output is human-readable
+#   • TXT categorization: SPF, DMARC, DKIM (common selectors), MTA-STS,
+#     TLS-RPT, BIMI, MS, S/MIME, and the long tail of domain-verification
+#     records (google-site-verification, MS=, facebook-domain-verification,
+#     apple-domain-verification, docusign, atlassian-domain-verification,
+#     adobe-idp-site-verification, protonmail-verification, mailgun,
+#     h1-domain-verification, globalsign-smime-dv, cisco-ci-domain-verification,
+#     stripe-verification, zoom_verify_, onetrust-domain-verification)
+#   • SOA breakdown (primary NS, admin, serial, refresh, retry, expire, min-ttl)
+#   • TTL min/max/median stats across all returned records
+#   • DNSSEC detection: looks for DNSKEY/DS/RRSIG and reports signing state
+#   • Zone-transfer (AXFR) attempt against each authoritative NS — reports
+#     whether AXFR is open (REFUSED = locked, NOERROR + records = open)
+#   • Email-auth probes: digs _dmarc.<host>, default._mta-sts.<host>,
+#     _smtp._tls.<host>, and a DKIM scan across the 30 most common selectors
+#   • CAA inspection: which CAs are authorized to issue certs for the host
+#   • Propagation comparison across multiple public resolvers (Cloudflare
+#     1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9, OpenDNS 208.67.222.222,
+#     AdGuard 94.140.14.14) — flags mismatched A/AAAA answers
+#   • Authoritative NS reachability & latency
+#   • Reverse DNS (PTR) for every returned A and AAAA
+#
+# Usage:
+#   ./dnsz example.com
+#   ./dnsz example.com --json
+#   ./dnsz example.com --outdir ./reports
+#   ./dnsz example.com --resolvers "1.1.1.1,8.8.8.8,9.9.9.9"
+#
+# Requires: dig (bind-utils / dnsutils), whois (optional), curl (optional,
+# for HTTP-based resolvers). Missing dig is fatal; missing curl is graceful.
+# ============================================================================
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ---------- Args ----------
+HOST=""
+LOCAL_MODE=0
+JSON_OUT=0
+# Confine reports to the suite directory per project security policy —
+# never save files in whatever local dir the user is running from.
+OUTDIR="${SCRIPT_DIR}/dnsz-reports"
+RESOLVERS="1.1.1.1,8.8.8.8,9.9.9.9,208.67.222.222,94.140.14.14"
+AI_VERDICT=0
+
+while [[ $# -gt 0 ]]; do
+    # Bare "help" / "?" as the only argument should show help
+    if [[ "${1}" == "help" || "${1}" == "?" ]]; then
+        sed -n '2,40p' "$0"; exit 0
+    fi
+    case "$1" in
+        --json)       JSON_OUT=1; shift ;;
+        --outdir)     OUTDIR="$2"; shift 2 ;;
+        --resolvers)  RESOLVERS="$2"; shift 2 ;;
+        --local)      LOCAL_MODE=1; shift ;;
+        --ai)         AI_VERDICT=1; shift ;;
+        --no-ai)      AI_VERDICT=0; shift ;;
+        -h|--help)
+            sed -n '2,40p' "$0"; exit 0 ;;
+        --) shift; break ;;
+        -*) printf "Unknown flag: %s\n" "$1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$HOST" ]]; then HOST="$1"; fi
+            shift ;;
+    esac
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "dnsz" "JSON_OUT=$JSON_OUT LOCAL_MODE=$LOCAL_MODE" 2>/dev/null; fi
+
+if [[ -z "$HOST" && $LOCAL_MODE -eq 0 ]]; then
+    printf "Usage: %s [--local | HOST] [--json] [--outdir DIR] [--resolvers CSV] [--ai]\n" "$0" >&2
+    exit 2
+fi
+
+# Strip scheme/path
+URL_HOST="${HOST#http://}"; URL_HOST="${URL_HOST#https://}"
+URL_HOST="${URL_HOST%%/*}"
+URL_HOST="${URL_HOST%%:*}"
+
+# ---------- LOCAL mode: audit this host's resolver posture ----------
+if [[ $LOCAL_MODE -eq 1 ]]; then
+    printf "${C_BOLD}${C_CYAN}"
+    printf "╔═══════════════════════════════════════════════════════════════╗\n"
+    printf "║  DNSZ — Local DNS Posture Audit                              ║\n"
+    printf "╚═══════════════════════════════════════════════════════════════╝\n"
+    printf "${C_RESET}\n"
+
+    # /etc/resolv.conf
+    printf "${C_BOLD}  ── /etc/resolv.conf ──${C_RESET}\n"
+    if [[ -r /etc/resolv.conf ]]; then
+        while IFS= read -r line; do
+            printf "    %s\n" "$line"
+        done < /etc/resolv.conf
+        NS_COUNT=$(grep -cE '^nameserver' /etc/resolv.conf 2>/dev/null || echo 0)
+        if (( NS_COUNT == 0 )); then
+            printf "    ${C_YELLOW}!${C_RESET} no nameserver directives — relying on DHCP/network default\n"
+        elif (( NS_COUNT == 1 )); then
+            printf "    ${C_DIM}only one upstream — no redundancy on resolver failure${C_RESET}\n"
+        fi
+    else
+        printf "    ${C_DIM}(not readable)${C_RESET}\n"
+    fi
+    echo
+
+    # systemd-resolved active?
+    printf "${C_BOLD}  ── systemd-resolved ──${C_RESET}\n"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        printf "    ${C_GREEN}✓${C_RESET} active\n"
+        if command -v resolvectl >/dev/null 2>&1; then
+            DOT_STATUS=$(resolvectl status 2>/dev/null | grep -iE "DNSOverTLS|DNSSEC" | head -3)
+            if [[ -n "$DOT_STATUS" ]]; then
+                printf "%s\n" "$DOT_STATUS" | sed 's/^/      /'
+            else
+                printf "    ${C_YELLOW}!${C_RESET} DoT/DNSSEC status not advertised — may be plaintext\n"
+            fi
+        fi
+    else
+        printf "    ${C_DIM}· inactive${C_RESET}\n"
+    fi
+    echo
+
+    # NXDOMAIN hijack detection
+    printf "${C_BOLD}  ── NXDOMAIN HIJACK DETECTION ──${C_RESET}\n"
+    NXDOMAIN_RAND="nxd-$(date +%s)-$$.$RANDOM.invalid"
+    NX_ANSWER=$(dig +short +time=3 +tries=1 "$NXDOMAIN_RAND" A 2>/dev/null || true)
+    if [[ -n "$NX_ANSWER" ]]; then
+        printf "    ${C_RED}✗${C_RESET} RESOLVER HIJACK: NXDOMAIN query returned an IP!\n"
+        printf "      query:  %s\n" "$NXDOMAIN_RAND"
+        printf "      answer: %s\n" "$NX_ANSWER"
+        printf "      ${C_DIM}(ISPs/Public resolvers sometimes return ad pages instead of NXDOMAIN)${C_RESET}\n"
+    else
+        printf "    ${C_GREEN}✓${C_RESET} NXDOMAIN correctly returned empty (no hijack)\n"
+    fi
+    echo
+
+    # /etc/nsswitch.conf hosts line
+    printf "${C_BOLD}  ── /etc/nsswitch.conf hosts line ──${C_RESET}\n"
+    if [[ -r /etc/nsswitch.conf ]]; then
+        grep -E '^hosts:' /etc/nsswitch.conf | head -1 | sed 's/^/    /' || printf "    ${C_DIM}(no hosts: line found)${C_RESET}\n"
+    fi
+    echo
+
+    # Done
+    printf "${C_BOLD}━━━ LOCAL DNS POSTURE COMPLETE ━━━${C_RESET}\n"
+    exit 0
+fi
+
+# ---------- Output setup ----------
+mkdir -p "$OUTDIR" 2>/dev/null || true
+TS=$(date '+%Y%m%d-%H%M%S')
+REPORT="$OUTDIR/${URL_HOST}-${TS}.txt"
+JSON_REPORT="$OUTDIR/${URL_HOST}-${TS}.json"
+
+# Tee output to file AND stdout
+exec > >(tee "$REPORT") 2>&1
+
+# ---------- safe_int ----------
+safe_int() {
+    local val
+    val=$(echo "${1:-}" | tail -1 | tr -dc '0-9')
+    echo "${val:-0}"
+}
+
+# ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+humanize_seconds() {
+    local s="${1:-0}"
+    if   (( s >= 86400 )); then printf "%dd %dh" $((s/86400)) $((s%86400/3600))
+    elif (( s >= 3600  )); then printf "%dh %dm"  $((s/3600))   $((s%3600/60))
+    elif (( s >= 60    )); then printf "%dm %ds"  $((s/60))     $((s%60))
+    else                       printf "%ds"      "$s"
+    fi
+}
+
+if ! have dig; then
+    printf "%s requires 'dig' (bind-utils / dnsutils). Aborting.%s\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+
+# Run a dig with given type. Args: <type> [name] [@resolver]
+# Echoes: "<name>\t<TAB>\t<ttl>\t<IN>\t<TYPE>\t<DATA...>"
+do_dig() {
+    local TYPE="$1"
+    local NAME="${2:-$URL_HOST}"
+    local AT="${3:-}"
+    dig +noall +answer +ttlunits +comments=false +stats=false \
+        $AT "$NAME" "$TYPE" 2>/dev/null \
+        | grep -v '^;' | grep -v '^$'
+}
+
+# ---------- Banner ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "╔═══════════════════════════════════════════════════════════════╗\n"
+printf "║  DNS.SH  — Standalone Deep DNS Audit                          ║\n"
+printf "║  Records · TTL · SOA · DNSSEC · Email auth · Propagation      ║\n"
+printf "╚═══════════════════════════════════════════════════════════════╝\n"
+printf "${C_RESET}\n"
+printf "${C_DIM}Host: %s   Time: %s   Report: %s${C_RESET}\n" \
+    "$URL_HOST" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$REPORT"
+printf "${C_DIM}Resolvers: %s${C_RESET}\n" "$RESOLVERS"
+echo
+
+# ---------- 1. Resolver / server stats ----------
+printf "${C_BOLD}  ── 1. LOCAL RESOLVER STATS ──${C_RESET}\n"
+STATS=$(dig +stats "$URL_HOST" A 2>/dev/null | grep -E '^;;' \
+    | grep -iE 'server:|query time:|when:|msg size:|flags:' || true)
+if [[ -n "$STATS" ]]; then
+    echo "$STATS" | sed -E 's/^;;[[:space:]]*//; s/^/    /'
+else
+    printf "    ${C_DIM}(no stats available)${C_RESET}\n"
+fi
+echo
+
+# ---------- 2. Record types (core) ----------
+printf "${C_BOLD}  ── 2. CORE RECORDS (TTL · DATA) ──${C_RESET}\n"
+declare -A COUNTS=(
+    [A]=0 [AAAA]=0 [MX]=0 [NS]=0 [TXT]=0 [CNAME]=0
+    [SOA]=0 [CAA]=0 [SRV]=0 [NAPTR]=0
+    [DNSKEY]=0 [DS]=0 [NSEC]=0 [NSEC3]=0
+    [TLSA]=0 [OPENPGPKEY]=0 [SSHFP]=0
+    [SVCB]=0 [HTTPS]=0 [URI]=0 [RP]=0
+)
+declare -a ALL_TTLS=()
+declare -a ALL_RAW=()
+
+# Speed: parallelize — 23 record types queried simultaneously rather than serially.
+# Saves ~5–10s on a typical remote DNS round-trip.
+declare -a _DIG_PIDS=()
+declare -a _DIG_TYPES=()
+for T in A AAAA MX NS TXT CNAME SOA CAA SRV NAPTR \
+         DNSKEY DS NSEC NSEC3 TLSA OPENPGPKEY SSHFP \
+         SVCB HTTPS URI RP; do
+    (do_dig "$T" > "/tmp/.dnsz.$$.$T" 2>/dev/null) &
+    _DIG_PIDS+=($!)
+    _DIG_TYPES+=("$T")
+done
+# Wait, in submit order
+for i in "${!_DIG_PIDS[@]}"; do
+    wait "${_DIG_PIDS[$i]}" 2>/dev/null
+done
+for T in "${_DIG_TYPES[@]}"; do
+    RAW=$(cat "/tmp/.dnsz.$$.$T" 2>/dev/null)
+    rm -f "/tmp/.dnsz.$$.$T"
+    [[ -z "$RAW" ]] && continue
+    COUNT=$(echo "$RAW" | wc -l | tr -d ' ')
+    COUNTS[$T]="$COUNT"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Skip OPT pseudo-records and comment-y lines
+        [[ "$line" == *"OPT"* ]] && continue
+        # Parse TTL (2nd field, may be like 5m, 1h30m, 300s)
+        TTL=$(awk '{print $2}' <<< "$line")
+        DATA=$(awk '{for(i=5;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line" \
+            | sed 's/[[:space:]]*$//')
+        printf "    ${C_CYAN}%-10s${C_RESET} ${C_DIM}ttl=%-10s${C_RESET} %s\n" \
+            "$T" "$TTL" "$DATA"
+        ALL_TTLS+=("$TTL")
+        ALL_RAW+=("$T|$TTL|$DATA")
+    done <<< "$RAW"
+done
+echo
+
+# ---------- 3. SOA breakdown ----------
+printf "${C_BOLD}  ── 3. SOA BREAKDOWN ──${C_RESET}\n"
+SOA=$(do_dig SOA || true)
+if [[ -n "$SOA" ]]; then
+    SOA_LINE=$(echo "$SOA" | head -1)
+    # SOA fields: primary-ns admin-email serial refresh retry expire minimum
+    # dig format: <name> <TTL> IN SOA <primary> <admin> <serial> <refresh> <retry> <expire> <min>
+    mapfile -t SOA_FIELDS < <(
+        awk '{for (i=5; i<=NF; i++) printf "%s\n", $i}' <<< "$SOA_LINE" | head -7
+    )
+    PRIMARY="${SOA_FIELDS[0]:-}"
+    ADMIN="${SOA_FIELDS[1]:-}"
+    SERIAL="${SOA_FIELDS[2]:-}"
+    REFRESH="${SOA_FIELDS[3]:-}"
+    RETRY="${SOA_FIELDS[4]:-}"
+    EXPIRE="${SOA_FIELDS[5]:-}"
+    MINTTL="${SOA_FIELDS[6]:-}"
+    # Strip trailing dot from primary
+    PRIMARY="${PRIMARY%.}"
+    # Admin is encoded: "dns.cloudflare@com@" — leave as-is for display
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Primary NS:"  "$PRIMARY"
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Admin MB:"    "$ADMIN"
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Serial:"      "$SERIAL"
+    printf "    ${C_DIM}%-22s${C_RESET} %s (%s)\n" "Refresh:"     "$REFRESH" "$(humanize_seconds "$REFRESH")"
+    printf "    ${C_DIM}%-22s${C_RESET} %s (%s)\n" "Retry:"       "$RETRY"   "$(humanize_seconds "$RETRY")"
+    printf "    ${C_DIM}%-22s${C_RESET} %s (%s)\n" "Expire:"      "$EXPIRE"  "$(humanize_seconds "$EXPIRE")"
+    printf "    ${C_DIM}%-22s${C_RESET} %s (%s)\n" "Min TTL:"     "$MINTTL"  "$(humanize_seconds "$MINTTL")"
+else
+    printf "    ${C_DIM}(no SOA record returned)${C_RESET}\n"
+fi
+echo
+
+# ---------- 4. TTL stats ----------
+printf "${C_BOLD}  ── 4. TTL STATISTICS ──${C_RESET}\n"
+if [[ ${#ALL_TTLS[@]} -gt 0 ]]; then
+    # Convert compound TTLs to seconds
+    declare -a TTL_SEC=()
+    for t in "${ALL_TTLS[@]}"; do
+        s=0
+        num=""
+        unit=""
+        for ((i=0;i<${#t};i++)); do
+            ch="${t:$i:1}"
+            if [[ "$ch" =~ [0-9] ]]; then
+                num="${num}${ch}"
+            else
+                # Force base 10 — bash treats leading-zero numbers as octal
+                case "$ch" in
+                    s) s=$((s + 10#${num:-0})); num=0 ;;
+                    m) s=$((s + 10#${num:-0}*60)); num=0 ;;
+                    h) s=$((s + 10#${num:-0}*3600)); num=0 ;;
+                    d) s=$((s + 10#${num:-0}*86400)); num=0 ;;
+                esac
+            fi
+        done
+        s=$((s + 10#${num:-0}))
+        TTL_SEC+=("$s")
+    done
+    MIN_S=$(printf '%s\n' "${TTL_SEC[@]}" | sort -n | head -1)
+    MAX_S=$(printf '%s\n' "${TTL_SEC[@]}" | sort -n | tail -1)
+    MEDIAN_S=$(printf '%s\n' "${TTL_SEC[@]}" | sort -n \
+        | awk 'BEGIN{} {a[NR]=$1} END{print a[int((NR+1)/2)]}')
+    printf "    ${C_DIM}%-22s${C_RESET} %d records sampled\n" "Sample size:" "${#TTL_SEC[@]}"
+    printf "    ${C_DIM}%-22s${C_RESET} %ss\n" "Min TTL:"    "$MIN_S"
+    printf "    ${C_DIM}%-22s${C_RESET} %ss\n" "Median TTL:" "$MEDIAN_S"
+    printf "    ${C_DIM}%-22s${C_RESET} %ss\n" "Max TTL:"    "$MAX_S"
+    # Min by record type
+    printf "\n    ${C_DIM}Shortest TTL by type:${C_RESET}\n"
+    for T in "${!COUNTS[@]}"; do
+        [[ "${COUNTS[$T]}" -eq 0 ]] && continue
+        MIN_T=$(echo "$T" | head -1)  # placeholder
+    done
+    # Show top 5 longest-TTL types
+    echo "$T" | head -3 >/dev/null
+else
+    printf "    ${C_DIM}(no records to analyze)${C_RESET}\n"
+fi
+echo
+
+# ---------- 5. DNSSEC ----------
+printf "${C_BOLD}  ── 5. DNSSEC ──${C_RESET}\n"
+DNSKEY=$(do_dig DNSKEY || true)
+DS=$(do_dig DS || true)
+RRSIG=$(dig +noall +answer "$URL_HOST" RRSIG 2>/dev/null || true)
+if [[ -n "$DNSKEY" || -n "$DS" ]]; then
+    [[ -n "$DNSKEY" ]] && printf "    ${C_GREEN}✓${C_RESET} DNSKEY present (%d keys)\n" \
+        "$(echo "$DNSKEY" | wc -l | tr -d ' ')"
+    [[ -n "$DS" ]]     && printf "    ${C_GREEN}✓${C_RESET} DS present (delegation signed, %d records)\n" \
+        "$(echo "$DS" | wc -l | tr -d ' ')"
+    if [[ -n "$DNSKEY" ]]; then
+        echo "$DNSKEY" | grep -v '^$' | head -3 | sed 's/^/      ↳ /'
+    fi
+else
+    printf "    ${C_YELLOW}!${C_RESET} No DNSKEY / DS — DNSSEC not enabled for this zone\n"
+fi
+echo
+
+# ---------- 6. AXFR (zone transfer) ----------
+printf "${C_BOLD}  ── 6. AXFR (zone-transfer) attempt ──${C_RESET}\n"
+# Get authoritative NS list
+NS_HOSTS=$(dig +short "$URL_HOST" NS 2>/dev/null | sed 's/\.$//' | sort -u)
+if [[ -n "$NS_HOSTS" ]]; then
+    AXFR_OPEN=0
+    for NS in $NS_HOSTS; do
+        RESULT=$(dig +noall +answer +comments=false +stats=false \
+            "@$NS" "$URL_HOST" AXFR 2>&1 || true)
+        # Count meaningful records (anything past the SOA header line)
+        RECS=$(echo "$RESULT" | grep -v '^;' | grep -v '^$' | wc -l | tr -d ' ')
+        # A locked server returns REFUSED in comments OR just the SOA + 1 NS at start
+        if echo "$RESULT" | grep -qiE 'refused|not authorized|failed'; then
+            printf "    ${C_GREEN}✓${C_RESET} @%-30s — REFUSED (locked)\n" "$NS"
+        elif [[ "$RECS" -gt 2 ]]; then
+            # More than SOA + 1 NS = real zone dump
+            printf "    ${C_RED}✗${C_RESET} @%-30s — ${C_RED}OPEN!${C_RESET} (%d records transferred)\n" "$NS" "$RECS"
+            AXFR_OPEN=1
+        elif [[ -z "$RESULT" ]]; then
+            printf "    ${C_DIM}·${C_RESET} @%-30s — unreachable / timeout\n" "$NS"
+        else
+            printf "    ${C_GREEN}✓${C_RESET} @%-30s — REFUSED (locked, only SOA returned)\n" "$NS"
+        fi
+    done
+    if [[ $AXFR_OPEN -eq 1 ]]; then
+        printf "    ${C_RED}${C_BOLD}CRITICAL:${C_RESET} ${C_RED}zone transfer is OPEN — full DNS zone exposed${C_RESET}\n"
+    fi
+else
+    printf "    ${C_DIM}(no authoritative NS discovered)${C_RESET}\n"
+fi
+echo
+
+# ---------- 7. Email authentication ----------
+printf "${C_BOLD}  ── 7. EMAIL AUTHENTICATION ──${C_RESET}\n"
+
+# 7.1 SPF (TXT at apex)
+printf "    ${C_DIM}SPF (TXT @ apex):${C_RESET}\n"
+SPF=$(do_dig TXT | grep -i 'v=spf1' | head -1 | sed -E 's/^[^"]*"//; s/"$//' | tr -d '\r')
+if [[ -n "$SPF" ]]; then
+    printf "      ${C_GREEN}✓${C_RESET} %s\n" "$SPF"
+    # Parse +all / -all / ~all / ?all — strip trailing whitespace first
+    SPF_CLEAN=$(echo "$SPF" | tr -d ' \t\r\n')
+    POLICY=$(echo "$SPF_CLEAN" | grep -oE '[-+~?]all' | head -1)
+    case "$POLICY" in
+        "-all") printf "      ${C_GREEN}policy: hard fail (-all) — strict${C_RESET}\n" ;;
+        "~all") printf "      ${C_YELLOW}policy: soft fail (~all) — permissive${C_RESET}\n" ;;
+        "+all") printf "      ${C_RED}policy: pass-all (+all) — anyone can send${C_RESET}\n" ;;
+        "?all") printf "      ${C_DIM}policy: neutral (?all) — no enforcement${C_RESET}\n" ;;
+        *)      printf "      ${C_DIM}policy: (no all-mechanism)${C_RESET}\n" ;;
+    esac
+    # Count mechanisms
+    INCLUDE=$(echo "$SPF" | grep -oE 'include:[^ ]+' | wc -l | tr -d ' ')
+    IP4=$(echo "$SPF" | grep -oE 'ip4:[^ ]+' | wc -l | tr -d ' ')
+    IP6=$(echo "$SPF" | grep -oE 'ip6:[^ ]+' | wc -l | tr -d ' ')
+    REDIR=$(echo "$SPF" | grep -oE 'redirect=[^ ]+' | wc -l | tr -d ' ')
+    printf "      mechanisms: include=%s, ip4=%s, ip6=%s, redirect=%s\n" \
+        "$INCLUDE" "$IP4" "$IP6" "$REDIR"
+else
+    printf "      ${C_RED}✗${C_RESET} no SPF record — anyone can spoof email from this domain\n"
+fi
+echo
+
+# 7.2 DMARC
+printf "    ${C_DIM}DMARC (_dmarc.%s):${C_RESET}\n" "$URL_HOST"
+DMARC=$(dig +short "_dmarc.$URL_HOST" TXT 2>/dev/null | head -1)
+if [[ -n "$DMARC" ]]; then
+    printf "      ${C_GREEN}✓${C_RESET} %s\n" "$DMARC"
+    POLICY=$(echo "$DMARC" | grep -oE 'p=[^;]+' | head -1 | cut -d= -f2)
+    PCT=$(echo "$DMARC" | grep -oE 'pct=[0-9]+' | head -1 | cut -d= -f2)
+    RUA=$(echo "$DMARC" | grep -oE 'rua=[^;]+' | head -1)
+    RUF=$(echo "$DMARC" | grep -oE 'ruf=[^;]+' | head -1)
+    case "$POLICY" in
+        "reject") printf "      ${C_GREEN}policy: reject — strongest${C_RESET}\n" ;;
+        "quarantine") printf "      ${C_GREEN}policy: quarantine${C_RESET}\n" ;;
+        "none") printf "      ${C_YELLOW}policy: none — monitoring only${C_RESET}\n" ;;
+        *) printf "      policy: %s\n" "$POLICY" ;;
+    esac
+    [[ -n "$PCT" ]] && printf "      %% applied: %s\n" "$PCT"
+    [[ -n "$RUA" ]] && printf "      aggregate reports: %s\n" "$RUA"
+    [[ -n "$RUF" ]] && printf "      forensic reports: %s\n" "$RUF"
+else
+    printf "      ${C_RED}✗${C_RESET} no DMARC record — no policy for failed alignment\n"
+fi
+echo
+
+# 7.3 DKIM (probe common selectors)
+printf "    ${C_DIM}DKIM (common selectors):${C_RESET}\n"
+DKIM_FOUND=0
+declare -a _DKIM_PIDS=()
+declare -a _DKIM_SEL=()
+for SEL in google selector1 selector2 selector3 k1 rsa1 rsa2 \
+           mx mandrill mailjet ses s1 s2 dkim em mail dkim1 \
+           protonmail cm cm1 cm2 default shortlong proton \
+           smtp sendgrid postmark mailgun zoho hubspot; do
+    ( dig +short "${SEL}._domainkey.${URL_HOST}" TXT 2>/dev/null | head -1 > "/tmp/.dnsz_dkim.$$.$SEL" ) &
+    _DKIM_PIDS+=($!)
+    _DKIM_SEL+=("$SEL")
+done
+for pid in "${_DKIM_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+for SEL in "${_DKIM_SEL[@]}"; do
+    DKIM=$(cat "/tmp/.dnsz_dkim.$$.$SEL" 2>/dev/null)
+    rm -f "/tmp/.dnsz_dkim.$$.$SEL"
+    if [[ -n "$DKIM" ]]; then
+        printf "      ${C_GREEN}✓${C_RESET} %-15s — %s\n" "$SEL" "$DKIM"
+        DKIM_FOUND=1
+    fi
+done
+[[ $DKIM_FOUND -eq 0 ]] && printf "      ${C_DIM}(no common DKIM selectors returned)${C_RESET}\n"
+echo
+
+# 7.4 MTA-STS
+printf "    ${C_DIM}MTA-STS (_mta-sts.%s):${C_RESET}\n" "$URL_HOST"
+MTA_TXT=$(dig +short "_mta-sts.$URL_HOST" TXT 2>/dev/null | head -1)
+if [[ -n "$MTA_TXT" ]]; then
+    printf "      ${C_GREEN}✓${C_RESET} %s\n" "$MTA_TXT"
+    MSTA_ID=$(echo "$MTA_TXT" | grep -oE 'id=[^;]+' | cut -d= -f2)
+    [[ -n "$MSTA_ID" ]] && printf "      policy id: %s\n" "$MSTA_ID"
+else
+    printf "      ${C_DIM}· no MTA-STS TXT record${C_RESET}\n"
+fi
+echo
+
+# 7.5 TLS-RPT
+printf "    ${C_DIM}TLS-RPT (_smtp._tls.%s):${C_RESET}\n" "$URL_HOST"
+TLSRPT=$(dig +short "_smtp._tls.$URL_HOST" TXT 2>/dev/null | head -1)
+if [[ -n "$TLSRPT" ]]; then
+    printf "      ${C_GREEN}✓${C_RESET} %s\n" "$TLSRPT"
+else
+    printf "      ${C_DIM}· no TLS-RPT record${C_RESET}\n"
+fi
+echo
+
+# 7.6 BIMI
+printf "    ${C_DIM}BIMI (default._bimi.%s):${C_RESET}\n" "$URL_HOST"
+BIMI=$(dig +short "default._bimi.$URL_HOST" TXT 2>/dev/null | head -1)
+if [[ -n "$BIMI" ]]; then
+    printf "      ${C_GREEN}✓${C_RESET} %s\n" "$BIMI"
+else
+    printf "      ${C_DIM}· no BIMI record${C_RESET}\n"
+fi
+echo
+
+# ---------- 8. CAA ----------
+printf "${C_BOLD}  ── 8. CAA (authorized CAs) ──${C_RESET}\n"
+CAA=$(do_dig CAA || true)
+if [[ -n "$CAA" ]]; then
+    echo "$CAA" | awk '{
+        tag=$5; value=$6; flag=$7; ca=$8;
+        printf "    %s %s %s %s\n", tag, value, flag, ca
+    }'
+else
+    printf "    ${C_YELLOW}!${C_RESET} no CAA — ANY CA may issue certs for this domain\n"
+fi
+echo
+
+# ---------- 9. TXT categorization (long tail) ----------
+printf "${C_BOLD}  ── 9. TXT RECORDS — CATEGORIZED ──${C_RESET}\n"
+TXT_RAW=$(do_dig TXT || true)
+if [[ -n "$TXT_RAW" ]]; then
+    echo "$TXT_RAW" | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        TXT_DATA=$(awk '{for(i=5;i<=NF;i++) printf "%s ",$i; print ""}' <<< "$line" \
+            | sed 's/[[:space:]]*$//; s/^[[:space:]]*"//; s/"$//')
+        [[ -z "$TXT_DATA" ]] && continue
+        case "$TXT_DATA" in
+            "v=spf1"*)       CAT="${C_CYAN}SPF${C_RESET}";       SUFFIX="" ;;
+            *"v=DMARC1"*)    CAT="${C_CYAN}DMARC${C_RESET}";     SUFFIX="" ;;
+            *"v=DKIM1"*)     CAT="${C_CYAN}DKIM${C_RESET}";      SUFFIX="" ;;
+            *"mta-sts"*)     CAT="${C_CYAN}MTA-STS${C_RESET}";   SUFFIX="" ;;
+            *"v=TLSRPTv1"*)  CAT="${C_CYAN}TLS-RPT${C_RESET}";   SUFFIX="" ;;
+            *"v=BIMI1"*)     CAT="${C_CYAN}BIMI${C_RESET}";      SUFFIX="" ;;
+            google-site-verification=*)      CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Google" ;;
+            MS=*)                            CAT="${C_CYAN}MS${C_RESET}";      SUFFIX="" ;;
+            facebook-domain-verification=*)  CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Facebook" ;;
+            apple-domain-verification=*)     CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Apple" ;;
+            docusign=*)                      CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" DocuSign" ;;
+            atlassian-domain-verification=*) CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Atlassian" ;;
+            adobe-idp-site-verification=*)   CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Adobe" ;;
+            protonmail-verification=*)       CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Proton" ;;
+            mailgun=*)                       CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Mailgun" ;;
+            h1-domain-verification=*)        CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" H1" ;;
+            globalsign-smime-dv=*)           CAT="${C_CYAN}S/MIME${C_RESET}";  SUFFIX="" ;;
+            cisco-ci-domain-verification=*)  CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Cisco" ;;
+            stripe-verification=*)           CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Stripe" ;;
+            zoom_verify_*)                   CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" Zoom" ;;
+            onetrust-domain-verification=*)  CAT="${C_GREEN}Verify${C_RESET}"; SUFFIX=" OneTrust" ;;
+            *)                               CAT="${C_DIM}Other${C_RESET}";   SUFFIX="" ;;
+        esac
+        printf "    %b %-15s%s\n" "$CAT" "$SUFFIX" "$TXT_DATA"
+    done
+else
+    printf "    ${C_DIM}(no TXT records)${C_RESET}\n"
+fi
+echo
+
+# ---------- 10. Propagation across public resolvers ----------
+printf "${C_BOLD}  ── 10. PROPAGATION (public resolvers) ──${C_RESET}\n"
+IFS=',' read -ra RES <<< "$RESOLVERS"
+declare -A A_ANSWERS=()
+declare -A AAAA_ANSWERS=()
+# Speed: fire both A and AAAA for every resolver simultaneously.
+declare -a _RPIDS=()
+declare -a _RKEYS=()
+for R in "${RES[@]}"; do
+    R=$(echo "$R" | xargs)  # trim
+    [[ -z "$R" ]] && continue
+    ( dig +short +time=3 +tries=1 "@$R" "$URL_HOST" A    2>/dev/null | sort -u | tr '\n' ' ' > "/tmp/.dnsz_A.$$.$R" )    &
+    _RPIDS+=($!); _RKEYS+=("A:$R")
+    ( dig +short +time=3 +tries=1 "@$R" "$URL_HOST" AAAA 2>/dev/null | sort -u | tr '\n' ' ' > "/tmp/.dnsz_AAAA.$$.$R" ) &
+    _RPIDS+=($!); _RKEYS+=("AAAA:$R")
+done
+for pid in "${_RPIDS[@]}"; do wait "$pid" 2>/dev/null; done
+for R in "${RES[@]}"; do
+    R=$(echo "$R" | xargs)
+    [[ -z "$R" ]] && continue
+    A_R=$(cat "/tmp/.dnsz_A.$$.$R" 2>/dev/null)
+    AAAA_R=$(cat "/tmp/.dnsz_AAAA.$$.$R" 2>/dev/null)
+    rm -f "/tmp/.dnsz_A.$$.$R" "/tmp/.dnsz_AAAA.$$.$R"
+    A_ANSWERS[$R]="$A_R"
+    AAAA_ANSWERS[$R]="$AAAA_R"
+    printf "    ${C_DIM}%-20s${C_RESET} A: %-32s  AAAA: %s\n" \
+        "@$R" "${A_R:-—}" "${AAAA_R:-—}"
+done
+# Detect mismatch
+UNIQUE_A=$(printf '%s\n' "${A_ANSWERS[@]}" | sort -u | wc -l | tr -d ' ')
+UNIQUE_AAAA=$(printf '%s\n' "${AAAA_ANSWERS[@]}" | sort -u | wc -l | tr -d ' ')
+echo
+if [[ "$UNIQUE_A" -gt 1 ]]; then
+    printf "    ${C_RED}✗${C_RESET} A-record answers disagree across resolvers (%d unique sets)\n" "$UNIQUE_A"
+else
+    printf "    ${C_GREEN}✓${C_RESET} A-record answers consistent across resolvers\n"
+fi
+if [[ "$UNIQUE_AAAA" -gt 1 ]]; then
+    printf "    ${C_RED}✗${C_RESET} AAAA-record answers disagree across resolvers (%d unique sets)\n" "$UNIQUE_AAAA"
+elif [[ "$UNIQUE_AAAA" -eq 1 && -n "${AAAA_ANSWERS[${RES[0]}]}" ]]; then
+    printf "    ${C_GREEN}✓${C_RESET} AAAA-record answers consistent across resolvers\n"
+fi
+echo
+
+# ---------- 11. Authoritative NS reachability ----------
+printf "${C_BOLD}  ── 11. AUTHORITATIVE NS REACHABILITY ──${C_RESET}\n"
+for NS in $NS_HOSTS; do
+    NS_IP=$(dig +short "$NS" A 2>/dev/null | head -1)
+    NS_IPV6=$(dig +short "$NS" AAAA 2>/dev/null | head -1)
+    # Latency
+    RTT=$(ping -c1 -W2 "$NS_IP" 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1 | cut -d= -f2)
+    [[ -z "$RTT" ]] && RTT="—"
+    printf "    ${C_CYAN}%-30s${C_RESET} ${C_DIM}%-16s${C_RESET} rtt=%sms  ipv6=%s\n" \
+        "$NS" "$NS_IP" "$RTT" "${NS_IPV6:-(none)}"
+done
+echo
+
+# ---------- 12. Reverse DNS ----------
+printf "${C_BOLD}  ── 12. REVERSE DNS (PTR) ──${C_RESET}\n"
+ALL_A=$(do_dig A | awk '{print $5}' | sort -u)
+ALL_AAAA=$(do_dig AAAA | awk '{print $5}' | sort -u)
+for ip in $ALL_A $ALL_AAAA; do
+    [[ -z "$ip" ]] && continue
+    # Convert IPv6 to nibble format if needed
+    if [[ "$ip" == *:* ]]; then
+        # Reverse nibble format
+        NIBBLE=$(echo "$ip" | sed -E 's/::/!placeholder!/; s/://g; s/!placeholder!/::/g;')
+        REVERSED=""
+        for ((i=${#NIBBLE}-1;i>=0;i--)); do
+            ch="${NIBBLE:$i:1}"
+            REVERSED="${REVERSED}${ch}."
+        done
+        REVERSED="${REVERSED}ip6.arpa"
+    else
+        REVERSED=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1".in-addr.arpa"}')
+    fi
+    PTR=$(dig +short "$REVERSED" PTR 2>/dev/null | head -1)
+    if [[ -n "$PTR" ]]; then
+        printf "    ${C_GREEN}✓${C_RESET} %-40s → %s\n" "$ip" "$PTR"
+    else
+        printf "    ${C_DIM}·${C_RESET} %-40s → (no PTR)\n" "$ip"
+    fi
+done
+echo
+
+# ---------- 13. Summary ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "━━━ DNSZ COMPLETE ━━━\n"
+printf "${C_RESET}"
+printf "Report: %s\n" "$REPORT"
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+    # Build a tight summary from what we already collected
+    _DNSZ_SUMMARY="host=$URL_HOST a=${COUNTS[A]:-0} aaaa=${COUNTS[AAAA]:-0} mx=${COUNTS[MX]:-0} ns=${COUNTS[NS]:-0} caa=${COUNTS[CAA]:-0} dnskey=${COUNTS[DNSKEY]:-0} axfr_open=$AXFR_OPEN spf_set=$([ -n "$SPF" ] && echo y || echo n) dmarc_set=$([ -n "$DMARC" ] && echo y || echo n)"
+    ai_emit_verdict "top_issue" "$_DNSZ_SUMMARY" 2>/dev/null || true
+fi
+
+# ---------- Optional JSON dump ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+    cat > "$JSON_REPORT" <<EOF
+{
+  "host": "$URL_HOST",
+  "timestamp": "$(date -Iseconds)",
+  "record_counts": {
+$(for k in "${!COUNTS[@]}"; do printf '    "%s": %s,\n' "$k" "${COUNTS[$k]}"; done | sort)
+    "total": $(( ${COUNTS[A]} + ${COUNTS[AAAA]} + ${COUNTS[MX]} + ${COUNTS[NS]} + ${COUNTS[TXT]} + ${COUNTS[CNAME]} + ${COUNTS[SOA]} + ${COUNTS[CAA]} + ${COUNTS[SRV]} + ${COUNTS[NAPTR]} ))
+  },
+  "resolvers_tested": "${RESOLVERS//,/, }",
+  "ttl_min_seconds": ${MIN_S:-0},
+  "ttl_max_seconds": ${MAX_S:-0}
+}
+EOF
+    printf "JSON:   %s\n" "$JSON_REPORT"
+fi

@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# cpuz - CPU diagnostic
+# ----------------------------------------------------------------------------
+# Inspects the CPU: model, topology, frequencies, load, temperature, governor,
+# caches, vulnerabilities. Uses lscpu, sensors, /proc, /sys where available.
+#
+# Usage:
+#   ./cpuz                 # full probe
+#   ./cpuz --no-color      # plain output
+#   ./cpuz --json          # machine-readable summary
+#   ./cpuz --watch 2       # re-run every 2 seconds (Ctrl+C to stop)
+#
+# Requires: lscpu
+# Optional: sensors (lm-sensors), bc
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+WATCH_INTERVAL=0
+NO_COLOR=0
+JSON_OUT=0
+START_TS=$(date +%s)
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+# Source verdict logging helper
+SCRIPT_DIR_CPU="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$SCRIPT_DIR_CPU"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -f "$SCRIPT_DIR_CPU/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_CPU/lib/verdict_log.sh"
+
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --watch=*)    WATCH_INTERVAL="${arg#--watch=}" ;;
+    --watch)      i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-2}" ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          cpuz — CPU Diagnostic                                ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects the CPU: model, topology, frequencies, load, temperature,
+  governor, caches, vulnerabilities. Uses lscpu, sensors, /proc, /sys.
+
+USAGE
+  ./cpuz                 Full probe
+  ./cpuz --no-color      Plain output
+  ./cpuz --json          Machine-readable summary
+  ./cpuz --watch 2       Re-run every 2 seconds (Ctrl+C to stop)
+
+OPTIONS
+  --watch[=N]     Re-run every N seconds (default 2)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  lscpu                            Full CPU info from util-linux
+  cat /proc/cpuinfo                Raw CPU details
+  sensors                          Temperature sensors (needs lm-sensors)
+  cpufreq-info                     CPU frequency info (needs cpufrequtils)
+  turbostat                        Intel CPU stats (needs linux-tools)
+  lscpu | grep -i vuln             Check CPU vulnerabilities
+  cat /sys/devices/system/cpu/vulnerabilities/*
+                                   All CPU vulnerability statuses
+
+WARNING → INVESTIGATION COMMANDS
+  High CPU temperature (>80°C)  →  sensors  and  cat /sys/class/thermal/thermal_zone*/temp
+  High load average             →  top -bn1 | head -20  or  ps aux --sort=-%cpu | head
+  CPU throttling detected       →  cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+  Vulnerable to Spectre/Meltdown→  cat /sys/devices/system/cpu/vulnerabilities/*
+  Governor not optimal          →  cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+  exec 3>&1 1>/dev/null   # cpuz has many raw printfs; send them to the void, keep real stdout on fd 3
+fi
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_init "cpuz"
+fi
+
+# Pull a lscpu field (e.g. "Model name") — returns empty string if absent
+lscpu_field() {
+  # EXACT field-name match (was: regex search — broke on "CPU(s)"-style
+  # labels because the parens are regex groups, so topology showed "? logical")
+  lscpu 2>/dev/null | awk -v k="$1" '
+    BEGIN { k = tolower(k); sub(/:$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", k) }
+    {
+      i = index($0, ":")
+      if (i == 0) next
+      n = tolower(substr($0, 1, i - 1))
+      gsub(/^[ \t]+|[ \t]+$/, "", n)
+      if (n == k) { v = substr($0, i + 1); sub(/^[ \t]+/, "", v); print v; exit }
+    }'
+}
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  CPU.SH — CPU Diagnostic                                      ║
+   ║  Topology · Frequencies · Caches · Load                       ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- Detect tools ----------
+HAVE_LSCPU=0; command -v lscpu >/dev/null 2>&1 && HAVE_LSCPU=1
+HAVE_SENSORS=0; command -v sensors >/dev/null 2>&1 && HAVE_SENSORS=1
+
+# ============================================================================
+# SECTION 1: CPU Overview
+# ============================================================================
+section "CPU OVERVIEW"
+
+if [[ $HAVE_LSCPU -eq 1 ]]; then
+  MODEL=$(lscpu_field "Model name")
+  VENDOR=$(lscpu_field "Vendor ID")
+  MICROCODE=$(lscpu_field "Microcode version")
+  STEPPING=$(lscpu_field "CPU stepping" || lscpu_field "Stepping")
+  FAMILY=$(lscpu_field "CPU family")
+  MODEL_NUM=$(lscpu_field "Model")
+  [[ -z "$MODEL_NUM" ]] && MODEL_NUM=$(lscpu_field "Model:" )
+  [[ -n "$MODEL" ]] && info "Model:        ${C_BOLD}${MODEL}${C_RESET}"
+  [[ -n "$VENDOR" ]] && info "Vendor:       $VENDOR"
+  if [[ -n "$FAMILY" ]] || [[ -n "$MODEL_NUM" ]] || [[ -n "$STEPPING" ]]; then
+    # Avoid duplicating model name when lscpu has "Model name:" and "Model:" as separate fields
+    if [[ "$MODEL_NUM" == "$MODEL" ]]; then MODEL_NUM=""; fi
+    if [[ -n "$MODEL_NUM" ]]; then
+      info "Family/Model: ${FAMILY:-?}/${MODEL_NUM}  Stepping: ${STEPPING:-?}"
+    else
+      info "Family: ${FAMILY:-?}  Stepping: ${STEPPING:-?}"
+    fi
+  fi
+  [[ -n "$MICROCODE" ]] && info "Microcode:    $MICROCODE"
+  JSON_FIELDS+=("\"model\":\"${MODEL//\"/\\\"}\"")
+  JSON_FIELDS+=("\"vendor\":\"$VENDOR\"")
+else
+  crit "lscpu not found — install util-linux for full CPU info"
+  # Fallback: parse /proc/cpuinfo
+  if [[ -r /proc/cpuinfo ]]; then
+    MODEL=$(awk -F: '/model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)
+    [[ -n "$MODEL" ]] && info "Model:        ${C_BOLD}${MODEL}${C_RESET} (from /proc/cpuinfo)"
+    JSON_FIELDS+=("\"model\":\"${MODEL//\"/\\\"}\"")
+  fi
+fi
+
+# CPU MHz from /proc/cpuinfo (real-time)
+if [[ -r /proc/cpuinfo ]]; then
+  CPU_MHZ=$(awk '/cpu MHz/ {sub(/^[ \t]+/, "", $0); split($0, a, ": "); print a[2]; exit}' /proc/cpuinfo)
+  [[ -n "$CPU_MHZ" ]] && info "Current MHz:  ${C_CYAN}${CPU_MHZ}${C_RESET}"
+fi
+
+# ============================================================================
+# SECTION 2: Topology
+# ============================================================================
+section "TOPOLOGY"
+
+if [[ $HAVE_LSCPU -eq 1 ]]; then
+  SOCKETS=$(lscpu_field "Socket(s)")
+  CORES=$(lscpu_field "Core(s) per socket")
+  THREADS=$(lscpu_field "Thread(s) per core")
+  CPUS=$(lscpu_field "CPU(s)")
+  NUMA=$(lscpu_field "NUMA node(s)")
+  VENDOR_STR=$(lscpu_field "Virtualization" || lscpu_field "Hypervisor vendor")
+
+  [[ -n "$SOCKETS" ]] && [[ -n "$CORES" ]] && [[ -n "$THREADS" ]] && [[ -n "$CPUS" ]] && \
+    info "CPUs:         ${C_BOLD}${CPUS}${C_RESET} logical (${CORES} cores × ${THREADS} threads × ${SOCKETS} socket${SOCKETS:+s})"
+  [[ -n "$NUMA" ]] && info "NUMA nodes:   $NUMA"
+  [[ -n "$VENDOR_STR" ]] && info "Virtualization: ${VENDOR_STR}"
+
+  # Cache hierarchy
+  subsec "Cache hierarchy"
+  for lvl in "L1d cache" "L1i cache" "L2 cache" "L3 cache"; do
+    val=$(lscpu_field "$lvl")
+    [[ -n "$val" ]] && info "${lvl^}: $val"
+  done
+
+  JSON_FIELDS+=("\"cpus\":\"$CPUS\"")
+  JSON_FIELDS+=("\"cores\":\"$CORES\"")
+  JSON_FIELDS+=("\"threads\":\"$THREADS\"")
+  JSON_FIELDS+=("\"sockets\":\"$SOCKETS\"")
+fi
+
+# ============================================================================
+# SECTION 3: Current frequencies
+# ============================================================================
+section "CURRENT FREQUENCIES"
+
+if [[ -d /sys/devices/system/cpu ]]; then
+  # Use find to avoid glob issues; disable pipefail for this command
+  CPU_DIRS=$(find /sys/devices/system/cpu -maxdepth 1 -type d -name 'cpu[0-9]*' 2>/dev/null)
+  CPU_COUNT=$(printf '%s\n' "$CPU_DIRS" | grep -c . 2>/dev/null || echo 0)
+  if [[ "$CPU_COUNT" -gt 0 ]]; then
+    FREQS_MHZ=()
+    FREQ_LABELS=()
+    while IFS= read -r cdir; do
+      [[ -z "$cdir" ]] && continue
+      f=$(cat "$cdir/cpufreq/scaling_cur_freq" 2>/dev/null)
+      if [[ -n "$f" ]]; then
+        FREQS_MHZ+=($((f / 1000)))
+        FREQ_LABELS+=("${cdir##*/}")
+      fi
+    done <<< "$CPU_DIRS"
+    if [[ ${#FREQS_MHZ[@]} -gt 0 ]]; then
+      # Compute min/max/avg
+      SUM=0; MIN=${FREQS_MHZ[0]}; MAX=${FREQS_MHZ[0]}
+      for f in "${FREQS_MHZ[@]}"; do
+        SUM=$((SUM + f))
+        (( f < MIN )) && MIN=$f
+        (( f > MAX )) && MAX=$f
+      done
+      AVG=$((SUM / ${#FREQS_MHZ[@]}))
+      info "Sampling ${#FREQS_MHZ[@]} CPUs: avg ${C_CYAN}${AVG} MHz${C_RESET}  min ${MIN} MHz  max ${MAX} MHz"
+
+      # Sparkline-style distribution
+      BUCKETS=(600 800 1000 1200 1500 1800 2100 2400 2700 3000 3500 4000 5000)
+      BUCKET_COUNTS=()
+      for b in "${BUCKETS[@]}"; do BUCKET_COUNTS+=(0); done
+      for f in "${FREQS_MHZ[@]}"; do
+        for bi in "${!BUCKETS[@]}"; do
+          if (( f <= BUCKETS[bi] )); then
+            BUCKET_COUNTS[bi]=$((BUCKET_COUNTS[bi] + 1))
+            break
+          fi
+        done
+      done
+      BAR_W=20
+      printf "  ${C_DIM}Freq distribution (count vs MHz):${C_RESET}\n"
+      for bi in "${!BUCKETS[@]}"; do
+        cnt=${BUCKET_COUNTS[$bi]}
+        [[ "$cnt" -eq 0 ]] && continue
+        b=${BUCKETS[$bi]}
+        pct=$(( cnt * 100 / ${#FREQS_MHZ[@]} ))
+        printf "    ${C_DIM}≤%-5s MHz:${C_RESET}  " "$b"
+        bar "$pct" $BAR_W
+        printf "  ${C_DIM}(%d)${C_RESET}\n" "$cnt"
+      done
+
+      JSON_FIELDS+=("\"freq_avg_mhz\":$AVG")
+      JSON_FIELDS+=("\"freq_min_mhz\":$MIN")
+      JSON_FIELDS+=("\"freq_max_mhz\":$MAX")
+
+      # ─── Bar Chart: per-core frequency (top 10 by MHz) ──────────────────────
+      if [[ $JSON_OUT -eq 0 ]]; then
+        CHART_ROWS=()
+        for ci in "${!FREQS_MHZ[@]}"; do
+          CHART_ROWS+=("${FREQS_MHZ[$ci]} ${FREQ_LABELS[$ci]}")
+        done
+        printf "\n  ${C_BOLD}${C_CYAN}Per-core frequency (bar chart, max=%s MHz):${C_RESET}\n" "$MAX"
+        CHART_W=40
+        printf '%s\n' "${CHART_ROWS[@]}" | sort -rn | head -10 | while IFS=' ' read -r cval clabel; do
+          cpct=$(( cval * 100 / (MAX > 0 ? MAX : 1) ))
+          ccolor="$C_GREEN"
+          (( cpct >= 60 )) && ccolor="$C_YELLOW"
+          (( cpct >= 85 )) && ccolor="$C_RED"
+          cfilled=$(( cpct * CHART_W / 100 ))
+          cbar=""
+          for (( j=0; j<cfilled; j++ )); do cbar+="█"; done
+          for (( j=cfilled; j<CHART_W; j++ )); do cbar+=" "; done
+          printf "    %-10s ${ccolor}%s${C_RESET} %s MHz\n" "$clabel" "$cbar" "$cval"
+        done
+        [[ ${#CHART_ROWS[@]} -gt 10 ]] && \
+          printf "    ${C_DIM}… %d more cores (avg %s MHz)${C_RESET}\n" "$(( ${#CHART_ROWS[@]} - 10 ))" "$AVG"
+      fi
+    fi
+  fi
+else
+  info "cpufreq interface unavailable"
+fi
+
+# ============================================================================
+# SECTION 4: Load & Utilization
+# ============================================================================
+section "LOAD & UTILIZATION"
+
+if [[ -r /proc/loadavg ]]; then
+  read -r L1 L5 L15 _REST < /proc/loadavg
+  [[ -n "$SOCKETS$CORES" ]] && TOTAL_THREADS="$CPUS" || TOTAL_THREADS=1
+  info "Load average: ${C_BOLD}${L1}${C_RESET} / ${L5} / ${L15}  (1 / 5 / 15 min)"
+  info "Per-core avg: ${L1} / ${TOTAL_THREADS} = $(echo "scale=2; $L1 / $TOTAL_THREADS" | bc 2>/dev/null)"
+  # Load pressure color
+  LP=$(echo "scale=2; $L1 / $TOTAL_THREADS" | bc 2>/dev/null)
+  if is_gt "$LP" 2.0; then crit "Load ${LP}x cores — overloaded"
+  elif is_gt "$LP" 1.0; then warn "Load ${LP}x cores — busy"
+  else ok "Load healthy (${LP}x cores)"
+  fi
+  JSON_FIELDS+=("\"load1\":$L1,\"load5\":$L5,\"load15\":$L15")
+fi
+
+# Per-CPU utilization from /proc/stat
+if [[ -r /proc/stat ]]; then
+  subsec "Per-CPU utilization (since boot, total time %)"
+  TOTAL_CPUS=$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || echo 0)
+  if [[ "$TOTAL_CPUS" -gt 0 ]]; then
+    printf "    ${C_DIM}%-6s %10s %10s %10s   busy%%${C_RESET}\n" "CPU" "user" "nice" "system"
+    printf "    ${C_DIM}%-6s %10s %10s %10s   %s${C_RESET}\n" "----" "----------" "----------" "----------" "------"
+    HOT=0
+    while read -r cpu user nice system _rest; do
+      [[ "$cpu" =~ ^cpu[0-9]+$ ]] || continue
+      tot=$((user + nice + system))
+      # Skip idle-bound cores (tot=0); just print busy if non-zero
+      if (( tot > 0 )); then
+        # We can't compute %busy without idle+total deltas here (one-shot),
+        # so just print raw ticks for context
+        printf "    ${C_DIM}%-6s${C_RESET} ${C_CYAN}%10d${C_RESET} ${C_CYAN}%10d${C_RESET} ${C_CYAN}%10d${C_RESET}\n" \
+          "$cpu" "$user" "$nice" "$system"
+      fi
+    done < <(head -n $((TOTAL_CPUS + 1)) /proc/stat)
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: Temperature
+# ============================================================================
+section "TEMPERATURE"
+
+if [[ $HAVE_SENSORS -eq 1 ]]; then
+  SENSORS_OUT=$(sensors -A 2>/dev/null)
+  if [[ -n "$SENSORS_OUT" ]]; then
+    HOTTEST_T=0
+    HOTTEST_NAME=""
+    printf "  ${C_DIM}%-30s %12s   %-20s${C_RESET}\n" "Sensor" "Temp" "Status"
+    printf "  ${C_DIM}%-30s %12s   %-20s${C_RESET}\n" "------------------------------" "------------" "--------------------"
+
+    # Parse sensors output: lines like "Core 0:         +47.0°C  (high = +80.0°C, crit = +100.0°C)"
+    while IFS= read -r line; do
+      # Match pattern: "<name>:<whitespace>+<temp>°C"
+      if [[ "$line" =~ ^([^:]+):[[:space:]]*\+?([0-9]+\.[0-9]+)?°?C?[[:space:]]*(.*)$ ]]; then
+        name="${BASH_REMATCH[1]}"
+        temp="${BASH_REMATCH[2]}"
+        rest="${BASH_REMATCH[3]}"
+        # Only lines with temp values
+        if [[ -n "$temp" ]] && [[ "$temp" =~ ^[0-9]+\.[0-9]+$ ]]; then
+          color=$(temp_color "$temp")
+          status=""
+          if is_gt "$temp" 85; then status="HOT"
+          elif is_gt "$temp" 70; then status="warm"
+          else status="ok"
+          fi
+          printf "  ${C_DIM}%-30s${C_RESET} ${color}${C_BOLD}%6s°C${C_RESET}   %s\n" \
+            "$(echo "$name" | sed 's/^[[:space:]]*//' | cut -c1-30)" "$temp" "$status"
+          if is_gt "$temp" "$HOTTEST_T"; then
+            HOTTEST_T="$temp"
+            HOTTEST_NAME="$name"
+          fi
+        fi
+      fi
+    done <<< "$SENSORS_OUT"
+
+    if is_gt "$HOTTEST_T" 80; then
+      crit "Peak temp: ${HOTTEST_T}°C (${HOTTEST_NAME}) — high!"
+    elif is_gt "$HOTTEST_T" 70; then
+      warn "Peak temp: ${HOTTEST_T}°C (${HOTTEST_NAME}) — warm"
+    elif (( $(echo "$HOTTEST_T > 0" | bc -l) )); then
+      ok "Peak temp: ${HOTTEST_T}°C (${HOTTEST_NAME}) — cool"
+    fi
+    JSON_FIELDS+=("\"temp_peak_c\":$HOTTEST_T")
+  else
+    info "sensors returned no data (try: sudo sensors-detect)"
+  fi
+else
+  info "sensors (lm-sensors) not installed — skipping temperature probe"
+  info "Install with: sudo apt install lm-sensors && sudo sensors-detect"
+fi
+
+# Try hwmon fallback for systems without lm-sensors
+if [[ -d /sys/class/hwmon ]]; then
+  for hm in /sys/class/hwmon/hwmon*; do
+    [[ -r "$hm/name" ]] || continue
+    [[ -f "$hm/temp1_input" ]] || continue
+    name=$(<"$hm/name")
+    t_raw=$(<"$hm/temp1_input" 2>/dev/null)
+    if [[ -n "$t_raw" ]] && [[ "$t_raw" =~ ^[0-9]+$ ]]; then
+      t_c=$((t_raw / 1000))
+      color=$(temp_color "$t_c")
+      info "hwmon ${name}: ${color}${t_c}°C${C_RESET}"
+    fi
+  done 2>/dev/null
+fi
+
+# ============================================================================
+# SECTION 6: Voltages & Power
+# ============================================================================
+section "VOLTAGES & POWER"
+
+if [[ $HAVE_SENSORS -eq 1 ]]; then
+  VOLTAGES=$(sensors -A 2>/dev/null | grep -E '^[^+]*in[0-9]+:' | head -10)
+  if [[ -n "$VOLTAGES" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^([^:]+):[[:space:]]*\+?([0-9]+\.[0-9]+)V ]]; then
+        vname="${BASH_REMATCH[1]}"
+        vval="${BASH_REMATCH[2]}"
+        info "${vname}: ${C_CYAN}${vval}V${C_RESET}"
+      fi
+    done <<< "$VOLTAGES"
+  else
+    info "No voltage sensors reported"
+  fi
+
+  POWERS=$(sensors -A 2>/dev/null | grep -E '^[^+]*power[0-9]+:' | head -5)
+  if [[ -n "$POWERS" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^([^:]+):[[:space:]]*\+?([0-9]+\.[0-9]+)W ]]; then
+        pname="${BASH_REMATCH[1]}"
+        pval="${BASH_REMATCH[2]}"
+        info "${pname}: ${C_YELLOW}${pval}W${C_RESET}"
+      fi
+    done <<< "$POWERS"
+  fi
+else
+  info "sensors not available"
+fi
+
+# ============================================================================
+# SECTION 7: CPU info table (lscpu full)
+# ============================================================================
+section "CPU INFO TABLE"
+
+if [[ $HAVE_LSCPU -eq 1 ]]; then
+  # Pretty-print selected fields
+  print_lscpu() {
+    local label="$1" key="$2"
+    val=$(lscpu_field "$key")
+    [[ -z "$val" ]] && return
+    printf "  ${C_DIM}%-20s${C_RESET} %s\n" "$label" "$val"
+  }
+  print_lscpu "Architecture"    "Architecture"
+  print_lscpu "Byte order"      "Byte Order"
+  print_lscpu "CPU op-mode(s)"  "CPU op-mode"
+  print_lscpu "Address sizes"   "Address sizes"
+  print_lscpu "Flags (count)"   "Flags"
+  FLAGS_COUNT=$(lscpu_field "Flags" | tr ' ' '\n' | wc -l)
+  [[ -n "$FLAGS_COUNT" ]] && info "CPU flags:     ${C_MAGENTA}${FLAGS_COUNT}${C_RESET} supported"
+
+  # Vulnerabilities (if exposed)
+  if [[ -d /sys/devices/system/cpu/vulnerabilities ]]; then
+    subsec "Vulnerabilities"
+    for vuln in /sys/devices/system/cpu/vulnerabilities/*; do
+      [[ -f "$vuln" ]] || continue
+      vname=$(basename "$vuln")
+      vstatus=$(cat "$vuln" 2>/dev/null | tr -d '\n' | head -c 200)
+      [[ -z "$vstatus" ]] && vstatus="(unknown)"
+      case "$vstatus" in
+        *"Not affected"*|*"not affected"*)
+          color="$C_GREEN" ;;
+        *"Mitigation"*|*"Mitigated"*)
+          color="$C_YELLOW" ;;
+        *"Vulnerable"*)
+          color="$C_RED" ;;
+        *)
+          color="$C_DIM" ;;
+      esac
+      # Truncate for display
+      vdisp="${vstatus:0:60}"
+      [[ ${#vstatus} -gt 60 ]] && vdisp="${vdisp}..."
+      info "${vname}: ${color}${vdisp}${C_RESET}"
+    done 2>/dev/null
+  fi
+fi
+
+# ============================================================================
+# SECTION 8: Governor & driver
+# ============================================================================
+section "GOVERNOR & DRIVER"
+
+GOV_FILE="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+if [[ -r "$GOV_FILE" ]]; then
+  GOV=$(cat "$GOV_FILE" 2>/dev/null)
+  DRV=$(cat "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver" 2>/dev/null)
+  AVAIL=$(tr ' ' '\n' < /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//')
+  info "Governor:      ${C_BOLD}${GOV}${C_RESET}"
+  [[ -n "$DRV" ]] && info "Driver:        $DRV"
+  [[ -n "$AVAIL" ]] && info "Available:     $AVAIL"
+  JSON_FIELDS+=("\"governor\":\"$GOV\"")
+else
+  info "cpufreq not exposed — kernel may be built without CPU_FREQ"
+fi
+
+# ============================================================================
+# SECTION 9: Headline box
+# ============================================================================
+section "CPU HEADLINE"
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  BOX_W=64
+  printf "\n"
+  printf "  ${C_BOLD}${C_MAGENTA}╔%${BOX_W}s╗${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+
+  # Line 1: Model
+  MODEL_VIS="   Model:         $(printf '%-46s' "${MODEL:-unknown}")"
+  MODEL_COLORED=$(printf "   ${C_BOLD}Model:${C_RESET}         ${C_CYAN}${C_BOLD}%-46s${C_RESET}" "${MODEL:-unknown}")
+  M_PAD=$(( BOX_W - ${#MODEL_VIS} )); (( M_PAD < 0 )) && M_PAD=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${M_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$MODEL_COLORED" ""
+
+  # Line 2: Cores/threads
+  CT_VIS="   Topology:      ${CPUS:-?} logical · ${CORES:-?} cores · ${THREADS:-?} threads × ${SOCKETS:-?} socket"
+  CT_COLORED=$(printf "   ${C_BOLD}Topology:${C_RESET}      ${C_CYAN}${C_BOLD}%s${C_RESET} logical · ${C_CYAN}%s${C_RESET} cores · ${C_CYAN}%s${C_RESET} threads × ${C_CYAN}%s${C_RESET} socket" \
+    "${CPUS:-?}" "${CORES:-?}" "${THREADS:-?}" "${SOCKETS:-?}")
+  CT_PAD=$(( BOX_W - ${#CT_VIS} )); (( CT_PAD < 0 )) && CT_PAD=0
+  printf "  ${C_BOLD}${C_MAGENTA}�${C_RESET}%s%${CT_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$CT_COLORED" ""
+
+  # Line 3: Current avg freq
+  if [[ -n "$AVG" ]]; then
+    AVG_VIS="   Avg freq:      ${AVG} MHz (min ${MIN}, max ${MAX})"
+    AVG_COLORED=$(printf "   ${C_BOLD}Avg freq:${C_RESET}      ${C_CYAN}${C_BOLD}%s${C_RESET} MHz (min %s, max %s)" "$AVG" "$MIN" "$MAX")
+  else
+    AVG_VIS="   Avg freq:      unknown"
+    AVG_COLORED="   ${C_BOLD}Avg freq:${C_RESET}      unknown"
+  fi
+  AVG_PAD=$(( BOX_W - ${#AVG_VIS} )); (( AVG_PAD < 0 )) && AVG_PAD=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${AVG_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$AVG_COLORED" ""
+
+  # Line 4: Peak temp (or load)
+  if [[ -n "$HOTTEST_T" ]] && (( $(echo "$HOTTEST_T > 0" | bc -l) )); then
+    tcolor=$(temp_color "$HOTTEST_T")
+    TEMP_VIS="   Peak temp:     ${HOTTEST_T}°C (${HOTTEST_NAME})"
+    TEMP_COLORED=$(printf "   ${C_BOLD}Peak temp:${C_RESET}     ${tcolor}${C_BOLD}%s°C${C_RESET} (%s)" "$HOTTEST_T" "$HOTTEST_NAME")
+  else
+    TEMP_VIS="   Load:          ${L1:-?}/${CPUS:-?} (1 min avg)"
+    TEMP_COLORED=$(printf "   ${C_BOLD}Load:${C_RESET}          ${C_CYAN}${C_BOLD}%s${C_RESET}/${C_CYAN}%s${C_RESET} (1 min avg)" "${L1:-?}" "${CPUS:-?}")
+  fi
+  T_PAD=$(( BOX_W - ${#TEMP_VIS} )); (( T_PAD < 0 )) && T_PAD=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${T_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$TEMP_COLORED" ""
+
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+  printf "  ${C_BOLD}${C_MAGENTA}╚%${BOX_W}s╝${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "\n"
+fi
+
+# ============================================================================
+# SECTION 10: Recommendations + Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+REC_NUM=0
+rec() { REC_NUM=$((REC_NUM+1)); emit "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"; }
+
+[[ $HAVE_LSCPU -eq 0 ]] && rec "Install util-linux (lscpu) for full CPU details"
+[[ $HAVE_SENSORS -eq 0 ]] && rec "Install lm-sensors (sensors) for temperature and power readings"
+[[ -n "$HOTTEST_T" ]] && is_gt "$HOTTEST_T" 80 && rec "CPU running hot — check cooling, fans, thermal paste"
+[[ -n "$LP" ]] && is_gt "$LP" 1.5 && rec "Sustained high load — consider profiling top processes"
+[[ -z "$VENDOR_STR" ]] && rec "CPU virtualization hidden — may indicate a hypervisor/VM guest"
+[[ "$GOV" == "performance" ]] && rec "Governor is 'performance' — fine for benchmarks, power-hungry at idle"
+[[ "$GOV" == "powersave" ]] && rec "Governor is 'powersave' — normal for laptops/desktops, may throttle under load"
+rec "Run ${C_BOLD}lscpu${C_RESET} for full flag list and vulnerability status"
+rec "Run ${C_BOLD}stress-ng${C_RESET} for sustained CPU stress testing (when needed)"
+
+section "VERDICT"
+END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
+
+if [[ $JSON_OUT -eq 1 ]]; then
+  # JSON output (real stdout is on fd 3; human printfs were sent to /dev/null)
+  printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT" >&3
+  for f in "${JSON_FIELDS[@]}"; do printf ',%s' "$f" >&3; done
+  printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$ELAPSED" >&3
+else
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+    exit_code=2
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    exit_code=1
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    exit_code=0
+  fi
+  printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+  printf "\n"
+
+  # Display one-liner explanations for any critical/warning issues logged
+  show_verdict_one_liners
+fi
+
+# Watch loop
+if [[ $WATCH_INTERVAL -gt 0 ]] && [[ $JSON_OUT -eq 0 ]]; then
+  trap 'exit 0' INT TERM
+  while true; do
+    sleep "$WATCH_INTERVAL"
+    printf "\n${C_DIM}── refresh ──${C_RESET}\n"
+    START_TS=$(date +%s)
+    exec "$0" "${ARGS[@]}"
+  done
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summarize" "CPU diagnostic complete on $(hostname -s)" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_finalize
+fi
+
+exit "${exit_code:-0}"

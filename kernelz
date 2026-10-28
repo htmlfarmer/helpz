@@ -1,0 +1,1921 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# kernelz - Kernel study, source builds, safe upgrade, GRUB recovery & benchmarks
+# ----------------------------------------------------------------------------
+# Shows what kernel you run, whether a newer one exists in the repos, and
+# studies the risks of updating (/boot space, Secure Boot, dkms, GRUB
+# entries, CPU mitigations, taint flags, changelog CVEs).
+#
+# The safety model: after `kernelz upgrade`, GRUB's permanent default stays
+# on the LAST KNOWN GOOD kernel while the NEW kernel is booted exactly once
+# via grub-reboot. If the new kernel fails, the next reboot falls back to
+# the good one automatically. `kernelz verify` promotes the new kernel to
+# the permanent default once it has booted cleanly. `kernelz protect`
+# (apt-mark hold/manual + meta-package + removal simulation) makes sure a
+# later `sudo apt upgrade` can never void or remove the new kernel.
+#
+# Usage:
+#   ./kernelz                        What kernel am I on + update check + risk study
+#   ./kernelz study                  Deep kernel study (config, CVEs, mitigations)
+#   ./kernelz upgrade                Install latest kernel + GRUB safety net + protect
+#   ./kernelz update                 Alias for upgrade
+#   ./kernelz build                  Compile the latest mainline from source (toolchain audit + GRUB safety net)
+#   ./kernelz verify                 After reboot: promote new kernel or report fallback
+#   ./kernelz recover                Force GRUB back to the last known good kernel
+#   ./kernelz protect                Ensure `sudo apt upgrade` cannot void the kernel
+#   ./kernelz bench                  Benchmark this kernel+boot; compare across boots
+#   ./kernelz fix                    Package doctor: which packages are missing & how to install them
+#   ./kernelz cleanup                Preview safe purge of old kernels (keeps current)
+#   ./kernelz history                Show past kernelz actions
+# ============================================================================
+
+set -o pipefail
+# shellcheck disable=SC2086
+
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------- Commands & flags ----------
+COMMAND="status"
+case "${1:-}" in
+    status|check|study|upgrade|update|build|verify|recover|protect|bench|cleanup|history|fix)
+        COMMAND="$1"; shift ;;
+    -h|--help) COMMAND="help" ;;
+    ""|-*) ;;
+    *) printf 'kernelz: unknown command "%s" (try --help)\n' "$1" >&2; exit 64 ;;
+esac
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"   # resets JSON_OUT/NO_COLOR — parse AFTER sourcing
+
+DRY_RUN=0; FORCE=0; ASSUME_YES=0; WANT_IO=0; BENCH_FULL=0; APPLY_FIX=0; APPLY_FIX=0
+TO_PKG=""
+BUILD_VER=""; BUILD_LTS=0; BUILD_JOBS=""; BUILD_MINIMAL=0; BUILD_GIT=0
+BUILD_DIR="${BUILD_DIR:-$HOME/linux-build}"
+ARGS=("$@")
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1 ;;
+        --dry-run)   DRY_RUN=1 ;;
+        --force)     FORCE=1 ;;
+        -y|--yes)    ASSUME_YES=1 ;;
+        --apply)     APPLY_FIX=1 ;;
+        --io)        WANT_IO=1 ;;
+        --full)      BENCH_FULL=1 ;;
+        --to)        shift; TO_PKG="${1:-}" ;;
+        --to=*)      TO_PKG="${1#--to=}" ;;
+        --ver)       shift; BUILD_VER="${1:-}" ;;
+        --ver=*)     BUILD_VER="${1#--ver=}" ;;
+        --jobs)      shift; BUILD_JOBS="${1:-}" ;;
+        --jobs=*)    BUILD_JOBS="${1#--jobs=}" ;;
+        --dir)       shift; BUILD_DIR="${1:-}" ;;
+        --dir=*)     BUILD_DIR="${1#--dir=}" ;;
+        --minimal)   BUILD_MINIMAL=1 ;;
+        --git)       BUILD_GIT=1 ;;
+        --lts)       BUILD_LTS=1 ;;
+        -h|--help)   COMMAND="help" ;;
+        show|compare) [[ "$COMMAND" == "bench" ]] && { shift; continue; }
+                      printf 'kernelz: unknown option "%s" (try --help)\n' "$1" >&2; exit 64 ;;
+        *) if [[ "$COMMAND" == "bench" && "$1" != -* ]]; then shift; continue; fi
+           printf 'kernelz: unknown option "%s" (try --help)\n' "$1" >&2; exit 64 ;;
+    esac
+    shift
+done
+init_colors
+
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+    if [[ "$JSON_OUT" -eq 0 ]] && declare -f run_comparison_init >/dev/null 2>&1; then
+        case "$COMMAND" in
+            status|check|study|history)
+                run_comparison_init "kernelz" "JSON_OUT=$JSON_OUT" ;;
+        esac
+    fi
+fi
+
+STATE_SYS="/var/lib/kernelz"
+STATE_USR="$HOME/.kernelz"
+REL="$(uname -r)"
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+BOOT_EPOCH="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null || echo 0)"
+TS_EPOCH="$(date +%s)"
+
+SUDO=""
+if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+fi
+
+# ---------- Small utilities ----------
+ver_gt()  { dpkg --compare-versions "$1" gt "$2" 2>/dev/null; }
+ver_ge()  { dpkg --compare-versions "$1" ge "$2" 2>/dev/null; }
+
+pkg_for_release() {
+    local rel="$1" p
+    p=$(dpkg -S "/boot/vmlinuz-$rel" 2>/dev/null | cut -d: -f1 | tr -d ' ')
+    [[ -z "$p" ]] && p=$(dpkg-query -W -f='${Package}' "linux-image-$rel" 2>/dev/null)
+    printf '%s' "$p"
+}
+pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
+pkg_state()   { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null; }
+pkg_is_held() { [[ "$(pkg_state "$1")" == h* ]]; }
+
+installed_image_pkgs() {
+    dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Abbrev}\n' 'linux-image-*' 2>/dev/null \
+        | awk -F'\t' '$3 ~ /^(ii|hi)/ {print}'
+}
+
+apt_candidate() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}' | grep -v '^$'; }
+
+META_PKG=""; META_CAND=""; HDR_PKG=""; HDR_CAND=""
+detect_meta() {
+    local m v
+    for m in linux-image-amd64 linux-generic linux-image-generic; do
+        v=$(apt_candidate "$m" 2>/dev/null)
+        if [[ -n "$v" && "$v" != "(none)" ]]; then
+            META_PKG="$m"; META_CAND="$v"; break
+        fi
+    done
+    for m in linux-headers-amd64 linux-headers-generic; do
+        v=$(apt_candidate "$m" 2>/dev/null)
+        if [[ -n "$v" && "$v" != "(none)" ]]; then
+            HDR_PKG="$m"; HDR_CAND="$v"; break
+        fi
+    done
+}
+
+# float compare helpers (bc-free)
+f_gt()  { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0>b+0)}'; }
+f_ne()  { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0!=b+0)}'; }
+f_zero() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0==0 && b+0==0)}'; }
+
+boot_free_kb() { df -Pk /boot 2>/dev/null | awk 'NR==2{print $4}'; }
+root_free_kb() { df -Pk /      2>/dev/null | awk 'NR==2{print $4}'; }
+
+newest_installed_release() {
+    ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1
+}
+
+# ---------- State files ----------
+state_path() {
+    local d
+    for d in "$STATE_SYS" "$STATE_USR"; do
+        [[ -r "$d/$1" ]] && { printf '%s/%s' "$d" "$1"; return 0; }
+    done
+    printf ''
+}
+state_read() {
+    local p; p=$(state_path "$1")
+    [[ -n "$p" ]] && cat "$p"
+}
+state_write() {   # name content
+    [[ "$DRY_RUN" -eq 1 ]] && { printf "  ${C_DIM}[dry-run] would record state file: %s${C_RESET}\n" "$1"; return 0; }
+    local n="$1" c="$2"
+    if $SUDO mkdir -p "$STATE_SYS" 2>/dev/null \
+       && printf '%s\n' "$c" | $SUDO tee "$STATE_SYS/$n" >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "$STATE_USR" && printf '%s\n' "$c" > "$STATE_USR/$n"
+}
+state_append() {  # name line
+    local n="$1" line="$2"
+    if $SUDO mkdir -p "$STATE_SYS" 2>/dev/null \
+       && printf '%s\n' "$line" | $SUDO tee -a "$STATE_SYS/$n" >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "$STATE_USR" && printf '%s\n' "$line" >> "$STATE_USR/$n"
+}
+state_rm() {
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    $SUDO rm -f "$STATE_SYS/$1" 2>/dev/null
+    rm -f "$STATE_USR/$1" 2>/dev/null
+}
+kz_hist() { [[ "$DRY_RUN" -eq 1 ]] && return 0; state_append history.tsv "$(date +%s)	${COMMAND}	$*"; }
+
+pending_get() { state_read pending.conf | grep "^$1=" | head -1 | cut -d= -f2-; }
+
+# silence human display while collecting JSON fields
+json_muffle()   { [[ "${JSON_OUT:-0}" -eq 1 ]] && { exec 5>&1 >/dev/null; return 0; }; return 1; }
+json_unmuffle() { [[ "${JSON_OUT:-0}" -eq 1 ]] && exec 1>&5 5>&-; return 0; }
+
+# Boot ledger: boot_id \t kernel_rel \t boot_epoch \t boot_sec (0=unknown)
+LEDGER="$STATE_USR/boot-ledger.tsv"
+record_boot() {
+    mkdir -p "$STATE_USR" 2>/dev/null
+    local bsec=0
+    if [[ ! -f "$LEDGER" ]] || ! grep -qF "$BOOT_ID" "$LEDGER" 2>/dev/null; then
+        bsec=$(systemd-analyze time 2>/dev/null | grep -oE '=[0-9.]+s' | head -1 | tr -d '=s')
+        printf '%s\t%s\t%s\t%s\n' "$BOOT_ID" "$REL" "$BOOT_EPOCH" "${bsec:-0}" >> "$LEDGER" 2>/dev/null
+    elif systemd-analyze time >/dev/null 2>&1; then
+        bsec=$(systemd-analyze time 2>/dev/null | grep -oE '=[0-9.]+s' | head -1 | tr -d '=s')
+        if [[ -n "$bsec" ]]; then
+            local tmp; tmp=$(mktemp)
+            awk -F'\t' -v id="$BOOT_ID" -v s="$bsec" 'BEGIN{OFS="\t"} $1==id && $4=="0" {$4=s} {print}' "$LEDGER" > "$tmp" && mv "$tmp" "$LEDGER"
+        fi
+    fi
+}
+
+# ---------- GRUB entry parsing (submenu-aware) ----------
+read_grubcfg() {
+    local f=/boot/grub/grub.cfg
+    if [[ -r "$f" ]]; then cat "$f"
+    elif [[ -f "$f" ]] && command -v sudo >/dev/null 2>&1; then
+        sudo -n cat "$f" 2>/dev/null || true   # never prompt during read-only passes
+    fi
+}
+grub_entries() {   # $1=cfg -> "id<TAB>title" (submenu-aware, indent-tolerant)
+    awk '
+    function qtitle(s,  i, j, q) {
+        q = sprintf("%c", 39)                       # single quote
+        i = index(s, q); if (i) { s = substr(s, i+1); j = index(s, q); if (j) return substr(s, 1, j-1) }
+        q = sprintf("%c", 34)                       # double quote
+        i = index(s, q); if (i) { s = substr(s, i+1); j = index(s, q); if (j) return substr(s, 1, j-1) }
+        return "?"
+    }
+    BEGIN { top = 0; depth = 0; in_sub = 0; subpos = -1; subcnt = 0 }
+    {
+        line = $0
+        if (line ~ /^[ \t]*submenu[ \t]/ && depth == 0) {
+            subpos = top; top++; in_sub = 1; subcnt = 0
+        } else if (line ~ /^[ \t]*menuentry[ \t]/) {
+            t = qtitle(line)
+            if (in_sub && depth >= 1) { print subpos ">" subcnt "\t" t; subcnt++ }
+            else                      { print top "\t" t; top++ }
+        }
+        tmp = line
+        o = gsub(/{/, "&", tmp); c = gsub(/}/, "&", tmp)
+        depth += o - c
+        if (depth <= 0) { depth = 0; in_sub = 0 }
+    }' <<<"$1"
+}
+grub_entry_id_for() {   # $1=cfg, rest=tokens to match in titles
+    local cfg="$1"; shift
+    local tok id
+    for tok in "$@"; do
+        [[ -z "$tok" ]] && continue
+        id=$(grub_entries "$cfg" | awk -F'\t' -v t="$tok" 'index($2,t){print $1; exit}')
+        [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+    done
+    return 1
+}
+entry_tokens() {   # release -> tokens that may appear in a GRUB title
+    local rel="$1" pkgver=""
+    pkgver=$(pkg_version "$(pkg_for_release "$rel")" 2>/dev/null)
+    printf '%s %s' "$rel" "$pkgver"
+}
+
+# ---------- Core data ----------
+CUR_PKG=""; CUR_VER=""; CUR_HELD=0; IN_REPO=0; UPDATE=0
+gather_kernel_facts() {
+    detect_meta
+    CUR_PKG=$(pkg_for_release "$REL")
+    CUR_VER=$(pkg_version "$CUR_PKG"); CUR_VER=${CUR_VER:-"$REL"}
+    [[ -n "$CUR_PKG" ]] && CUR_HELD=$(pkg_state "$CUR_PKG") && [[ "$CUR_HELD" == h* ]] && CUR_HELD=1 || CUR_HELD=0
+    [[ -n "$CUR_PKG" ]] && [[ "$(apt_candidate "$CUR_PKG" 2>/dev/null)" != "" ]] \
+        && [[ "$(apt_candidate "$CUR_PKG")" != "(none)" ]] && IN_REPO=1
+    UPDATE=0
+    [[ -n "$META_CAND" ]] && ver_gt "$META_CAND" "$CUR_VER" && UPDATE=1
+}
+
+# ============================================================================
+# HELP
+# ============================================================================
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║   kernelz — Kernel Study · Source Build · Safe Upgrade · Recovery║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Answers "what kernel am I on, is there an update, and what could go
+  wrong?" — then does the update with a safety net. After `kernelz upgrade`
+  the GRUB *permanent* default stays on the last known good kernel and the
+  new kernel boots exactly ONCE (grub-reboot). If it panics or fails, the
+  next reboot falls back to the good kernel by itself. `kernelz verify`
+  promotes the new kernel to the default once it proves healthy.
+  `kernelz protect` guarantees `sudo apt upgrade` can never void/remove
+  the installed kernels (meta-package, apt-mark hold/manual, removal
+  simulation). `kernelz bench` records per-kernel, per-boot benchmark and
+  boot-time data and compares kernels side by side.
+  When the repos are too old for you: `kernelz build` finds the latest
+  mainline on kernel.org, audits the FULL compile toolchain (names every
+  missing package with the exact install line), checks disk/RAM, then
+  compiles sha256-verified source and installs it behind the very same
+  GRUB one-shot fallback net — a bad home-built kernel reboots itself
+  back to the last known good one.
+
+USAGE
+  ./kernelz                     Kernel snapshot + update check + risk study
+  ./kernelz study               Deep study: config hardening, CVE changelog,
+                                CPU mitigations, taint, boot ledger
+  ./kernelz upgrade             Install latest kernel + GRUB safety net + protect
+  ./kernelz update              Alias for upgrade
+  ./kernelz build               Compile the LATEST MAINLINE from source: toolchain
+                                audit → sha256-verified download → bindeb-pkg →
+                                install → same GRUB one-shot safety net
+  ./kernelz build --lts         Target latest longterm instead of current stable
+  ./kernelz build --ver=X.Y.Z   Pin an exact kernel version
+  ./kernelz build --minimal     localmodconfig — only build modules you have
+                                loaded (much faster, smaller, safer)
+  ./kernelz build --git         Incremental mode: shallow git tags in one reused tree —
+                                a point release rebuilds only what changed (minutes)
+  ./kernelz build --apply       Execute (default is plan + build-script only)
+  ./kernelz verify              Post-reboot: promote new kernel / report fallback
+  ./kernelz recover             Force GRUB back to last known good kernel
+  ./kernelz protect             Harden so `sudo apt upgrade` can't void the kernel
+  ./kernelz bench               Benchmark this boot; save metrics for comparison
+  ./kernelz bench --io          Include disk write/read benchmarks
+  ./kernelz bench --full        Also run ./benchmarkz and diff vs other kernel
+  ./kernelz bench show          Show all recorded benchmark runs
+  ./kernelz bench compare A B   Compare averages of kernel A vs kernel B
+  ./kernelz fix                 Package doctor: study errors/missing pkgs that
+                                would break a kernel build/install, print fixes
+  ./kernelz cleanup             Preview safe purge of old kernels
+  ./kernelz history             Past kernelz actions
+
+OPTIONS
+  --to=VERSION|PKG   Upgrade to a specific kernel instead of repo candidate
+  --ver=X.Y.Z        (build) exact mainline version to compile
+  --lts              (build) latest longterm series instead of current stable
+  --minimal          (build) make localmodconfig after olddefconfig
+  --git              (build) shallow-tag git tree, incremental rebuilds across point releases
+  --jobs=N           (build) compile parallelism (default: nproc)
+  --dir=PATH         (build) build location (default ~/linux-build, needs ~25-30G)
+  --apply            (build) run the full pipeline instead of plan-only
+  --io               Include disk benchmarks in `bench`
+  --full             Include full benchmarkz run in `bench`
+  --dry-run          Print what upgrade/protect would do, change nothing
+  --yes              No confirmation prompt (cleanup/upgrade)
+  --force            Allow downgrade with --to
+  --json             Machine-readable verdict (status/study)
+  --no-color         Plain output
+  -h, --help         Show this help
+
+HOW RECOVERY WORKS
+  1. upgrade → apt installs new kernel, GRUB default pinned to known-good,
+     next_entry set to the NEW kernel (boots once only)
+  2. reboot  → new kernel either works (run `kernelz verify` → promoted to
+     default) or fails (next reboot returns to known-good automatically)
+  3. stuck?  → at boot hold Shift → GRUB menu → "Advanced options" → pick
+     the previous kernel → log in → run `kernelz recover`
+
+WHEN apt upgrade IS SAFE
+  kernelz installs the linux-image-amd64 meta-package (so apt keeps pulling
+  kernel updates), marks kernels manual (protects from autoremove), holds
+  out-of-repo custom kernels, and simulates `apt-get upgrade` to prove no
+  installed kernel would be removed.
+
+ALTERNATIVE COMMANDS
+  uname -r                          Current kernel release
+  apt-cache policy linux-image-amd64 Candidate kernel version
+  dpkg -l 'linux-image*'            Installed kernel packages
+  grep ^menuentry /boot/grub/grub.cfg  Boot menu entries (sudo)
+  sudo grub-reboot "title"          Boot an entry once
+  sudo grub-set-default "title"     Set permanent default
+  journalctl --list-boots           Recorded boots
+  systemd-analyze time              This boot's duration
+
+HELPEOF
+    exit 0
+}
+
+# ============================================================================
+# STATUS  (kernelz | kernelz check)
+# ============================================================================
+section_snapshot() {
+    section "KERNEL SNAPSHOT"
+    local arch up
+    arch=$(uname -m)
+    up=$(uptime -p 2>/dev/null || uptime | sed 's/^ *//')
+    printf "  ${C_BOLD}Running:${C_RESET}      Linux %s (%s) — package %s %s%s\n" \
+        "$REL" "$arch" "${CUR_PKG:-unknown}" "$CUR_VER" "$( [[ $CUR_HELD -eq 1 ]] && printf ' [HELD]' )"
+    printf "  ${C_DIM}Built:${C_RESET}        %s\n" "$(uname -v)"
+    printf "  ${C_DIM}Uptime:${C_RESET}       %s\n" "$up"
+    printf "  ${C_DIM}Cmdline:${C_RESET}      %s\n" "$(cat /proc/cmdline 2>/dev/null)"
+    add_json_field kernel_release "$REL"
+    add_json_field kernel_package "${CUR_PKG:-}"
+    add_json_field kernel_version "$CUR_VER"
+    add_json_field kernel_held "$([[ $CUR_HELD -eq 1 ]] && echo true || echo false)" 1
+
+    subsec "Installed kernels"
+    local pkg ver stat mark
+    while IFS=$'\t' read -r pkg ver stat; do
+        mark=""
+        [[ "$pkg" == "$CUR_PKG" ]] && mark=" ${C_BOLD}${C_GREEN}◀ running${C_RESET}"
+        [[ "$stat" == h* ]] && mark="$mark ${C_MAGENTA}[held]${C_RESET}"
+        printf "  %-32s %-16s %s%b\n" "$pkg" "$ver" "$stat" "$mark"
+    done < <(installed_image_pkgs)
+
+    subsec "Available in repositories"
+    if [[ -n "$META_CAND" ]]; then
+        add_json_field meta_package "$META_PKG"
+        add_json_field apt_candidate "$META_CAND"
+        if [[ $UPDATE -eq 1 ]]; then
+            printf "  ${C_MAGENTA}${C_BOLD}UPDATE AVAILABLE${C_RESET}  %s → %s  (via %s)\n" "$CUR_VER" "$META_CAND" "$META_PKG"
+            printf "  ${C_DIM}Next: %s upgrade   (safe, with GRUB fallback)${C_RESET}\n" "${0##*/}"
+        elif ver_ge "$CUR_VER" "$META_CAND"; then
+            printf "  ${C_GREEN}Up to date${C_RESET} — running %s ≥ repo candidate %s\n" "$CUR_VER" "$META_CAND"
+            [[ $IN_REPO -eq 0 ]] && printf "  ${C_DIM}Note: %s is a custom kernel not tracked by %s; repo max is %s${C_RESET}\n" "$CUR_PKG" "$META_PKG" "$META_CAND"
+        fi
+        printf "  ${C_DIM}Headers:  ${HDR_PKG:-n/a} → ${HDR_CAND:-n/a}${C_RESET}\n"
+    else
+        info "No kernel meta-package found in repositories"
+    fi
+    add_json_field update_available "$([[ $UPDATE -eq 1 ]] && echo true || echo false)" 1
+}
+
+section_grub() {
+    section "BOOT LOADER (GRUB)"
+    local mode gdefault cfg nentries gv
+    gv=$(dpkg-query -W -f='${Version}' grub-efi-amd64 2>/dev/null || dpkg-query -W -f='${Version}' grub-pc 2>/dev/null || echo '?')
+    [[ -d /sys/firmware/efi ]] && mode="UEFI (grub $gv)" || mode="BIOS/Legacy (grub $gv)"
+    gdefault=$(grep -E '^GRUB_DEFAULT=' /etc/default/grub 2>/dev/null | cut -d= -f2- | tr -d '"')
+    printf "  ${C_DIM}Mode:${C_RESET}    %s\n" "$mode"
+    printf "  ${C_DIM}Default:${C_RESET} GRUB_DEFAULT=%s\n" "${gdefault:-<unset>}"
+    add_json_field boot_mode "$([[ -d /sys/firmware/efi ]] && echo efi || echo bios)"
+    add_json_field grub_default "${gdefault:-unset}"
+
+    if grub-editenv /boot/grub/grubenv list 2>/dev/null | grep -qE '^(saved_entry|next_entry)='; then
+        grub-editenv /boot/grub/grubenv list 2>/dev/null | grep -E '^(saved_entry|next_entry)=' \
+            | while IFS= read -r l; do info "$l"; done
+    fi
+
+    cfg=$(read_grubcfg)
+    if [[ -z "$cfg" ]]; then
+        info "/boot/grub/grub.cfg needs root (mode 600) — run 'sudo ./kernelz' for per-kernel entry check"
+        nentries=$(ls /boot/vmlinuz-* 2>/dev/null | wc -l)
+        printf "  ${C_DIM}Kernels present in /boot:${C_RESET} %s\n" "$nentries"
+        return 0
+    fi
+    nentries=$(grub_entries "$cfg" | wc -l)
+    printf "  ${C_DIM}Menu entries:${C_RESET}     %s\n" "$nentries"
+    local rel id
+    while read -r rel; do
+        [[ -z "$rel" ]] && continue
+        read -r -a toks <<< "$(entry_tokens "$rel")"
+        if id=$(grub_entry_id_for "$cfg" "${toks[@]}"); then
+            ok "kernel $rel → entry $id"
+        else
+            critf "GrubEntry" "No GRUB menu entry for installed kernel $rel" "sudo update-grub"
+        fi
+    done < <(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||')
+}
+
+run_risk_checks() {
+    section "UPDATE RISK STUDY"
+    local bfree rfree bmount
+    bfree=$(boot_free_kb); rfree=$(root_free_kb)
+    bmount=$(df -Pk /boot 2>/dev/null | awk 'NR==2{print $6}')
+    local bmb=${bfree:-0} rmb=${rfree:-0}
+    bmb=$((bmb/1024)); rmb=$((rmb/1024))
+    local bwhere="/boot"
+    [[ "$bmount" == "/" ]] && bwhere="/boot (shares the root partition)"
+    add_json_field boot_free_mb "$bmb" 1
+    add_json_field root_free_mb "$rmb" 1
+    if (( bmb < 250 )); then
+        critf "BootSpace" "$bwhere only ${bmb}MB free — a kernel install may fail midway" "purge old kernels: sudo apt purge linux-image-<old> (kernelz cleanup shows candidates)"
+    elif [[ "$bmount" == "/boot" && $bmb -lt 500 ]]; then
+        warnf "BootSpace" "/boot low (${bmb}MB free)" "consider 'kernelz cleanup' before upgrading"
+    else
+        ok "$bwhere has ${bmb}MB free"
+    fi
+    if (( rmb < 2048 )); then
+        warnf "RootSpace" "root filesystem low (${rmb}MB free)" "apt needs room for image+headers+initramfs"
+    else
+        ok "root filesystem has $(( rmb/1024 ))GB free"
+    fi
+
+    # Kernel meta package: without it `apt upgrade` stops tracking kernels
+    if [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]]; then
+        warnf "KernelMeta" "$META_PKG not installed — 'sudo apt upgrade' will NOT track kernel updates" "kernelz protect installs it"
+    elif [[ -n "$META_PKG" ]]; then
+        ok "$META_PKG installed — apt upgrade keeps pulling kernel updates"
+    fi
+
+    # Custom (out-of-repo) running kernel
+    if [[ -n "$CUR_PKG" && $IN_REPO -eq 0 ]]; then
+        warnf "CustomKernel" "$CUR_PKG is not from the repositories — no security updates via apt" "keep it held (kernelz protect) and plan migration to a repo kernel, or use kernelz study CVE list on repo kernels"
+        if [[ $CUR_HELD -eq 1 ]]; then
+            ok "$CUR_PKG is apt-mark held — 'apt upgrade' cannot touch/remove it"
+        else
+            critf "HoldMissing" "$CUR_PKG is NOT held — 'sudo apt upgrade' could replace or remove it" "kernelz protect (applies apt-mark hold + manual)"
+        fi
+    fi
+
+    # initrd per kernel
+    local rel
+    while read -r rel; do
+        [[ -z "$rel" ]] && continue
+        if [[ -f "/boot/initrd.img-$rel" ]]; then ok "initrd present for $rel"
+        else critf "Initrd" "Missing /boot/initrd.img-$rel — that kernel cannot boot root filesystem" "sudo apt-get install --reinstall linux-image-$rel"
+        fi
+    done < <(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||')
+
+    # Secure Boot vs custom modules
+    local sb="unknown"
+    if command -v mokutil >/dev/null 2>&1; then
+        sb=$(mokutil --sb-state 2>/dev/null | awk '{print $1}')
+    fi
+    add_json_field secure_boot "$sb"
+    if [[ "$sb" == "enabled" ]]; then
+        if [[ $IN_REPO -eq 0 ]]; then
+            critf "SecureBoot" "Secure Boot is ON with an unsigned/custom kernel — modules may be refused" "enroll key with mokutil, or disable Secure Boot in firmware, or boot a signed repo kernel"
+        else
+            ok "Secure Boot on, running a distro-signed kernel"
+        fi
+    else
+        info "Secure Boot: $sb"
+    fi
+
+    # dkms modules need a rebuild per new kernel
+    if command -v dkms >/dev/null 2>&1; then
+        local dk
+        dk=$(timeout 10 dkms status 2>/dev/null | head -5)
+        if [[ -n "$dk" ]]; then
+            warnf "Dkms" "dkms modules present — they rebuild on kernel install" "watch for build errors during kernelz upgrade; verify after boot: dkms status"
+        fi
+    fi
+
+    # Pending upgrade from a previous run
+    local pt pr
+    pr=$(pending_get TARGET_REL)
+    if [[ -n "$pr" ]]; then
+        pt=$(pending_get TS)
+        if [[ "$pr" == "$REL" ]]; then
+            warnf "Pending" "New kernel $pr booted but was never verified/promoted" "run: kernelz verify"
+        elif [[ "$BOOT_EPOCH" -gt "${pt:-0}" ]]; then
+            critf "Pending" "Kernel $pr was installed but system is back on $REL — update failed" "run: kernelz verify (shows why), then kernelz recover or kernelz study"
+        else
+            info "Kernel $pr installed — waiting for reboot (GRUB armed with fallback)"
+        fi
+        add_json_field pending_kernel "$pr"
+    else
+        add_json_field pending_kernel ""
+    fi
+
+    # last boot errors (best-effort, no sudo prompt)
+    local perr
+    perr=$(journalctl -q -b -1 -p err --no-pager 2>/dev/null | wc -l)
+    if [[ -n "$perr" ]] && (( perr > 0 )); then
+        warnf "PriorBoot" "$perr error lines in the previous boot" "journalctl -b -1 -p err   (or ./bootz --boot -1)"
+    fi
+}
+
+cmd_status() {
+    gather_kernel_facts
+    record_boot
+    emit "\n  ${C_BOLD}${C_BLUE}╔═══════════════════════════════════════════════════════════════╗
+  ║  KERNELZ — kernel study · upgrade · recovery · bench          ║
+  ╚═══════════════════════════════════════════════════════════════╝${C_RESET}\n"
+    emit "  ${C_DIM}v%s · %s · %s${C_RESET}\n" "$SCRIPT_VERSION" "$TIMESTAMP" "$HOSTNAME_SHORT"
+
+    json_muffle
+    section_snapshot
+    section_grub
+    run_risk_checks
+    json_unmuffle
+
+    if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
+        run_comparison_finalize 2>/dev/null || true
+    fi
+    emit_verdict
+}
+
+# ============================================================================
+# STUDY  (deeper dive)
+# ============================================================================
+study_hardening() {
+    section "HARDENING STUDY — /boot/config-$REL"
+    local cfg="/boot/config-$REL"
+    if [[ ! -r "$cfg" ]]; then
+        info "no readable kernel config for $REL"
+        return 0
+    fi
+    local opt
+    for opt in CONFIG_RANDOMIZE_BASE CONFIG_RANDOMIZE_MEMORY CONFIG_STACKPROTECTOR_STRONG \
+               CONFIG_HARDENED_USERCOPY CONFIG_FORTIFY_SOURCE CONFIG_INIT_ON_ALLOC_DEFAULT_ON \
+               CONFIG_STRICT_KERNEL_RWX CONFIG_MODULE_SIG CONFIG_DEBUG_SET_MODULE_RONX; do
+        if grep -qE "^${opt}=y" "$cfg"; then ok "$opt=y"
+        elif grep -qE "^${opt}=m" "$cfg"; then info "$opt=m"
+        else warnf "KernelConfig" "$opt is not enabled" "cosmetic for study: prefer kernels built with $opt=y"
+        fi
+    done
+}
+
+study_cpu_vulns() {
+    section "CPU MITIGATION STATUS"
+    local dir=/sys/devices/system/cpu/vulnerabilities f vuln=0 mit=0 name val
+    [[ -d $dir ]] || { info "sysfs vulnerabilities not exposed"; return 0; }
+    for f in "$dir"/*; do
+        [[ -e "$f" ]] || continue
+        name=${f##*/}; val=$(cat "$f" 2>/dev/null)
+        case "$val" in
+            "Mitigation"*) mit=$((mit+1));  printf "  ${C_YELLOW}!${C_RESET} %-32s %s\n" "$name" "$val" ;;
+            "Not affected"*)                printf "  ${C_GREEN}✓${C_RESET} %-32s %s\n" "$name" "$val" ;;
+            "Vulnerable"*)   vuln=$((vuln+1)); printf "  ${C_RED}✗${C_RESET} %-32s ${C_BOLD}%s${C_RESET}\n" "$name" "$val" ;;
+            *)                              printf "  ${C_DIM}·${C_RESET} %-32s %s\n" "$name" "$val" ;;
+        esac
+    done
+    (( vuln > 0 )) && critf "CpuVuln" "$vuln CPU vulnerabilit$([[ $vuln -eq 1 ]] && echo y || echo ies) unmitigated — new kernels usually add mitigations" "kernelz upgrade; check 'cat /sys/devices/system/cpu/vulnerabilities/*'"
+    add_json_field cpu_vulnerable "$vuln" 1
+    info "$mit mitigated via software, $vuln vulnerable"
+}
+
+study_changelog() {
+    section "UPDATE DIGEST — changelog & CVEs ($META_PKG → $META_CAND)"
+    [[ -z "$META_PKG" ]] && { info "no repo kernel meta-package"; return 0; }
+    local cl
+    cl=$(timeout 30 apt-get changelog "$META_PKG" 2>/dev/null)
+    if [[ -z "$cl" ]]; then
+        warnf "Changelog" "Could not fetch changelog (offline?)" "apt-get changelog $META_PKG"
+        return 0
+    fi
+    local cves
+    cves=$(grep -Eo 'CVE-[0-9]{4}-[0-9]{4,7}' <<< "$cl" | sort -u)
+    local n; n=$( [[ -n "$cves" ]] && printf '%s\n' "$cves" | wc -l || echo 0 )
+    info "changelog mentions $n unique CVE id(s) in available history"
+    if [[ -n "$cves" ]]; then
+        printf '%s\n' "$cves" | tail -12 | sed 's/^/      /'
+    fi
+    subsec "most recent changelog entries"
+    printf '%s\n' "$cl" | head -25 | sed 's/^/      /'
+}
+
+study_boots() {
+    section "BOOT LEDGER (per-kernel boot history)"
+    if [[ -r "$LEDGER" ]]; then
+        printf "  ${C_DIM}boot                            kernel                    boot-time${C_RESET}\n"
+        sort -t$'\t' -k3,3nr "$LEDGER" | head -12 | while IFS=$'\t' read -r id rel ep sec; do
+            local tag=""
+            [[ "$rel" == "$REL" ]] && tag=" ${C_GREEN}◀ current${C_RESET}"
+            printf "  %-31s %-25s %s%b\n" "${id:0:8}… ($(date -d "@$ep" '+%m-%d %H:%M' 2>/dev/null || echo "$ep"))" "$rel" "$([[ "$sec" != "0" && -n "$sec" ]] && printf '%ss' "$sec" || printf '?')" "$tag"
+        done
+        local nrel
+        nrel=$(cut -f2 "$LEDGER" | sort -u | tr '\n' ' ')
+        info "kernels seen across boots: $nrel"
+    else
+        info "no ledger yet — it records automatically on every kernelz run"
+    fi
+}
+
+cmd_study() {
+    gather_kernel_facts
+    record_boot
+    json_muffle
+    section_snapshot
+    section_grub
+    run_risk_checks
+    section "KERNEL IDENTITY"
+    printf "  %s\n" "$(uname -a)"
+    [[ -r /proc/version ]] && printf "  ${C_DIM}%s${C_RESET}\n" "$(cat /proc/version)"
+    local taint; taint=$(cat /proc/sys/kernel/tainted 2>/dev/null || echo 0)
+    if [[ "$taint" != "0" ]]; then
+        warnf "Tainted" "kernel taint value $taint (out-of-tree or unsigned modules)" "expected for custom kernels like $REL; not a boot risk"
+    else
+        ok "kernel untainted"
+    fi
+    add_json_field tainted "$taint" 1
+    info "loaded modules: $(lsmod 2>/dev/null | awk 'NR>1' | wc -l) · module trees: $(ls -d /lib/modules/* 2>/dev/null | wc -l)"
+    study_hardening
+    study_cpu_vulns
+    study_changelog
+    study_boots
+    json_unmuffle
+    if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
+        run_comparison_finalize 2>/dev/null || true
+    fi
+    emit_verdict
+}
+
+# ============================================================================
+# UPGRADE  (kernelz upgrade | kernelz update)
+# ============================================================================
+run_cmd() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf "  ${C_DIM}[dry-run] \$ %s %s${C_RESET}\n" "$SUDO" "$*"
+        return 0
+    fi
+    printf "  ${C_DIM}\$ %s %s${C_RESET}\n" "$SUDO" "$*"
+    # shellcheck disable=SC2068
+    $SUDO "$@"
+}
+
+ensure_grub_savedefault() {
+    local f=/etc/default/grub changed=0 line
+    [[ -r "$f" ]] || { critf "GrubCfg" "/etc/default/grub missing/unreadable" "install grub-common"; return 1; }
+    grep -qE '^GRUB_DEFAULT=saved$' "$f" || {
+        line=$(grep -E '^GRUB_DEFAULT=' "$f" | head -1 || true)
+        if [[ -n "$line" ]]; then
+            run_cmd sed -i -E "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=saved|" "$f" || return 1
+        else
+            [[ "$DRY_RUN" -eq 1 ]] || printf '%s\n' "GRUB_DEFAULT=saved" | $SUDO tee -a "$f" >/dev/null || return 1
+            printf "  ${C_DIM}[dry-run] append GRUB_DEFAULT=saved${C_RESET}\n"
+        fi
+        changed=1
+    }
+    # Make sure the menu is visible for manual recovery
+    grep -qE '^GRUB_TIMEOUT=[5-9]|^GRUB_TIMEOUT=[0-9]{2}' "$f" || {
+        run_cmd sed -i -E "s|^GRUB_TIMEOUT=.*|GRUB_TIMEOUT=5|" "$f" || true; changed=1; }
+    if [[ $changed -eq 1 ]]; then
+        info "GRUB_DEFAULT → saved (default = last known good kernel)"
+        run_cmd update-grub || warnf "UpdateGrub" "update-grub failed" "sudo update-grub manually"
+    fi
+    return 0
+}
+
+cmd_upgrade() {
+    gather_kernel_facts
+    if [[ $EUID -ne 0 && -z "$SUDO" ]]; then
+        critf "Privileges" "no root and no sudo available" "run as root"
+        emit_verdict
+    fi
+    # preflight: don't build on a broken package database
+    if dpkg --audit 2>/dev/null | grep -qiE 'half-installed|half-configured|not fully installed'; then
+        warnf "Preflight" "dpkg database has unfinished installs — kernel postinst hooks may fail mid-upgrade" "run 'kernelz fix --apply' first (or continue; install will show the same error)"
+    fi
+
+    section_snapshot
+
+    heading "── PLAN ──"
+    local target_pkg="" target_rel="" downgrade=0
+    if [[ -n "$TO_PKG" ]]; then
+        [[ "$TO_PKG" == linux-* ]] && target_pkg="$TO_PKG" || target_pkg="linux-image-$TO_PKG"
+        local cand; cand=$(apt_candidate "$target_pkg")
+        [[ -z "$cand" || "$cand" == "(none)" ]] && { critf "Target" "$target_pkg not available in repositories" "apt-cache search linux-image"; exit 2; }
+        if ver_gt "$CUR_VER" "${cand}" && [[ $FORCE -eq 0 ]]; then
+            critf "Downgrade" "requested $target_pkg ($cand) is older than running $CUR_VER — use --force to allow" "kernelz status shows what you run"
+            exit 2
+        fi
+        downgrade=1
+    elif [[ $UPDATE -eq 1 ]]; then
+        target_pkg="$META_PKG"
+    else
+        ok "Running kernel $CUR_VER is already the newest (repo candidate: ${META_CAND:-n/a})"
+    fi
+
+    local pkgs_to_install=()
+    [[ -n "$target_pkg" ]] && pkgs_to_install+=("$target_pkg")
+    if [[ -n "$target_pkg" && -n "$HDR_PKG" ]]; then pkgs_to_install+=("$HDR_PKG"); fi
+
+    heading "── 1. Refresh & install ──"
+    run_cmd apt-get update || warnf "AptUpdate" "apt-get update failed (offline?)" "retry with network"
+    if [[ ${#pkgs_to_install[@]} -gt 0 ]]; then
+        # noninteractive prompts keep apt from asking about GRUB device lists
+        run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs_to_install[@]}" \
+            || { critf "Install" "apt-get install failed — nothing changed, you are still on $REL" "re-run with network / check apt logs"; exit 2; }
+    else
+        info "nothing to install — ensuring protection for current kernel instead"
+    fi
+
+    target_rel=$(newest_installed_release)
+    if [[ -n "$TO_PKG" ]]; then
+        # if --to was given as an ABI/version, the exact release is knowable
+        local to_rel="${TO_PKG#linux-image-}"
+        [[ "$TO_PKG" == linux-* ]] || to_rel="$TO_PKG"
+        [[ -f "/boot/vmlinuz-$to_rel" ]] && target_rel="$to_rel"
+    fi
+    [[ -n "$target_rel" ]] || target_rel="$REL"
+    if [[ ${#pkgs_to_install[@]} -gt 0 && ! -f "/boot/vmlinuz-$target_rel" ]]; then
+        critf "Verify" "install ran but /boot/vmlinuz-$target_rel is missing" "check apt output; kernelz status to inspect"
+        exit 2
+    fi
+
+    heading "── 2. Snapshot current state ──"
+    local snap ts; ts=$(date +%Y%m%d-%H%M%S)
+    [[ "$DRY_RUN" -eq 1 ]] || { $SUDO mkdir -p "$STATE_SYS/snapshots" 2>/dev/null || mkdir -p "$STATE_USR/snapshots"; }
+    local snapdir="$STATE_SYS/snapshots"; [[ -w "$snapdir" ]] || snapdir="$STATE_USR/snapshots"
+    [[ "$DRY_RUN" -eq 1 ]] || {
+        $SUDO cp /etc/default/grub "$snapdir/$ts-etc-grub" 2>/dev/null || cp /etc/default/grub "$snapdir/$ts-etc-grub" 2>/dev/null
+        read_grubcfg > "$snapdir/$ts-grub.cfg" 2>/dev/null
+        installed_image_pkgs > "$snapdir/$ts-kernels.tsv" 2>/dev/null
+    }
+    ok "snapshots + last_good ($REL) recorded"
+    state_write last_good "$REL"
+    state_write last_good_pkg "$CUR_PKG"
+
+    heading "── 3. GRUB safety net (new kernel boots ONCE, default stays known-good) ──"
+    ensure_grub_savedefault || true
+    local cfg good_id new_id
+    cfg=$(read_grubcfg)
+    if [[ -z "$cfg" ]]; then
+        critf "GrubCfg" "cannot read grub.cfg" "sudo kernelz verify after reboot"
+    else
+        [[ -n "$target_rel" ]] || target_rel="$REL"
+        if [[ "$target_rel" == "$REL" ]]; then
+            # nothing new: pin current as the permanent good default
+            read -r -a toks <<< "$(entry_tokens "$REL")"
+            if good_id=$(grub_entry_id_for "$cfg" "${toks[@]}"); then
+                run_cmd grub-set-default "$good_id" && ok "permanent default = known-good entry $good_id ($REL)"
+            fi
+        else
+            read -r -a g_toks <<< "$(entry_tokens "$REL")"
+            read -r -a n_toks <<< "$(entry_tokens "$target_rel")"
+            good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
+            new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
+            if [[ -z "$good_id" || -z "$new_id" ]]; then
+                info "entry lookup failed — running update-grub and retrying"
+                run_cmd update-grub || true
+                cfg=$(read_grubcfg)
+                good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
+                new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
+            fi
+            if [[ -n "$good_id" && -n "$new_id" ]]; then
+                run_cmd grub-set-default "$good_id" || warnf "GrubDefault" "grub-set-default failed" "sudo grub-set-default $good_id"
+                run_cmd grub-reboot "$new_id"       || warnf "GrubReboot"  "grub-reboot failed"       "sudo grub-reboot $new_id"
+                ok "default = $REL (entry $good_id) — next boot = $target_rel (entry $new_id), once only"
+                printf "  ${C_DIM}If %s fails to boot, the following reboot lands back on %s automatically${C_RESET}\n" "$target_rel" "$REL"
+            else
+                critf "GrubEntry" "could not resolve GRUB entries for $REL / $target_rel" "sudo update-grub, then re-run kernelz upgrade"
+            fi
+        fi
+    fi
+
+    heading "── 4. Make 'sudo apt upgrade' unable to void the new kernel ──"
+    protect_apply 1
+
+    heading "── 5. Record pending update ──"
+    if [[ -n "$target_rel" && "$target_rel" != "$REL" ]]; then
+        state_write pending.conf "TARGET_REL=$target_rel
+TARGET_PKG=$(pkg_for_release "$target_rel")
+PREV_REL=$REL
+TS=$TS_EPOCH"
+        ok "pending target recorded: $target_rel"
+    fi
+    kz_hist "upgrade from=$REL to=${target_rel:-$REL} target_pkg=${target_pkg:-none}"
+
+    section "NEXT STEPS"
+    if [[ -n "$target_rel" && "$target_rel" != "$REL" ]]; then
+        printf "  ${C_BOLD}1.${C_RESET} reboot now:            ${C_CYAN}sudo reboot${C_RESET}\n"
+        printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verify${C_RESET}  (promotes new kernel to default)\n" "${0##*/}"
+        printf "  ${C_BOLD}3.${C_RESET} if it fails at boot:   GRUB menu → Advanced options → %s → then %s recover\n" "$REL" "${0##*/}"
+    else
+        printf "  ${C_GREEN}Already on the newest kernel — protections applied, no reboot needed.${C_RESET}\n"
+    fi
+    printf "  ${C_DIM}You can still run 'sudo apt upgrade' any time — kernelz protect holds the line.${C_RESET}\n"
+    exit 0
+}
+
+# ============================================================================
+# BUILD — compile the latest mainline kernel from source (same safety net)
+# ============================================================================
+KERNEL_ORG_JSON="https://www.kernel.org/releases.json"
+KERNEL_GIT="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+BUILD_FLAVOR="deb"
+TOOLCHAIN_FIX_CMD=""
+CFG_CMD=""
+CFG_LABEL=""
+BUILD_SCRIPT=""
+
+build_pkg_manager() {
+    if   command -v apt-get  >/dev/null 2>&1; then echo deb
+    elif command -v dnf      >/dev/null 2>&1; then echo rpm
+    elif command -v rpm      >/dev/null 2>&1; then echo rpm
+    elif command -v pacman   >/dev/null 2>&1; then echo pacman
+    else echo none; fi
+}
+
+build_derive_urls() {   # $1 = version -> UP_* set
+    UP_VER="$1"
+    UP_SERIES="v${UP_VER%%.*}.x"
+    UP_TARBALL="linux-${UP_VER}.tar.xz"
+    UP_URL="https://cdn.kernel.org/pub/linux/kernel/${UP_SERIES}/${UP_TARBALL}"
+    UP_SHAURL="https://cdn.kernel.org/pub/linux/kernel/${UP_SERIES}/sha256sums.asc"
+}
+
+build_latest_query() {   # sets UP_* on success
+    local json=""
+    json=$(curl -fsS --max-time 15 "$KERNEL_ORG_JSON" 2>/dev/null) || json=""
+    if [[ -z "$json" ]] && command -v wget >/dev/null 2>&1; then
+        json=$(wget -qO- --timeout=15 "$KERNEL_ORG_JSON" 2>/dev/null) || json=""
+    fi
+    local v=""
+    if [[ -n "$json" ]] && command -v jq >/dev/null 2>&1; then
+        if (( BUILD_LTS )); then
+            # LTS rows are marked by a non-false/non-null .longterm value
+            v=$(printf '%s' "$json" | jq -r '
+                [.releases[] | select(.longterm != false and .longterm != null)
+                 | .version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // empty' 2>/dev/null)
+            [[ -z "$v" ]] && warnf "SourceNet" "kernel.org feed carries no longterm markers — showing latest stable instead" \
+                "pin an LTS explicitly: kernelz build --ver 6.12.x"
+        fi
+        if [[ -z "$v" ]]; then
+            v=$(printf '%s' "$json" | jq -r '
+                [.releases[] | .version
+                 | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // empty' 2>/dev/null)
+        fi
+    fi
+    if [[ -z "$v" ]] && command -v git >/dev/null 2>&1; then   # offline-json fallback: git tags
+        v=$(timeout 30 git ls-remote --tags --refs "$KERNEL_GIT" 'v[0-9]*' 2>/dev/null \
+            | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' \
+            | sort -V | tail -1)
+    fi
+    [[ -n "$v" ]] || return 1
+    build_derive_urls "$v"
+}
+
+toolchain_audit() {
+    local -a need=() missing=()
+    local mgr; mgr=$(build_pkg_manager)
+    case "$mgr" in
+        deb)    need=(build-essential bc flex bison libssl-dev libelf-dev dwarves
+                      rsync cpio dpkg-dev libncurses-dev git curl) ;;
+        rpm)    need=(gcc make bc flex bison openssl-devel elfutils-libelf-devel
+                      dwarves rsync cpio rpm-build ncurses-devel git) ;;
+        pacman) need=(base-devel bc flex bison openssl libelf rsync cpio pahole ncurses git) ;;
+        *)      warnf "BuildToolchain" "unrecognized package manager — verify gcc/make/bc/flex/bison/openssl/elf manually" \
+                    "see https://docs.kernel.org/build/initializing.html"; BUILD_FLAVOR=plain; return 0 ;;
+    esac
+    [[ "$mgr" == "deb" ]] && BUILD_FLAVOR=deb
+    [[ "$mgr" == "rpm" ]] && BUILD_FLAVOR=rpm
+    [[ "$mgr" == "pacman" ]] && BUILD_FLAVOR=plain
+    local p st
+    for p in "${need[@]}"; do
+        case "$mgr" in
+            deb)    st=$(pkg_state "$p") ;;
+            rpm)    rpm -q "$p" >/dev/null 2>&1 && st="ii" || st="" ;;
+            pacman) pacman -Qi "$p" >/dev/null 2>&1 && st="ii" || st="" ;;
+        esac
+        [[ "$st" == ii* || "$st" == hi* ]] || missing+=("$p")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        case "$mgr" in
+            deb)    TOOLCHAIN_FIX_CMD="sudo apt-get install -y ${missing[*]}" ;;
+            rpm)    TOOLCHAIN_FIX_CMD="sudo dnf install -y ${missing[*]}" ;;
+            pacman) TOOLCHAIN_FIX_CMD="sudo pacman -S --noconfirm ${missing[*]}" ;;
+        esac
+        critf "BuildToolchain" "missing build packages (${#missing[@]}): ${missing[*]}" \
+            "$TOOLCHAIN_FIX_CMD"
+    else
+        ok "build toolchain complete — ${#need[@]} packages verified"
+    fi
+}
+
+build_resource_check() {
+    local free_kb gb probe
+    probe="$BUILD_DIR"
+    while [[ ! -d "$probe" && "$probe" != "/" ]]; do probe=$(dirname "$probe"); done
+    free_kb=$(df -Pk "$probe" 2>/dev/null | awk 'NR==2{print $4}'); free_kb=${free_kb:-0}
+    gb=$(( free_kb / 1024 / 1024 ))
+    if (( gb < 25 )); then
+        warnf "BootSpace" "build filesystem ($probe) has ${gb}G free — source build needs ~25-30G" \
+            "free space, or point at a bigger disk: kernelz build --dir=/path/to/30G+disk"
+    else
+        ok "build space: ${gb}G free at $probe"
+    fi
+    local bfree; bfree=$(( $(boot_free_kb 2>/dev/null || echo 0) / 1024 ))
+    if (( bfree < 150 )); then
+        warnf "BootSpace" "/boot has only ${bfree}M free — a new kernel's vmlinuz+initrd+config won't fit" \
+            "kernelz cleanup previews safe purge of old kernels"
+    else
+        ok "/boot: ${bfree}M free"
+    fi
+    local mt; mt=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
+    if (( ${mt:-0} > 0 && mt < 8388608 )); then
+        info "RAM $(( mt / 1024 / 1024 ))G — for full configs consider --minimal (localmodconfig) and -j 4"
+    fi
+    local sw; sw=$(awk '/^SwapTotal/{print $2}' /proc/meminfo 2>/dev/null)
+    (( ${sw:-0} == 0 )) && info "no swap — link steps can OOM at high -j; --minimal lowers the peak"
+}
+
+build_config_plan() {
+    if [[ -r /proc/config.gz ]]; then
+        CFG_LABEL="/proc/config.gz (live config of $REL)"
+        CFG_CMD="zcat /proc/config.gz > .config"
+    elif [[ -r "/boot/config-$REL" ]]; then
+        CFG_LABEL="/boot/config-$REL"
+        CFG_CMD="cp /boot/config-$REL .config"
+    else
+        CFG_LABEL="defconfig (no readable config of the running kernel)"
+        CFG_CMD="make defconfig"
+        warnf "Pending" "cannot read running kernel config — plan falls back to defconfig" \
+            "install linux-cloud-tools/kernel config module, or reuse an old /boot/config-*"
+    fi
+    info "config base: $CFG_LABEL → make olddefconfig$( ((BUILD_MINIMAL)) && echo ' + localmodconfig (minimal)')"
+}
+
+build_script_write() {
+    BUILD_SCRIPT="${HOME}/kernelz-build-${UP_VER}.sh"
+    cat > "$BUILD_SCRIPT" <<EOS
+#!/usr/bin/env bash
+# kernelz build script — linux ${UP_VER} (generated $(date '+%F %T'))
+# Compiles + packages ONLY. Installing and the GRUB one-shot safety net are
+# applied by 'kernelz build --apply' (or follow the NEXT STEPS it prints).
+set -euo pipefail
+VER="${UP_VER}"; SERIES="${UP_SERIES}"; TARBALL="${UP_TARBALL}"
+URL="${UP_URL}"; SHA_URL="${UP_SHAURL}"
+BUILDDIR="${BUILD_DIR}"; JOBS=${JOBS_N}; MINIMAL=${BUILD_MINIMAL}; TARGET="${BUILD_FLAVOR}"
+MODE="${BUILD_GIT}"; GITREPO="${KERNEL_GIT}"
+
+mkdir -p "\$BUILDDIR"
+if [[ "\$MODE" == "1" ]]; then
+    # ── git incremental: same tree, only changed files rebuild next version
+    SRC="\$BUILDDIR/linux-git"
+    echo "── [1/3] git: fetch tag v\$VER (shallow) into \$SRC"
+    if [[ ! -d "\$SRC/.git" ]]; then
+        git init -q "\$SRC"
+        git -C "\$SRC" remote add origin "\$GITREPO"
+    fi
+    git -C "\$SRC" fetch --depth=1 origin tag "v\$VER"
+    git -C "\$SRC" -c advice.detachedHead=false checkout -f "v\$VER"
+    git -C "\$SRC" verify-tag "v\$VER" 2>/dev/null \\
+        && echo "  ✓ tag signature verified against a trusted kernel maintainer key" \\
+        || echo "  · tag signature not verifiable here (no keyring) — integrity rides on the tag name"
+else
+    SRC="\$BUILDDIR/linux-\$VER"
+    cd "\$BUILDDIR"
+    echo "── [1/3] fetch \$TARBALL"
+    if [[ ! -s "\$TARBALL" ]]; then
+        curl -fLO --retry 3 "\$URL" || wget -c "\$URL"
+    fi
+    echo "── [2/3] verify sha256"
+    curl -fsSL --retry 3 "\$SHA_URL" -o sha256sums.asc || wget -q "\$SHA_URL" -O sha256sums.asc
+    grep -F "\$TARBALL" sha256sums.asc | sha256sum -c -
+    echo "── unpack"
+    [[ -d "\$SRC" ]] || tar -xf "\$TARBALL"
+fi
+cd "\$SRC"
+echo "── configure (base: ${CFG_LABEL})"
+[[ -f .config ]] || { ${CFG_CMD}; }
+make olddefconfig
+if [[ "\$MINIMAL" == "1" ]]; then make localmodconfig || true; make olddefconfig; fi
+echo '-kz' > localversion-kernelz    # uname becomes <ver>-kz: apt-proof, unmistakable in GRUB
+echo "── build (-j\$JOBS; first pass 30-90 min, --git reruns only rebuild what changed)"
+case "\$TARGET" in
+    deb) make -j"\$JOBS" bindeb-pkg ;;
+    rpm) make -j"\$JOBS" rpm-pkg ;;
+    *)   echo "plain target — run as root when ready:"
+         echo "  sudo make modules_install install && sudo grub-mkconfig -o /boot/grub/grub.cfg" ;;
+esac
+echo "── artifacts in \$BUILDDIR:"
+ls -1 "\$BUILDDIR"/linux-image-*.deb "\$BUILDDIR"/linux-headers-*.deb "\$BUILDDIR"/linux-libc-dev_*.deb 2>/dev/null || true
+ls -1 "\$BUILDDIR"/rpm/RPMS/*/kernel-*.rpm 2>/dev/null || true
+echo
+echo "Done. Install + GRUB safety net: sudo ${SCRIPT_DIR}/kernelz build --apply --ver \$VER$( ((BUILD_GIT)) && echo ' --git')"
+EOS
+    chmod +x "$BUILD_SCRIPT" 2>/dev/null || true
+    ok "build script written: $BUILD_SCRIPT"
+}
+
+confirm_or_abort() {   # $1 = prompt
+    (( ASSUME_YES )) && return 0
+    [[ -t 0 ]] || { critf "Confirm" "non-interactive session and no -y — refusing to start a 30-90 min build" \
+        "re-run with -y (or --dry-run to review the plan)"; exit 2; }
+    printf "  %s [y/N] " "$1"
+    local a; read -r a || a=""
+    [[ "${a,,}" == y* ]] || { info "aborted — plan and script remain available"; exit 0; }
+}
+
+cmd_build() {
+    gather_kernel_facts
+    section "SOURCE BUILD — mainline from kernel.org"
+
+    if [[ -n "$BUILD_VER" && ! "$BUILD_VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        critf "Target" "--ver wants X.Y or X.Y.Z (or omit for latest): got '$BUILD_VER'" \
+            "kernelz build --ver 6.12.58   ·   kernelz build --lts   ·   kernelz build"
+        emit_verdict
+    fi
+
+    heading "── 1. Which version? ──"
+    if [[ -n "$BUILD_VER" ]]; then
+        build_derive_urls "$BUILD_VER"
+        info "target pinned by --ver: $UP_VER"
+    else
+        if ! with_spin "querying kernel.org" build_latest_query; then
+            critf "SourceNet" "cannot determine latest kernel (kernel.org unreachable, no git fallback)" \
+                "try: git ls-remote --tags $KERNEL_GIT 'v*' — then kernelz build --ver X.Y.Z"
+            emit_verdict
+        fi
+        info "latest $( ((BUILD_LTS)) && echo 'LONGTERM ' )on kernel.org: ${C_BOLD}$UP_VER${C_RESET} ${DIM}(running $CUR_VER, series $UP_SERIES)${C_RESET}"
+    fi
+    add_json_field "build_target" "$UP_VER"
+    if dpkg --compare-versions "$CUR_VER" ge "$UP_VER" 2>/dev/null && (( FORCE == 0 )); then
+        ok "running $CUR_VER is already ≥ $UP_VER — nothing to build (use --force to rebuild anyway)"
+    fi
+
+    heading "── 2. Build toolchain ──"
+    toolchain_audit
+
+    heading "── 3. Resources ──"
+    build_resource_check
+    local JOBS_N="${BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+    info "make -j$JOBS_N"
+
+    heading "── 4. Config strategy ──"
+    build_config_plan
+    if command -v dkms >/dev/null 2>&1 && [[ -d /var/lib/dkms ]]; then
+        info "dkms present — third-party modules auto-rebuild on install; verify after: dkms status (./driverz)"
+    fi
+
+    heading "── 5. The plan ──"
+    local i=1 fetch_step unpack_step
+    if (( BUILD_GIT )); then
+        fetch_step="git shallow-fetch tag v$UP_VER into $BUILD_DIR/linux-git — tree is REUSED across versions, so a 7.2.8→7.2.9 style bump recompiles only the few changed files (minutes, not hours)"
+    else
+        fetch_step="download $UP_TARBALL from cdn.kernel.org + sha256 verify"
+    fi
+    if (( BUILD_GIT )); then
+        unpack_step="checkout tag v$UP_VER inside the shared tree (previous .config + objects are kept — that's what makes it incremental)"
+    else
+        unpack_step="unpack into $BUILD_DIR/linux-$UP_VER"
+    fi
+    for step in \
+        "$fetch_step" \
+        "$unpack_step" \
+        "${CFG_LABEL} → make olddefconfig$( ((BUILD_MINIMAL)) && echo ' → localmodconfig (only loaded modules — much smaller/faster)')" \
+        "append -kz localversion (uname → $UP_VER-kz: apt has no idea it exists — it can never be wiped or collided with) + make -j$JOBS_N bindeb-pkg" \
+        "sudo dpkg -i the debs (initramfs + GRUB entries are created by the package hooks)" \
+        "GRUB default stays on $REL; new kernel boots ONCE via grub-reboot (same net as kernelz upgrade)" \
+        "reboot → ./kernelz verify promotes it once the boot is healthy"; do
+        printf "  ${C_BOLD}%d.${C_RESET} %s\n" "$i" "$step"; i=$((i+1))
+    done
+
+    build_script_write
+
+    if (( APPLY_FIX == 0 )); then
+        section "NEXT STEPS"
+        printf "  ${C_GREEN}→${C_RESET} run everything now (build + install + safety net):\n"
+        printf "      ${C_BOLD}sudo %s build --apply %s-y${C_RESET}\n" "${0##*/}" "$( ((BUILD_LTS)) && echo '--lts ' )"
+        printf "  ${C_GREEN}→${C_RESET} or compile yourself, then let kernelz wire the safety net:\n"
+        printf "      ${C_BOLD}bash %s${C_RESET}  ${C_DIM}(long part — logs in $BUILD_DIR)${C_RESET}\n" "$BUILD_SCRIPT"
+        printf "      ${C_BOLD}sudo %s build --apply --ver %s${C_RESET}  ${C_DIM}(installs artifacts + grub one-shot)${C_RESET}\n" "${0##*/}" "$UP_VER"
+        if [[ -n "$TOOLCHAIN_FIX_CMD" ]]; then
+            printf "  ${C_YELLOW}!${C_RESET} toolchain first: ${C_BOLD}%s${C_RESET}\n" "$TOOLCHAIN_FIX_CMD"
+        fi
+        printf "  ${C_DIM}Recurring point releases? add --git — the tree is reused, rebuilds only touch changed files.${C_RESET}\n"
+        kz_hist "build plan ver=$UP_VER flavor=$BUILD_FLAVOR apply=0"
+        emit_verdict
+    fi
+
+    # ---------------- APPLY ----------------
+    confirm_or_abort "Build linux $UP_VER now (compiles up to ~90 min, then installs with GRUB fallback net)?"
+
+    heading "── A. compile & package ──"
+    if ls "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb >/dev/null 2>&1; then
+        ok "artifacts already present — skipping compile (rebuild = delete \$BUILDDIR debs)"
+    else
+        run_cmd bash "$BUILD_SCRIPT" || {
+            critf "BuildFail" "compile failed — nothing was installed, you remain on $REL" \
+                "read the make output above; common causes: missing toolchain ($TOOLCHAIN_FIX_CMD), OOM (retry -j lower or --minimal)"
+            emit_verdict
+        }
+    fi
+
+    if [[ "$BUILD_FLAVOR" == "deb" ]]; then
+        heading "── B. install packages ──"
+        shopt -s nullglob
+        local -a debs=( "$BUILD_DIR"/linux-image_*"$UP_VER"*.deb "$BUILD_DIR"/linux-headers_*"$UP_VER"*.deb \
+                        "$BUILD_DIR"/linux-libc-dev_*.deb )
+        shopt -u nullglob
+        (( ${#debs[@]} )) || { critf "BuildFail" "no debs found in $BUILD_DIR after build" "check script output"; emit_verdict; }
+        local d; for d in "${debs[@]}"; do info "$(basename "$d")"; done
+        run_cmd env DEBIAN_FRONTEND=noninteractive dpkg -i "${debs[@]}" || {
+            run_cmd apt-get -f install -y || true
+        }
+    else
+        heading "── B. install (source-built artifacts) ──"
+        critf "Pending" "$BUILD_FLAVOR artifacts produced — install + safety net for non-deb targets is manual this release" \
+            "rpm: sudo rpm -ivh --force kernel-*.$UP_VER*.rpm && sudo grub-mkconfig -o /boot/grub/grub.cfg; then kernelz recover to pin last good if needed"
+        emit_verdict
+    fi
+
+    local new_rel
+    new_rel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -vx "$REL" | sort -V | tail -1)
+    [[ -z "$new_rel" ]] && { critf "VerifyFail" "dpkg ran but no new /boot/vmlinuz-* appeared" "check dpkg output above; nothing to boot" ; emit_verdict; }
+    ok "new kernel on disk: $new_rel"
+
+    heading "── C. GRUB safety net (new kernel boots ONCE, default stays known-good) ──"
+    state_write last_good "$REL"
+    ensure_grub_savedefault || true
+    local cfg g_toks n_toks good_id new_id
+    cfg=$(read_grubcfg)
+    if [[ -z "$cfg" ]]; then
+        critf "GrubCfg" "cannot read grub.cfg — default NOT switched" "run with sudo: sudo kernelz build --apply"
+    else
+        read -r -a g_toks <<< "$(entry_tokens "$REL")"
+        read -r -a n_toks <<< "$(entry_tokens "$new_rel")"
+        good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
+        new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
+        if [[ -z "$good_id" || -z "$new_id" ]]; then
+            run_cmd update-grub || true
+            cfg=$(read_grubcfg)
+            good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
+            new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
+        fi
+        if [[ -n "$good_id" && -n "$new_id" ]]; then
+            run_cmd grub-set-default "$good_id" || warnf "GrubDefault" "grub-set-default failed" "sudo grub-set-default $good_id"
+            run_cmd grub-reboot "$new_id" || warnf "GrubReboot" "grub-reboot failed" "sudo grub-reboot $new_id"
+            ok "default = $REL (entry $good_id) — next boot = $new_rel (entry $new_id), once only"
+        else
+            critf "GrubEntry" "GRUB entries unresolved for $REL / $new_rel" "sudo update-grub, then: kernelz recover"
+        fi
+    fi
+
+    heading "── D. pending record (so kernelz verify recognizes the source kernel) ──"
+    state_write pending.conf "TARGET_REL=$new_rel
+TARGET_PKG=source:$UP_VER
+PREV_REL=$REL
+TS=$(date +%s)"
+    ok "pending: $new_rel (source:$UP_VER) — verify after reboot"
+
+    heading "── E. shield the fallback line from sudo apt upgrade ──"
+    if [[ "$BUILD_FLAVOR" == "deb" ]]; then
+        info "your $REL fallback IS an apt package — protect keeps 'sudo apt upgrade' from ever removing it"
+        protect_apply 1
+    else
+        info "non-apt fallback — nothing for kernelz protect to hold; GRUB default already pins $REL"
+    fi
+
+    kz_hist "build apply ver=$UP_VER new_rel=$new_rel flavor=$BUILD_FLAVOR"
+    section "NEXT STEPS"
+    printf "  ${C_BOLD}1.${C_RESET} reboot now:            ${C_CYAN}sudo reboot${C_RESET}\n"
+    printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verify${C_RESET}  ${C_DIM}(promotes %s to permanent default)${C_RESET}\n" "${0##*/}" "$new_rel"
+    printf "  ${C_BOLD}3.${C_RESET} if it fails at boot:   the reboot falls back to %s by itself — then %s recover\n" "$REL" "${0##*/}"
+    printf "  ${C_DIM}Repo apt upgrades can never touch your %s kernel (not an apt package, apt-proof -kz suffix) — and kernelz protect now holds the fallback repo kernel safe too.${C_RESET}\n" "$new_rel"
+    exit 0
+}
+
+# ============================================================================
+# PROTECT
+# ============================================================================
+PROTECT_APPLY=0
+protect_apply() {   # 1 = apply fixes now
+    PROTECT_APPLY="$1"
+    section "APT-UPGRADE HARDENING (kernel protection)"
+
+    # 1) meta-package keeps apt pulling kernels
+    if [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]]; then
+        if [[ "$PROTECT_APPLY" -eq 1 ]]; then
+            if run_cmd apt-get install -y "$META_PKG"; then
+                if [[ "$DRY_RUN" -eq 1 ]]; then info "would install $META_PKG — future kernels arrive via plain apt upgrade"
+                else ok "installed $META_PKG — future kernels arrive via plain apt upgrade"; fi
+            fi
+        else
+            warnf "KernelMeta" "$META_PKG missing" "kernelz protect installs it"
+        fi
+    elif [[ -n "$META_PKG" ]]; then
+        ok "$META_PKG present"
+    fi
+
+    # 2) every installed kernel: manual (never autoremove)
+    local pkg ver stat
+    installed_image_pkgs | while IFS=$'\t' read -r pkg ver stat; do
+        if apt-mark showmanual 2>/dev/null | grep -qxF "$pkg"; then
+            :
+        elif [[ "$PROTECT_APPLY" -eq 1 ]]; then
+            run_cmd apt-mark manual "$pkg" >/dev/null
+            printf "  ${C_GREEN}✓${C_RESET} marked manual: %s (protected from autoremove)\n" "$pkg"
+        else
+            printf "  ${C_YELLOW}!${C_RESET} %s is auto-marked — autoremove could target it (run: kernelz protect --yes)\n" "$pkg"
+        fi
+    done
+
+    # 3) running kernel: hold if it's not repo-managed
+    if [[ -n "$CUR_PKG" && $IN_REPO -eq 0 ]]; then
+        if apt-mark showhold 2>/dev/null | grep -qxF "$CUR_PKG"; then
+            ok "custom kernel $CUR_PKG is held — apt cannot remove it"
+        elif [[ "$PROTECT_APPLY" -eq 1 ]]; then
+            run_cmd apt-mark hold "$CUR_PKG" >/dev/null && ok "held $CUR_PKG (custom kernel protected from apt upgrade/autoremove)"
+        else
+            warnf "HoldMissing" "custom kernel $CUR_PKG not held" "kernelz protect --apply? run: sudo apt-mark hold $CUR_PKG"
+        fi
+    fi
+
+    # 4) simulate: would apt upgrade/full-upgrade remove any installed kernel?
+    local sim removed rels
+    sim=$(apt-get -s upgrade 2>/dev/null || $SUDO apt-get -s upgrade 2>/dev/null || true)
+    if [[ -z "$sim" ]]; then
+        info "apt simulation needs root — re-run 'sudo kernelz protect' for the removal check"
+    else
+        removed=$(printf '%s\n' "$sim" | awk '/REMOVED:/{f=1;next} f&&/upgraded,/{exit} f' | grep -oE 'linux-image[a-zA-Z0-9._+-]*' || true)
+        if [[ -n "$removed" ]]; then
+            warnf "AptRemoval" "apt upgrade simulation plans to REMOVE: $(tr '\n' ' ' <<< "$removed")"
+            if [[ "$PROTECT_APPLY" -eq 1 ]]; then
+                local p
+                for p in $removed; do run_cmd apt-mark hold "$p" >/dev/null && printf "  ${C_GREEN}✓${C_RESET} held %s against removal\n" "$p"; done
+            else
+                info "kernelz protect --yes holds these automatically"
+            fi
+        else
+            ok "apt upgrade simulation: no installed kernel would be removed"
+        fi
+    fi
+}
+
+cmd_protect() {
+    gather_kernel_facts
+    protect_apply "$ASSUME_YES"
+    if [[ "$ASSUME_YES" -eq 0 ]]; then
+        printf "  ${C_DIM}analysis-only — to apply the fixes: kernelz protect --yes (or run via sudo)${C_RESET}\n"
+    fi
+    emit_verdict
+}
+
+# ============================================================================
+# VERIFY
+# ============================================================================
+cmd_verify() {
+    gather_kernel_facts
+    record_boot
+    local target prev pts
+    target=$(pending_get TARGET_REL); prev=$(pending_get PREV_REL); pts=$(pending_get TS)
+
+    if [[ -z "$target" ]]; then
+        section "VERIFY"
+        local lg; lg=$(state_read last_good)
+        if [[ "$REL" == "$lg" ]]; then
+            ok "running $REL == last known good ($lg) — nothing pending"
+        else
+            warnf "Verify" "no pending update recorded; running $REL, last_good=${lg:-unknown}" "kernelz recover sets default to last_good if needed"
+        fi
+        add_json_field verify_result "no-pending"
+        emit_verdict
+    fi
+
+    section "VERIFY — pending kernel: $target (installed $(date -d "@${pts:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?'))"
+    add_json_field verify_target "$target"
+
+    local errs nerrs jrc=0
+    errs=$(journalctl -q -b -p err --no-pager 2>/dev/null) || jrc=1
+    if (( jrc )); then
+        nerrs=-1
+        info "journalctl unreadable for this user — run 'sudo journalctl -b -p err' to review boot errors"
+    else
+        nerrs=$(printf '%s\n' "$errs" | grep -c . || true)
+    fi
+
+    if [[ "$REL" == "$target" ]]; then
+        ok "${C_BOLD}new kernel $REL booted successfully${C_RESET}"
+        if (( nerrs > 0 )); then
+            warnf "BootErrors" "$nerrs error line(s) this boot" "journalctl -b -p err   (review before trusting the kernel)"
+            printf '%s\n' "$errs" | tail -5 | sed 's/^/      /'
+        else
+            ok "zero error-level journal entries this boot"
+        fi
+        # promote to permanent default
+        local cfg id
+        cfg=$(read_grubcfg)
+        read -r -a toks <<< "$(entry_tokens "$REL")"
+        id=$(grub_entry_id_for "$cfg" "${toks[@]}")
+        if [[ -n "$id" ]]; then
+            run_cmd grub-set-default "$id" >/dev/null && ok "GRUB default promoted to $REL (entry $id)"
+        else
+            warnf "GrubDefault" "entry for $REL not found to promote" "sudo update-grub && sudo kernelz verify"
+        fi
+        $SUDO grub-editenv /boot/grub/grubenv unset next_entry >/dev/null 2>&1 || true
+        # keep the fallback kernel around
+        if [[ -f "/boot/vmlinuz-$prev" ]]; then
+            ok "fallback kernel still present: $prev"
+        else
+            warnf "Fallback" "previous kernel $prev missing from /boot" "no automatic fallback — keep one old kernel until stable"
+        fi
+        state_write last_good "$REL"
+        state_write last_good_pkg "$(pkg_for_release "$REL")"
+        state_rm pending.conf
+        kz_hist "verify-ok kernel=$REL"
+        printf "  ${C_GREEN}${C_BOLD}✔ $REL is now the trusted default. 'sudo apt upgrade' is protected.${C_RESET}\n"
+    elif [[ "$BOOT_EPOCH" -le "${pts:-0}" ]]; then
+        info "system has not rebooted since the update — GRUB is armed: next reboot tries $target, fallback stays $prev"
+        add_json_field verify_result "awaiting-reboot"
+    elif [[ "$REL" == "$prev" ]]; then
+        critf "VerifyFail" "$target failed to boot — fallback worked, you are safe on $REL" "run ./bootz for boot errors; try 'sudo apt install --reinstall linux-image-$target' or keep $REL and 'kernelz protect'"
+        printf "  ${C_DIM}previous boot errors (likely cause):${C_RESET}\n"
+        journalctl -q -b -1 -p err --no-pager 2>/dev/null | tail -8 | sed 's/^/      /' || info "journalctl not readable without sudo"
+        state_append pending.conf "STATUS=failed"
+        kz_hist "verify-fail target=$target fell-back=$REL"
+    else
+        warnf "Verify" "unexpected kernel $REL (expected $target or $prev)" "check GRUB entries: sudo kernelz"
+    fi
+    add_json_field verify_kernel "$REL"
+    emit_verdict
+}
+
+# ============================================================================
+# RECOVER
+# ============================================================================
+cmd_recover() {
+    gather_kernel_facts
+    local lg
+    lg=$(state_read last_good)
+    section "RECOVER → last known good: ${lg:-$REL}"
+    if [[ -z "$lg" ]]; then
+        lg="$REL"
+        warnf "Recover" "no last_good recorded — using current $REL as known good"
+    fi
+    if [[ ! -f "/boot/vmlinuz-$lg" ]]; then
+        critf "Recover" "/boot/vmlinuz-$lg missing — cannot recover to it" "boot any kernel, then kernelz upgrade"
+        emit_verdict
+    fi
+    state_write last_good "$lg"
+    ensure_grub_savedefault || true
+    run_cmd update-grub || true
+    local cfg id
+    cfg=$(read_grubcfg)
+    read -r -a toks <<< "$(entry_tokens "$lg")"
+    id=$(grub_entry_id_for "$cfg" "${toks[@]}")
+    if [[ -n "$id" ]]; then
+        run_cmd grub-set-default "$id" && ok "GRUB permanent default forced to $lg (entry $id)"
+    else
+        critf "Recover" "no menu entry for $lg after update-grub" "inspect: sudo grep menuentry /boot/grub/grub.cfg"
+    fi
+    run_cmd grub-editenv /boot/grub/grubenv unset next_entry
+    state_rm pending.conf
+    kz_hist "recover to=$lg"
+    section "MANUAL RECIPE (if you cannot boot at all)"
+    cat << EOF
+  1. Power on → hold ${C_BOLD}Shift${C_RESET} (BIOS) or hammer ${C_BOLD}Esc${C_RESET} (UEFI) for the GRUB menu
+  2. ${C_BOLD}Advanced options${C_RESET} → pick the kernel BEFORE the bad one (${C_CYAN}$lg${C_RESET})
+  3. Log in, then run: ${C_CYAN}${0##*/} recover${C_RESET}
+  4. To undo the bad kernel entirely: ${C_CYAN}sudo apt-mark hold linux-image-$REL && sudo kernelz protect${C_RESET}
+EOF
+    emit_verdict
+}
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+cmd_cleanup() {
+    gather_kernel_facts
+    section "CLEANUP — old kernel purge preview"
+    local keep_current list keep1 keep2
+    keep_current="$CUR_PKG"
+    # always keep the two newest installed image packages
+    mapfile -t _sorted_imgs < <(installed_image_pkgs | sort -t$'\t' -k2,2Vr | cut -f1)
+    keep1="${_sorted_imgs[0]:-}"; keep2="${_sorted_imgs[1]:-}"
+    printf "  ${C_GREEN}keep:${C_RESET} %s (running)\n" "$keep_current"
+    [[ -n "$keep1" && "$keep1" != "$keep_current" ]] && printf "  ${C_GREEN}keep:${C_RESET} %s (newest installed)\n" "$keep1"
+    [[ -n "$keep2" && "$keep2" != "$keep_current" && "$keep2" != "$keep1" ]] && printf "  ${C_GREEN}keep:${C_RESET} %s (2nd newest)\n" "$keep2"
+    local lg; lg=$(pkg_for_release "$(state_read last_good)")
+    [[ -n "$lg" && "$lg" != "$keep_current" && "$lg" != "$keep1" && "$lg" != "$keep2" ]] && printf "  ${C_GREEN}keep:${C_RESET} %s (last known good)\n" "$lg"
+
+    list=""
+    local pkg ver stat
+    while IFS=$'\t' read -r pkg ver stat; do
+        case " $keep_current $keep1 $keep2 $lg $META_PKG " in *" $pkg "*) continue ;; esac
+        printf "  ${C_YELLOW}remove:${C_RESET} %-36s %s %s\n" "$pkg" "$ver" "$stat"
+        list="$list $pkg"
+    done < <(installed_image_pkgs)
+
+    if [[ -z "$list" ]]; then
+        ok "nothing safe to remove"
+        return 0
+    fi
+    if [[ "$ASSUME_YES" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+        # header/meta packages must stay: filter them out
+        local real=()
+        for p in $list; do [[ "$p" == "$META_PKG" ]] || real+=("$p"); done
+        run_cmd apt-get purge -y "${real[@]}" || critf "Cleanup" "purge failed" "apt-get -f install"
+        run_cmd update-grub || true
+        kz_hist "cleanup purged$(echo "$list")"
+        ok "purged old kernels; GRUB regenerated"
+    else
+        printf "  ${C_DIM}to execute: kernelz cleanup --yes${C_RESET}\n"
+    fi
+}
+
+# ============================================================================
+# BENCH
+# ============================================================================
+BENCH="$STATE_USR/bench.tsv"
+# format: epoch \t kernel_rel \t boot_id \t cpu_ms \t crypto_kBps \t fork_ops_s \t mem_MBps \t io_w \t io_r \t boot_s
+
+bench_cpu_ms() {
+    local t0 t1 n i=0
+    t0=$(date +%s%N)
+    for (( n=0; n<150000; n++ )); do i=$(( i + (n*7) % 997 )); done
+    t1=$(date +%s%N)
+    echo $(( (t1 - t0) / 1000000 ))
+}
+bench_crypto() {
+    command -v openssl >/dev/null 2>&1 || { echo 0; return; }
+    openssl speed -seconds 1 sha256 2>/dev/null | awk '/^sha256/{v=$NF} END{gsub(/[k,]/,"",v); print (v==""?0:v)+0}'
+}
+bench_fork() {
+    local n t0 t1
+    t0=$(date +%s%N)
+    for (( n=0; n<200; n++ )); do /bin/true & done
+    wait
+    t1=$(date +%s%N)
+    local ms=$(( (t1 - t0) / 1000000 ))
+    (( ms < 1 )) && ms=1
+    echo $(( 200 * 1000 / ms ))
+}
+bench_mem() {
+    local r
+    r=$(dd if=/dev/zero bs=1M count=128 2>&1 >/dev/null | grep -oE '[0-9.]+ (MB|GB|kB)/s' | tail -1)
+    awk -v x="$r" 'BEGIN{ if (x ~ /GB/) {split(x,a," "); print int(a[1]*1024)} else if (x ~ /MB/) {split(x,a," "); print int(a[1])} else if (x ~ /kB/) {split(x,a," "); print int(a[1]/1024)} else print 0 }'
+}
+bench_io() {
+    local f=/tmp/kernelz-io.$$.img r w
+    w=$(dd if=/dev/zero of="$f" bs=1M count=128 conv=fdatasync 2>&1 >/dev/null | grep -oE '[0-9.]+ MB/s' | tail -1 | awk '{print $1}')
+    r=$(dd if="$f" of=/dev/null bs=1M iflag=direct 2>&1 >/dev/null | grep -oE '[0-9.]+ MB/s' | tail -1 | awk '{print $1}')
+    [[ -z "$r" ]] && r=$(dd if="$f" of=/dev/null bs=1M 2>&1 >/dev/null | grep -oE '[0-9.]+ MB/s' | tail -1 | awk '{print $1}')
+    rm -f "$f"
+    echo "${w:-0}	${r:-0}"
+}
+bench_boot_sec() {
+    local s
+    s=$(systemd-analyze time 2>/dev/null | awk '/Startup finished/{print $NF}')
+    s=${s%s}          # strip trailing 's'
+    s=${s%m}          # (ms totals are rare; unit-agnostic for comparisons)
+    echo "${s:-0}"
+}
+
+bench_show_table() {
+    [[ -r "$BENCH" ]] || { printf "  no bench data yet — run: kernelz bench\n"; return 0; }
+    printf "  ${C_DIM}%-19s %-22s %7s %9s %7s %7s %6s %6s %6s${C_RESET}\n" "when" "kernel" "cpu_ms↓" "crypto↑" "fork/s↑" "mem↑" "io_w↑" "io_r↑" "boot↓"
+    while IFS=$'\t' read -r ts rel bid cpu cry fkr mem iow ior bsec; do
+        local mark=""
+        [[ "$rel" == "$REL" ]] && mark="${C_GREEN}◀${C_RESET}" || mark=" "
+        printf "  %-19s %-22s %7s %9s %7s %7s %6s %6s %6s %b\n" \
+            "$(date -d "@$ts" '+%m-%d %H:%M' 2>/dev/null || echo "$ts")" "$rel" "$cpu" "$cry" "$fkr" "$mem" "$iow" "$ior" "$bsec" "$mark"
+    done < <(sort -t$'\t' -k1,1n "$BENCH")
+}
+
+bench_avg_by_kernel() {   # $1=rel
+    awk -F'\t' -v k="$1" '$2==k {n++; for(i=4;i<=10;i++) s[i]+=$i} END{if(!n){print "none"; exit} printf "%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.1f\t%d\n", s[4]/n, s[5]/n, s[6]/n, s[7]/n, s[8]/n, s[9]/n, s[10]/n, n}' "$BENCH" 2>/dev/null
+}
+
+bench_compare() {   # $1 $2 kernel releases
+    local a="$1" b="$2"
+    [[ -r "$BENCH" ]] || { printf "  no bench data yet\n"; return 1; }
+    local av bv
+    av=$(bench_avg_by_kernel "$a"); bv=$(bench_avg_by_kernel "$b")
+    if [[ "$av" == "none" || "$bv" == "none" ]]; then
+        printf "  need at least one bench row per kernel ('$a': %s runs, '$b': %s runs)\n" \
+            "$(awk -F'\t' -v k="$a" '$2==k{n++} END{print n+0}' "$BENCH")" \
+            "$(awk -F'\t' -v k="$b" '$2==k{n++} END{print n+0}' "$BENCH")"
+        return 1
+    fi
+    heading "── Averages: $a vs $b ──"
+    local labels=("cpu_ms" "crypto_kBps" "fork_ops" "mem_MBps" "io_w" "io_r" "boot_s")
+    local better=("lower" "higher" "higher" "higher" "higher" "higher" "lower")
+    local i va vb pct verdict
+    printf "  ${C_DIM}%-12s %-12s %-12s %-9s %s${C_RESET}\n" "metric" "$a" "$b" "Δ%" "winner"
+    for i in 0 1 2 3 4 5 6; do
+        va=$(cut -f$((i+1)) <<< "$av"); vb=$(cut -f$((i+1)) <<< "$bv")
+        f_zero "$va" "$vb" && continue
+        pct=$(awk -v x="$va" -v y="$vb" 'BEGIN{if (x+0==0) print "n/a"; else printf "%+.1f", (y-x)/x*100}')
+        verdict=""
+        if [[ "$pct" != "n/a" ]] && f_ne "$va" "$vb"; then
+            if [[ "${better[$i]}" == "lower" ]]; then
+                f_gt "$vb" "$va" && verdict="${C_GREEN}$a${C_RESET}" || verdict="${C_CYAN}$b${C_RESET}"
+            else
+                f_gt "$va" "$vb" && verdict="${C_GREEN}$a${C_RESET}" || verdict="${C_CYAN}$b${C_RESET}"
+            fi
+        fi
+        printf "  %-12s %-12s %-12s %-9s %b\n" "${labels[$i]}" "$va" "$vb" "$pct" "$verdict"
+    done
+    info "rows: $a=$(cut -f8 <<< "$av") runs, $b=$(cut -f8 <<< "$bv") runs — lower cpu_ms/boot_s is better, higher the rest"
+}
+
+cmd_bench() {
+    gather_kernel_facts
+    record_boot
+    case "${1:-}" in
+        show)    section "BENCH HISTORY"; bench_show_table; return 0 ;;
+        compare) shift
+                 section "BENCH COMPARE"
+                 local a b
+                 a="${1:-}"; b="${2:-}"
+                 if [[ -z "$a" || -z "$b" ]]; then
+                     mapfile -t kernels < <(cut -f2 "$BENCH" 2>/dev/null | sort -u)
+                     (( ${#kernels[@]} < 2 )) && { printf "  need ≥2 kernels benched (have: %s) — data accrues after kernelz upgrade + reboot + bench\n" "${kernels[*]:-none}"; return 0; }
+                     a=${kernels[-2]}; b=${kernels[-1]}
+                     info "auto-picked two most recent kernels: $a vs $b"
+                 fi
+                 bench_compare "$a" "$b"; return 0 ;;
+    esac
+
+    section "BENCH — kernel $REL (boot ${BOOT_ID:0:8})"
+    printf "  ${C_DIM}running quick benchmarks…${C_RESET}\n"
+    local cpu cry fkr mem iow ior bsec
+    cpu=$(bench_cpu_ms);   ok "cpu arithmetic:   ${cpu} ms"
+    cry=$(bench_crypto);   ok "sha256 speed:     ${cry} kB/s"
+    fkr=$(bench_fork);     ok "fork rate:        ${fkr} ops/s"
+    mem=$(bench_mem);      ok "mem bandwidth:    ${mem} MB/s"
+    iow=0; ior=0
+    if [[ "$WANT_IO" -eq 1 ]]; then
+        read -r iow ior <<< "$(bench_io)"
+        ok "disk write:       ${iow} MB/s"
+        ok "disk read:        ${ior} MB/s"
+    else
+        info "skipping disk io (add --io)"
+    fi
+    bsec=$(grep -F "$BOOT_ID" "$LEDGER" 2>/dev/null | cut -f4 | tail -1)
+    [[ -z "$bsec" || "$bsec" == "0" ]] && bsec=$(bench_boot_sec)
+    ok "boot time:        ${bsec}s"
+
+    mkdir -p "$STATE_USR"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$TS_EPOCH" "$REL" "$BOOT_ID" "$cpu" "$cry" "$fkr" "$mem" "$iow" "$ior" "$bsec" >> "$BENCH"
+    kz_hist "bench kernel=$REL cpu=$cpu cry=$cry fork=$fkr mem=$mem boot=$bsec"
+
+    if [[ "$BENCH_FULL" -eq 1 && -x "$SCRIPT_DIR/benchmarkz" ]]; then
+        subsec "benchmarkz --full snapshot"
+        local outdir="$STATE_USR/benchlogs" cur other prevf
+        mkdir -p "$outdir"
+        cur="$outdir/$REL-$(date +%s).txt"
+        "$SCRIPT_DIR/benchmarkz" > "$cur" 2>&1 || warnf "BenchFull" "benchmarkz exited non-zero" "$SCRIPT_DIR/benchmarkz"
+        other=$(ls -1t "$outdir"/*.txt 2>/dev/null | grep -v "/$(basename "$cur")$" | grep -v "/$REL-" | head -1 || true)
+        if [[ -n "$other" ]]; then
+            prevf=${other##*/}; prevf=${prevf%%-*}
+            heading "── benchmarkz diff: $prevf (other kernel) vs $REL ──"
+            diff -u "$other" "$cur" 2>/dev/null | grep -E '^[+-][^+-]' | head -40 || true
+            info "full diff saved: $outdir/"
+        else
+            info "no benchmarkz snapshot from a different kernel yet — run 'kernelz bench --full' on each kernel to compare"
+        fi
+        ok "snapshot saved: $cur"
+    fi
+
+    subsec "per-kernel averages so far"
+    local rels r av mark
+    rels=$(cut -f2 "$BENCH" 2>/dev/null | sort -u)
+    for r in $rels; do
+        av=$(bench_avg_by_kernel "$r")
+        [[ "$av" == "none" ]] && continue
+        mark=""
+        [[ "$r" == "$REL" ]] && mark=" ${C_GREEN}◀${C_RESET}"
+        printf "  %-24s cpu=%s ms  sha256=%s kB/s  fork=%s/s  mem=%s MB/s  boot=%s s  ${C_DIM}(%s runs)${C_RESET}%b\n" \
+            "$r" $(cut -f1,2,3,4,7,8 <<< "$av") "$mark"
+        if [[ "$r" == "$REL" ]]; then
+            local hist; hist=$(awk -F'\t' -v k="$REL" '$2==k{print $4}' "$BENCH" 2>/dev/null | head -40)
+            [[ -n "$hist" ]] && printf "      ${C_DIM}cpu_ms history:${C_RESET} %b\n" "$(spark $hist)"
+        fi
+    done
+    printf "  ${C_DIM}next: after a kernelz upgrade + reboot, run 'kernelz bench' again, then 'kernelz bench compare'${C_RESET}\n"
+}
+
+# ============================================================================
+# HISTORY
+# ============================================================================
+cmd_history() {
+    gather_kernel_facts
+    section "kernelz ACTION HISTORY"
+    local h
+    h=$(state_read history.tsv)
+    if [[ -z "$h" ]]; then
+        info "no actions recorded yet"
+    else
+        printf '%s\n' "$h" | tail -30 | while IFS=$'\t' read -r ts cmd detail; do
+            printf "  %-17s ${C_BOLD}%-9s${C_RESET} %s\n" "$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$ts")" "$cmd" "$detail"
+        done
+    fi
+    subsec "kernel identity"
+    printf "  last_good: ${C_BOLD}%s${C_RESET}\n" "$(state_read last_good || echo none)"
+    local pr; pr=$(pending_get TARGET_REL)
+    printf "  pending:   %s\n" "${pr:-none}"
+    [[ -r "$BENCH" ]] && printf "  bench rows:%s (kernels: %s)\n" "$(wc -l < "$BENCH")" "$(cut -f2 "$BENCH" | sort -u | tr '\n' ' ')"
+    emit_verdict
+}
+
+# ============================================================================
+# FIX — package doctor: what's missing/broken that would wreck a kernel
+# install, and the exact commands to repair it
+# ============================================================================
+declare -A FIX_RECS=()
+fix_rec() {   # pkg "reason"
+    local p="$1" why="$2"
+    [[ -z "$p" ]] && return 0
+    if [[ -n "${FIX_RECS[$p]:-}" ]]; then
+        FIX_RECS[$p]="${FIX_RECS[$p]} · $why"
+    else
+        FIX_RECS[$p]="$why"
+    fi
+}
+apt_exists() { [[ "$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}')" =~ ^[0-9] ]]; }
+owner_pkg_of() {   # file -> owning package or empty
+    dpkg -S "$1" 2>/dev/null | cut -d: -f1 | tr -d ' '
+}
+fw_to_pkg() {
+    case "$1" in
+        iwlwifi*|iwl-*)                 printf 'firmware-iwlwifi' ;;
+        amdgpu/*)                       printf 'firmware-amd-graphics' ;;
+        nvidia/*|nouveau/*|i915/*)      printf 'firmware-misc-nonfree' ;;
+        brcm/*)                         printf 'firmware-brcm80211' ;;
+        rtl*|rtw89/*|rtl8*)             printf 'firmware-realtek' ;;
+        mediatek/*|mt76*)               printf 'firmware-misc-nonfree' ;;
+        *)                              printf '' ;;
+    esac
+}
+
+cmd_fix() {
+    gather_kernel_facts
+    json_muffle
+    local broken=0
+    section "PACKAGE DOCTOR — kernel toolchain integrity"
+
+    # ── 1. dpkg / apt database health ───────────────────────────────────
+    subsec "dpkg & apt state"
+    local audit
+    audit=$(dpkg --audit 2>/dev/null)
+    if [[ -n "$audit" ]]; then
+        broken=1
+        critf "DpkgBroken" "dpkg reports unfinished installs — kernel postinst (initramfs/grub hooks) WILL fail" "sudo dpkg --configure -a && sudo apt-get -f install -y   (kernelz fix --apply does this)"
+        printf '%s\n' "$audit" | head -4 | sed 's/^/      /'
+    else
+        ok "dpkg database clean (no half-installed/half-configured packages)"
+    fi
+    local aptchk="" aptc_rc=0
+    aptchk=$(apt-get check 2>&1) || aptc_rc=$?
+    if [[ $aptc_rc -eq 0 ]]; then
+        ok "apt dependency graph satisfiable"
+    elif grep -qi "lock\|root" <<< "$aptchk"; then
+        if sudo -n apt-get check >/dev/null 2>&1; then
+            ok "apt dependency graph satisfiable (verified via sudo)"
+        else
+            info "apt-get check needs root (dpkg lock) — run 'sudo kernelz fix' to verify the dependency graph"
+        fi
+    else
+        broken=1
+        critf "AptDeps" "apt-get check found unmet dependencies — upgrades may refuse the kernel" "sudo apt-get -f install -y; then inspect: apt-get check"
+        printf '%s\n' "$aptchk" | grep -E "^E:" | head -3 | sed 's/^/      /'
+    fi
+    add_json_field dpkg_broken "$([[ -n "$audit" ]] && echo true || echo false)" 1
+
+    # ── 2. packages the kernel pipeline REQUIRES ────────────────────────
+    subsec "kernel-critical packages"
+    local bootpkg
+    if [[ -d /sys/firmware/efi ]]; then bootpkg="grub-efi-amd64"; else bootpkg="grub-pc"; fi
+    local p st
+    for p in linux-base initramfs-tools "$bootpkg" kmod e2fsprogs apt-utils; do
+        st=$(pkg_state "$p")
+        case "$st" in
+            ii*|hi*) ok "$p installed" ;;
+            *) broken=1; critf "PkgMissing" "$p is NOT installed — required for kernel install/boot pipeline" "sudo apt install $p"
+               apt_exists "$p" && fix_rec "$p" "kernel-critical" ;;
+        esac
+    done
+    local why
+    for p in dkms linux-headers-amd64 apt-listchanges; do
+        case "$p" in
+            dkms)               why="third-party modules (GPU/WiFi) rebuild through it on every kernel" ;;
+            linux-headers-amd64) why="module builds need the headers matching the newest kernel" ;;
+            apt-listchanges)    why="shows changelog/CVE notes before upgrades" ;;
+        esac
+        st=$(pkg_state "$p")
+        case "$st" in
+            ii*|hi*) ok "$p installed (recommended)" ;;
+            *) warnf "PkgRecommended" "$p missing — $why" "sudo apt install $p"
+               apt_exists "$p" && fix_rec "$p" "$why" ;;
+        esac
+    done
+    # meta package for tracking kernel updates
+    [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]] && {
+        fix_rec "$META_PKG" "keeps 'apt upgrade' tracking new kernels"
+        warnf "PkgMissing" "$META_PKG not installed — plain 'sudo apt upgrade' won't pull kernel updates" "kernelz protect --yes, or sudo apt install $META_PKG"
+    }
+
+    # ── 3. tools kernelz & the boot chain depend on ─────────────────────
+    subsec "required binaries"
+    local b bin owner
+    for b in mkinitramfs update-grub grub-mkconfig depmod modprobe lsinitramfs; do
+        if command -v "$b" >/dev/null 2>&1; then
+            bin=$(command -v "$b")
+            owner=$(owner_pkg_of "$bin")
+            [[ -z "$owner" ]] && owner=$(basename "$bin")
+            [[ "$b" == "update-grub" || "$b" == "mkinitramfs" || "$b" == "depmod" ]] && \
+                info "$b → $bin ${C_DIM}($owner)${C_RESET}"
+        else
+            broken=1
+            critf "BinMissing" "$b not found — kernel/initramfs/grub steps cannot run" "dpkg -S or: sudo apt install $(case $b in mkinitramfs|lsinitramfs) echo initramfs-tools;; update-grub|grub-mkconfig) echo "$bootpkg";; depmod|modprobe) echo kmod;; esac)"
+            case "$b" in
+                mkinitramfs|lsinitramfs) fix_rec "initramfs-tools" "$b missing" ;;
+                update-grub|grub-mkconfig) fix_rec "$bootpkg" "$b missing" ;;
+                depmod|modprobe) fix_rec "kmod" "$b missing" ;;
+            esac
+        fi
+    done
+
+    # ── 4. study THIS BOOT'S kernel log: module & firmware failures ─────
+    subsec "kernel log errors/warnings affecting the kernel stack"
+    local klog=""
+    klog=$(journalctl -k -b --no-pager -q 2>/dev/null) || true
+    [[ -z "$klog" ]] && klog=$(dmesg 2>/dev/null) || true
+    [[ -z "$klog" ]] && klog=$(sudo -n dmesg 2>/dev/null) || true
+    if [[ -z "$klog" ]]; then
+        info "kernel log unreadable without sudo — run: sudo kernelz fix  (for log study)"
+    else
+        local fwmiss
+        fwmiss=$(grep -ioE 'Direct firmware load for [^ ]+ failed' <<<"$klog" | sed -E 's/.*for (.*) failed/\1/' | sort -u)
+        if [[ -z "$fwmiss" ]]; then
+            ok "no firmware-load failures this boot"
+        else
+            local fw pkg
+            while IFS= read -r fw; do
+                [[ -z "$fw" ]] && continue
+                pkg=$(fw_to_pkg "$fw")
+                if [[ -n "$pkg" ]]; then
+                    warnf "Firmware" "firmware '$fw' failed to load" "sudo apt install $pkg"
+                    printf "  ${C_YELLOW}!${C_RESET} %s → ${C_BOLD}sudo apt install %s${C_RESET}\n" "$fw" "$pkg"
+                    fix_rec "$pkg" "firmware $fw"
+                else
+                    warnf "Firmware" "firmware '$fw' failed to load (no known package)" "apt-cache search '${fw%%/*}'"
+                fi
+            done <<< "$fwmiss"
+        fi
+        local modmiss nmod=0
+        modmiss=$(grep -ioE 'Module [a-zA-Z0-9_-]+ not found' <<<"$klog" | awk '{print $2}' | sort -u)
+        for m in $modmiss; do
+            nmod=$((nmod+1))
+            warnf "KernelModule" "kernel could not load module '$m' this boot" "find it: apt-file search $m.ko (sudo apt install apt-file) — or run ./driverz"
+        done
+        (( nmod == 0 )) && ok "no missing-module errors this boot"
+    fi
+
+    # ── 5. failed services that often mean missing packages ─────────────
+    if command -v systemctl >/dev/null 2>&1; then
+        subsec "failed units → owning packages"
+        local units unit frag owner u_err=0
+        units=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+        if [[ -z "$units" ]]; then
+            ok "no failed systemd units"
+        else
+            while IFS= read -r unit; do
+                [[ -z "$unit" ]] && continue
+                frag=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null)
+                owner=""
+                [[ -n "$frag" && -f "$frag" ]] && owner=$(owner_pkg_of "$frag")
+                if [[ -n "$owner" && "$owner" != "systemd" ]]; then
+                    warnf "FailedUnit" "$unit failed (package $owner)" "journalctl -u $unit -b; if missing files: sudo apt install --reinstall $owner"
+                    u_err=1
+                else
+                    warnf "FailedUnit" "$unit failed" "journalctl -u $unit -b   (or ./bootz)"
+                fi
+            done <<< "$units"
+            add_json_field failed_units "$(printf '%s\n' $units | wc -w)" 1
+        fi
+    fi
+
+    # ── 6. delegate hardware-level gaps to driverz (if installed here) ──
+    if [[ -x "$SCRIPT_DIR/driverz" ]]; then
+        subsec "hardware driver/firmware gaps (via ./driverz --json)"
+        local dj drecs
+        dj=$(timeout 60 "$SCRIPT_DIR/driverz" --json 2>/dev/null)
+        if [[ -n "$dj" ]]; then
+            drecs=$(printf '%s' "$dj" | awk -F'"recommended_packages":"' '{print $2}' | cut -d'"' -f1 | xargs)
+            local r
+            for r in $drecs; do
+                fix_rec "$r" "hardware need reported by driverz"
+                printf "  ${C_YELLOW}!${C_RESET} driverz recommends: ${C_BOLD}sudo apt install %s${C_RESET}\n" "$r"
+            done
+            [[ -z "$drecs" ]] && ok "driverz found no missing driver/firmware packages"
+        else
+            info "driverz produced no JSON (run './driverz' to see why)"
+        fi
+    fi
+
+    # ── 7. copy-paste fixes ──────────────────────────────────────────────
+    local fixpkgs=()
+    for p in $(printf '%s\n' "${!FIX_RECS[@]}" | sort); do apt_exists "$p" && fixpkgs+=("$p"); done
+    section "FIX PLAN"
+    if (( broken )); then
+        [[ -n "$audit" ]] && emit "  ${C_BOLD}1.${C_RESET} dpkg state needs repair first (will run: sudo dpkg --configure -a)\n"
+        (( broken )) && emit "  ${C_BOLD}•${C_RESET} or run it all: ${C_CYAN}kernelz fix --apply${C_RESET}\n"
+    fi
+    if [[ ${#FIX_RECS[@]} -gt 0 ]]; then
+        emit "  ${C_BOLD}Missing/needed packages:${C_RESET}\n"
+        for p in $(printf '%s\n' "${!FIX_RECS[@]}" | sort); do
+            printf "    ${C_GREEN}%-28s${C_RESET} %s\n" "$p" "${FIX_RECS[$p]}"
+        done
+        if [[ ${#fixpkgs[@]} -gt 0 ]]; then
+            printf "\n  ${C_BOLD}one-liner:${C_RESET} ${C_CYAN}sudo apt install -y %s${C_RESET}\n" "${fixpkgs[*]}"
+        fi
+        if [[ "$APPLY_FIX" -eq 1 ]]; then
+            heading "── applying ──"
+            [[ -n "$audit" ]] && run_cmd dpkg --configure -a
+            run_cmd apt-get -f install -y
+            ((${#fixpkgs[@]})) && run_cmd apt-get install -y "${fixpkgs[@]}"
+            kz_hist "fix applied pkgs=${fixpkgs[*]:-none}"
+        else
+            emit "  ${C_DIM}(analysis-only — apply with: kernelz fix --apply)${C_RESET}\n"
+        fi
+    else
+        ok "nothing missing — your kernel toolchain is complete"
+    fi
+    add_json_field fix_needed "$([[ ${#FIX_RECS[@]} -gt 0 || $broken -eq 1 ]] && echo true || echo false)" 1
+    json_unmuffle
+    emit_verdict
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+case "$COMMAND" in
+    help)    show_help ;;
+    status|check) cmd_status ;;
+    study)   cmd_study ;;
+    upgrade|update) cmd_upgrade ;;
+    build)   cmd_build ;;
+    verify)  cmd_verify ;;
+    recover) cmd_recover ;;
+    protect) cmd_protect ;;
+    bench)   cmd_bench "${ARGS[@]+"${ARGS[@]}"}" ;;
+    fix)     cmd_fix ;;
+    cleanup) cmd_cleanup ;;
+    history) cmd_history ;;
+    *)       show_help ;;
+esac

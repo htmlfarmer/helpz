@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# helpz — Cheat-sheet for the security-audit suite (all *z-suffixed scripts).
+#
+# Scans the directory this script lives in for executables whose name ends
+# in 'z' and prints a one-line description + example. New scripts dropped
+# into the same directory are picked up automatically — just add a
+# `desc:` line in the script's header.
+#
+# Usage:
+#   helpz                # list every *z script + what it does
+#   helpz websitez       # detailed help for one script
+#   helpz --json         # machine-readable list
+#   helpz --usage        # usage analytics: vital vs dormant tools
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPZ_HIST="${SCRIPT_DIR}/.helpz_history"
+
+# ---------- ANSI for suggestions ----------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    _R=$'\033[0m'; _B=$'\033[1m'; _D=$'\033[2m'
+    _C=$'\033[36m'; _Y=$'\033[33m'; _G=$'\033[32m'; _M=$'\033[35m'; _RD=$'\033[31m'
+else
+    _R=""; _B=""; _D=""; _C=""; _Y=""; _G=""; _M=""; _RD=""
+fi
+
+# ---------- "what should I run next?" quick system scan ----------
+# Each probe is <1s, read-only, no sudo. Findings become ranked tool picks.
+suggest_next() {
+    [[ "${HELPZ_NO_SUGGEST:-0}" -eq 1 ]] && return 0
+    local _TAB; _TAB=$(printf '\t')
+    local -a S=()   # "weight<TAB>tool<TAB>reason"
+    local v n
+
+    # load vs cores → topz
+    if [[ -r /proc/loadavg ]]; then
+        v=$(awk '{print $1}' /proc/loadavg); n=$(nproc 2>/dev/null || echo 4)
+        awk -v l="$v" -v n="$n" 'BEGIN{exit !(l>n)}' && S+=("30${_TAB}topz${_TAB}load ${v} exceeds ${n} cores — see what is hogging the box")
+    fi
+    # memory pressure → memoryz/topz
+    if [[ -r /proc/pressure/memory ]]; then
+        v=$(grep -oE 'some avg10=[0-9.]+' /proc/pressure/memory | cut -d= -f2)
+        awk -v x="${v:-0}" 'BEGIN{exit !(x>10)}' && S+=("28${_TAB}memoryz${_TAB}memory pressure avg10=${v}% — find the eaters")
+    fi
+    # disk space → diskz
+    v=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+    [[ "${v:-0}" -ge 85 ]] 2>/dev/null && S+=("26${_TAB}diskz${_TAB}root filesystem at ${v}% full")
+    # journal errors in last 10 min → logz
+    if command -v journalctl >/dev/null 2>&1; then
+        v=$(timeout 2 journalctl -q -p err --since "-10 min" --no-pager 2>/dev/null | wc -l)
+        (( ${v:-0} > 0 )) 2>/dev/null && S+=("22${_TAB}logz${_TAB}${v} error-level journal entries in the last 10 minutes")
+    fi
+    # failed units → bootz
+    v=$(timeout 2 systemctl --failed --no-legend --plain 2>/dev/null | wc -l)
+    (( ${v:-0} > 0 )) 2>/dev/null && S+=("24${_TAB}bootz${_TAB}${v} failed systemd unit(s) right now")
+    # kernel: missing meta / update available → kernelz
+    if command -v apt-cache >/dev/null 2>&1; then
+        local cur cand pkg
+        pkg=$(dpkg-query -W -f='\${Package}' "linux-image-$(uname -r)" 2>/dev/null)
+        cur=$(dpkg-query -W -f='\${Version}' "$pkg" 2>/dev/null || uname -r)
+        cand=$(apt-cache policy linux-image-amd64 2>/dev/null | awk '/Candidate:/{print $2}')
+        if [[ "$cand" =~ ^[0-9] ]] && dpkg --compare-versions "$cand" gt "$cur" 2>/dev/null; then
+            S+=("25${_TAB}kernelz${_TAB}newer kernel in repos: ${cand} (running ${cur}) — kernelz for a safe GRUB-fallback upgrade")
+        elif ! dpkg -l linux-image-amd64 2>/dev/null | grep -q '^ii'; then
+            [[ "$cand" =~ ^[0-9] ]] && S+=("15${_TAB}kernelz${_TAB}kernel meta-package missing — plain 'apt upgrade' won't track kernels")
+        fi
+    fi
+    # wildcard listeners → portz
+    if command -v ss >/dev/null 2>&1; then
+        v=$(ss -tln 2>/dev/null | awk '$4 ~ /0\.0\.0\.0:|\[::\]:/ && $4 !~ /:22$/ {c++} END{print c+0}')
+        (( ${v:-0} > 0 )) && S+=("27${_TAB}portz${_TAB}${v} service(s) listening on all interfaces (not just SSH)")
+    fi
+    # ssh brute force in journal → sshauditz
+    if command -v journalctl >/dev/null 2>&1; then
+        v=$(timeout 2 journalctl -q --since "-30 min" --no-pager 2>/dev/null | grep -c "Failed password\|invalid user" || true)
+        (( ${v:-0} > 5 )) 2>/dev/null && S+=("29${_TAB}sshauditz${_TAB}${v} failed/invalid SSH login attempts in the last 30 minutes")
+    fi
+    # battery health → powerz
+    for b in /sys/class/power_supply/BAT*/uevent; do
+        [[ -r "$b" ]] || continue
+        local full full_d
+        full=$(awk -F= '/POWER_SUPPLY_CHARGE_FULL=|POWER_SUPPLY_ENERGY_FULL=/{print $2; exit}' "$b")
+        full_d=$(awk -F= '/CHARGE_FULL_DESIGN=|ENERGY_FULL_DESIGN=/{print $2; exit}' "$b")
+        [[ -n "$full" && -n "$full_d" && "$full_d" != "0" ]] || continue
+        local wear=$(( full * 100 / full_d ))
+        (( wear < 80 )) && S+=("20${_TAB}powerz${_TAB}battery wear ${wear}% of design capacity")
+        break
+    done
+    # no firewall active → firewallz
+    if command -v ufw >/dev/null 2>&1; then
+        if ! timeout 2 ufw status 2>/dev/null | grep -q "Status: active"; then
+            _ec=$(awk -F= '/^ENABLED/{print $2}' /etc/ufw/ufw.conf 2>/dev/null)
+            _sv=$(systemctl is-active ufw 2>/dev/null)
+            [[ "$_ec" == "yes" && "$_sv" == "active" ]] || S+=("18${_TAB}firewallz${_TAB}ufw looks inactive (conf=${_ec:-?}, service=${_sv:-?})")
+        fi
+    fi
+
+    [[ ${#S[@]} -eq 0 ]] && { printf "  ${_G}✓ all probes quiet — nothing urgent; browse the tool list above${_R}\n\n"; return 0; }
+    # rank by weight, show top 5
+    printf '%s\n' "${S[@]}" | sort -t"$_TAB" -k1 -rn | head -5 | while IFS="$_TAB" read -r w tool why; do
+        printf "  ${_M}→${_R} ${_B}${_C}%-12s${_R} ${_D}%s${_R}\n" "$tool" "$why"
+    done
+    printf "  ${_D}(based on a 1-second read-only scan — HELPZ_NO_SUGGEST=1 to skip)${_R}\n\n"
+}
+
+# ---------- recent usage (from shared log) ----------
+recent_tools() {
+    # Read the log, find the most recent invocation of each distinct tool,
+    # sorted newest-first. Caps at 6.
+    [[ -r "$HELPZ_HIST" ]] || return 0
+    # log lines: "<epoch>\t<tool> [args]"
+    # Walk bottom-up, keep first occurrence per tool name, stop at 6.
+    awk -F'\t' '
+        { ts[$1]=$0; split($2, parts, " "); tool=parts[1] }
+        !(tool in seen) { seen[tool]=1; order[++n]=tool }
+        END {
+            # Reverse order so newest is first
+            for (i=n; i>=1 && printed<6; i--) print order[i]
+        }
+    ' "$HELPZ_HIST" | head -n 6
+}
+
+# ---------- describe one *z script by parsing its header ----------
+describe() {
+    local f="$1" name desc usage
+    name=$(basename "$f")
+    # Title line — accept any of: em-dash (—), en-dash (–), hyphen (-), colon (:)
+    #   # websitez — Universal Website Audit & Diagnostics
+    #   # cpuz - CPU diagnostic
+    #   # cpu: CPU diagnostic
+    desc=$(grep -m1 -E "^#[[:space:]]*${name}[[:space:]]*([-–—:])[[:space:]]+" "$f" 2>/dev/null \
+           | sed -E "s/^#[[:space:]]*${name}[[:space:]]*([-–—:])[[:space:]]+//; s/[[:space:]]+\$//")
+    # Fallback description from filename
+    [[ -z "$desc" ]] && desc=$(echo "$name" | sed 's/z$//')
+    # Usage examples: lines starting with "  #   ./<name> "
+    usage=$(grep -E "^#[[:space:]]+\./${name}[[:space:]]" "$f" 2>/dev/null \
+            | sed -E "s/^#[[:space:]]+//" \
+            | head -3 \
+            | paste -sd'|' -)
+    printf "  %-14s %s\n" "$name" "${desc:-(no description)}"
+    if [[ -n "$usage" ]]; then
+        IFS='|' read -r -a parts <<< "$usage"
+        for u in "${parts[@]}"; do
+            printf "    %s\n" "$u"
+        done
+    fi
+    echo
+}
+
+# ---------- detailed view for one script ----------
+detail() {
+    local name="$1" file="${SCRIPT_DIR}/${1}"
+    if [[ ! -x "$file" ]]; then
+        printf "helpz: %s not found in %s\n" "$name" "$SCRIPT_DIR" >&2
+        return 1
+    fi
+    printf "━━━ %s ━━━\n\n" "$name"
+    # Preferred: pull the "# =====" banner documentation block (between the
+    # opening and closing separator lines). Falls back to the leading comment
+    # block for scripts that don't use the banner style.
+    local out
+    out=$(awk -v name="$name" '
+        BEGIN{ state=0 }
+        state==0 && /^#[[:space:]]*={5,}[[:space:]]*$/ { state=1; next }
+        state==1 && /^#[[:space:]]*={5,}[[:space:]]*$/ { exit }
+        state==1 && $0 !~ /^#/ { exit }
+        state==1 {
+            line=$0; sub(/^#[[:space:]]?/, "", line)
+            if (line ~ ("^"name" [-–—:] ")) sub(("^"name" [-–—:] "), "", line)
+            print line
+        }
+    ' "$file")
+    if [[ -z "$out" ]]; then
+        out=$(awk -v name="$name" '
+            NR==1 { next }
+            /^[^#[:space:]]/ { exit }
+            /^#/ {
+                line = $0
+                sub(/^# ?/, "", line)
+                if (line ~ ("^"name" [-–—:] ")) sub(("^"name" [-–—:] "), "", line)
+                print line
+            }
+        ' "$file")
+    fi
+    printf '%s\n' "$out" | head -40
+}
+
+# ---------- JSON output ----------
+emit_json() {
+    printf '['
+    local first=1
+    while IFS= read -r f; do
+        local name desc
+        name=$(basename "$f")
+        # Match any of: em-dash, en-dash, hyphen, colon — same regex as describe()
+        desc=$(grep -m1 -E "^#[[:space:]]*${name}[[:space:]]*([-–—:])[[:space:]]+" "$f" 2>/dev/null \
+               | sed -E "s/^#[[:space:]]*${name}[[:space:]]*([-–—:])[[:space:]]+//; s/[\"\\\\]/\\\\&/g")
+        [[ -z "$desc" ]] && desc=""
+        [[ $first -eq 0 ]] && printf ','
+        first=0
+        printf '{"name":"%s","path":"%s","description":"%s"}' \
+               "$name" "$f" "$desc"
+    done < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -executable -name '*z' \
+             ! -name 'helpz' | sort)
+    printf ']\n'
+}
+
+
+# ---------- usage analytics: what do you actually run? ----------
+usage_report() {
+    local uR uD uY uG uM uC uNC
+    if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+        uNC=$'\033[0m' uB=$'\033[1m' uD=$'\033[2m' uR=$'\033[31m' uG=$'\033[32m'
+        uY=$'\033[33m' uC=$'\033[36m' uM=$'\033[35m'
+    else
+        uNC="" uB="" uD="" uR="" uG="" uY="" uC="" uM=""
+    fi
+    if [[ ! -r "$HELPZ_HIST" ]]; then
+        echo "no usage history yet — every tool logs itself automatically; use the suite a while, then re-run: helpz --usage"
+        return 0
+    fi
+    local total now tmp
+    total=$(wc -l < "$HELPZ_HIST")
+    now=$(date +%s)
+    tmp=$(mktemp)
+    awk -F'\t' '
+        {
+            ts=$1+0; split($2,a," "); t=a[1]
+            if (t=="" || t=="helpz") next
+            if (t ~ /\.(bak|patched|orig)$/ || t ~ /_test$/) next
+            c[t]++
+            if (ts > L[t]) L[t]=ts
+            seen[t "#" int(ts/86400)]=1
+        }
+        END {
+            for (x in seen) { split(x,p,"#"); d[p[1]]++ }
+            for (k in c) printf "%s\t%d\t%d\t%d\n", k, c[k], L[k], d[k]+0
+        }' "$HELPZ_HIST" | sort -t"$(printf '\t')" -k2,2nr > "$tmp"
+
+    echo
+    printf "%s\n" "╔══════════════════════════════════════════════════════════════╗"
+    printf "║  %sUSAGE ANALYTICS%s — %d logged invocations               ║\n" "$uD" "$uC" "$total"
+    printf "╚══════════════════════════════════════════════════════════════╝\n\n"
+
+    # live tools on disk
+    mapfile -t DISK_TOOLS < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -executable -name '*z' ! -name 'helpz' -printf '%f\n' | sort)
+
+    local maxruns
+    maxruns=$(awk -F'\t' 'BEGIN{m=0} $2>m{m=$2} END{print (m<1?1:m)}' "$tmp")
+
+    printf "  %s%-16s %6s %5s %12s  %-8s %s%s\n" "$uD" "tool" "runs" "days" "last used" "status" "share" "$uC" "$uD"
+    printf "  %s%s%s\n" "$uD" "────────────────────────────────────────────────────────────────────────" "$uD"
+
+    local tool runs lastt days ago rel bar len st col i
+    declare -A IN_HIST=()
+    while IFS="$(printf '\t')" read -r tool runs lastt days; do
+        IN_HIST[$tool]=1
+        ago=$(( (now - lastt) / 86400 ))
+        if   (( runs >= 15 )); then st="VITAL";   col="$uG"
+        elif (( runs >= 5  )); then st="REGULAR"; col="$uC"
+        elif (( ago > 30 ));   then st="STALE";   col="$uY"
+        else                        st="RARE";    col="$uD"
+        fi
+        (( ago == 0 )) && rel="today" || rel="${ago}d ago"
+        len=$(( runs * 28 / maxruns )); (( len < 1 )) && len=1
+        bar=""; for ((i=0;i<len;i++)); do bar+="▰"; done
+        printf "  %s%-16s%s %6s %5s %12s  %b%-8s%s %s%s%s\n" \
+               "$uB" "$tool" "$uC" "$runs" "$days" "$rel" "$col" "$st" "$uC" "$uD" "$bar" "$uC"
+    done < "$tmp"
+
+    # never-used tools
+    local -a NEVER=()
+    for tool in "${DISK_TOOLS[@]}"; do
+        [[ -n "${IN_HIST[$tool]:-}" ]] || NEVER+=("$tool")
+    done
+    echo
+    if (( ${#NEVER[@]} > 0 )); then
+        printf "  %sNEVER USED (%d):%s %s\n" "$uY" "${#NEVER[@]}" "$uNC" "${NEVER[*]}"
+        printf "  %shint:%s these still work — promote them in allz tiers / helpz docs, or consider archiving\n" "$uD" "$uNC"
+    else
+        printf "  %s✓ every tool on disk has been used at least once%s\n" "$uG" "$uNC"
+    fi
+    local vital_n stale_n
+    vital_n=$(awk -F'\t' '$2>=15' "$tmp" | wc -l)
+    stale_n=$(awk -F'\t' -v now="$now" '($2>0) && ((now-$3)/86400)>30' "$tmp" | wc -l)
+    printf "\n  %svital:%s %d   %sstale(>30d):%s %d   %son-disk:%s %d   %sin history:%s %d\n" \
+        "$uG" "$uC" "$vital_n" "$uY" "$uC" "$stale_n" "$uC" "$uC" "${#DISK_TOOLS[@]}" "$uD" "$uC" "$(wc -l < "$tmp")"
+    echo
+    rm -f "$tmp"
+}
+
+# ---------- guard: global git secret/personal-file hooks ----------
+# Installs ~/.git-hooks/{pre-commit,pre-push} and points git at them GLOBALLY,
+# so ANY repo in ANY directory is checked before commit/push — even forks of
+# this suite. Patterns come from lib/guard.sh (single source of truth).
+guard_install() {
+    source "$SCRIPT_DIR/lib/guard.sh" || { echo "helpz guard: missing lib/guard.sh" >&2; return 1; }
+    local hd="$HOME/.git-hooks"
+    mkdir -p "$hd"
+    printf '%s\n' "$GUARD_SECRET_RE"  > "$hd/guard-patterns"
+    printf '%s\n' "$GUARD_BLOCK_TOKENS" > "$hd/guard-paths"
+    printf '%s\n' "$GUARD_SAFE_SUFFIX_RE" > "$hd/guard-safe-suffix"
+    cat > "$hd/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+# secret-guard pre-commit — installed by: helpz guard
+[[ "${SECRET_GUARD_OK:-0}" == 1 ]] && { echo "guard: bypassed (SECRET_GUARD_OK=1)"; exit 0; }
+hd="$HOME/.git-hooks"
+RE=$(cat "$hd/guard-patterns"); TOKS=$(cat "$hd/guard-paths")
+SAFE=$(cat "$hd/guard-safe-suffix" 2>/dev/null || true)
+files=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+[[ -z "$files" ]] && exit 0
+rc=0
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  # template files (.example/.sample/.template) never carry live secrets
+  [[ -n "$SAFE" && "$(basename "$f")" =~ $SAFE ]] && continue
+  for t in $TOKS; do [[ "$f" == *"$t"* ]] && { echo "guard: BLOCKED personal path: $f" >&2; rc=1; break; }; done
+done <<< "$files"
+allow=""
+[[ -r "$(git rev-parse --show-toplevel 2>/dev/null)/.secret-guard-ignore" ]] && allow=$(cat "$(git rev-parse --show-toplevel)/.secret-guard-ignore")
+hits=$(git diff --cached -U0 --diff-filter=ACM 2>/dev/null | grep -inE -e "$RE" | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]' | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } | head -8)
+if [[ -n "$hits" ]]; then
+  echo "guard: BLOCKED credential-shaped strings in staged content:" >&2
+  printf '%s\n' "$hits" | sed 's/[A-Za-z0-9_-]\{16,\}/[REDACTED]/g; s/^/    /' >&2
+  rc=1
+fi
+(( rc )) && echo "guard: fix, or bypass ONCE → SECRET_GUARD_OK=1 git commit …" >&2
+exit $rc
+HOOK
+    cat > "$hd/pre-push" <<'HOOK'
+#!/usr/bin/env bash
+# secret-guard pre-push — installed by: helpz guard
+[[ "${SECRET_GUARD_OK:-0}" == 1 ]] && { echo "guard: bypassed (SECRET_GUARD_OK=1)"; exit 0; }
+hd="$HOME/.git-hooks"
+RE=$(cat "$hd/guard-patterns"); TOKS=$(cat "$hd/guard-paths")
+SAFE=$(cat "$hd/guard-safe-suffix" 2>/dev/null || true)
+allow=""
+[[ -r "$(git rev-parse --show-toplevel 2>/dev/null)/.secret-guard-ignore" ]] && allow=$(cat "$(git rev-parse --show-toplevel)/.secret-guard-ignore")
+rc=0
+while read -r refname local_sha remote_sha; do
+  [[ "$local_sha" =~ ^0+$ ]] && continue
+  # paths in pushed trees that match personal tokens
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ -n "$SAFE" && "$(basename "$f")" =~ $SAFE ]] && continue
+    for t in $TOKS; do [[ "$f" == *"$t"* ]] && { echo "guard: BLOCKED personal path in pushed tree: $f" >&2; rc=1; break; }; done
+  done < <(git ls-tree -r --name-only "$local_sha" 2>/dev/null)
+  # credential scan over pushed blobs only
+  hits=$(git grep -niE -e "$RE" "$local_sha" -- 2>/dev/null | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]' | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } | head -8)
+  [[ -n "$hits" ]] && { echo "guard: BLOCKED credential-shaped strings in pushed content:" >&2
+    printf '%s\n' "$hits" | sed 's/[A-Za-z0-9_-]\{16,\}/[REDACTED]/g; s/^/    /' >&2; rc=1; }
+done
+exit $rc
+HOOK
+    cat > "$hd/post-merge" <<'HOOK'
+#!/usr/bin/env bash
+# trustz reminder after pulls — falls through to repo-local hooks too
+[[ -x ./trustz ]] && ! ./trustz --check >/dev/null 2>&1 && {
+  echo ""; echo "  ⚠ code just changed (git merge/pull) — review before running: ./trustz"; echo ""; }
+exit 0
+HOOK
+    chmod +x "$hd"/pre-commit "$hd"/pre-push "$hd"/post-merge
+    git config --global core.hooksPath "$hd"
+    echo "✓ guard installed: $hd (+ global core.hooksPath)"
+    echo "  every repo you commit in — this machine, any fork — now self-checks."
+    echo "  uninstall: helpz guard --uninstall"
+}
+guard_status() {
+    local cur; cur=$(git config --global core.hooksPath 2>/dev/null || echo "(unset)")
+    echo "global core.hooksPath: ${cur:-unset}"
+    [[ "$cur" == "$HOME/.git-hooks" ]] && echo "guard: ACTIVE ($(ls "$cur" 2>/dev/null | tr '\n' ' '))" || echo "guard: NOT installed (or hooksPath elsewhere)"
+}
+guard_uninstall() {
+    rm -f "$HOME/.git-hooks/pre-commit" "$HOME/.git-hooks/pre-push" "$HOME/.git-hooks/post-merge" \
+          "$HOME/.git-hooks/guard-patterns" "$HOME/.git-hooks/guard-paths" "$HOME/.git-hooks/guard-safe-suffix" 2>/dev/null
+    local cur; cur=$(git config --global core.hooksPath 2>/dev/null)
+    [[ "$cur" == "$HOME/.git-hooks" ]] && git config --global --unset core.hooksPath
+    echo "guard hooks removed (per-repo trustz hooks still work: ./trustz --install-hook)"
+}
+
+# ---------- main ----------
+if [[ "${1:-}" == "guard" ]]; then
+    case "${2:-install}" in
+        --status) guard_status ;; --uninstall) guard_uninstall ;; *) guard_install ;;
+    esac
+    exit 0
+fi
+if [[ "${1:-}" == "--usage" ]]; then usage_report; exit 0; fi
+if [[ "${1:-}" == "--json" ]]; then
+    emit_json
+    exit 0
+fi
+
+if [[ -n "${1:-}" ]]; then
+    detail "$1"
+    exit $?
+fi
+
+# Default: list everything
+cat <<'BANNER'
+╔═══════════════════════════════════════════════════════════════╗
+║  HELPZ  —  Your security-audit command toolbox                ║
+║  All scripts live in the folder beside helpz and end in 'z'  ║
+║  so they never collide with system commands.                 ║
+╚═══════════════════════════════════════════════════════════════╝
+BANNER
+echo
+echo "Usage: <command> <target> [options]"
+echo "      helpz <command>   for detail on a specific script"
+echo "      helpz --json      machine-readable list"
+echo
+
+# Recent usage — only shows if there's history
+echo "── SUGGESTED NEXT (quick system scan) ──"
+_suggest_out=$(suggest_next 2>/dev/null) || _suggest_out=""
+_suggest_out=${_suggest_out//$'\t'/$(printf '\t')}
+IFS=$(printf '\t'); _TAB=$'\t'; unset IFS
+export _TAB
+printf '%s\n' "$_suggest_out"
+if [[ -n "$RECENT" ]]; then
+    printf "${C_BOLD}${C_YELLOW}  📌 You've used recently:${C_RESET}\n"
+    for r in $RECENT; do
+        # last-arg hint from log
+        LAST_INVOKE=$(awk -F'\t' -v t="$r" '$2 ~ "^"t"( |$)" {print $2}' "$HELPZ_HIST" | tail -1)
+        LAST_ARGS=$(echo "$LAST_INVOKE" | sed -E "s/^${r}//; s/^ //")
+        if [[ -n "$LAST_ARGS" && "$LAST_ARGS" != "--help" && "$LAST_ARGS" != "-h" ]]; then
+            printf "      ${C_CYAN}→${C_RESET} %s ${C_DIM}%s${C_RESET}\n" "$r" "$LAST_ARGS"
+        else
+            printf "      ${C_CYAN}→${C_RESET} %s\n" "$r"
+        fi
+    done
+    printf "      ${C_DIM}(re-run any of these with the same args)${C_RESET}\n"
+    echo
+fi
+
+mapfile -t SCRIPTS < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -executable -name '*z' \
+                       ! -name 'helpz' | sort)
+if [[ ${#SCRIPTS[@]} -eq 0 ]]; then
+    echo "(no *z scripts found in $SCRIPT_DIR)"
+    exit 1
+fi
+
+for f in "${SCRIPTS[@]}"; do
+    describe "$f"
+done
+
+# ---------- compact quick-reference at the end ----------
+echo
+printf "── Quick reference (${#SCRIPTS[@]} tools) ──\n"
+NAMES=()
+for f in "${SCRIPTS[@]}"; do
+    NAMES+=("$(basename "$f")")
+done
+# Print in 4 columns so the long names fit on one terminal width
+COLS=4
+COL_WIDTH=20
+i=0
+for n in "${NAMES[@]}"; do
+    printf "  %-${COL_WIDTH}s" "$n"
+    i=$((i + 1))
+    if (( i % COLS == 0 )); then echo; fi
+done
+(( i % COLS != 0 )) && echo
+echo
+echo "━━━ HELPZ COMPLETE ━━━"

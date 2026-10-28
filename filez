@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# filez — Directory Surveyor, Security Auditor & Size Diagram
+#
+# Walks a directory tree, classifies every file by type, ranks by size, and
+# flags security-relevant patterns (world-writable, setuid, symlink escapes,
+# backup files left behind, exposed secrets, etc.). Produces bar-chart
+# diagrams of where the bytes actually live.
+#
+# Usage:
+#   ./filez                          # scan cwd (depth 5)
+#   ./filez /var/log                 # scan a path
+#   ./filez /etc --depth 3           # shallow scan
+#   ./filez . --top 20               # top-N largest
+#   ./filez . --max-files 5000       # cap total files
+#   ./filez . --recent 7             # files modified in last 7 days
+#   ./filez . --no-color             # plain output
+#   ./filez . --json                 # machine-readable summary
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+C_RESET="${C_RESET:-}"; C_BOLD="${C_BOLD:-}"; C_DIM="${C_DIM:-}"
+C_RED="${C_RED:-}"; C_GREEN="${C_GREEN:-}"; C_YELLOW="${C_YELLOW:-}"
+C_CYAN="${C_CYAN:-}"
+
+# ---------- Args ----------
+SCAN_PATH="."
+DEPTH=5
+TOP_N=10
+MAX_FILES=50000
+RECENT_DAYS=7
+JSON_OUT=0
+OUTDIR="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")-reports"
+NO_COLOR=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --depth)     DEPTH="$2"; shift 2 ;;
+        --top)       TOP_N="$2"; shift 2 ;;
+        --max-files) MAX_FILES="$2"; shift 2 ;;
+        --recent)    RECENT_DAYS="$2"; shift 2 ;;
+        --outdir)    OUTDIR="$2"; shift 2 ;;
+        --json)      JSON_OUT=1; shift ;;
+        --no-color)  NO_COLOR=1; shift ;;
+        --ai)        AI_VERDICT=1; shift ;;
+        --no-ai)     AI_VERDICT=0; shift ;;
+        -h|--help)   sed -n '2,30p' "$0"; exit 0 ;;
+        --) shift; break ;;
+        -*) printf "Unknown flag: %s\n" "$1" >&2; exit 2 ;;
+        *) SCAN_PATH="$1"; shift ;;
+    esac
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+if [[ $NO_COLOR -eq 1 ]]; then
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+fi
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "filez"
+fi
+
+# Resolve absolute path
+SCAN_PATH=$(cd "$SCAN_PATH" 2>/dev/null && pwd || echo "$SCAN_PATH")
+if [[ ! -d "$SCAN_PATH" ]]; then
+    printf "filez: %s is not a directory\n" "$SCAN_PATH" >&2
+    exit 2
+fi
+SCAN_ROOT_NAME=$(basename "$SCAN_PATH")
+[[ "$SCAN_ROOT_NAME" == "/" ]] && SCAN_ROOT_NAME="/"
+
+# ---------- Output setup ----------
+mkdir -p "$OUTDIR" 2>/dev/null || true
+TS=$(date '+%Y%m%d-%H%M%S')
+SAFE=$(echo "$SCAN_PATH" | tr '/ ' '__')
+REPORT="$OUTDIR/${SAFE}-${TS}.txt"
+if [[ $JSON_OUT -eq 0 ]]; then
+    exec > >(tee "$REPORT") 2>&1
+fi
+
+# ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Human-readable bytes
+hr() {
+    awk -v b="$1" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2fTB", b/1099511627776
+        else if (b >= 1073741824) printf "%.2fGB", b/1073741824
+        else if (b >= 1048576)    printf "%.2fMB", b/1048576
+        else if (b >= 1024)       printf "%.1fKB", b/1024
+        else                       printf "%dB",   b
+    }'
+}
+
+# Bar chart: prints `n` block characters proportional to v/max_v * max_b
+bar() {
+    awk -v v="$1" -v max_v="$2" -v max_b="${3:-40}" 'BEGIN {
+        if (max_v <= 0 || v <= 0) { exit }
+        n = int(v * max_b / max_v + 0.5)
+        if (n < 1) n = 1
+        if (n > max_b) n = max_b
+        for (i=0; i<n; i++) printf "█"
+    }'
+}
+
+# Width of terminal (fallback 100)
+TERM_W=100
+if have tput; then TERM_W=$(tput cols 2>/dev/null || echo 100); fi
+
+# ---------- Banner ----------
+printf "${C_BOLD}${C_CYAN}"
+cat <<BANNER
+╔═══════════════════════════════════════════════════════════════╗
+║  FILEZ  —  Directory Surveyor & Security Auditor            ║
+║  Inventory · Size diagram · Security findings                ║
+╚═══════════════════════════════════════════════════════════════╝
+BANNER
+printf "${C_RESET}\n"
+printf "${C_DIM}Path: %s   Depth: %s   Time: %s   Report: %s${C_RESET}\n" \
+    "$SCAN_PATH" "$DEPTH" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$REPORT"
+echo
+
+# ---------- Phase 1: walk the tree ----------
+TMPDIR_RUN=$(mktemp -d 2>/dev/null || mktemp -d -t 'filez')
+trap 'rm -rf "$TMPDIR_RUN"' EXIT
+INVENTORY="$TMPDIR_RUN/inventory.tsv"   # path<TAB>size<TAB>mode<TAB>uid:gid<TAB>type<TAB>mtime
+: > "$INVENTORY"
+
+START_T=$(date +%s)
+FIND_ARGS=( "$SCAN_PATH" )
+[[ $DEPTH -gt 0 ]] && FIND_ARGS+=( -maxdepth "$DEPTH" )
+# %s size, %m mode (octal), %u uid, %g gid, %T@ mtime epoch, %p path, %y type
+find "${FIND_ARGS[@]}" \( -type f -o -type l -o -type d \) -printf \
+    '%s\t%m\t%u:%g\t%T@\t%y\t%p\n' 2>/dev/null \
+  | head -n "$MAX_FILES" > "$INVENTORY"
+END_T=$(date +%s)
+SCAN_SECS=$((END_T - START_T))
+
+# Single awk pass: counts files/dirs/symlinks and sums file bytes
+read -r TOTAL_FILES TOTAL_DIRS TOTAL_LINKS TOTAL_BYTES < <(
+    awk -F'\t' '
+        BEGIN { f=0; d=0; l=0; b=0 }
+        $5=="f" { f++; b+=$1 }
+        $5=="d" { d++ }
+        $5=="l" { l++ }
+        END { printf "%d %d %d %d\n", f, d, l, b+0 }
+    ' "$INVENTORY"
+)
+TRUNCATED=$([[ $(wc -l < "$INVENTORY") -ge $MAX_FILES ]] && echo 1 || echo 0)
+
+# ---------- 1. Summary ----------
+printf "${C_BOLD}  ── 1. SUMMARY ──${C_RESET}\n"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Scan path:"        "$SCAN_PATH"
+printf "    ${C_DIM}%-22s${C_RESET} %s (depth %s)\n" "Scan depth:"     "$SCAN_ROOT_NAME" "$DEPTH"
+printf "    ${C_DIM}%-22s${C_RESET} %s files   %s dirs   %s symlinks\n" \
+    "Counts:" "$TOTAL_FILES" "$TOTAL_DIRS" "$TOTAL_LINKS"
+printf "    ${C_DIM}%-22s${C_RESET} %s  (%s bytes)\n" "Total size:" "$(hr "$TOTAL_BYTES")" \
+    "$(printf "%'d" "$TOTAL_BYTES" 2>/dev/null || echo "$TOTAL_BYTES")"
+printf "    ${C_DIM}%-22s${C_RESET} %ss\n" "Scan duration:" "$SCAN_SECS"
+[[ $TRUNCATED -eq 1 ]] && printf "    ${C_YELLOW}!${C_RESET} truncated at --max-files=%d\n" "$MAX_FILES"
+echo
+
+# ---------- 2. Top files by size ----------
+printf "${C_BOLD}  ── 2. TOP %d LARGEST FILES ──${C_RESET}\n" "$TOP_N"
+TOP_FILES="$TMPDIR_RUN/top_files.tsv"
+awk -F'\t' '$5=="f"' "$INVENTORY" | sort -t$'\t' -k1,1 -nr | head -n "$TOP_N" > "$TOP_FILES"
+if [[ -s "$TOP_FILES" ]]; then
+    IFS=$'\t' read -r MAX_TOP _ < <(head -1 "$TOP_FILES")
+    while IFS=$'\t' read -r sz mode own mtime type path; do
+        REL="${path#$SCAN_PATH/}"
+        [[ "$path" == "$SCAN_PATH" ]] && REL="."
+        # Pad path to fill remaining width
+        W_PATH=$(( TERM_W - 30 ))
+        (( W_PATH < 30 )) && W_PATH=30
+        printf "    ${C_DIM}%-10s${C_RESET} %-${W_PATH}s  %s\n" \
+               "$(hr "$sz")" "${REL:0:$W_PATH}" "$(bar "$sz" "$MAX_TOP" 25)"
+    done < "$TOP_FILES"
+else
+    printf "    ${C_DIM}(no files)${C_RESET}\n"
+fi
+echo
+
+# ---------- 3. Extension breakdown ----------
+printf "${C_BOLD}  ── 3. FILE TYPE BREAKDOWN ──${C_RESET}\n"
+BY_EXT="$TMPDIR_RUN/by_ext.tsv"
+awk -F'\t' '$5=="f" {
+    n = split($6, parts, "/")
+    base = parts[n]
+    if (base ~ /\./) {
+        ext = base; sub(/^.*\./, "", ext)
+        ext = "." ext
+    } else { ext = "(none)" }
+    count[ext]++; bytes[ext] += $1
+} END {
+    for (e in count) printf "%d\t%d\t%s\n", bytes[e], count[e], e
+}' "$INVENTORY" | sort -t$'\t' -k1,1 -nr > "$BY_EXT"
+
+if [[ -s "$BY_EXT" ]]; then
+    IFS=$'\t' read -r MAX_EXT _ < <(head -1 "$BY_EXT")
+    TOTAL_EXT_BYTES=$(awk -F'\t' '{s+=$1} END{print s+0}' "$BY_EXT")
+    head -n 15 "$BY_EXT" | while IFS=$'\t' read -r bytes count ext; do
+        PCT=$(awk -v a="$bytes" -v b="$TOTAL_EXT_BYTES" 'BEGIN { if (b>0) printf "%.1f", a*100/b; else print "0.0" }')
+        printf "    ${C_CYAN}%-12s${C_RESET} %5d files  %10s  %5s%%  %s\n" \
+               "$ext" "$count" "$(hr "$bytes")" "$PCT" \
+               "$(bar "$bytes" "$MAX_EXT" 30)"
+    done
+    # Note if there are more
+    MORE=$(($(wc -l < "$BY_EXT") - 15))
+    (( MORE > 0 )) && printf "    ${C_DIM}... and %d more extensions${C_RESET}\n" "$MORE"
+fi
+echo
+
+# ---------- 4. Top-level directory breakdown ----------
+printf "${C_BOLD}  ── 4. TOP-LEVEL DIRECTORY BREAKDOWN ──${C_RESET}\n"
+BY_TOPDIR="$TMPDIR_RUN/by_topdir.tsv"
+awk -F'\t' -v root="$SCAN_PATH" '
+    $5=="f" {
+        path = $6
+        sub("^"root"/?", "", path)   # strip the suite root prefix
+        n = split(path, p, "/")
+        if (n <= 1 || path == "") top = "(root)"
+        else                       top = p[1]
+        bytes[top] += $1; count[top]++
+    } END {
+        for (t in count) printf "%d\t%d\t%s\n", bytes[t], count[t], t
+    }
+' "$INVENTORY" | sort -t$'\t' -k1,1 -nr | head -n 15 > "$BY_TOPDIR"
+
+if [[ -s "$BY_TOPDIR" ]]; then
+    IFS=$'\t' read -r MAX_TD _ < <(head -1 "$BY_TOPDIR")
+    while IFS=$'\t' read -r bytes count top; do
+        printf "    ${C_CYAN}%-30s${C_RESET} %5d files  %10s  %s\n" \
+               "$top" "$count" "$(hr "$bytes")" "$(bar "$bytes" "$MAX_TD" 30)"
+    done < "$BY_TOPDIR"
+fi
+echo
+
+# ---------- 5. Recently modified ----------
+printf "${C_BOLD}  ── 5. RECENTLY MODIFIED (last %d days) ──${C_RESET}\n" "$RECENT_DAYS"
+CUTOFF=$(date -d "$RECENT_DAYS days ago" +%s 2>/dev/null || \
+         awk -v d="$RECENT_DAYS" 'BEGIN { print systime() - d*86400 }')
+RECENT="$TMPDIR_RUN/recent.tsv"
+awk -F'\t' -v cutoff="$CUTOFF" '$5=="f" && $4 >= cutoff { print $1"\t"$6 }' \
+    "$INVENTORY" | sort -t$'\t' -k1,1 -nr | head -n 15 > "$RECENT"
+if [[ -s "$RECENT" ]]; then
+    while IFS=$'\t' read -r sz path; do
+        REL="${path#$SCAN_PATH/}"
+        [[ "$path" == "$SCAN_PATH" ]] && REL="."
+        printf "    ${C_GREEN}%-10s${C_RESET}  %s\n" "$(hr "$sz")" "${REL:0:$((TERM_W-20))}"
+    done < "$RECENT"
+    COUNT_RECENT=$(wc -l < "$RECENT")
+    [[ $COUNT_RECENT -ge 15 ]] && printf "    ${C_DIM}... showing top 15 of %d+ recent files${C_RESET}\n" "$COUNT_RECENT"
+else
+    printf "    ${C_DIM}(no files modified in the last %d days)${C_RESET}\n" "$RECENT_DAYS"
+fi
+echo
+
+# ---------- 6. Executables ----------
+printf "${C_BOLD}  ── 6. EXECUTABLES ──${C_RESET}\n"
+EXEC_COUNT=$(awk -F'\t' '$5=="f" && $2 ~ /^7/ {n++} END {print n+0}' "$INVENTORY")
+printf "    %s files with +x bit set\n" "$EXEC_COUNT"
+if [[ $EXEC_COUNT -gt 0 && $EXEC_COUNT -le 30 ]]; then
+    awk -F'\t' '$5=="f" && $2 ~ /^7/ { print $1"\t"$6 }' "$INVENTORY" \
+        | sort -t$'\t' -k1,1 -nr | head -n 15 | while IFS=$'\t' read -r sz path; do
+            REL="${path#$SCAN_PATH/}"
+            [[ "$path" == "$SCAN_PATH" ]] && REL="."
+            printf "      ${C_CYAN}%-10s${C_RESET}  %s\n" "$(hr "$sz")" "${REL:0:$((TERM_W-22))}"
+        done
+fi
+echo
+
+# ---------- 7. Security findings ----------
+printf "${C_BOLD}  ── 7. SECURITY FINDINGS ──${C_RESET}\n"
+SCORE=100
+declare -a FINDINGS=()
+
+# 7a. World-writable files
+WW=$(awk -F'\t' '$5=="f" && $2 ~ /..7/ { print $6 }' "$INVENTORY")
+WW_COUNT=0
+[[ -n "$WW" ]] && WW_COUNT=$(printf '%s\n' "$WW" | wc -l)
+if [[ $WW_COUNT -gt 0 ]]; then
+    printf "    ${C_RED}✗${C_RESET} ${C_RED}World-writable files: %d${C_RESET}\n" "$WW_COUNT"
+    echo "$WW" | sed "s|^${SCAN_PATH}/||" | head -n 5 | sed 's/^/        /'
+    [[ $WW_COUNT -gt 5 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((WW_COUNT - 5))
+    FINDINGS+=("$WW_COUNT world-writable file(s)")
+    SCORE=$((SCORE - WW_COUNT * 2))
+fi
+
+# 7b. World-writable directories
+WWD=$(awk -F'\t' '$5=="d" && $2 ~ /..7/ { print $6 }' "$INVENTORY")
+WWD_COUNT=0
+[[ -n "$WWD" ]] && WWD_COUNT=$(printf '%s\n' "$WWD" | wc -l)
+if [[ $WWD_COUNT -gt 0 ]]; then
+    printf "    ${C_YELLOW}!${C_RESET} World-writable dirs:  %d\n" "$WWD_COUNT"
+    echo "$WWD" | sed "s|^${SCAN_PATH}/||" | head -n 5 | sed 's/^/        /'
+    [[ $WWD_COUNT -gt 5 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((WWD_COUNT - 5))
+    FINDINGS+=("$WWD_COUNT world-writable dir(s)")
+fi
+
+# 7c. setuid / setgid binaries
+SUID=$(awk -F'\t' '$5=="f" && $2 ~ /^4[0-7]{3}$/ { print $6 }' "$INVENTORY")
+SGID=$(awk -F'\t' '$5=="f" && $2 ~ /^2[0-7]{3}$/ { print $6 }' "$INVENTORY")
+SUID_C=0
+[[ -n "$SUID" ]] && SUID_C=$(printf '%s\n' "$SUID" | wc -l)
+SGID_C=0
+[[ -n "$SGID" ]] && SGID_C=$(printf '%s\n' "$SGID" | wc -l)
+if [[ $SUID_C -gt 0 ]]; then
+    printf "    ${C_RED}✗${C_RESET} ${C_RED}setuid binaries:     %d${C_RESET}\n" "$SUID_C"
+    echo "$SUID" | sed "s|^${SCAN_PATH}/||" | head -n 5 | sed 's/^/        /'
+    [[ $SUID_C -gt 5 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((SUID_C - 5))
+    FINDINGS+=("$SUID_C setuid binary/ies")
+    SCORE=$((SCORE - SUID_C * 3))
+fi
+if [[ $SGID_C -gt 0 ]]; then
+    printf "    ${C_YELLOW}!${C_RESET} setgid binaries:     %d\n" "$SGID_C"
+    echo "$SGID" | head -n 5 | sed 's/^/        /'
+    [[ $SGID_C -gt 5 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((SGID_C - 5))
+    FINDINGS+=("$SGID_C setgid binary/ies")
+fi
+
+# 7d. Symlinks pointing outside the scan root
+# Depth #8: use readlink -f (resolves all symlinks fully) instead of -m (which
+# fabricates paths for non-existent components — gave false negatives).
+# Also parallelize the per-link readlink calls.
+ESC_DIR=$(mktemp -d -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp -d)
+trap "rm -rf '$ESC_DIR' 2>/dev/null" RETURN
+ESC_LINKS_FILE="$ESC_DIR/links.txt"
+ESC_TMPDIR="$ESC_DIR/per"
+mkdir -p "$ESC_TMPDIR"
+declare -a _ESC_PIDS=()
+_el=0
+awk -F'\t' '$5=="l" {print $6}' "$INVENTORY" > "$ESC_DIR/all_links.txt"
+while IFS= read -r link; do
+    [[ -z "$link" ]] && continue
+    (
+        target=$(readlink -- "$link" 2>/dev/null || true)
+        # -f follows entire chain; -e would error on broken, but we still want
+        # to know if any component exists, so use -f and check after.
+        resolved=$(readlink -f -- "$link" 2>/dev/null || true)
+        printf '%s\t%s\t%s\n' "$link" "$target" "$resolved" > "$ESC_TMPDIR/$_el"
+    ) &
+    _ESC_PIDS+=($!)
+    _el=$((_el + 1))
+done < "$ESC_DIR/all_links.txt"
+for pid in "${_ESC_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+# Detect escapes from cached results
+ESC_LINKS=""
+while IFS=$'\t' read -r link target resolved; do
+    [[ -z "$link" ]] && continue
+    [[ -z "$resolved" ]] && continue
+    if [[ "$resolved" != "$SCAN_PATH" && "$resolved" != "${SCAN_PATH}/"* ]]; then
+        printf '%s → %s\n' "$link" "$target"
+    fi
+done < <(cat "$ESC_TMPDIR"/* 2>/dev/null) > "$ESC_LINKS_FILE"
+ESC_LINKS=$(cat "$ESC_LINKS_FILE")
+ESC_COUNT=0
+[[ -n "$ESC_LINKS" ]] && ESC_COUNT=$(printf '%s\n' "$ESC_LINKS" | wc -l)
+if [[ $ESC_COUNT -gt 0 ]]; then
+    printf "    ${C_YELLOW}!${C_RESET} Symlinks escaping root: %d\n" "$ESC_COUNT"
+    echo "$ESC_LINKS" | head -n 5 | sed 's/^/        /'
+    [[ $ESC_COUNT -gt 5 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((ESC_COUNT - 5))
+    FINDINGS+=("$ESC_COUNT symlink(s) point outside scan root")
+fi
+
+# 7e. Sensitive-looking files
+SENS_PATTERNS='([.]env$|[.]env[.]|id_rsa|id_ed25519|id_dsa|[.]pem$|[.]key$|[.]pfx$|[.]p12$|[.]htpasswd$|[.]pgpass$|shadow$|shadow-|passwd$|credentials|secrets[.]ya?ml$|[.]netrc$|[.]pgpass|^[.]/[.].*token)'
+SENS=$(awk -F'\t' -v root="$SCAN_PATH" -v pat="$SENS_PATTERNS" '
+    $5=="f" {
+        rel = $6; sub("^"root"/", "", rel)
+        if (rel ~ pat) print rel
+    }' "$INVENTORY")
+SENS_C=0
+[[ -n "$SENS" ]] && SENS_C=$(printf '%s\n' "$SENS" | wc -l)
+if [[ $SENS_C -gt 0 ]]; then
+    printf "    ${C_RED}✗${C_RESET} ${C_RED}Sensitive-looking files: %d${C_RESET}\n" "$SENS_C"
+    echo "$SENS" | head -n 8 | sed 's/^/        /'
+    [[ $SENS_C -gt 8 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((SENS_C - 8))
+    FINDINGS+=("$SENS_C sensitive-looking file(s)")
+    SCORE=$((SCORE - SENS_C * 5))
+fi
+
+# 7f. Backup / leftover files
+BKP_PATTERNS='([.]bak$|[.]orig$|[.]swp$|[.]swo$|~$|[.]tmp$|[.]backup$|[.]old$|[.]rej$|^[.][#]|^[.][#].*[#]$)'
+BKP=$(awk -F'\t' -v root="$SCAN_PATH" -v pat="$BKP_PATTERNS" '
+    $5=="f" {
+        n = split($6, p, "/")
+        base = p[n]
+        if (base ~ pat) print $6
+    }' "$INVENTORY")
+BKP_C=0
+[[ -n "$BKP" ]] && BKP_C=$(printf '%s\n' "$BKP" | wc -l)
+if [[ $BKP_C -gt 0 ]]; then
+    printf "    ${C_YELLOW}!${C_RESET} Backup/leftover files:  %d\n" "$BKP_C"
+    echo "$BKP" | sed "s|^${SCAN_PATH}/||" | head -n 8 | sed 's/^/        /'
+    [[ $BKP_C -gt 8 ]] && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((BKP_C - 8))
+    FINDINGS+=("$BKP_C backup/leftover file(s)")
+fi
+
+# 7g. Hidden files (dotfiles)
+HID=$(awk -F'\t' -v root="$SCAN_PATH" '
+    $5=="f" {
+        n = split($6, p, "/")
+        base = p[n]
+        if (base ~ /^\./) print $6
+    }' "$INVENTORY")
+HID_C=0
+[[ -n "$HID" ]] && HID_C=$(printf '%s\n' "$HID" | wc -l)
+if [[ $HID_C -gt 0 ]]; then
+    printf "    ${C_DIM}·${C_RESET} Hidden files (dotfiles): %d\n" "$HID_C"
+    [[ $HID_C -le 10 ]] && echo "$HID" | sed "s|^${SCAN_PATH}/||" | sed 's/^/        /'
+    [[ $HID_C -gt 10 ]] && printf "        ${C_DIM}(use 'ls -A' to enumerate)${C_RESET}\n"
+fi
+
+# 7h. Orphaned files (uid/gid no longer in /etc/passwd or /etc/group)
+if [[ -r /etc/passwd ]]; then
+    ORPH=$(awk -F'\t' '
+        $5=="f" {
+            split($3, id, ":")
+            print id[1] ":" id[2]
+        }' "$INVENTORY" | sort -u | while IFS=: read -r u g; do
+            getent passwd "$u" >/dev/null 2>&1 || { echo "ORPH:$u"; continue; }
+            getent group  "$g" >/dev/null 2>&1 || { echo "ORPH::$g"; }
+        done)
+    ORPH_C=0
+    [[ -n "$ORPH" ]] && ORPH_C=$(printf '%s\n' "$ORPH" | wc -l)
+    if [[ $ORPH_C -gt 0 ]]; then
+        printf "    ${C_YELLOW}!${C_RESET} Orphaned uid/gid:        %d unique owner(s) with no matching account\n" "$ORPH_C"
+        echo "$ORPH" | head -n 5 | sed 's/^/        /'
+        FINDINGS+=("$ORPH_C orphaned owner(s)")
+    fi
+fi
+
+# Clean exit if no findings at all
+if [[ ${#FINDINGS[@]} -eq 0 ]]; then
+    printf "    ${C_GREEN}✓${C_RESET} ${C_GREEN}No security issues detected${C_RESET}\n"
+fi
+echo
+
+# ---------- 8. Verdict ----------
+printf "${C_BOLD}  ── 8. VERDICT ──${C_RESET}\n"
+(( SCORE < 0 )) && SCORE=0
+if [[ $SCORE -ge 90 ]]; then
+    printf "    ${C_GREEN}CLEAN${C_RESET}        Score: ${C_GREEN}%d/100${C_RESET}\n" "$SCORE"
+elif [[ $SCORE -ge 60 ]]; then
+    printf "    ${C_YELLOW}REVIEW${C_RESET}       Score: ${C_YELLOW}%d/100${C_RESET}\n" "$SCORE"
+else
+    printf "    ${C_RED}ACTION NEEDED${C_RESET} Score: ${C_RED}%d/100${C_RESET}\n" "$SCORE"
+fi
+if [[ ${#FINDINGS[@]} -gt 0 ]]; then
+    echo
+    printf "    ${C_DIM}Issues (%d):${C_RESET}\n" "${#FINDINGS[@]}"
+    for f in "${FINDINGS[@]}"; do
+        printf "      ${C_YELLOW}●${C_RESET} %s\n" "$f"
+    done
+fi
+echo
+
+# ---------- 9. Remediation hints ----------
+printf "${C_BOLD}  ── 9. REMEDIATION ──${C_RESET}\n"
+cat <<'EOF'
+    □  Lock down world-writable files/dirs    : chmod o-w <path>
+    □  Audit setuid/setgid binaries           : find . -perm /6000 -type f
+    □  Move secrets out of repo tree          : .env, *.key, *.pem, id_rsa
+    □  Clean up editor backups                : find . \( -name '*~' -o -name '*.bak' -o -name '*.swp' \) -delete
+    □  Resolve broken/escape symlinks         : find . -xtype l
+    □  Reassign orphaned ownership            : chown -R <user>:<group> <path>
+    □  Exclude noisy dirs from future scans   : filez . --depth 3 (skip build/, node_modules/)
+EOF
+echo
+
+# ---------- Done ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "━━━ FILEZ COMPLETE ━━━\n"
+printf "${C_RESET}"
+printf "${C_DIM}Report: %s${C_RESET}\n" "$REPORT"
+printf "\n"
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "filez complete: scan_path=$SCAN_PATH depth=$DEPTH top=$TOP_N report=$REPORT" 2>/dev/null || true
+fi

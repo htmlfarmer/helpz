@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# nextz - "What should I run next?" — prescriptive router over recent findings
+# ----------------------------------------------------------------------------
+# Reads the suite's append-only error/warning logs (~/.security-logs) plus a
+# few live 1-second probes, maps every issue category to the tool that can
+# actually fix it, and hands you a ranked action list: which script to run,
+# why, and what to expect.
+#
+# Usage:
+#   ./nextz                     Ranked next steps (logs + live probes)
+#   ./nextz --since 24          Only look back N hours in the logs
+#   ./nextz --json              Machine-readable recommendations
+#   ./nextz --no-color          Plain output
+#
+# Requires: lib/common.sh (same directory)
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+SINCE_H=72; JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --since)   shift; SINCE_H="${1:-72}" ;;
+        --since=*) SINCE_H="${1#--since=}" ;;
+        --json)    JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,20p' "$0"; exit 0 ;;
+        *) echo "nextz: unknown option $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+CUTOFF=$(( $(date +%s) - SINCE_H * 3600 ))
+declare -A HITS=()      # category → count
+declare -A SEEN_SRC=()  # category → which tools reported it
+
+scan_log() {   # file
+    local f="$1"
+    [[ -r "$f" ]] || return 0
+    awk -F'\t' '{print}' "$f" 2>/dev/null | while IFS= read -r line; do
+        # format: [ts] [script] [CATEGORY] message — FIX/SUGGESTION: ...
+        [[ "$line" =~ ^\[([^]]+)\][[:space:]]+\[([^]]+)\][[:space:]]+\[([^]]+)\] ]] || continue
+        tsraw="${BASH_REMATCH[1]}"; src="${BASH_REMATCH[2]}"; cat="${BASH_REMATCH[3]}"
+        if [[ "$tsraw" =~ ^[0-9]+$ ]]; then ts=$tsraw
+        else ts=$(date -d "$tsraw" +%s 2>/dev/null || echo 0); fi
+        (( ts >= CUTOFF )) || continue
+        printf '%s\t%s\n' "$cat" "$src"
+    done
+}
+
+LIVE=$( { scan_log "$ERROR_LOG"; scan_log "$WARNING_LOG"; } 2>/dev/null | sort | uniq -c | sort -rn | head -25 )
+
+# ---- category → tool mapping comes straight from the shared router ----
+declare -A REASONS=()
+for key in "${!NEXT_TOOL_MAP[@]}"; do
+    REASONS[$key]="${NEXT_TOOL_MAP[$key]}"
+done
+
+# ---- ranked recommendation build ----
+declare -A PICK=() PICKSCORE=()
+while read -r n cat src; do
+    [[ -z "${cat:-}" ]] && continue
+    tool_reason="${REASONS[$cat]:-}"
+    [[ -z "$tool_reason" ]] && continue
+    tool="${tool_reason%%|*}"; reason="${tool_reason#*|}"
+    cur=${PICKSCORE[$tool]:-0}
+    PICKSCORE[$tool]=$(( cur + n ))
+    PICK[$tool]="${reason} (${n}× ${cat}, reported by ${src})"
+done <<< "$LIVE"
+
+# ---- live probes (same lightweight set helpz uses, trimmed) ----
+v=$(awk '{print $1}' /proc/loadavg); n=$(nproc 2>/dev/null || echo 4)
+awk -v l="$v" -v n="$n" 'BEGIN{exit !(l>n)}' && { PICK[topz]="load ${v} > ${n} cores — see who is hogging" ; PICKSCORE[topz]=$((${PICKSCORE[topz]:-0}+5)); }
+if [[ -r /proc/pressure/io ]]; then
+    pio=$(grep -oE 'some avg10=[0-9.]+' /proc/pressure/io | cut -d= -f2)
+    awk -v x="${pio:-0}" 'BEGIN{exit !(x>25)}' && { PICK[diskz]="I/O pressure ${pio}% avg10 — storage is the bottleneck" ; PICKSCORE[diskz]=$((${PICKSCORE[diskz]:-0}+6)); PICK[slowz]="rank what is waiting on I/O" ; }
+fi
+if [[ -r /proc/pressure/memory ]]; then
+    pm=$(grep -oE 'some avg10=[0-9.]+' /proc/pressure/memory | cut -d= -f2)
+    awk -v x="${pm:-0}" 'BEGIN{exit !(x>10)}' && { PICK[memoryz]="memory pressure ${pm}% avg10 — find the eaters" ; PICKSCORE[memoryz]=$((${PICKSCORE[memoryz]:-0}+5)); }
+fi
+v=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5);print $5}')
+[[ "${v:-0}" -ge 85 ]] && { PICK[diskz]="root fs ${v}% full — what is using it" ; PICKSCORE[diskz]=$((${PICKSCORE[diskz]:-0}+4)); }
+if command -v apt-cache >/dev/null 2>&1 && apt-cache policy linux-image-amd64 2>/dev/null | grep -q "Candidate: [0-9]"; then
+    cur=$(dpkg-query -W -f='${Version}' "linux-image-$(uname -r)" 2>/dev/null || uname -r)
+    cand=$(apt-cache policy linux-image-amd64 2>/dev/null | awk '/Candidate:/{print $2}')
+    dpkg --compare-versions "$cand" gt "$cur" 2>/dev/null && { PICK[kernelz]="kernel ${cand} available (running ${cur}) — safe GRUB-fallback upgrade" ; PICKSCORE[kernelz]=$((${PICKSCORE[kernelz]:-0}+3)); }
+fi
+
+# ---- render ----
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"nextz","since_h":%s,"picks":[' "$SINCE_H"
+    first=1
+    for t in "${!PICK[@]}"; do
+        [[ $first -eq 0 ]] && printf ','
+        first=0
+        rr="${PICK[$t]//\"/}"
+        printf '{"tool":"%s","score":%s,"reason":"%s"}' "$t" "${PICKSCORE[$t]}" "$rr"
+    done
+    printf ']}\n'
+    exit 0
+fi
+
+printf "\n  ${C_BOLD}${C_BLUE}╭─ nextz ─ what to run, and why${C_RESET}  ${C_DIM}(last %sh of logs + live probes)${C_RESET}\n" "$SINCE_H"
+hr
+if [[ ${#PICK[@]} -eq 0 ]]; then
+    printf "  ${C_GREEN}✓ nothing pressing — no logged findings in the last %sh and all probes quiet${C_RESET}\n\n" "$SINCE_H"
+    printf "  ${C_DIM}curious? try:${C_RESET} ./securityz ${C_DIM}(full audit)${C_RESET} · ./speedz ${C_DIM}(make it fast)${C_RESET} · ./helpz ${C_DIM}(all tools)${C_RESET}\n\n"
+    exit 0
+fi
+total_pts=0
+for t in "${!PICKSCORE[@]}"; do total_pts=$((total_pts + ${PICKSCORE[$t]})); done
+maxp=$(printf '%s\n' "${PICKSCORE[@]}" | sort -rn | head -1)
+declare -A RSHOW=()
+for t in $(printf '%s\n' "${!PICK[@]}" | while read -r k; do [[ -n "$k" ]] && printf '%s\t%s\n' "${PICKSCORE[$k]:-0}" "$k"; done | sort -rn | cut -f2); do
+    [[ -z "${PICK[$t]:-}" ]] && continue
+    [[ -n "${RSHOW[$t]:-}" ]] && continue
+    RSHOW[$t]=1
+    sc=${PICKSCORE[$t]:-1}
+    len=$(( sc * 20 / (maxp>0?maxp:1) )); (( len < 1 )) && len=1
+    bar=""
+    for ((j=0;j<len;j++)); do bar+="█"; done
+    col="$C_GREEN"; (( sc > maxp/2 )) && col="$C_RED"
+    printf "  ${C_BOLD}./%s${C_RESET} %b%s${C_RESET} %s\n" "$t" "$col" "$bar" "${PICK[$t]}"
+done
+printf "\n  ${C_DIM}logs: %s · %s${C_RESET}\n\n" "$ERROR_LOG" "$WARNING_LOG"
+exit 0

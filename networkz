@@ -1,0 +1,1282 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# networkz - Comprehensive network diagnostic
+# ----------------------------------------------------------------------------
+# Inspects interfaces, routing, DNS, latency, bandwidth, traceroutes, packet
+# sniffing (tcpdump), listening ports, and active connections. Includes
+# reachability tests against major endpoints (Google, Cloudflare, Facebook /
+# Meta, LinkedIn, Apple, Microsoft, GitHub, Amazon) with mini-graphs.
+#
+# Usage:
+#   ./networkz                        # Full scan
+#   ./networkz --quick                # Faster scan (3 pings, no sniff)
+#   ./networkz --iface eth0           # Pin to a specific interface
+#   ./networkz --sniff 10             # Capture 10s on default iface
+#   ./networkz --sniff 30 -i wlx...   # Capture 30s on specific iface
+#   ./networkz --router URL           # Custom darkstat URL (default: http://192.168.1.1:667/hosts/)
+#   ./networkz --no-router            # Skip the LAN top talkers section
+#   ./networkz --no-color             # Plain output
+#   ./networkz --json                 # Machine-readable summary
+#
+# Requires: ip, ss, ping, dig, curl, traceroute, tcpdump (root for sniff)
+# Optional: mtr, whois, jq, figlet
+#
+# Exits 0 if healthy, 1 warnings, 2 critical.
+# Works with or without sudo (graceful degradation).
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+IFACE=""
+SNIFF_SECS=0
+SNIFF_IFACE=""
+NO_COLOR=0
+JSON_OUT=0
+QUICK=0
+PING_COUNT=5
+TIMEOUT=10
+DARKSTAT_URL="http://192.168.1.1:667/hosts/?full=yes&sort=total"
+USE_ROUTER=1
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+
+# ---------- Source verdict logging helper ----------
+SCRIPT_DIR_NET="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR_NET/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_NET/lib/verdict_log.sh"
+
+# Index-based parser for multi-word support
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --iface=*)     IFACE="${arg#--iface=}" ;;
+    --iface|-i)    i=$((i+1)); IFACE="${ARGS[$i]:-}" ;;
+    --sniff=*)     SNIFF_SECS="${arg#--sniff=}" ;;
+    --sniff)       i=$((i+1)); SNIFF_SECS="${ARGS[$i]:-0}" ;;
+    --no-color)    NO_COLOR=1 ;;
+    --json)        JSON_OUT=1 ;;
+    --quick)       QUICK=1; PING_COUNT=3; SNIFF_SECS=0 ;;
+    --router=*)    DARKSTAT_URL="${arg#--router=}" ;;
+    --router)      i=$((i+1)); DARKSTAT_URL="${ARGS[$i]:-}" ;;
+    --no-router)   USE_ROUTER=0 ;;
+    --timeout=*)   TIMEOUT="${arg#--timeout=}" ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          networkz — Comprehensive Network Diagnostic          ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects interfaces, routing, DNS, latency, bandwidth, traceroutes,
+  packet sniffing (tcpdump), listening ports, and active connections.
+  Tests reachability against major endpoints with mini-graphs.
+
+USAGE
+  ./networkz                        Full scan
+  ./networkz --quick                Faster scan (3 pings, no sniff)
+  ./networkz --iface eth0           Pin to a specific interface
+  ./networkz --sniff 10             Capture 10s on default iface
+  ./networkz --no-router            Skip the LAN top talkers section
+  ./networkz --no-color             Plain output
+  ./networkz --json                 Machine-readable summary
+
+OPTIONS
+  --iface=IFACE     Pin to a specific interface
+  --sniff[=N]       Capture N seconds of packets (needs root)
+  --quick           Faster scan (fewer pings, no sniff)
+  --router=URL      Custom darkstat URL for LAN talkers
+  --no-router       Skip LAN top talkers section
+  --timeout=N       Connection timeout in seconds
+  --no-color        Disable colors
+  --json            Output JSON summary
+  -h, --help        Show this help
+
+ALTERNATIVE COMMANDS
+  ip addr                            Show all interfaces and IPs
+  ss -tlnp                           Listening TCP ports with processes
+  netstat -tlnp                      Legacy port listing
+  ping <host>                        Basic reachability test
+  traceroute <host>                  Path to host
+  dig <domain>                       DNS lookup
+  mtr --report <host>                Combined ping+traceroute
+  tcpdump -i any -n                  Live packet capture (needs root)
+  iftop -i <iface>                   Live bandwidth by connection
+  nload -i <iface>                   Live interface throughput
+  curl -s https://ipinfo.io/json     Public IP and geolocation
+
+WARNING → INVESTIGATION COMMANDS
+  High latency to endpoints         →  mtr --report google.com  or  traceroute 8.8.8.8
+  Packet loss detected              →  ping -c 100 <host>  and  mtr --report <host>
+  DNS resolution failing            →  dig google.com @8.8.8.8  and  cat /etc/resolv.conf
+  No default route                  →  ip route show  and  ip route add default via <gateway>
+  Multiple default routes           →  ip route show default  and  ip route del default dev <iface>
+  Unexpected listening ports        →  ss -tlnp  and  sudo lsof -i -P -n | grep LISTEN
+  Download speed slow               →  curl -o /dev/null https://speed.cloudflare.com/__down?bytes=10485760
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "networkz"
+fi
+
+# If JSON mode is enabled, suppress all stdout during data collection
+if [[ $JSON_OUT -eq 1 ]]; then
+  exec 3>&1
+  exec 1>/dev/null
+fi
+
+# ---------- Privilege detection ----------
+SUDO=""
+SUDO_BG=""
+if [[ $EUID -eq 0 ]]; then
+  SUDO=""
+  PRIV_LEVEL="root"
+elif command -v sudo >/dev/null 2>&1; then
+  if sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+    PRIV_LEVEL="sudo (cached)"
+  else
+    if [[ -t 0 ]] && [[ $SNIFF_SECS -gt 0 ]]; then
+      printf "Need sudo for packet sniffing. Enter password: "
+      if sudo -v 2>/dev/null; then
+        SUDO="sudo"
+        PRIV_LEVEL="sudo (interactive)"
+      else
+        PRIV_LEVEL="no-sudo"
+      fi
+    else
+      PRIV_LEVEL="no-sudo"
+    fi
+  fi
+else
+  PRIV_LEVEL="no-sudo"
+fi
+
+# ---------- Colors (networkz-specific additions) ----------
+if [[ -t 1 ]] && [[ $JSON_OUT -eq 0 ]] && [[ $NO_COLOR -eq 0 ]]; then
+  C_ITALIC=$'\033[3m'
+  C_BG_BLUE=$'\033[44m'
+  C_BG_RED=$'\033[41m'
+else
+  C_ITALIC=""
+  C_BG_BLUE=""; C_BG_RED=""
+fi
+
+# ---------- Helpers ----------
+# Percentage bar: 0-100 -> 20-char bar (green/yellow/red)
+bar() {
+  local pct=$1 width=${2:-20}
+  (( pct < 0 )) && pct=0; (( pct > 100 )) && pct=100
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local color="$C_GREEN"
+  (( pct >= 50 )) && color="$C_YELLOW"
+  (( pct >= 80 )) && color="$C_RED"
+  printf "${color}"
+  printf '█%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null
+  printf "${C_DIM}"
+  printf '░%.0s' $(seq 1 $empty 2>/dev/null) 2>/dev/null
+  printf "${C_RESET}"
+}
+
+# Percentage bar: 0-100 -> 20-char bar (green/yellow/red)
+bar() {
+  local pct=$1 width=${2:-20}
+  (( pct < 0 )) && pct=0; (( pct > 100 )) && pct=100
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local color="$C_GREEN"
+  (( pct >= 50 )) && color="$C_YELLOW"
+  (( pct >= 80 )) && color="$C_RED"
+  printf "${color}"
+  printf '█%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null
+  printf "${C_DIM}"
+  printf '░%.0s' $(seq 1 $empty 2>/dev/null) 2>/dev/null
+  printf "${C_RESET}"
+}
+
+# Speed bar: value (MB/s) -> bar with color thresholds
+# Used for bandwidth visualization
+hbar() {
+  local pct=$1 width=${2:-30}
+  bar "$pct" "$width"
+}
+
+# Sparkline: 6 chars representing values 0..max
+spark() {
+  local -a vals=("$@")
+  local max=0 v
+  for v in "${vals[@]}"; do
+    if is_gt "$v" "$max"; then max=$v; fi
+  done
+  [[ "$max" == "0" || -z "$max" ]] && max=1
+  local glyphs=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+  for v in "${vals[@]}"; do
+    local idx=$(echo "$v * 7 / $max" | bc 2>/dev/null)
+    [[ -z "$idx" ]] && idx=0
+    idx=${idx%.*}
+    (( idx > 7 )) && idx=7
+    (( idx < 0 )) && idx=0
+    printf "%s" "${glyphs[$idx]}"
+  done
+}
+
+# colorize a latency in ms (or non-numeric like "BLOCKED")
+lat_color() {
+  local v=$1
+  # Non-numeric values (BLOCKED, —) get a fixed-width dim placeholder
+  if ! [[ "$v" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+    printf "${C_DIM}%9s${C_RESET}" "$v"
+    return
+  fi
+  if is_lt "$v" 50;  then printf "${C_GREEN}%6.1fms${C_RESET}" "$v"
+  elif is_lt "$v" 150; then printf "${C_YELLOW}%6.1fms${C_RESET}" "$v"
+  elif is_lt "$v" 300; then printf "${C_MAGENTA}%6.1fms${C_RESET}" "$v"
+  else printf "${C_RED}%6.1fms${C_RESET}" "$v"
+  fi
+}
+
+# colorize throughput in Mbps (megabits/sec)
+mbps_color() {
+  local mbps=$1
+  if is_gt "$mbps" 400; then
+    printf "${C_GREEN}%7.2f Mbps${C_RESET}" "$mbps"
+  elif is_gt "$mbps" 80; then
+    printf "${C_YELLOW}%7.2f Mbps${C_RESET}" "$mbps"
+  elif is_gt "$mbps" 8; then
+    printf "${C_MAGENTA}%7.2f Mbps${C_RESET}" "$mbps"
+  else
+    printf "${C_RED}%7.2f Mbps${C_RESET}" "$mbps"
+  fi
+}
+
+# colorize percentage 0-100 loss
+loss_color() {
+  local pct=$1
+  if   is_eq "$pct" 0; then printf "${C_GREEN}%3d%%${C_RESET}" "$pct"
+  elif is_lt "$pct" 5; then printf "${C_YELLOW}%3d%%${C_RESET}" "$pct"
+  else printf "${C_RED}%3d%%${C_RESET}" "$pct"
+  fi
+}
+
+# Truncate string (using common.sh trunc)
+# Float comparisons via common.sh is_gt/is_lt/is_eq
+
+# Run command, hide stderr unless VERBOSE
+run() {
+  "$@" 2>/dev/null
+}
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+  if command -v figlet >/dev/null 2>&1; then
+    printf "${C_BOLD}${C_BLUE}"
+    figlet -f standard "NETWORK" 2>/dev/null | head -10 || true
+    printf "${C_RESET}"
+  else
+    printf "${C_BOLD}${C_BLUE}"
+    cat << 'EOF'
+  _   _ ______ _   _  _____
+ | \ | |  _ \ \ | |/ ____|
+ |  \| | |_) |  \| | |  _
+ | |\  |  _ <| . ` | |_| |
+ |_| \_|_| \_\_|\_|\____|
+EOF
+    printf "${C_RESET}"
+  fi
+  printf "${C_DIM}  Network diagnostic — %s on %s  [priv: %s]${C_RESET}\n\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT" "$PRIV_LEVEL"
+fi
+
+# ============================================================================
+# SECTION 1: Host identity (public IP, ASN, geolocation)
+# ============================================================================
+section "HOST IDENTITY"
+
+PUBLIC_IP=$(run curl -s --max-time 8 https://api.ipify.org)
+[[ -z "$PUBLIC_IP" ]] && PUBLIC_IP=$(run curl -s --max-time 8 https://ifconfig.me)
+
+if [[ -n "$PUBLIC_IP" ]]; then
+  ok "Public IP: ${C_BOLD}${C_CYAN}$PUBLIC_IP${C_RESET}"
+  if command -v jq >/dev/null 2>&1; then
+    IPINFO=$(run curl -s --max-time 8 "https://ipinfo.io/$PUBLIC_IP/json")
+    if [[ -n "$IPINFO" ]]; then
+      CITY=$(printf '%s' "$IPINFO" | jq -r '.city // "?"' 2>/dev/null)
+      REGION=$(printf '%s' "$IPINFO" | jq -r '.region // "?"' 2>/dev/null)
+      COUNTRY=$(printf '%s' "$IPINFO" | jq -r '.country // "?"' 2>/dev/null)
+      ORG=$(printf '%s' "$IPINFO" | jq -r '.org // "?"' 2>/dev/null)
+      LOC=$(printf '%s' "$IPINFO" | jq -r '.loc // "?"' 2>/dev/null)
+      TZ_INFO=$(printf '%s' "$IPINFO" | jq -r '.timezone // "?"' 2>/dev/null)
+      info "Location:  ${C_BOLD}$CITY, $REGION, $COUNTRY${C_RESET}  ($LOC)"
+      info "Network:   ${C_BOLD}$ORG${C_RESET}"
+      info "Timezone:  ${C_BOLD}$TZ_INFO${C_RESET}"
+    fi
+  else
+    info "Install ${C_DIM}jq${C_RESET} for detailed geo info"
+  fi
+else
+  warn "Could not determine public IP (offline or rate-limited)"
+fi
+
+# Local IPs
+subsec "Local addresses"
+ip -br addr 2>/dev/null | while IFS= read -r line; do
+  name=$(printf '%s' "$line" | awk '{print $1}')
+  state=$(printf '%s' "$line" | awk '{print $2}')
+  addrs=$(printf '%s' "$line" | awk '{print $3}')
+  if [[ "$state" == "UP" ]]; then
+    printf "  ${C_GREEN}●${C_RESET} ${C_BOLD}%-20s${C_RESET} ${C_CYAN}%-10s${C_RESET} %s\n" \
+      "$name" "$state" "$addrs"
+  elif [[ "$state" == "DOWN" ]]; then
+    printf "  ${C_DIM}○ %-20s %-10s %s${C_RESET}\n" "$name" "$state" "$addrs"
+  else
+    printf "  ${C_YELLOW}●${C_RESET} %-20s ${C_YELLOW}%-10s${C_RESET} %s\n" "$name" "$state" "$addrs"
+  fi
+done
+
+# Determine default interface if not set
+if [[ -z "$IFACE" ]]; then
+  IFACE=$(ip route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+fi
+[[ -n "$IFACE" ]] && info "Active interface: ${C_BOLD}${C_CYAN}$IFACE${C_RESET}"
+
+# ============================================================================
+# SECTION 2: Routing table
+# ============================================================================
+section "ROUTING TABLE"
+
+DEFAULT_ROUTES=$(ip route show default 2>/dev/null)
+if [[ -n "$DEFAULT_ROUTES" ]]; then
+  while IFS= read -r route; do
+    info "$route"
+  done <<< "$DEFAULT_ROUTES"
+  DEFAULT_COUNT=$(printf '%s\n' "$DEFAULT_ROUTES" | wc -l)
+  if (( DEFAULT_COUNT > 1 )); then
+    warn "Multiple default routes ($DEFAULT_COUNT) - possible asymmetric routing"
+  fi
+else
+  crit "No default route - no internet connectivity"
+fi
+
+subsec "All routes (count by destination)"
+ip route show 2>/dev/null | awk '{
+  if ($1 ~ /^[0-9]/) { split($1, a, "/"); prefix = a[2]; count[prefix]++ }
+  else if ($1 == "default") { default_count++ }
+}
+END {
+  printf "  Total routes: %d\n", NR
+  for (p in count) printf "    /%-3s : %d\n", p, count[p]
+  if (default_count) printf "    default: %d\n", default_count
+}'
+
+# IPv6 routes
+IPV6_DEFAULT=$(ip -6 route show default 2>/dev/null | head -1)
+[[ -n "$IPV6_DEFAULT" ]] && info "IPv6 default: ${C_DIM}$IPV6_DEFAULT${C_RESET}"
+
+# ============================================================================
+# SECTION 2.5: LAN top talkers (darkstat on router)
+# ============================================================================
+if [[ $USE_ROUTER -eq 1 ]]; then
+  section "LAN TOP TALKERS  (router: ${C_DIM}${DARKSTAT_URL}${C_RESET})"
+
+  DS_HTML=$(run curl -s --max-time 8 "$DARKSTAT_URL")
+  if [[ -z "$DS_HTML" ]]; then
+    info "${C_DIM}Router darkstat not reachable - skipping (use --no-router to silence)${C_RESET}"
+  elif ! grep -q '<table>' <<< "$DS_HTML"; then
+    info "${C_DIM}Darkstat returned non-table response - skipping${C_RESET}"
+  else
+    # Parse darkstat hosts table:
+    #   <tr><td><a href="IP/">IP</a></td><td>HOSTNAME</td><td>MAC</td>
+    #       <td class="num">IN</td><td class="num">OUT</td>
+    #       <td class="num">TOTAL</td><td class="num">LASTSEEN</td></tr>
+    HOSTS_DATA=$(printf '%s' "$DS_HTML" | awk '
+      /<tr class="alt[12]">/ { in_row = 1; row = ""; next }
+      in_row && /<\/tr>/ {
+        # Extract fields from the row
+        ip = ""; host = ""; in_b = ""; out_b = ""; total_b = ""; last = ""
+        n = split(row, cells, "</td>")
+        for (i = 1; i <= n; i++) {
+          c = cells[i]
+          # Strip tags + whitespace
+          gsub(/<[^>]*>/, "", c)
+          gsub(/^ +| +$/, "", c)
+          gsub(/,/, "", c)        # remove thousand separators
+          if (i == 1) ip = c
+          else if (i == 2) host = c
+          else if (i == 4) in_b = c
+          else if (i == 5) out_b = c
+          else if (i == 6) total_b = c
+          else if (i == 7) last = c
+        }
+        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", ip, host, in_b, out_b, total_b, last
+        }
+        in_row = 0
+        next
+      }
+      in_row { row = row " " $0 }
+    ' | sort -t$'\t' -k5 -rn)
+
+    if [[ -z "$HOSTS_DATA" ]]; then
+      info "${C_DIM}No hosts parsed from darkstat${C_RESET}"
+    else
+      HOST_COUNT=$(printf '%s\n' "$HOSTS_DATA" | wc -l)
+      info "Hosts on LAN: ${C_BOLD}${C_CYAN}$HOST_COUNT${C_RESET}"
+
+      # Determine max total for bar scaling
+      MAX_TOTAL=$(printf '%s\n' "$HOSTS_DATA" | awk -F'\t' '{print $5}' | sort -n | tail -1)
+      [[ -z "$MAX_TOTAL" ]] && MAX_TOTAL=1
+
+      subsec "Top 10 by total traffic  ${C_DIM}(resolving names for unknown hosts)${C_RESET}"
+
+      printf "  ${C_BOLD}%-18s %-38s %10s %10s %10s   %-9s %s${C_RESET}\n" \
+        "IP" "Hostname" "In" "Out" "Total" "Last seen" "Distribution"
+      printf "  ${C_DIM}%-18s %-38s %10s %10s %10s   %-9s %s${C_RESET}\n" \
+        "------------------" "------------------------------------" "----------" "----------" "----------" "---------" "------------"
+
+      printf '%s\n' "$HOSTS_DATA" | head -10 | while IFS=$'\t' read -r ip host in_b out_b total_b last; do
+        # Friendly hostname - if darkstat didn't resolve, try rDNS
+        if [[ -z "$host" || "$host" == "(none)" ]]; then
+          rdns=$(run dig +short -x "$ip" +time=2 +tries=1 2>/dev/null | sed 's/\.$//' | head -1)
+          if [[ -n "$rdns" ]]; then
+            host="${rdns}"
+          else
+            host="${C_DIM}(no rDNS)${C_RESET}"
+          fi
+        fi
+        # Strip trailing dot from FQDN
+        host="${host%.}"
+        # Format bytes humanly
+        in_h=$(numfmt --to=iec --suffix=B "${in_b:-0}" 2>/dev/null || echo "${in_b}B")
+        out_h=$(numfmt --to=iec --suffix=B "${out_b:-0}" 2>/dev/null || echo "${out_b}B")
+        total_h=$(numfmt --to=iec --suffix=B "${total_b:-0}" 2>/dev/null || echo "${total_b}B")
+
+        # Bar (percentage of max)
+        pct=$(echo "scale=0; ${total_b:-0} * 100 / $MAX_TOTAL" | bc 2>/dev/null)
+        [[ -z "$pct" ]] && pct=0
+
+        # Color by IP class
+        if [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]; then
+          ip_color="$C_CYAN"     # LAN
+        elif [[ "$ip" =~ ^(8\.|156\.|157\.|173\.|142\.|23\.|104\.|74\.|52\.|54\.|50\.|13\.|3\.|35\.|34\.|108\.|162\.|146\.|52\.2) ]]; then
+          ip_color="$C_YELLOW"   # Public likely
+        else
+          ip_color="$C_DIM"
+        fi
+
+        # Color last-seen
+        if [[ "$last" == *"0 secs"* ]] || [[ "$last" == *"1 sec"* ]]; then
+          last_color="$C_GREEN"
+        elif [[ "$last" =~ ([0-9]+)\ hrs? ]]; then
+          hrs=${BASH_REMATCH[1]}
+          (( hrs < 1 )) && last_color="$C_YELLOW" || last_color="$C_DIM"
+        else
+          last_color="$C_DIM"
+        fi
+
+        printf "  ${ip_color}%-18s${C_RESET} ${C_BOLD}%-38s${C_RESET} %10s %10s ${C_GREEN}%10s${C_RESET}   ${last_color}%-9s${C_RESET} %s\n" \
+          "$ip" "$(trunc "$host" 38)" \
+          "$in_h" "$out_h" "$total_h" "$(trunc "$last" 9)" "$(hbar "$pct" 24)"
+      done
+
+      # Local host count summary
+      LAN_COUNT=$(printf '%s\n' "$HOSTS_DATA" | awk -F'\t' '$1 ~ /^192\.168\./ || $1 ~ /^10\./ || $1 ~ /^172\.(1[6-9]|2[0-9]|3[01])\./' | wc -l)
+      PUB_COUNT=$(printf '%s\n' "$HOSTS_DATA" | wc -l)
+      PUB_COUNT=$((PUB_COUNT - LAN_COUNT))
+      subsec "Summary"
+      info "Local LAN hosts:    ${C_BOLD}${C_CYAN}$LAN_COUNT${C_RESET}"
+      info "External IPs seen:  ${C_BOLD}${C_YELLOW}$PUB_COUNT${C_RESET}  ${C_DIM}(peers we communicated with)${C_RESET}"
+    fi
+  fi
+fi
+
+# ============================================================================
+# SECTION 3: DNS resolution
+# ============================================================================
+section "DNS"
+
+RESOLV_CONF=$(cat /etc/resolv.conf 2>/dev/null | grep -E '^nameserver' | awk '{print $2}' | head -5)
+if [[ -n "$RESOLV_CONF" ]]; then
+  info "Local resolvers: ${C_DIM}$(echo $RESOLV_CONF | tr '\n' ' ')${C_RESET}"
+else
+  warn "No nameservers in /etc/resolv.conf"
+fi
+
+subsec "Resolver benchmark (query google.com)"
+TEST_DOMAINS=("google.com" "cloudflare.com" "github.com")
+
+printf "  ${C_BOLD}%-22s %-18s %10s   %s${C_RESET}\n" "Resolver" "Result IP" "Time" "Status"
+printf "  ${C_DIM}%-22s %-18s %10s   %s${C_RESET}\n" "----------------------" "------------------" "----------" "------"
+
+# Internal + external resolvers to test
+RESOLVERS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
+[[ -n "$RESOLV_CONF" ]] && read -ra LOCAL_NS <<< "$RESOLV_CONF"
+for ns in "${LOCAL_NS[@]:0:1}"; do
+  [[ -n "$ns" ]] && RESOLVERS=("$ns" "${RESOLVERS[@]}")
+done
+
+for resolver in "${RESOLVERS[@]}"; do
+  [[ -z "$resolver" ]] && continue
+  result=$(run dig +stats +time=2 +tries=1 +short "@$resolver" google.com A 2>/dev/null | grep -E '^[0-9]' | head -1)
+  query_time=$(run dig +noall +stats "@$resolver" google.com 2>/dev/null | awk '/Query time:/ {print $4 "ms"}' | head -1)
+  if [[ -n "$result" ]]; then
+    ok_color="${C_GREEN}✓${C_RESET}"
+    [[ -z "$query_time" ]] && query_time="?"
+    printf "  ${C_BOLD}%-22s${C_RESET} ${C_CYAN}%-18s${C_RESET} ${C_DIM}%10s${C_RESET}   %b\n" \
+      "$resolver" "$(trunc "$result" 18)" "$query_time" "$ok_color"
+  else
+    crit_color="${C_RED}✗${C_RESET}"
+    printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%-18s %10s${C_RESET}   %b\n" \
+      "$resolver" "—" "timeout" "$crit_color"
+    warn "Resolver $resolver unreachable"
+  fi
+done
+
+# ============================================================================
+# SECTION 4: Reachability & latency to major endpoints
+# ============================================================================
+section "REACHABILITY & LATENCY"
+
+ENDPOINTS=(
+  "8.8.8.8:Google DNS"
+  "1.1.1.1:Cloudflare DNS"
+  "9.9.9.9:Quad9 DNS"
+  "google.com:Google"
+  "cloudflare.com:Cloudflare"
+  "facebook.com:Facebook/Meta"
+  "linkedin.com:LinkedIn"
+  "apple.com:Apple"
+  "microsoft.com:Microsoft"
+  "github.com:GitHub"
+  "amazon.com:Amazon"
+)
+
+printf "  ${C_BOLD}%-22s %-15s %8s %8s %8s %8s %5s   %s${C_RESET}\n" \
+  "Endpoint" "IP" "Min" "Avg" "Max" "Mdev" "Loss" "Graph"
+printf "  ${C_DIM}%-22s %-15s %8s %8s %8s %8s %5s   %s${C_RESET}\n" \
+  "----------------------" "---------------" "-------" "-------" "-------" "-------" "-----" "----"
+
+# Speed: pre-fire all 11 endpoint probes in parallel. Each probe writes its
+# result line to a tmpfile; the display loop below just reads them.
+NET_TMP=$(mktemp -d -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp -d)
+trap 'rm -rf "$NET_TMP"' EXIT
+declare -a NET_PIDS=()
+declare -a NET_ORDER=()
+i=0
+for entry in "${ENDPOINTS[@]}"; do
+    host="${entry%%:*}"
+    name="${entry#*:}"
+    (
+        # Resolve
+        ip=$(run dig +short "$host" A 2>/dev/null | head -1)
+        [[ -z "$ip" ]] && ip=$(run getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | head -1)
+        [[ -z "$ip" ]] && ip="?"
+        if [[ "$ip" == "?" ]]; then
+            printf 'UNREACHABLE\t%s\t%s\n' "$name" "$host" > "$NET_TMP/$i"
+        else
+            PING_OUT=$(run ping -c "$PING_COUNT" -W 2 -i 0.2 "$ip" 2>/dev/null)
+            STATS=$(printf '%s' "$PING_OUT" | awk '
+                /^---/ { flag = 1; next }
+                flag && /packet loss/ {
+                  n = split($0, a, ", ")
+                  for (i = 1; i <= n; i++) if (a[i] ~ /loss/) loss_str = a[i]
+                }
+                flag && /min.avg.max/ {
+                  split($0, b, "=")
+                  split(b[2], c, " ")
+                  print c[1] "\t" c[3] "\t" c[5] "\t" c[7] "\t" loss_str
+                  exit
+                }
+            ')
+            TIMES=$(printf '%s' "$PING_OUT" | awk '/time=[0-9]/ {
+                for (i=1; i<=NF; i++) if ($i ~ /^time=/) print substr($i, 6) + 0
+            }' | paste -sd',' -)
+            printf '%s\t%s\t%s\t%s\n' "$name" "$ip" "$STATS" "$TIMES" > "$NET_TMP/$i"
+        fi
+    ) &
+    NET_PIDS+=($!)
+    NET_ORDER+=("$i")
+    i=$((i+1))
+done
+for pid in "${NET_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+
+for idx in "${NET_ORDER[@]}"; do
+  f="$NET_TMP/$idx"
+  [[ -r "$f" ]] || continue
+  IFS=$'\t' read -r name ip stats_line < "$f"
+  if [[ "$name" == "UNREACHABLE" ]]; then
+      printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%-15s${C_RESET} ${C_RED}%-8s${C_RESET}\n" \
+        "$(trunc "${stats_line%%	*}" 22)" "$(trunc "${stats_line##*	}" 15)" "FAIL"
+      crit "$name unreachable"
+      continue
+  fi
+  if [[ -z "$stats_line" ]]; then
+      printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%-15s${C_RESET} ${C_RED}%-8s${C_RESET}\n" \
+        "$(trunc "$name" 22)" "$(trunc "$ip" 15)" "BLOCKED"
+      continue
+  fi
+  IFS=$'\t' read -r MIN AVG MAX MDEV LOSS <<< "$stats_line"
+
+  # Resolve IP via dig for display
+  ip=$(run dig +short "$host" A 2>/dev/null | head -1)
+  [[ -z "$ip" ]] && ip=$(run getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | head -1)
+  [[ -z "$ip" ]] && ip="?"
+
+  # Run ping (one-shot summary via -c)
+  if [[ "$ip" == "?" ]]; then
+    crit "Cannot resolve $host"
+    continue
+  fi
+
+  PING_OUT=$(run ping -c "$PING_COUNT" -W 2 -i 0.2 "$ip" 2>/dev/null)
+  if [[ -z "$PING_OUT" ]]; then
+    printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%-15s${C_RESET} ${C_RED}%-8s${C_RESET}\n" \
+      "$(trunc "$name" 22)" "$(trunc "$ip" 15)" "FAIL"
+    crit "$name ($ip) unreachable"
+    continue
+  fi
+
+  # Extract stats - ping outputs:
+  #   --- HOST ping statistics ---
+  #   N packets transmitted, N received, X% packet loss, time ...
+  #   rtt min/avg/max/mdev = a/b/c/d ms
+  # Some hosts (Microsoft, Amazon) block ICMP -> 100% loss, no rtt line
+  STATS=$(printf '%s' "$PING_OUT" | awk '
+    /^---/ { flag = 1; next }
+    flag && /packet loss/ {
+      n = split($0, a, ", ")
+      for (i = 1; i <= n; i++) if (a[i] ~ /loss/) loss_str = a[i]
+    }
+    flag && /min.avg.max/ {
+      i = index($0, "=")
+      rest = substr($0, i + 1)
+      sub(/[ ]*ms$/, "", rest)
+      time_str = rest
+    }
+    END {
+      n = split(time_str, t, "/")
+      if (n >= 4) printf "%s %s %s %s %s", t[1], t[2], t[3], t[4], loss_str
+      else if (loss_str != "") printf "0 0 0 0 %s", loss_str
+    }
+  ')
+
+  if [[ -z "$STATS" ]]; then
+    printf "  ${C_BOLD}%-22s${C_RESET} ${C_DIM}%-15s${C_RESET} ${C_DIM}%-8s${C_RESET}\n" \
+      "$(trunc "$name" 22)" "$(trunc "$ip" 15)" "—"
+    continue
+  fi
+
+  read -r MIN AVG MAX MDEV LOSS_STR <<< "$STATS"
+  LOSS=$(printf '%s' "$LOSS_STR" | grep -oE '[0-9.]+' | head -1)
+  [[ -z "$LOSS" ]] && LOSS="0"
+
+  # Detect 100% loss (ICMP blocked) - mark latency columns as BLOCKED
+  if is_eq "${LOSS%.*}" 100; then
+    MIN="—"; AVG="BLOCKED"; MAX="—"; MDEV="—"
+  fi
+
+  # Build mini sparkline from individual ping times
+  IFS=$'\t' read -r _ _ _ TIMES <<< "$(cat "$f")"
+  TIMES_ARR=()
+  if [[ -n "$TIMES" ]]; then
+    IFS=',' read -ra TIMES_ARR <<< "$TIMES"
+  fi
+  if [[ ${#TIMES_ARR[@]} -gt 0 ]]; then
+    SPARK=$(spark "${TIMES_ARR[@]}")
+  else
+    SPARK="------"
+  fi
+
+  # Color sparkline based on max latency
+  if is_lt "$MAX" 50; then
+    SPARK_COLORED="${C_GREEN}${SPARK}${C_RESET}"
+  elif is_lt "$MAX" 150; then
+    SPARK_COLORED="${C_YELLOW}${SPARK}${C_RESET}"
+  else
+    SPARK_COLORED="${C_RED}${SPARK}${C_RESET}"
+  fi
+
+  printf "  ${C_BOLD}%-22s${C_RESET} ${C_CYAN}%-15s${C_RESET} %s %s %s %s %s   %b\n" \
+    "$(trunc "$name" 22)" "$(trunc "$ip" 15)" \
+    "$(lat_color "$MIN")" "$(lat_color "$AVG")" "$(lat_color "$MAX")" \
+    "${C_DIM}${MDEV}ms${C_RESET}" "$(loss_color "${LOSS%.*}")" \
+    "$SPARK_COLORED"
+
+  # Flag high latency / loss (skip ICMP-blocked hosts - already shown as BLOCKED)
+  if [[ "$AVG" != "BLOCKED" ]]; then
+    if is_gt "$AVG" 200; then
+      warn "High latency to $name (avg ${AVG}ms)"
+    fi
+    if is_gt "${LOSS%.*}" 5; then
+      warn "Packet loss to $name (${LOSS}%)"
+    fi
+  fi
+done
+
+# ============================================================================
+# SECTION 5: Bandwidth / Speed test
+# ============================================================================
+section "BANDWIDTH / SPEED  ${C_DIM}(what you're paying for)${C_RESET}"
+
+info "Measuring download speeds (${C_BOLD}reported in Mbps${C_RESET}, megabits/sec — the ISP unit) from 10MB files..."
+info "${C_DIM}(no speedtest-cli available — using curl + known-size downloads)${C_RESET}"
+
+# Endpoints with known file sizes (in bytes)
+# Each row: URL|size_bytes|label
+# Reliability (verified 2026-09-27): Cloudflare + OVH are HTTPS and reachable.
+# Tele2 was removed: plain HTTP only (TLS handshake fails) and the service is
+# being sunset — it is blocked/filter-prone on many networks.
+# Replaced with ThinkBroadband (HTTPS, exact 10MB payload, stable).
+SPEED_TARGETS=(
+  "https://speed.cloudflare.com/__down?bytes=10485760|10485760|Cloudflare (10MB)"
+  "https://proof.ovh.net/files/10Mb.dat|10485760|OVH (10MB)"
+  "https://download.thinkbroadband.com/10MB.zip|10485760|ThinkBroadband (10MB)"
+)
+
+if [[ $QUICK -eq 1 ]]; then
+  SPEED_TARGETS=("https://speed.cloudflare.com/__down?bytes=5242880|5242880|Cloudflare (5MB)")
+fi
+
+printf "\n  ${C_BOLD}%-25s %12s %12s   %s${C_RESET}\n" "Source" "Speed" "Time" "Bar"
+printf "  ${C_DIM}%-25s %12s %12s   %s${C_RESET}\n" "-------------------------" "----------" "----------" "----"
+
+MAX_SPEED=0
+declare -A SPEEDS
+for target in "${SPEED_TARGETS[@]}"; do
+  url=$(printf '%s' "$target" | cut -d'|' -f1)
+  size=$(printf '%s' "$target" | cut -d'|' -f2)
+  label=$(printf '%s' "$target" | cut -d'|' -f3)
+
+  SPEED_OUT=$(run curl -s -o /dev/null \
+    -w '%{speed_download} %{time_total} %{http_code}' \
+    --max-time 15 -L "$url" 2>/dev/null)
+
+  if [[ -n "$SPEED_OUT" ]]; then
+    DL_BPS=$(printf '%s' "$SPEED_OUT" | awk '{print $1}')
+    TIME=$(printf '%s' "$SPEED_OUT" | awk '{print $2}')
+    HTTP=$(printf '%s' "$SPEED_OUT" | awk '{print $3}')
+
+    if [[ "$HTTP" =~ ^2 ]]; then
+      # curl %{speed_download} is ALREADY bytes/sec -> megabits/sec (x8, decimal):
+      # Mbps is the unit people/ISPs actually quote for network speed
+      MPS=$(echo "scale=2; $DL_BPS * 8 / 1000000" | bc 2>/dev/null)
+      [[ -z "$MPS" ]] && MPS="0"
+      SPEEDS["$label"]="$MPS"
+      if is_gt "$MPS" "$MAX_SPEED"; then MAX_SPEED=$MPS; fi
+      printf "  ${C_BOLD}%-25s${C_RESET} ${C_BOLD}${C_BG_BLUE}${C_WHITE} %s ${C_RESET}   %8.2fs   %s\n" \
+        "$label" "$(printf '%7.2f Mbps' "$MPS")" "$TIME" "$(hbar 30 30)"
+    else
+      printf "  ${C_BOLD}%-25s${C_RESET} ${C_BG_RED}${C_WHITE} %12s ${C_RESET}   ${C_DIM}HTTP %s${C_RESET}\n" \
+        "$label" "FAIL" "$HTTP"
+      warn "$label returned HTTP $HTTP"
+    fi
+  else
+    printf "  ${C_BOLD}%-25s${C_RESET} ${C_BG_RED}${C_WHITE} %12s ${C_RESET}   ${C_DIM}timeout${C_RESET}\n" \
+      "$label" "FAIL"
+    warn "$label timed out"
+  fi
+done
+
+if [[ ${#SPEEDS[@]} -gt 0 ]]; then
+  AVG_SPEED=$(printf '%s\n' "${SPEEDS[@]}" | awk '{s+=$1; n++} END {if(n>0) printf "%.2f", s/n; else print "0"}')
+
+  # ----- BIG HEADLINE -----
+  # Color the peak speed value (Mbps): >400 green, >80 yellow, >8 magenta
+  if   is_gt "$MAX_SPEED" 400; then PEAK_COLOR="$C_GREEN"
+  elif is_gt "$MAX_SPEED" 80;  then PEAK_COLOR="$C_YELLOW"
+  elif is_gt "$MAX_SPEED" 8;   then PEAK_COLOR="$C_MAGENTA"
+  else PEAK_COLOR="$C_RED"
+  fi
+
+  # MAX_SPEED is already megabits/sec — direct ISP-plan comparison
+  PEAK_MBPS_INT=${MAX_SPEED%.*}
+  [[ -z "$PEAK_MBPS_INT" ]] && PEAK_MBPS_INT=0
+
+  # Estimate tier
+  TIER="unknown"
+  if   (( PEAK_MBPS_INT >= 800 )); then TIER="Gigabit+ (>800 Mbps)"
+  elif (( PEAK_MBPS_INT >= 400 )); then TIER="500 Mbps tier"
+  elif (( PEAK_MBPS_INT >= 200 )); then TIER="250 Mbps tier"
+  elif (( PEAK_MBPS_INT >= 80 ));  then TIER="100 Mbps tier"
+  elif (( PEAK_MBPS_INT >= 30 ));  then TIER="40 Mbps tier"
+  elif (( PEAK_MBPS_INT >= 8 ));   then TIER="10 Mbps tier"
+  else TIER="below 10 Mbps (capped/slow)"
+  fi
+
+  # Build the headline box. Inner width = 66 chars between the two ║.
+  BOX_W=66
+  printf "\n"
+  printf "  ${C_BOLD}${C_MAGENTA}╔%${BOX_W}s╗${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+
+  # Build PEAK line content (pad to BOX_W) — peak + avg in Mbps
+  PEAK_STR=$(printf "   ${C_BOLD}PEAK DOWNLOAD:${C_RESET}  ${PEAK_COLOR}${C_BOLD}%7.2f Mbps${C_RESET}  (avg ${C_CYAN}${C_BOLD}%6.2f Mbps${C_RESET})" \
+    "$MAX_SPEED" "$AVG_SPEED")
+  # Compute visible width (strip ANSI for sizing)
+  PEAK_VISIBLE=$(printf "   PEAK DOWNLOAD:  %7.2f Mbps  (avg %6.2f Mbps)" "$MAX_SPEED" "$AVG_SPEED")
+  PEAK_PAD=$(( BOX_W - ${#PEAK_VISIBLE} ))
+  [[ $PEAK_PAD -lt 0 ]] && PEAK_PAD=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${PEAK_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$PEAK_STR" ""
+
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+
+  # TIER line
+  TIER_STR=$(printf "   ${C_BOLD}Estimated tier:${C_RESET}  ${C_CYAN}${C_BOLD}%s${C_RESET}" "$TIER")
+  TIER_VISIBLE=$(printf "   Estimated tier:  %s" "$TIER")
+  TIER_PAD=$(( BOX_W - ${#TIER_VISIBLE} ))
+  [[ $TIER_PAD -lt 0 ]] && TIER_PAD=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${TIER_PAD}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$TIER_STR" ""
+
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+  printf "  ${C_BOLD}${C_MAGENTA}╚%${BOX_W}s╝${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "\n"
+
+  if is_lt "$MAX_SPEED" 10; then
+    crit "Bandwidth below 10 Mbps - severe bottleneck or capping"
+  elif is_lt "$MAX_SPEED" 80; then
+    warn "Bandwidth below 80 Mbps - check ISP plan / congestion"
+  fi
+fi
+
+# ============================================================================
+# SECTION 6: Traceroute to top endpoints (geo-enriched)
+# ============================================================================
+section "TRACEROUTE — PATH TO TOP SITES WITH GEOGRAPHY"
+
+# ─── Geo lookup helper ─────────────────────────────────────────────────────
+# Cache: avoid hammering ip-api.com (45 req/min free tier). One lookup per
+# unique IP per script run, written to ~/.cache/network-sh-geo.json.
+GEO_CACHE="${HOME}/.cache/network-sh-geo.json"
+mkdir -p "$(dirname "$GEO_CACHE")" 2>/dev/null || true
+
+# lookup_geo <ip> — prints "City|Country|Org" or "?"
+lookup_geo() {
+    local ip="$1"
+    # Skip private/non-routable
+    if [[ -z "$ip" ]] || [[ "$ip" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.|255\.|::) ]] \
+       || [[ "$ip" == *"."*"."*"."*"."* ]] && false; then
+        # fall through to real lookup if we couldn't short-circuit
+        :
+    fi
+    case "$ip" in
+        127.*|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|169.254.*|0.*) printf "LOCAL|—|local network\n"; return ;;
+    esac
+    # Skip "private" placeholders some traceroutes emit
+    if [[ "$ip" == *"private"* ]] || [[ "$ip" == *"timeout"* ]]; then
+        printf "—|—|—\n"; return
+    fi
+
+    # Check cache (simple line-based: ip|city|country|org)
+    # Cache returns 4 fields; re-emit as 3 (city|country|org) to match the
+    # live-API response shape.
+    if [[ -f "$GEO_CACHE" ]]; then
+        local hit city country org
+        hit=$(awk -F'|' -v ip="$ip" '$1==ip {print; exit}' "$GEO_CACHE" 2>/dev/null)
+        if [[ -n "$hit" ]]; then
+            city=$(awk -F'|' '{print $2}' <<< "$hit")
+            country=$(awk -F'|' '{print $3}' <<< "$hit")
+            org=$(awk -F'|' '{print $4}' <<< "$hit")
+            printf "%s|%s|%s\n" "$city" "$country" "$org"
+            return
+        fi
+    fi
+
+    # Live lookup (rate-limited to 1 req / 1.4s by ip-api.com free tier)
+    local resp
+    resp=$(run curl -s --max-time 6 "http://ip-api.com/json/$ip?fields=status,city,country,org,query" 2>/dev/null)
+    if [[ -n "$resp" ]] && command -v jq >/dev/null 2>&1; then
+        local status city country org
+        status=$(printf '%s' "$resp" | jq -r '.status // "fail"' 2>/dev/null)
+        if [[ "$status" == "success" ]]; then
+            city=$(printf '%s' "$resp" | jq -r '.city // "?"' 2>/dev/null)
+            country=$(printf '%s' "$resp" | jq -r '.country // "?"' 2>/dev/null)
+            org=$(printf '%s' "$resp" | jq -r '.org // "?"' 2>/dev/null)
+            # Trim "AS20055 " prefix from org for readability
+            org="${org#AS[0-9]* }"
+            printf "%s|%s|%s\n" "$city" "$country" "$org"
+            # Append to cache
+            printf "%s|%s|%s|%s\n" "$ip" "$city" "$country" "$org" >> "$GEO_CACHE" 2>/dev/null || true
+            sleep 1.4  # respect rate limit
+            return
+        fi
+    fi
+    printf "—|—|—\n"
+}
+
+# ─── Traceroute runner with geo enrichment ─────────────────────────────────
+if [[ $QUICK -eq 1 ]]; then
+    info "Traceroute skipped (--quick mode)"
+elif ! command -v traceroute >/dev/null 2>&1; then
+    warn "traceroute not available (install 'traceroute' or 'iputils-traceroute')"
+else
+    TRACE_TARGETS=(
+        "1.1.1.1:Cloudflare (San Francisco)"
+        "8.8.8.8:Google (Mountain View)"
+        "9.9.9.9:Quad9 (Switzerland)"
+        "github.com:GitHub"
+        "amazon.com:Amazon"
+        "meta.com:Meta"
+        "apple.com:Apple"
+        "azure.com:Microsoft Azure"
+    )
+
+    for entry in "${TRACE_TARGETS[@]}"; do
+        target="${entry%%:*}"
+        name="${entry#*:}"
+        subsec "$name ($target)"
+
+        # Run traceroute: 1 probe per hop, 2s timeout, 25 hops max
+        trace_output=$($SUDO traceroute -n -w 2 -q 1 -m 25 "$target" 2>/dev/null | tail -n +2)
+
+        if [[ -z "$trace_output" ]]; then
+            warn "No route to $target"
+            continue
+        fi
+
+        # Print header
+        printf "  ${C_DIM}%-4s %-7s %-18s %-22s %-16s %s${C_RESET}\n" \
+            "HOP" "RTTms" "IP" "HOST" "CITY/COUNTRY" "ORG"
+        printf "  ${C_DIM}%s${C_RESET}\n" "─────────────────────────────────────────────────────────────────────────────────────────────────────"
+
+        while IFS= read -r line; do
+            # traceroute -n output format: "  3  10.0.0.1  12.345 ms"
+            # → hop=3, ip=10.0.0.1, rtt=12.345
+            hop=$(awk '{print $1}' <<< "$line")
+            ip=$(awk '{print $2}' <<< "$line")
+            rtt=$(awk '{print $3}' <<< "$line")
+
+            # Handle timeout hops
+            if [[ "$ip" == "*" ]] || [[ -z "$ip" ]]; then
+                printf "  ${C_DIM}%-4s %-7s %-18s${C_RESET}\n" "$hop" "*" "*** (timeout)"
+                continue
+            fi
+            # Strip trailing colon (e.g. "10.0.0.1:")
+            ip="${ip%:}"
+
+            # Reverse DNS (best-effort, fast)
+            host=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' | head -1)
+            [[ -z "$host" ]] && host="—"
+
+            # Geo lookup (cached)
+            geo=$(lookup_geo "$ip")
+            city=$(awk -F'|' '{print $1}' <<< "$geo")
+            country=$(awk -F'|' '{print $2}' <<< "$geo")
+            org=$(awk -F'|' '{print $3}' <<< "$geo")
+
+            # Color the RTT
+            rtt_int=${rtt%.*}
+            [[ -z "$rtt_int" ]] && rtt_int=0
+            rtt_color=$C_GREEN
+            (( rtt_int > 50 ))  && rtt_color=$C_YELLOW
+            (( rtt_int > 150 )) && rtt_color=$C_RED
+
+            # Color the city/country
+            geo_color=$C_DIM
+            [[ "$city" != "—" && "$city" != "?" ]] && geo_color=$C_CYAN
+
+            # Truncate long fields
+            [[ ${#host} -gt 22 ]] && host="${host:0:21}…"
+            [[ ${#org}  -gt 22 ]] && org="${org:0:21}…"
+
+            printf "  ${C_DIM}%-4s${C_RESET} ${rtt_color}%-7s${C_RESET} %-18s ${C_DIM}%-22s${C_RESET} ${geo_color}%-16s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+                "$hop" "$rtt" "$ip" "$host" "$city, $country" "$org"
+        done <<< "$trace_output"
+
+        # Identify the bottleneck hop (largest latency jump from previous)
+        prev_rtt=0
+        bottleneck_hop=""
+        bottleneck_jump=0
+        while IFS= read -r line; do
+            hop=$(awk '{print $1}' <<< "$line")
+            ip=$(awk '{print $2}' <<< "$line")
+            rtt=$(awk '{print $3}' <<< "$line")
+            rtt_int=${rtt%.*}
+            [[ ! "$rtt_int" =~ ^[0-9]+$ ]] && continue
+            jump=$(( rtt_int - prev_rtt ))
+            (( jump > bottleneck_jump )) && { bottleneck_jump=$jump; bottleneck_hop="$hop ($ip, ${rtt}ms)"; }
+            prev_rtt=$rtt_int
+        done <<< "$trace_output"
+
+        if [[ -n "$bottleneck_hop" ]] && (( bottleneck_jump > 30 )); then
+            info "${C_YELLOW}Biggest latency jump: hop ${bottleneck_hop}${C_RESET}"
+        fi
+        echo ""
+    done
+fi
+
+# ============================================================================
+# SECTION 7: Listening ports & services
+# ============================================================================
+section "LISTENING SERVICES"
+
+LISTEN_OUT=$(run ss -tulnp 2>/dev/null || run netstat -tulnp 2>/dev/null)
+if [[ -n "$LISTEN_OUT" ]]; then
+  # Count by protocol
+  TCP_COUNT=$(printf '%s\n' "$LISTEN_OUT" | grep -cE '^tcp' 2>/dev/null || echo 0)
+  UDP_COUNT=$(printf '%s\n' "$LISTEN_OUT" | grep -cE '^udp' 2>/dev/null || echo 0)
+  TOTAL=$((TCP_COUNT + UDP_COUNT))
+  info "Total listeners: ${C_BOLD}${C_CYAN}$TOTAL${C_RESET}  (TCP: ${C_BOLD}$TCP_COUNT${C_RESET}, UDP: ${C_BOLD}$UDP_COUNT${C_RESET})"
+
+  # Histogram of listening ports by service
+  subsec "Top listening services"
+  printf '%s\n' "$LISTEN_OUT" | grep -oE ':[0-9]+[[:space:]]' | sort | uniq -c | sort -rn | head -10 | \
+    while read -r count port; do
+      portnum="${port//[!0-9]/}"
+      service=$(getent services "$portnum" 2>/dev/null | awk '{print $1}' | head -1)
+      [[ -z "$service" ]] && service="unknown"
+      printf "  ${C_DIM}%-4s${C_RESET} ${C_CYAN}%-15s${C_RESET} %s\n" "$count" "port $portnum" "$service"
+    done
+else
+  warn "Could not enumerate listening sockets (needs root for full view)"
+fi
+
+# ============================================================================
+# SECTION 8: Active connections
+# ============================================================================
+section "ACTIVE CONNECTIONS"
+
+CONN_OUT=$(run ss -tan state established 2>/dev/null || run netstat -tan 2>/dev/null | grep ESTABLISHED)
+if [[ -n "$CONN_OUT" ]]; then
+  TOTAL_CONN=$(printf '%s\n' "$CONN_OUT" | grep -cE 'ESTAB|tcp' || echo 0)
+  info "Established: ${C_BOLD}${C_CYAN}$TOTAL_CONN${C_RESET}"
+
+  subsec "Top remote peers"
+  printf '%s\n' "$CONN_OUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?' | \
+    awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
+    while read -r count ip; do
+      # Skip local
+      if [[ "$ip" =~ ^(127\.|0\.0\.0\.0|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.) ]]; then
+        continue
+      fi
+      printf "  ${C_DIM}%-4s${C_RESET} ${C_CYAN}%-22s${C_RESET}\n" "$count" "$ip"
+    done
+else
+  info "No established connections"
+fi
+
+# Connection state histogram (visual)
+subsec "Connection state distribution"
+STATE_DATA=$(run ss -tan 2>/dev/null | grep -oE '\b(LISTEN|ESTAB|TIME-WAIT|CLOSE-WAIT|FIN-WAIT|CLOSING|LAST-ACK|SYN-SENT|SYN-RECV|NONE)\b' | sort | uniq -c | sort -rn)
+if [[ -n "$STATE_DATA" ]]; then
+  STATE_TOTAL=$(printf '%s\n' "$STATE_DATA" | awk '{s+=$1} END {print s}')
+  printf "  ${C_BOLD}%-15s %8s   %s${C_RESET}\n" "State" "Count" "Distribution"
+  printf "  ${C_DIM}%-15s %8s   %s${C_RESET}\n" "-----" "-----" "------------"
+  while read -r count state; do
+    pct=$(( count * 100 / (STATE_TOTAL > 0 ? STATE_TOTAL : 1) ))
+    printf "  ${C_BOLD}%-15s${C_RESET} ${C_DIM}%8d${C_RESET}   %s\n" \
+      "$state" "$count" "$(hbar $pct 30)"
+  done <<< "$STATE_DATA"
+fi
+
+# ============================================================================
+# SECTION 9: Packet sniff (optional)
+# ============================================================================
+section "PACKET SNIFF"
+
+if [[ $SNIFF_SECS -gt 0 ]]; then
+  if ! command -v tcpdump >/dev/null 2>&1; then
+    crit "tcpdump not installed"
+  elif [[ -z "$SUDO" && $EUID -ne 0 ]]; then
+    crit "Sniff requires root/sudo"
+  else
+    # Resolve interface if not given
+    SNIFF_TARGET="${SNIFF_IFACE:-$IFACE}"
+    if [[ -z "$SNIFF_TARGET" ]]; then
+      SNIFF_TARGET=$(ip route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+    fi
+    if [[ -z "$SNIFF_TARGET" ]]; then
+      warn "No interface for sniff - use --iface"
+    else
+      PCAP="/tmp/network_sniff_$(date +%s).pcap"
+      info "Capturing ${C_BOLD}${SNIFF_SECS}s${C_RESET} on ${C_BOLD}${C_CYAN}${SNIFF_TARGET}${C_RESET}"
+      info "Output: ${C_DIM}$PCAP${C_RESET}"
+      printf "\n"
+      $SUDO timeout "$SNIFF_SECS" tcpdump -i "$SNIFF_TARGET" -nn -c 100 \
+        -w "$PCAP" 2>&1 | head -5 | sed 's/^/    /'
+      echo ""
+      if [[ -f "$PCAP" ]]; then
+        ok "Capture saved to $PCAP"
+        PCAP_SIZE=$(stat -c%s "$PCAP" 2>/dev/null)
+        info "Size: ${C_BOLD}$(numfmt --to=iec --suffix=B "$PCAP_SIZE" 2>/dev/null || echo "${PCAP_SIZE}B")${C_RESET}"
+        subsec "Top talkers (from capture)"
+        $SUDO tcpdump -nn -r "$PCAP" 2>/dev/null | awk '{print $3}' | \
+          grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort | uniq -c | sort -rn | head -8 | \
+          while read -r count ip; do
+            printf "  ${C_DIM}%-4s${C_RESET} ${C_CYAN}%-22s${C_RESET}\n" "$count" "$ip"
+          done
+        subsec "Top protocols"
+        $SUDO tcpdump -nn -r "$PCAP" 2>/dev/null | awk '{print $2}' | sort | uniq -c | sort -rn | head -5 | \
+          while read -r count proto; do
+            printf "  ${C_DIM}%-4s${C_RESET} ${C_BOLD}%-15s${C_RESET}\n" "$count" "$proto"
+          done
+      fi
+    fi
+  fi
+else
+  info "${C_DIM}Skipped (no --sniff flag)${C_RESET}"
+  info "Run ${C_BOLD}./networkz --sniff 30${C_RESET} to capture 30s on the default interface"
+  info "Run ${C_BOLD}./networkz --sniff 5 -i wlx...${C_RESET} for a specific interface"
+fi
+
+# ============================================================================
+# SECTION 10: MTU / Path
+# ============================================================================
+section "MTU & PATH"
+
+MTU_V4=$(ip route show default 2>/dev/null | grep -oE 'mtu [0-9]+' | awk '{print $2}' | head -1)
+[[ -z "$MTU_V4" ]] && MTU_V4="1500 (default)"
+info "Default interface MTU: ${C_BOLD}${C_CYAN}$MTU_V4${C_RESET}"
+
+# IPv4 connectivity check — fire all four MTU probes in parallel,
+# then pick the largest one that succeeded (saves up to 6s worst case).
+MTU_TMP=$(mktemp -d)
+declare -a _MTU_PIDS=()
+declare -A _MTU_OK=()
+for SIZE in 1472 1464 1400 1280; do
+    ( run ping -c 1 -W 2 -M do -s "$SIZE" 8.8.8.8 >/dev/null 2>&1 \
+        && echo "$SIZE" > "$MTU_TMP/$SIZE" ) &
+    _MTU_PIDS+=($!)
+done
+for pid in "${_MTU_PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+if [[ -s "$MTU_TMP/1472" ]]; then
+    ok "MTU 1500 path (standard Ethernet)"
+elif [[ -s "$MTU_TMP/1464" ]]; then
+    ok "MTU 1492 path (PPPoE)"
+elif [[ -s "$MTU_TMP/1400" ]]; then
+    ok "MTU 1428 path (VPN/tunnel)"
+elif [[ -s "$MTU_TMP/1280" ]]; then
+    ok "MTU 1300 path (IPv6 minimum)"
+else
+    warn "Path MTU discovery failing - possible fragmentation issues"
+fi
+rm -rf "$MTU_TMP"
+
+# IPv6 check
+if run ping -6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1; then
+  ok "IPv6 reachable (Cloudflare)"
+else
+  info "${C_DIM}IPv6 not reachable or disabled${C_RESET}"
+fi
+
+# ============================================================================
+# SECTION 11: Recommendations
+# ============================================================================
+section "RECOMMENDATIONS"
+
+REC_NUM=0
+rec() { REC_NUM=$((REC_NUM+1)); printf "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"; }
+
+# Generate recommendations based on findings
+[[ $PRIV_LEVEL == "no-sudo" ]] && rec "Re-run with sudo for full visibility (listening PIDs, packet capture)"
+
+if (( CRITICAL > 0 )); then
+  rec "${C_RED}${C_BOLD}Address critical issues first${C_RESET} - internet may be impaired"
+fi
+
+if (( WARNINGS > 3 )); then
+  rec "Many warnings - review section by section"
+fi
+
+# If speed is slow
+if [[ -n "$MAX_SPEED" ]] && is_lt "$MAX_SPEED" 10; then
+  rec "Bandwidth below 10 Mbps — check with ISP or re-test with a bigger pull: ${C_BOLD}curl -o /dev/null https://speed.cloudflare.com/__down?bytes=100000000${C_RESET}"
+fi
+
+# Multiple defaults
+# strip any trailing newlines from numeric vars
+DEFAULT_COUNT=${DEFAULT_COUNT//[!0-9]/}
+DEFAULT_COUNT=${DEFAULT_COUNT:-0}
+TOTAL_CONN=${TOTAL_CONN//[!0-9]/}
+TOTAL_CONN=${TOTAL_CONN:-0}
+
+if (( DEFAULT_COUNT > 1 )); then
+  rec "Multiple default routes detected - verify which is preferred (lower metric)"
+fi
+
+# High connection count
+if (( TOTAL_CONN > 200 )); then
+  rec "$TOTAL_CONN established connections - check for runaway apps with ${C_BOLD}ss -tanp | grep <pid>${C_RESET}"
+fi
+
+# Always-available suggestions
+rec "Test from another device to isolate (this-box vs ISP issues)"
+rec "Capture with ${C_BOLD}./networkz --sniff 60 -i ${IFACE:-eth0}${C_RESET} for deeper analysis"
+rec "Check ${C_BOLD}/etc/resolv.conf${C_RESET} if DNS is slow (use 1.1.1.1 or 8.8.8.8)"
+
+# ============================================================================
+# VERDICT
+# ============================================================================
+DURATION=$(($(date +%s) - START_TS))
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "\n${C_BOLD}${C_BLUE}━━━ VERDICT ━━━${C_RESET}\n"
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+    printf "  ${C_RED}Network impaired - investigate the flagged issues${C_RESET}\n"
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    printf "  ${C_YELLOW}Network usable but review above${C_RESET}\n"
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    printf "  ${C_GREEN}Network looks solid${C_RESET}\n"
+  fi
+  printf "\n${C_DIM}Scan completed in ${DURATION}s at $(date '+%H:%M:%S')${C_RESET}\n"
+
+  # Display one-liner explanations for any critical/warning issues logged
+  show_verdict_one_liners
+else
+  # JSON output
+  exec 1>&3
+  exec 3>&-
+  printf '{"timestamp":"%s","hostname":"%s","public_ip":"%s","iface":"%s","warnings":%d,"critical":%d,"duration_s":%d,"priv":"%s"}\n' \
+    "$TIMESTAMP" "$HOSTNAME_SHORT" "${PUBLIC_IP:-}" "$IFACE" \
+    "$WARNINGS" "$CRITICAL" "$DURATION" "$PRIV_LEVEL"
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    _NW_SUMMARY="iface=$IFACE warnings=$WARNINGS critical=$CRITICAL duration=${DURATION}s public_ip=${PUBLIC_IP:-?}"
+    ai_emit_verdict "top_issue" "$_NW_SUMMARY" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+# Exit code
+if (( CRITICAL > 0 )); then exit 2
+elif (( WARNINGS > 0 )); then exit 1
+else exit 0
+fi

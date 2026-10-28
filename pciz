@@ -1,0 +1,754 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# pciz - PCI/PCIe bus diagnostic
+# ----------------------------------------------------------------------------
+# Inspects the PCI hierarchy: devices, classes, drivers, link speeds/widths,
+# IOMMU groups, vendor breakdown. Uses lspci with /sys fallbacks.
+#
+# Usage:
+#   ./pciz                 # full probe
+#   ./pciz --no-color      # plain output
+#   ./pciz --json          # machine-readable summary
+#   ./pciz --class CLASS   # filter to a single class substring (e.g. Network)
+#   ./pciz --vendor VID    # filter to a vendor (e.g. 8086)
+#
+# Requires: lspci
+# Optional: bc, jq
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+NO_COLOR=0
+JSON_OUT=0
+FILTER_CLASS=""
+FILTER_VENDOR=""
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+SCRIPT_VERSION="1.0.0"
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --class=*)    FILTER_CLASS="${arg#--class=}" ;;
+    --class)      i=$((i+1)); FILTER_CLASS="${ARGS[$i]:-}" ;;
+    --vendor=*)   FILTER_VENDOR="${arg#--vendor=}" ;;
+    --vendor)     i=$((i+1)); FILTER_VENDOR="${ARGS[$i]:-}" ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          pciz — PCI/PCIe Bus Diagnostic                       ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects the PCI hierarchy: devices, classes, drivers, link speeds/
+  widths, IOMMU groups, vendor breakdown. Uses lspci with /sys fallbacks.
+
+USAGE
+  ./pciz                 Full probe
+  ./pciz --no-color      Plain output
+  ./pciz --json          Machine-readable summary
+  ./pciz --class Network Filter to a class substring
+  ./pciz --vendor 8086   Filter to a vendor ID
+
+OPTIONS
+  --class=NAME    Filter to a PCI class substring (e.g. Network, VGA)
+  --vendor=VID    Filter to a vendor hex ID (e.g. 8086 for Intel)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  lspci -vv                        Very verbose PCI device details
+  lspci -t                         PCI topology tree
+  lspci -k                         Show kernel driver bindings
+  setpci -s <BDF> <reg>=<val>      Direct PCI register access (dangerous)
+  sudo lshw -class pci -numeric    Alternate complete PCI listing
+  dmesg | grep -i pcie             PCIe errors in kernel log
+  journalctl -k | grep AER         Advanced Error Reporting events
+
+WARNING → INVESTIGATION COMMANDS
+  Downgraded PCIe links             →  lspci -vv | grep -i 'link.*speed\|link.*width'
+  Device without driver             →  lspci -k | grep -A2 '<BDF>'
+  IOMMU not enabled                 →  cat /proc/cmdline | grep -i iommu
+  PCIe AER errors                   →  sudo dmesg | grep -i AER
+  VFIO passthrough issues           →  find /sys/kernel/iommu_groups -type d | wc -l
+
+HELPEOF
+      exit 0 ;;
+    --ai)         AI_VERDICT=1 ;;
+    --no-ai)      AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "pciz"
+fi
+
+# Class code → human label (most common ones)
+class_label() {
+  case "$1" in
+    00) echo "Unclassified" ;;
+    01) echo "Storage" ;;
+    02) echo "Network" ;;
+    03) echo "Display" ;;
+    04) echo "Multimedia" ;;
+    05) echo "Memory" ;;
+    06) echo "Bridge" ;;
+    07) echo "Communication" ;;
+    08) echo "System peripheral" ;;
+    09) echo "Input" ;;
+    0a) echo "Docking" ;;
+    0b) echo "Processor" ;;
+    0c) echo "Serial bus" ;;
+    0d) echo "Wireless" ;;
+    0e) echo "Intelligent" ;;
+    0f) echo "Satellite" ;;
+    10) echo "Encryption" ;;
+    11) echo "Signal processing" ;;
+    12) echo "Processing accelerator" ;;
+    13) echo "Non-Essential Instrumentation" ;;
+    40) echo "Coprocessor" ;;
+    ff) echo "Unassigned" ;;
+    *)  echo "Class 0x$1" ;;
+  esac
+}
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "${C_BOLD}${C_MAGENTA}"
+  cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  PCI.SH — PCI/PCIe Bus Diagnostic                            ║
+   ║  Devices · Drivers · IOMMU · Link Speeds                     ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+  printf "${C_RESET}\n"
+  printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- Detect tools ----------
+HAVE_LSPCI=0; command -v lspci >/dev/null 2>&1 && HAVE_LSPCI=1
+HAVE_JQ=0;   command -v jq   >/dev/null 2>&1 && HAVE_JQ=1
+
+if [[ $HAVE_LSPCI -eq 0 ]]; then
+  crit "lspci not installed (apt install pciutils)"
+  exit 1
+fi
+
+# ============================================================================
+# SECTION 1: PCI Topology (lspci -tv)
+# ============================================================================
+section "PCI TOPOLOGY"
+
+TREE_OUT=$(lspci -tv 2>/dev/null)
+if [[ -n "$TREE_OUT" ]]; then
+  echo "$TREE_OUT" | while IFS= read -r line; do
+    # Highlight root ports and bridges in dim cyan
+    if [[ "$line" == *"[ROOT"* ]]; then
+      printf "  ${C_CYAN}%s${C_RESET}\n" "$line"
+    elif [[ "$line" == *"[BRIDGE"* ]]; then
+      printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+    else
+      printf "  %s\n" "$line"
+    fi
+  done
+else
+  warn "Could not read PCI tree"
+fi
+
+# ============================================================================
+# SECTION 2: Devices by Class
+# ============================================================================
+section "DEVICES BY CLASS"
+
+# Build a tmp file of all devices once (used by all sections)
+ALL_DEVICES=$(lspci 2>/dev/null)
+# Also a domain-prefixed variant for matching sysfs BDFs (0000:00:1f.0 etc.)
+ALL_DEVICES_D=$(lspci -D 2>/dev/null)
+TOTAL_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | wc -l)
+info "Total PCI devices: ${C_BOLD}${TOTAL_DEVICES}${C_RESET}"
+JSON_FIELDS+=("\"total_devices\":$TOTAL_DEVICES")
+
+# Apply filters
+FILTERED_DEVICES="$ALL_DEVICES"
+if [[ -n "$FILTER_CLASS" ]]; then
+  FILTERED_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | grep -i "$FILTER_CLASS" || true)
+  info "Filter: class=${C_CYAN}${FILTER_CLASS}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | wc -l) match(es)"
+fi
+if [[ -n "$FILTER_VENDOR" ]]; then
+  if [[ -n "$FILTER_CLASS" ]]; then
+    FILTERED_DEVICES=$(printf '%s\n' "$FILTERED_DEVICES" | grep -i "$FILTER_VENDOR" || true)
+  else
+    FILTERED_DEVICES=$(printf '%s\n' "$ALL_DEVICES" | grep -i "$FILTER_VENDOR" || true)
+  fi
+  info "Filter: vendor=${C_CYAN}${FILTER_VENDOR}${C_RESET} → $(printf '%s\n' "$FILTERED_DEVICES" | wc -l) match(es)"
+fi
+
+# Count by class (first token of lspci line after bus addr)
+CLASS_COUNTS=$(printf '%s\n' "$ALL_DEVICES" | grep -oE '(VGA compatible controller|3D controller|Display controller|Network controller|Ethernet controller|Wi-Fi controller|Wireless controller|Non-Volatile memory controller|SATA controller|RAID bus controller|IDE interface|SCSI storage controller|USB controller|USB xHCI|Host bridge|PCI bridge|ISA bridge|SMBus controller|Audio device|Multimedia audio controller|Communication controller|Serial controller|Bluetooth|Encryption controller|Processing accelerator|Signal processing controller|Coprocessor|Modem|InfiniBand|FireWire|IOMMU)' | sort | uniq -c | sort -rn)
+
+if [[ -n "$CLASS_COUNTS" ]]; then
+  MAX_C=$(printf '%s\n' "$CLASS_COUNTS" | awk '{print $1}' | sort -n | tail -1)
+  while IFS= read -r line; do
+    cnt=$(echo "$line" | awk '{print $1}')
+    label=$(echo "$line" | cut -d' ' -f2-)
+    pct=$(( cnt * 100 / TOTAL_DEVICES ))
+    printf "  ${C_DIM}%-40s${C_RESET} %3d  " "$label" "$cnt"
+    bar "$pct" 15
+    printf "  ${C_DIM}(%2d%%)${C_RESET}\n" "$pct"
+  done <<< "$CLASS_COUNTS"
+
+  # Bar chart: device counts by class (absolute)
+  if [[ $JSON_OUT -eq 0 ]]; then
+    subsec "Devices per class (chart)"
+    local_pci_max=$MAX_C
+    local_pci_total=0
+    while IFS= read -r line; do
+      cnt=$(echo "$line" | awk '{print $1}')
+      local_pci_total=$(( local_pci_total + cnt ))
+    done <<< "$CLASS_COUNTS"
+    printf "${C_BOLD}${C_CYAN}  Devices by class (bar chart, total=%d):${C_RESET}\n" "$local_pci_total"
+    local_pci_w=40
+    while IFS= read -r line; do
+      cnt=$(echo "$line" | awk '{print $1}')
+      label=$(echo "$line" | cut -d' ' -f2-)
+      (( local_pci_max == 0 )) && local_pci_max=1
+      pct=$(( cnt * 100 / local_pci_max ))
+      col="$C_GREEN"; (( pct >= 60 )) && col="$C_YELLOW"; (( pct >= 85 )) && col="$C_RED"
+      filled=$(( pct * local_pci_w / 100 ))
+      bar_s=""
+      for (( j=0; j<filled; j++ )); do bar_s+="█"; done
+      printf "  %-30s ${col}%-40s${C_RESET} %d\n" "${label:0:30}" "$bar_s" "$cnt"
+    done <<< "$CLASS_COUNTS"
+  fi
+else
+  info "Could not classify devices (unrecognized lspci output)"
+fi
+
+# ============================================================================
+# SECTION 3: Link Speeds (PCIe generation and width)
+# ============================================================================
+section "LINK SPEEDS"
+
+# /sys/bus/pci/devices/*/current_link_speed and current_link_width
+LINK_DATA=()
+SPEED_GEN_RANK=0
+FASTEST_GEN=0
+FASTEST_NAME=""
+GEN3_RANK=3   # Gen3 = 8 GT/s
+GEN4_RANK=4   # Gen4 = 16 GT/s
+GEN5_RANK=5
+GEN2_RANK=2
+
+for devdir in /sys/bus/pci/devices/*; do
+  [[ -d "$devdir" ]] || continue
+  [[ -r "$devdir/current_link_speed" ]] || continue
+  cur_speed=$(cat "$devdir/current_link_speed" 2>/dev/null | tr -d '\n')
+  cur_width=$(cat "$devdir/current_link_width" 2>/dev/null | tr -d '\n')
+  max_speed=$(cat "$devdir/max_link_speed" 2>/dev/null | tr -d '\n')
+  max_width=$(cat "$devdir/max_link_width" 2>/dev/null | tr -d '\n')
+
+  [[ -z "$cur_speed" ]] && continue
+  [[ "$cur_speed" == "(not applicable)"* ]] && continue
+
+  # Resolve BDF → lspci label
+  bdf=$(basename "$devdir")
+  dev_label=$(printf '%s\n' "$ALL_DEVICES_D" | awk -v bdf="$bdf" '$1 == bdf { sub(/^[^ ]+ /, ""); print; exit }')
+  [[ -z "$dev_label" ]] && dev_label="(no label)"
+
+  # Compute rank from generation number
+  # Strip trailing " PCIe" suffix if present (some kernels append it)
+  bare="${cur_speed% PCIe}"
+  rank=0
+  case "$bare" in
+    "2.5 GT/s")  rank=1 ;;
+    "5.0 GT/s")  rank=2 ;;
+    "8.0 GT/s")  rank=3 ;;
+    "16.0 GT/s") rank=4 ;;
+    "32.0 GT/s") rank=5 ;;
+    "64.0 GT/s") rank=6 ;;
+    *)           rank=0 ;;
+  esac
+
+  if (( rank > FASTEST_GEN )); then
+    FASTEST_GEN=$rank
+    FASTEST_NAME="$dev_label @ $cur_speed x$cur_width"
+  fi
+
+  # Warn if running below max (downgraded link)
+  state="ok"
+  if [[ -n "$max_speed" && "$max_speed" != "$cur_speed" && "$max_speed" != "(not applicable)"* ]]; then
+    state="downgraded"
+    WARNINGS=$((WARNINGS+1))
+  fi
+done
+
+if (( FASTEST_GEN > 0 )); then
+  gen_label=""
+  case "$FASTEST_GEN" in
+    1) gen_label="PCIe Gen1 (2.5 GT/s)" ;;
+    2) gen_label="PCIe Gen2 (5 GT/s)" ;;
+    3) gen_label="PCIe Gen3 (8 GT/s)" ;;
+    4) gen_label="PCIe Gen4 (16 GT/s)" ;;
+    5) gen_label="PCIe Gen5 (32 GT/s)" ;;
+    6) gen_label="PCIe Gen6 (64 GT/s)" ;;
+  esac
+  info "Fastest active link: ${C_CYAN}${gen_label}${C_RESET}"
+  info "  └─ ${FASTEST_NAME}"
+else
+  info "No PCIe link data available (kernel interface missing?)"
+fi
+
+# Count downgraded links
+DOWNGRADED=0
+for devdir in /sys/bus/pci/devices/*; do
+  [[ -d "$devdir" ]] || continue
+  [[ -r "$devdir/current_link_speed" ]] || continue
+  cur_speed=$(cat "$devdir/current_link_speed" 2>/dev/null | tr -d '\n')
+  max_speed=$(cat "$devdir/max_link_speed" 2>/dev/null | tr -d '\n')
+  if [[ -n "$max_speed" && "$max_speed" != "(not applicable)"* && -n "$cur_speed" && "$cur_speed" != "$max_speed" ]]; then
+    DOWNGRADED=$((DOWNGRADED+1))
+  fi
+done
+if (( DOWNGRADED > 0 )); then
+  warn "${DOWNGRADED} device(s) running below max link speed — check seating/cable"
+fi
+JSON_FIELDS+=("\"downgraded_links\":$DOWNGRADED")
+
+# Top 5 devices by link speed/width
+heading "Top 5 devices by link speed"
+printf "  ${C_DIM}%-14s %-13s %-6s %-13s${C_RESET}\n" \
+  "BDF" "Speed" "Width" "MaxSpd"
+printf "  ${C_DIM}%-14s %-13s %-6s %-13s${C_RESET}\n" \
+  "--------------" "-------------" "------" "-------------"
+
+# Collect all and sort
+TOP_DEVICES=""
+for devdir in /sys/bus/pci/devices/*; do
+  [[ -d "$devdir" ]] || continue
+  [[ -r "$devdir/current_link_speed" ]] || continue
+  cur_speed=$(cat "$devdir/current_link_speed" 2>/dev/null | tr -d '\n')
+  cur_width=$(cat "$devdir/current_link_width" 2>/dev/null | tr -d '\n')
+  max_speed=$(cat "$devdir/max_link_speed" 2>/dev/null | tr -d '\n')
+  [[ "$cur_speed" == "(not applicable)"* ]] && continue
+  [[ -z "$cur_speed" ]] && continue
+
+  bdf=$(basename "$devdir")
+  dev_label=$(printf '%s\n' "$ALL_DEVICES_D" | awk -v bdf="$bdf" '$1 == bdf { sub(/^[^ ]+ /, ""); print; exit }')
+  [[ -z "$dev_label" ]] && dev_label="(no label)"
+
+  # Rank key for sort (strip " PCIe" suffix on some kernels)
+  bare2="${cur_speed% PCIe}"
+  rank=0
+  case "$bare2" in
+    "2.5 GT/s")  rank=1 ;;
+    "5.0 GT/s")  rank=2 ;;
+    "8.0 GT/s")  rank=3 ;;
+    "16.0 GT/s") rank=4 ;;
+    "32.0 GT/s") rank=5 ;;
+    "64.0 GT/s") rank=6 ;;
+  esac
+
+  TOP_DEVICES+="${rank}|${cur_speed}|${cur_width}|${max_speed}|${bdf}|${dev_label}"$'\n'
+done
+
+# Sort by rank desc, take top 5
+printf '%s\n' "$TOP_DEVICES" | sort -t'|' -k1 -nr | head -5 | while IFS='|' read -r rank cur_speed cur_width max_speed bdf dev_label; do
+  [[ -z "$cur_speed" ]] && continue
+  # Color speed
+  speed_color="$C_DIM"
+  case "$rank" in
+    5|6) speed_color="$C_GREEN" ;;
+    4)   speed_color="$C_GREEN" ;;
+    3)   speed_color="$C_CYAN" ;;
+    *)   speed_color="$C_DIM" ;;
+  esac
+  # Color downgraded
+  end_color=""
+  if [[ "$max_speed" != "(not applicable)"* && -n "$max_speed" && "$max_speed" != "$cur_speed" ]]; then
+    end_color=" ${C_YELLOW}(↓)${C_RESET}"
+  fi
+  printf "  %-14s ${speed_color}%-13s${C_RESET} %-6s %-13s %s${end_color}\n" \
+    "$bdf" "$cur_speed" "x${cur_width}" "$max_speed" "$dev_label"
+done
+
+# ============================================================================
+# SECTION 4: IOMMU Groups (virtualization-relevant)
+# ============================================================================
+section "IOMMU GROUPS"
+
+if [[ -d /sys/kernel/iommu_groups ]]; then
+  IOMMU_GROUPS=$(find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+  info "IOMMU groups: ${C_BOLD}${IOMMU_GROUPS}${C_RESET}"
+  if [[ -f /sys/class/iommu/iommu0/type ]]; then
+    info "  └─ /sys/class/iommu type: $(cat /sys/class/iommu/iommu0/type 2>/dev/null)"
+  fi
+
+  # Show groups with >1 device (must be passed through together for VFIO)
+  heading "Multi-device IOMMU groups (relevant for VFIO passthrough)"
+  MULTI_FOUND=0
+  MULTI_GROUPS=0
+  for grpdir in /sys/kernel/iommu_groups/*; do
+    [[ -d "$grpdir" ]] || continue
+    devs=$(ls "$grpdir/devices" 2>/dev/null)
+    cnt=$(echo "$devs" | wc -l)
+    if (( cnt > 1 )); then
+      MULTI_FOUND=1
+      MULTI_GROUPS=$((MULTI_GROUPS + 1))
+      grpnum=$(basename "$grpdir")
+      printf "  ${C_DIM}Group %3s:${C_RESET} %d devices\n" "$grpnum" "$cnt"
+      for d in $devs; do
+        label=$(printf '%s\n' "$ALL_DEVICES_D" | awk -v bdf="$d" '$1 == bdf { sub(/^[^ ]+ /, ""); print; exit }')
+        printf "    ${C_DIM}└${C_RESET} %-8s %s\n" "$d" "$label"
+      done
+    fi
+  done
+  if [[ $MULTI_FOUND -eq 0 ]]; then
+    info "All groups contain a single device — ideal for VFIO passthrough"
+  fi
+
+  # Depth: assess DMA-attack exposure from external-facing PCIe devices.
+  # Thunderbolt / FireWire / ExpressCard / removable PCIe can be used to inject
+  # DMA attacks. If those devices sit in groups with other devices (or with the
+  # root complex), an attacker can DMA into kernel memory.
+  heading "DMA attack surface (external-facing PCIe)"
+  EXTERNAL_PCI_CLASSES=(
+      "Thunderbolt"            # 0c08 / 0c07
+      "FireWire"               # 0c00
+      "Serial bus controller"  # 0c (smbus/spi/i2c/etc)
+  )
+  EXTERNAL_FOUND=0
+  for d in /sys/bus/pci/devices/*; do
+      [[ -d "$d" ]] || continue
+      cls=$(awk '{printf "%02x%02x\n", $2, $1}' "$d/class" 2>/dev/null)
+      cls_hex=$(cat "$d/class" 2>/dev/null | awk '{printf "%02x%02x\n", $2, $1}')
+      [[ -z "$cls_hex" ]] && continue
+      # 0c00 = FireWire, 0c07/0c08 = Thunderbolt, 0c03 = USB (handled by usbz),
+      # 0606 = PCI bridge to external slot
+      case "$cls_hex" in
+          0c00|0c07|0c08)
+              bdf=$(basename "$d")
+              grp=$(basename "$(dirname "$d")" 2>/dev/null)
+              vendor=$(cat "$d/vendor" 2>/dev/null)
+              device=$(cat "$d/device" 2>/dev/null)
+              EXTERNAL_FOUND=1
+              # Find which IOMMU group this device belongs to
+              grp_path=$(readlink -f "$d" 2>/dev/null)
+              for g in /sys/kernel/iommu_groups/*/devices/*; do
+                  [[ "$(basename "$g")" == "$bdf" ]] || continue
+                  ig=$(basename "$(dirname "$(dirname "$g")")")
+                  devs_in_grp=$(ls "/sys/kernel/iommu_groups/$ig/devices" 2>/dev/null | wc -l)
+                  if (( devs_in_grp > 1 )); then
+                      critf "dma_grouped" "$bdf (class=$cls_hex) shares IOMMU group $ig with $((devs_in_grp - 1)) other device(s) — DMA into kernel memory possible via this port" \
+                          "If this is a real attack surface (Thunderbolt/FireWire), enable stricter IOMMU isolation (intel_iommu=strict on Intel, or block via udev rules)."
+                  else
+                      info "$bdf (class=$cls_hex) is in its own IOMMU group ($ig) — DMA blocked by default"
+                  fi
+                  break
+              done
+              ;;
+      esac
+  done
+  [[ $EXTERNAL_FOUND -eq 0 ]] && info "No Thunderbolt/FireWire/external-attached PCIe controllers detected"
+
+  # Check kernel cmdline for IOMMU enablement
+  CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+  if [[ "$CMDLINE" == *"intel_iommu=on"* || "$CMDLINE" == *"amd_iommu=on"* || "$CMDLINE" == *"iommu=on"* ]]; then
+      info "IOMMU enabled in kernel cmdline"
+      if [[ "$CMDLINE" == *"intel_iommu=strict"* ]]; then
+          info "intel_iommu=strict — full device isolation enforced"
+      elif [[ "$CMDLINE" == *"intel_iommu=on"* ]]; then
+          warn "intel_iommu=on (not 'strict') — DMA remapping permissive for legacy compat"
+          info "  Add intel_iommu=strict for stricter device isolation (may break some hardware)"
+      fi
+  else
+      critf "iommu_disabled" "No IOMMU kernel parameter in cmdline — DMA attacks via Thunderbolt/PCIe possible" \
+          "Add intel_iommu=on / amd_iommu=on to kernel cmdline and reboot."
+  fi
+else
+  info "IOMMU not exposed at /sys/kernel/iommu_groups"
+  if [[ -d /sys/class/iommu ]]; then
+    info "IOMMU class exists but no groups (driver not bound?)"
+  else
+    critf "iommu_disabled" "IOMMU appears DISABLED — DMA attacks via Thunderbolt/PCIe/FireWire are unmitigated" \
+        "Enable: add intel_iommu=on / amd_iommu=on to kernel cmdline and reboot."
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: Driver Binding
+# ============================================================================
+section "DRIVER BINDING"
+
+if [[ -d /sys/bus/pci/drivers ]]; then
+  DRIVER_LIST=$(lspci -k 2>/dev/null | grep -E '^\s+Kernel driver in use:' | awk '{print $NF}' | sort | uniq -c | sort -rn)
+  if [[ -n "$DRIVER_LIST" ]]; then
+    while IFS= read -r line; do
+      cnt=$(echo "$line" | awk '{print $1}')
+      drv=$(echo "$line" | awk '{print $2}')
+      printf "  ${C_DIM}%-25s${C_RESET} %3d device(s)\n" "$drv" "$cnt"
+    done <<< "$DRIVER_LIST"
+  else
+    info "No driver binding info available"
+  fi
+
+  # Find unbound devices
+  UNBOUND=0
+  while IFS= read -r devline; do
+    [[ -z "$devline" ]] && continue
+    if ! echo "$devline" | grep -q "Kernel driver in use"; then
+      UNBOUND=$((UNBOUND+1))
+    fi
+  done < <(lspci -k 2>/dev/null)
+  if (( UNBOUND > 0 )); then
+    warn "$UNBOUND device(s) without an active driver"
+  else
+    ok "All PCI devices have a driver bound"
+  fi
+else
+  info "/sys/bus/pci/drivers not available"
+fi
+
+# ============================================================================
+# SECTION 6: Vendors
+# ============================================================================
+section "VENDORS"
+
+# Use lspci -n for vendor IDs and look up common ones
+VENDOR_COUNTS=$(printf '%s\n' "$ALL_DEVICES" | awk '{
+  # lspci -n format: "0000:00:1f.0 8086:a182 ..."
+  for (i=1; i<=NF; i++) {
+    if ($i ~ /^[0-9a-f]{4}:[0-9a-f]{4}$/) {
+      split($i, v, ":")
+      print substr(v[1], 1, 2) ":" substr(v[1], 3, 2)
+      break
+    }
+  }
+}' | sort | uniq -c | sort -rn)
+
+# Top 5 vendors
+VENDOR_NAMES=(
+  "8086:Intel Corporation"
+  "10de:NVIDIA Corporation"
+  "1002:AMD/ATI"
+  "1022:Advanced Micro Devices"
+  "14e4:Broadcom"
+  "15b3:Mellanox"
+  "1969:Qualcomm Atheros"
+  "168c:Qualcomm Atheros"
+  "10ec:Realtek Semiconductor"
+  "1b21:ASMedia Technology"
+  "1b73:Fresco Logic"
+  "1af4:Red Hat (virtio)"
+  "1c5c:SK hynix"
+  "144d:Samsung Electronics"
+  "126f:Silicon Motion"
+  "1987:Phison Electronics"
+  "1cc1:ADATA Technology"
+  "1179:Toshiba Memory"
+  "1d79:Toshiba Memory"
+  "1d6a:Aquantia"
+  "1b4b:Marvell Technology"
+  "15ad:VMware"
+  "1234:Bochs/QEMU"
+  "1b36:Red Hat QEMU virtual"
+  "1414:Microsoft"
+  "106b:Apple"
+  "1443:ASPEED"
+)
+
+vendor_name() {
+  local vid="$1"
+  for v in "${VENDOR_NAMES[@]}"; do
+    if [[ "${v%%:*}" == "$vid" ]]; then
+      echo "${v#*:}"
+      return
+    fi
+  done
+  echo "Vendor 0x$vid"
+}
+
+if [[ -n "$VENDOR_COUNTS" ]]; then
+  printf "  ${C_DIM}%-40s %6s${C_RESET}\n" "Vendor" "Devices"
+  printf "  ${C_DIM}%-40s %6s${C_RESET}\n" "----------------------------------------" "------"
+  printf '%s\n' "$VENDOR_COUNTS" | head -10 | while IFS= read -r line; do
+    cnt=$(echo "$line" | awk '{print $1}')
+    vid=$(echo "$line" | awk '{print $2}')
+    name=$(vendor_name "$vid")
+    printf "  %-40s ${C_CYAN}%6d${C_RESET}\n" "$name" "$cnt"
+  done
+else
+  info "Could not enumerate vendors"
+fi
+
+# ============================================================================
+# SECTION 7: Device Detail (top devices)
+# ============================================================================
+section "DEVICE DETAIL (top 10 by class frequency)"
+
+# Capture `lspci -k` output once so we can show the kernel driver in use
+# alongside each device's description (DRIVER column).
+LSPCI_K=$(lspci -k 2>/dev/null)
+if [[ -n "$LSPCI_K" ]]; then
+  printf "  ${C_DIM}%-10s %-50s %s${C_RESET}\n" "BDF" "DESCRIPTION" "KERNEL DRIVER"
+  printf "  ${C_DIM}%-10s %-50s %s${C_RESET}\n" "----------" "--------------------------------------------------" "----------------"
+  # Walk lspci -k BDF-by-BDF: each header line begins with "<bdf> <desc>",
+  # subsequent indented lines can include "Kernel driver in use: <name>".
+  awk_cur_bdf=""
+  awk_cur_desc=""
+  awk_cur_drv=""
+  printf '%s\n' "$LSPCI_K" | head -120 | awk -v c_dim="" '
+    /^[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[[:xdigit:]]/ {
+      if (awk_cur_bdf != "") print awk_cur_bdf "|" awk_cur_desc "|" awk_cur_drv
+      awk_cur_bdf = $1
+      # Description is everything after "XX:XX.X " on that line
+      sub(/^[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[[:xdigit:]] +/, "")
+      awk_cur_desc = $0
+      awk_cur_drv = "(none)"
+      next
+    }
+    /Kernel driver in use:/ {
+      sub(/.*Kernel driver in use:[[:space:]]*/, "", $0)
+      sub(/[[:space:]]*$/, "", $0)
+      awk_cur_drv = $0
+      next
+    }
+    /^$/ {
+      if (awk_cur_bdf != "") {
+        print awk_cur_bdf "|" awk_cur_desc "|" awk_cur_drv
+        awk_cur_bdf = ""; awk_cur_desc = ""; awk_cur_drv = ""
+      }
+      next
+    }
+    END { if (awk_cur_bdf != "") print awk_cur_bdf "|" awk_cur_desc "|" awk_cur_drv }
+  ' | head -10 | while IFS='|' read -r bdf desc drv; do
+    [[ -z "$bdf" ]] && continue
+    printf "  ${C_CYAN}%-10s${C_RESET} ${C_DIM}%-50s${C_RESET} %s\n" \
+      "$bdf" "$(truncate "$desc" 48)" "$(truncate "$drv" 30)"
+  done
+fi
+
+# ============================================================================
+# SECTION 8: PCI Headline box
+# ============================================================================
+section "PCI HEADLINE"
+
+# Find widest line
+H1="Devices:        $TOTAL_DEVICES total"
+H2="Classes:        $(printf '%s\n' "$CLASS_COUNTS" | wc -l) distinct"
+H3="Fastest link:   $([[ $FASTEST_GEN -gt 0 ]] && echo "PCIe Gen$FASTEST_GEN" || echo "(unknown)")"
+H4="Downgraded:     $DOWNGRADED link(s) below max"
+H5="IOMMU groups:   $([[ -d /sys/kernel/iommu_groups ]] && find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || echo "0")"
+
+# Compute visible width (strip ANSI for measurement)
+strip_ansi() { printf '%s' "$1" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
+widest=0
+for line in "$H1" "$H2" "$H3" "$H4" "$H5"; do
+  w=${#line}
+  (( w > widest )) && widest=$w
+done
+BOX_W=$(( widest + 4 ))
+[[ $BOX_W -lt 56 ]] && BOX_W=56
+[[ $BOX_W -gt 72 ]] && BOX_W=72
+
+# Print box (raw bytes for box-drawing to avoid UTF-8 mangling)
+TOP="╔$(printf '═%.0s' $(seq 1 $BOX_W))╗"
+BOT="╚$(printf '═%.0s' $(seq 1 $BOX_W))╝"
+
+printf "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$TOP"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H1"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H2"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H3"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H4"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H5"
+printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+printf "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$BOT"
+
+# ============================================================================
+# SECTION 9: Recommendations & Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+
+rec() {
+  printf "  ${C_CYAN}#%d${C_RESET} → %s\n" "$1" "$2"
+}
+
+rec 1 "Run \`lspci -vv\` for full register/negotiation details on any device"
+rec 2 "Use \`lspci -tv\` to spot misrouted bridges or unexpected topology"
+rec 3 "For VFIO passthrough: each device in its own IOMMU group is ideal"
+rec 4 "Run \`sudo lshw -class pci -numeric\` for an alternate complete listing"
+rec 5 "For PCIe errors: \`dmesg | grep -i pcie\` and check \`journalctl -k | grep AER\`"
+
+if (( DOWNGRADED > 0 )); then
+  rec 6 "Re-seat any device running below its max link speed (check physical slot/cable)"
+fi
+
+# ---------- Verdict ----------
+section "VERDICT"
+
+ELAPSED=$(( $(date +%s) - START_TS ))
+
+if (( CRITICAL > 0 )); then
+  printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical issue(s) found\n" "$CRITICAL"
+  EXIT=2
+elif (( WARNINGS > 0 )); then
+  printf "  ${C_YELLOW}${C_BOLD}WARNINGS${C_RESET}: %d warning(s)\n" "$WARNINGS"
+  EXIT=1
+else
+  printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+  EXIT=0
+fi
+
+printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+
+# ---------- JSON output ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+  FIELDS=$(IFS=,; echo "${JSON_FIELDS[*]}")
+  printf '{"script":"pci","host":"%s","timestamp":"%s","total_devices":%d,"fastest_gen":%d,"downgraded":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
+    "$HOSTNAME_SHORT" "$TIMESTAMP" "$TOTAL_DEVICES" "$FASTEST_GEN" "$DOWNGRADED" "$WARNINGS" "$CRITICAL" "$EXIT"
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "pciz complete: total=$TOTAL_DEVICES gen=$FASTEST_GEN downgraded=$DOWNGRADED warnings=$WARNINGS critical=$CRITICAL class=$FILTER_CLASS vendor=$FILTER_VENDOR" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+exit $EXIT

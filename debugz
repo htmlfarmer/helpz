@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# debugz — Master "Debug Anything" Diagnostic Tool
+# ----------------------------------------------------------------------------
+# One place to start when something is wrong on a Linux box. Replays the
+# most common triage steps and surfaces the data needed to fix bugs:
+#
+#   - Recent system errors (dmesg + journalctl critical)
+#   - Open files / sockets (lsof, ss) for a target process
+#   - Files touched by a process recently (fanotify proxy-via /proc/PID/fd)
+#   - Kernel-tail ring-buffer tail (syslog of last errors)
+#   - Library / binary deps (ldd on a binary)
+#   - Running processes consumed by user/pid
+#   - Last-modified config files
+#   - Network connections, with geo-enrichment
+#   - Filesystem / proc virt maps
+#   - Process ancestry (parent → child chain)
+#   - "Stuck" or D-state threads (suspected I/O hangs)
+#   - Disk pressure / IO statistics
+#   - Per-CPU run-queue load
+#
+# Usage:
+#   ./debugz                              General triage overview
+#   ./debugz --pid <pid>                  Focus on a process
+#   ./debugz --bin /path/to/binary        Analyze a binary
+#   ./debugz --user someuser              Filter to one user
+#   ./debugz --since 2h                   Time window (e.g., 5m, 2h, 1d)
+#   ./debugz --json                       Machine-readable
+#   ./debugz --no-color                   Plain output
+#   ./debugz --debug <script.sh>          Re-run a suite script under bash -x
+#
+# Visual style:
+#   - Top metrics dashboard (load, mem, fds, threads)
+#   - Bar chart of FDs-per-process
+#   - Heatmap of disk I/O wait times
+#   - Sparkline-style recently-touched files
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"
+
+JSON_OUT=0
+NO_COLOR_FLAG=0
+PID_ARG=""
+BIN_ARG=""
+USER_ARG=""
+SINCE="1h"
+DEBUG_TARGET=""
+TOP_N=10
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              SHOW_HELP=1 ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --pid)                  i=$((i+1)); PID_ARG="${ARGS[$i]:-}" ;;
+        --bin)                  i=$((i+1)); BIN_ARG="${ARGS[$i]:-}" ;;
+        --user)                 i=$((i+1)); USER_ARG="${ARGS[$i]:-}" ;;
+        --since)                i=$((i+1)); SINCE="${ARGS[$i]:-1h}" ;;
+        --debug)                i=$((i+1)); DEBUG_TARGET="${ARGS[$i]:-}" ;;
+        --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
+        --ai)                  AI_VERDICT=1 ;;
+        --no-ai)               AI_VERDICT=0 ;;
+        *) echo "Unknown flag: $arg" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+if [[ "${SHOW_HELP:-0}" -eq 1 ]]; then
+    cat << 'EOF'
+debugz — Master "Debug Anything" Diagnostic
+
+USAGE
+  ./debugz                            Triage overview
+  ./debugz --pid <pid>                Focus on a process
+  ./debugz --bin <path>               Analyze a binary (ldd, ffm flags)
+  ./debugz --user <user>              Filter to user
+  ./debugz --since <time>             Time window: 5m, 2h, 1d
+  ./debugz --debug <script.sh>        Re-run a script under bash -x
+  ./debugz --top N                    Top N items
+  ./debugz --json                     Machine-readable output
+
+EXAMPLES
+  ./debugz --pid 1234                 Investigate hanging process
+  ./debugz --bin /usr/bin/firefox     Why is this failing?
+  ./debugz --since 30m                Last 30 min of activity
+EOF
+    exit 0
+fi
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "debugz"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  DEBUG.SH  — "Debug Anything" Diagnostic                     ║
+   ║  When something is wrong: start here.                         ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+fi
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+bar() {
+    local pct=$1 width=${2:-20}
+    [[ "$pct" < "0" ]] && pct=0
+    [[ "$pct" > "100" ]] && pct=100
+    local filled=$(( pct * width / 100 ))
+    [[ $filled -eq 0 && $pct -gt 0 ]] && filled=1
+    local empty=$(( width - filled ))
+    local color="$C_GREEN"
+    [[ $pct -ge 60 ]] && color="$C_YELLOW"
+    [[ $pct -ge 85 ]] && color="$C_RED"
+    printf '%s' "$color"
+    printf '█%.0s' $(seq 1 "$filled") 2>/dev/null || true
+    printf '%s' "$C_DIM"
+    printf '░%.0s' $(seq 1 "$empty") 2>/dev/null || true
+    printf '%s' "$C_RESET"
+}
+
+truncate() {
+    local s="$1" max="$2"
+    if (( ${#s} > max )); then
+        printf "%s…" "${s:0:$max-1}"
+    else
+        printf "%s" "$s"
+    fi
+}
+
+donut_chart() {
+    local title="$1" width=40
+    shift
+    local total=0
+    local -a labels=() counts=()
+    for rec in "$@"; do
+        [[ -z "$rec" ]] && continue
+        local label="${rec%%|*}"
+        local count="${rec##*|}"
+        [[ -z "$label" ]] && continue
+        labels+=("$label")
+        counts+=("$count")
+        total=$(( total + count ))
+    done
+    [[ $total -eq 0 ]] && { info "No data"; return 0; }
+
+    printf "${C_BOLD}%s${C_RESET}\n" "$title"
+    local colors=("$C_RED" "$C_YELLOW" "$C_GREEN" "$C_CYAN" "$C_MAGENTA" "$C_BLUE")
+    local i
+    for i in "${!labels[@]}"; do
+        local pct=$(( counts[i] * 100 / total ))
+        local arc_len=$(( counts[i] * width / total ))
+        [[ $arc_len -eq 0 ]] && arc_len=1
+        local bar=""
+        local j
+        for (( j=0; j<arc_len; j++ )); do bar+="█"; done
+        local c="${colors[$(( i % 6 ))]}"
+        printf "  ${c}%-14s${C_RESET} ${c}%-40s${C_RESET} ${C_BOLD}%4d${C_RESET} ${C_DIM}(%d%%)${C_RESET}\n" \
+            "${labels[i]}" "$bar" "${counts[i]}" "$pct"
+    done
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 1: HIGH-LEVEL METRICS DASHBOARD
+# ───────────────────────────────────────────────────────────────────────────
+section "1. HIGH-LEVEL METRICS"
+
+# Load & uptime
+if [[ -r /proc/loadavg ]]; then
+    loadavg=$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null)
+    load1=$(awk '{print $1}' <<< "$loadavg")
+    printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%s %s %s${C_RESET}\n" "Load (1/5/15m):" "$(awk '{print $1}' <<< "$loadavg")" "$(awk '{print $2}' <<< "$loadavg")" "$(awk '{print $3}' <<< "$loadavg")"
+fi
+if [[ -r /proc/uptime ]]; then
+    up_sec=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+    printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%dh%02dm${C_RESET}\n" "Uptime:" $((up_sec / 3600)) $(((up_sec % 3600) / 60))
+fi
+# Memory
+if [[ -r /proc/meminfo ]]; then
+    memtot=$(awk '/^MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+    memavail=$(awk '/^MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
+    if [[ -n "$memtot" && -n "$memavail" ]]; then
+        used_pct=$(( (memtot - memavail) * 100 / memtot ))
+        printf "  ${C_DIM}%-22s${C_RESET} " "Memory used:"
+        bar "$used_pct" 30
+        printf " ${C_BOLD}%d%%${C_RESET}\n" "$used_pct"
+    fi
+fi
+# Disk pressure (rough)
+if has_cmd df; then
+    set +e +o pipefail
+    df_root=$(df -h / 2>/dev/null | tail -1 | awk '{gsub("%","",$5); print $5}')
+    if [[ -n "$df_root" ]]; then
+        color=$C_GREEN
+        [[ $df_root -gt 60 ]] && color=$C_YELLOW
+        [[ $df_root -gt 85 ]] && color=$C_RED
+        printf "  ${C_DIM}%-22s${C_RESET} ${color}${C_BOLD}%3d%%${C_RESET} ${C_DIM}of /${C_RESET}\n" "/ filesystem used:" "$df_root"
+    fi
+    set -e -o pipefail
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 2: RECENT KERNEL ERRORS (dmesg tail)
+# ───────────────────────────────────────────────────────────────────────────
+section "2. RECENT KERNEL ERRORS — DMESG TAIL (since $SINCE)"
+
+# Convert --since shorthand into journalctl-compatible form
+SINCE_ARG="--since=${SINCE}"
+
+if has_cmd dmesg; then
+    set +e +o pipefail
+    err_count=$(dmesg --since="${SINCE}" --level=err --nopager 2>/dev/null | wc -l)
+    crit_count=$(dmesg --since="${SINCE}" --level=crit --nopager 2>/dev/null | wc -l)
+    set -e -o pipefail
+    err_count=${err_count:-0}; crit_count=${crit_count:-0}
+    printf "  ${C_DIM}%-22s${C_RESET} ${C_RED}${C_BOLD}%d${C_RESET}\n" "Kernel errors:" "${err_count:-0}"
+    printf "  ${C_DIM}%-22s${C_RESET} ${C_RED}${C_BOLD}%d${C_RESET}\n" "Kernel crits:" "${crit_count:-0}"
+    if [[ "${err_count:-0}" -gt 0 ]]; then
+        subsec "Last 5 ERR lines"
+        dmesg --since="${SINCE}" --level=err --nopager 2>/dev/null | tail -5 | sed 's/^/    /'
+    fi
+else
+    info "dmesg unavailable (restricted container)"
+fi
+
+# Also pull journalctl
+if has_cmd journalctl; then
+    set +e +o pipefail
+    jctl_n=$(journalctl -p err ${SINCE_ARG} --no-pager -q 2>/dev/null | wc -l)
+    jctl_n=${jctl_n:-0}
+    set -e -o pipefail
+    printf "  ${C_DIM}%-22s${C_RESET} ${C_RED}${C_BOLD}%d${C_RESET}\n" "journalctl ERR count:" "$jctl_n"
+    if [[ "$jctl_n" -gt 0 ]]; then
+        info "${C_DIM}Sample:${C_RESET}"
+        journalctl -p err ${SINCE_ARG} --no-pager -q 2>/dev/null | tail -5 | sed 's/^/    /'
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 3: PROCESS INVOCATION (--pid)
+# ───────────────────────────────────────────────────────────────────────────
+if [[ -n "$PID_ARG" ]]; then
+    section "3. PROCESS $PID_ARG — IN-DEPTH"
+
+    if [[ ! -r "/proc/$PID_ARG/stat" ]]; then
+        warn "PID $PID_ARG not visible (need sudo or invalid PID)"
+    else
+        # Process basics
+        comm=$(awk '{print $2}' "/proc/$PID_ARG/stat" 2>/dev/null | tr -d '()')
+        state=$(awk '{print $3}' "/proc/$PID_ARG/stat" 2>/dev/null)
+        ppid=$(awk '{print $4}' "/proc/$PID_ARG/stat" 2>/dev/null)
+        pri=$(awk '{print $18}' "/proc/$PID_ARG/status" 2>/dev/null | head -1)
+        pgrp=$(awk '/^Tgid/ {print $2}' "/proc/$PID_ARG/status" 2>/dev/null)
+        nice=$(awk '/^Nice/ {print $2}' "/proc/$PID_ARG/status" 2>/dev/null)
+        user=$(awk -F'\0' '/\0Uid/{getline; print "uid"}' /proc/$PID_ARG/status 2>/dev/null || awk '/Uid:/ {print $2}' "/proc/$PID_ARG/status" 2>/dev/null)
+        # Find user name for that UID
+        if [[ -n "$user" ]]; then
+            username=$(getent passwd "$user" 2>/dev/null | cut -d: -f1 || echo "$user")
+        else
+            username="?"
+        fi
+        # Cgroup
+        cgroup=$(awk -F'[:2]' '/cpu/ && !/cpu\.cpu/' "/proc/$PID_ARG/cgroup" 2>/dev/null | head -1 | awk '{print $2}' || echo "")
+
+        printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Command:" "${comm:-?}"
+        printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%s${C_RESET}\n" "State:" "${state:-?}"
+        printf "  ${C_DIM}%-22s${C_RESET} %s\n" "PPID:" "$ppid"
+        printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Nice:" "$nice"
+        printf "  ${C_DIM}%-22s${C_RESET} %s (uid %s)\n" "User:" "$username" "${user:-?}"
+        [[ -n "$cgroup" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Cgroup:" "$cgroup"
+
+        # Cmdline args
+        if [[ -r "/proc/$PID_ARG/cmdline" ]]; then
+            cmdline=$(tr '\0' ' ' < "/proc/$PID_ARG/cmdline" 2>/dev/null)
+            printf "  ${C_DIM}%-22s${C_RESET} %s\n" "Cmdline:" "$cmdline"
+        fi
+
+        # Threads
+        subsec "Threads"
+        if [[ -d "/proc/$PID_ARG/task" ]]; then
+            tids=$(ls "/proc/$PID_ARG/task/" 2>/dev/null)
+            n_threads=$(printf '%s\n' "$tids" | wc -l)
+            printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%d${C_RESET}\n" "Thread count:" "$n_threads"
+            if [[ $n_threads -le 20 && $n_threads -gt 0 ]]; then
+                printf "  ${C_DIM}%-7s %-7s %-6s %-6s${C_RESET}\n" "TID" "STATE" "PRI" "POLICY"
+                for t in $tids; do
+                    if [[ -r "/proc/$PID_ARG/task/$t/stat" ]]; then
+                        ts=$(awk '{print $3}' "/proc/$PID_ARG/task/$t/stat" 2>/dev/null)
+                        pri=$(awk '{print $18}' "/proc/$PID_ARG/task/$t/stat" 2>/dev/null)
+                        printf "  ${C_BOLD}%-7s${C_RESET} %-7s %-6s %-6s\n" "$t" "$ts" "$pri" "CFS"
+                    fi
+                done
+            fi
+        fi
+
+        # Open files (with /proc/PID/fd)
+        subsec "Open file descriptors"
+        if [[ -d "/proc/$PID_ARG/fd" ]]; then
+            fd_count=$(ls "/proc/$PID_ARG/fd" 2>/dev/null | wc -l)
+            printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%d${C_RESET}\n" "Open FDs:" "$fd_count"
+            if [[ "$fd_count" -gt 0 ]]; then
+                # Categorize FDs by target type
+                declare -A FD_TYPES
+                for fd in /proc/$PID_ARG/fd/*; do
+                    [[ -L "$fd" ]] || continue
+                    target=$(readlink "$fd" 2>/dev/null)
+                    case "$target" in
+                        socket:*) FD_TYPES[socket]=$((${FD_TYPES[socket]:-0} + 1)) ;;
+                        pipe:*)    FD_TYPES[pipe]=$((${FD_TYPES[pipe]:-0} + 1)) ;;
+                        anon_inode:*) FD_TYPES[anon]=$((${FD_TYPES[anon]:-0} + 1)) ;;
+                        /dev/*)    FD_TYPES[device]=$((${FD_TYPES[device]:-0} + 1)) ;;
+                        /tmp/*)    FD_TYPES[tmp]=$((${FD_TYPES[tmp]:-0} + 1)) ;;
+                        /home/*)   FD_TYPES[home]=$((${FD_TYPES[home]:-0} + 1)) ;;
+                        /usr/*|/*|*.so*) FD_TYPES[file]=$((${FD_TYPES[file]:-0} + 1)) ;;
+                        *)         FD_TYPES[other]=$((${FD_TYPES[other]:-0} + 1)) ;;
+                    esac
+                done
+                # Render donut
+                types_args=()
+                for k in socket pipe anon device tmp home file other; do
+                    v=${FD_TYPES[$k]:-0}
+                    [[ $v -gt 0 ]] && types_args+=("$k|$v")
+                done
+                if [[ ${#types_args[@]} -gt 0 ]]; then
+                    donut_chart "FD distribution (n=$fd_count)" "${types_args[@]}"
+                fi
+                # Top files
+                subsec "Top 10 open file targets"
+                ls -la /proc/$PID_ARG/fd/ 2>/dev/null | grep -E '^l' | awk '{print $NF}' \
+                | head -10 | while IFS= read -r target; do
+                    printf "  ${C_DIM}%s${C_RESET}\n" "$(truncate "$target" 80)"
+                done
+            fi
+        fi
+
+        # Process environment (just count vars + show first 5 if small)
+        if [[ -r "/proc/$PID_ARG/environ" ]]; then
+            env_count=$(tr '\0' '\n' < "/proc/$PID_ARG/environ" 2>/dev/null | wc -l)
+            printf "  ${C_DIM}%-22s${C_RESET} ${C_BOLD}%d${C_RESET}\n" "Env vars:" "$env_count"
+        fi
+
+        # Memory details
+        if [[ -r "/proc/$PID_ARG/status" ]]; then
+            vmrss=$(awk '/^VmRSS/ {print $2" "$3}' "/proc/$PID_ARG/status" 2>/dev/null)
+            vmsize=$(awk '/^VmSize/ {print $2" "$3}' "/proc/$PID_ARG/status" 2>/dev/null)
+            vmpeak=$(awk '/^VmPeak/ {print $2" "$3}' "/proc/$PID_ARG/status" 2>/dev/null)
+            vmswap=$(awk '/^VmSwap/ {print $2" "$3}' "/proc/$PID_ARG/status" 2>/dev/null)
+            [[ -n "$vmsize" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "VmSize:" "$vmsize"
+            [[ -n "$vmpeak" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "VmPeak:" "$vmpeak"
+            [[ -n "$vmrss" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "VmRSS:" "$vmrss"
+            [[ -n "$vmswap" ]] && printf "  ${C_DIM}%-22s${C_RESET} %s\n" "VmSwap:" "$vmswap"
+        fi
+
+        # Children
+        subsec "Children"
+        children=$(pgrep -P "$PID_ARG" 2>/dev/null | head -10 || true)
+        if [[ -n "$children" ]]; then
+            while IFS= read -r cpid; do
+                ccomm=$(awk '{print $2}' "/proc/$cpid/stat" 2>/dev/null | tr -d '()')
+                [[ -n "$ccomm" ]] && printf "  ${C_BOLD}%-7s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$cpid" "$ccomm"
+            done <<< "$children"
+        else
+            info "(none)"
+        fi
+
+        # Last 100 chars of /proc/$PID/maps
+        if [[ -r "/proc/$PID_ARG/maps" ]]; then
+            subsec "Memory map (first 10 entries)"
+            head -10 "/proc/$PID_ARG/maps" 2>/dev/null | sed 's/^/  /'
+            map_total=$(wc -l < "/proc/$PID_ARG/maps" 2>/dev/null || echo 0)
+            printf "  ${C_DIM}(%s total map entries)${C_RESET}\n" "$map_total"
+        fi
+
+        # Stalled in D?
+        n_d_state=$(awk '{print $3}' "/proc/$PID_ARG/task"/*/stat 2>/dev/null | grep -c '^D$' || true)
+        n_d_state=${n_d_state:-0}
+        if [[ "$n_d_state" -gt 0 ]]; then
+            warn "$n_d_state threads in D-state — likely waiting on I/O"
+            critf "process_d_state" "PID $PID_ARG has $n_d_state threads stuck in D-state" \
+                "Likely I/O hang (NFS, slow disk). Run 'ps -o stat,time,command -L -p $PID_ARG' to identify stuck threads."
+        fi
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 4: BINARY ANALYSIS (--bin)
+# ───────────────────────────────────────────────────────────────────────────
+if [[ -n "$BIN_ARG" ]]; then
+    section "4. BINARY $BIN_ARG"
+    if [[ ! -e "$BIN_ARG" ]]; then
+        warn "File does not exist: $BIN_ARG"
+    elif [[ ! -x "$BIN_ARG" ]]; then
+        warn "File is not executable (try: chmod +x $BIN_ARG or use a static-lister like file/ldd)"
+    fi
+    subsec "file"
+    has_cmd file && file "$BIN_ARG" 2>/dev/null | sed 's/^/  /' || info "(file command unavailable)"
+
+    subsec "ldd / linked libs"
+    if has_cmd ldd; then
+        set +e +o pipefail
+        ldd "$BIN_ARG" 2>&1 | head -30 | sed 's/^/  /'
+        # Missing libs warning
+        missing=$(ldd "$BIN_ARG" 2>&1 | awk '/not found/{print $1}' | sort -u | head -10)
+        set -e -o pipefail
+        if [[ -n "$missing" ]]; then
+            warn "Missing libraries:"
+            printf '  %s\n' $missing
+            critf "missing_libs" "$BIN_ARG references missing libs" \
+                "Install missing libs with: 'sudo apt install \$(printf '%s\\n' $missing | tr '\\n' ' ' | xargs)' (or a curated metapackage)"
+        fi
+    fi
+
+    subsec "Symbols / size"
+    if has_cmd objdump; then
+        sz=$(stat -c %s "$BIN_ARG")
+        printf "  Size: %s bytes\n" "$sz"
+        objdump -p "$BIN_ARG" 2>/dev/null | grep -E "NEEDED|RUNPATH|RPATH" | sed 's/^/  /' | head -10
+    fi
+
+    subsec "Static analysis: any libc issues?"
+    if has_cmd nm; then
+        nm -D --defined-only "$BIN_ARG" 2>/dev/null | wc -l | xargs printf "  Exported symbols: %s\n"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 5: TOP FD CONSUMERS (always shown)
+# ───────────────────────────────────────────────────────────────────────────
+section "5. TOP FD CONSUMERS — WHO IS HOLDING WHAT OPEN"
+if [[ -d /proc ]]; then
+    subsec "Top $TOP_N processes by open-FD count"
+    printf "  ${C_DIM}%-7s %-7s %-22s %s${C_RESET}\n" "PID" "FDs" "USER" "COMMAND"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    set +e +o pipefail
+    for d in /proc/[0-9]*; do
+        pid=$(basename "$d")
+        [[ -d "$d/fd" ]] || continue
+        fd_n=$(ls "$d/fd" 2>/dev/null | wc -l)
+        [[ -z "$fd_n" ]] && fd_n=0
+        [[ "$fd_n" =~ ^[0-9]+$ ]] || continue
+        echo "$fd_n $pid"
+    done | sort -rn | head -"$TOP_N" | while IFS= read -r line; do
+        fd_n=$(awk '{print $1}' <<< "$line")
+        pid=$(awk '{print $2}' <<< "$line")
+        comm=$(awk '{print $2}' "/proc/$pid/stat" 2>/dev/null | tr -d '()')
+        [[ -z "$comm" ]] && comm="?"
+        userid=$(awk '/^Uid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+        username=$(getent passwd "$userid" 2>/dev/null | cut -d: -f1 || echo "$userid")
+        printf "  ${C_BOLD}%-7s${C_RESET} ${C_BOLD}%-7s${C_RESET} ${C_CYAN}%-22s${C_RESET} %s\n" \
+            "$pid" "$fd_n" "$username" "$comm"
+    done
+    set -e -o pipefail
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 6: DISK I/O PRESSURE
+# ───────────────────────────────────────────────────────────────────────────
+section "6. DISK I/O PRESSURE"
+if [[ -r /proc/pressure/io ]]; then
+    info "PSImetrics (PSI):"
+    line1=$(head -1 /proc/pressure/io)
+    line2=$(head -2 /proc/pressure/io | tail -1)
+    printf "  ${C_DIM}%-30s${C_RESET} ${C_DIM}%s${C_RESET}\n" "Some-IO stall:" "$line1"
+    printf "  ${C_DIM}%-30s${C_RESET} ${C_DIM}%s${C_RESET}\n" "Full-IO stall:" "$line2"
+fi
+if [[ -r /proc/diskstats ]]; then
+    subsec "Per-device total ticks"
+    printf "  ${C_DIM}%-15s %10s %10s %10s %10s${C_RESET}\n" "DEVICE" "READS" "WRITES" "IOTICKS" "INFLIGHT"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    set +e +o pipefail
+    awk '$3 ~ /^[a-z]/' /proc/diskstats 2>/dev/null | head -8 \
+    | while IFS= read -r line; do
+        read -r mj dev rest <<< "$line"
+        # The fields vary by kernel; common: reads(3), reads_merged(4), sectors_read(5), reads_ms(6),
+        # writes(7), writes_merged(8), sectors_written(9), writes_ms(10), inflight(11), ioticks(12)
+        reads=$(awk '{print $4}' <<< "$line")
+        writes=$(awk '{print $8}' <<< "$line")
+        ioticks=$(awk '{print $13}' <<< "$line")
+        inflight=$(awk '{print $12}' <<< "$line")
+        printf "  ${C_BOLD}%-15s${C_RESET} ${C_CYAN}%10s${C_RESET} ${C_CYAN}%10s${C_RESET} ${C_BOLD}%10s${C_RESET} ${C_MAGENTA}%10s${C_RESET}\n" \
+            "$dev" "$reads" "$writes" "$ioticks" "$inflight"
+    done
+    set -e -o pipefail
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 7: NETWORK CONNECTIONS (with geo enrichment if external)
+# ───────────────────────────────────────────────────────────────────────────
+section "7. NETWORK CONNECTIONS"
+if has_cmd ss; then
+    subsec "Established TCP — external destinations"
+    printf "  ${C_DIM}%-7s %-7s %-22s %s${C_RESET}\n" "PID" "PROG" "REMOTE IP" "GEO"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+    # Parse ss -ptn output without nested slash regexes that confuse awk
+    set +e +o pipefail
+    ss -tnp 2>/dev/null | grep "ESTAB" | head -"$TOP_N" \
+    | while IFS= read -r line; do
+        # Extract remote address (4th whitespace-separated token)
+        remote=$(awk '{print $4}' <<< "$line")
+        [[ "$remote" == "LISTEN" ]] && remote=$(awk '{print $5}' <<< "$line")
+        ip="${remote%:*}"
+        # Extract pid=XXXX
+        pid=$(grep -oE 'pid=[0-9]+' <<< "$line" | head -1 | cut -d= -f2)
+        [[ -z "$pid" ]] && pid="?"
+        proc="?"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$pid/comm" ]]; then
+            proc=$(cat "/proc/$pid/comm" 2>/dev/null)
+        fi
+        # Resolve the binary's path too
+        proc_path="?"
+        if [[ -r "/proc/$pid/exe" ]]; then
+            proc_path=$(readlink "/proc/$pid/exe" 2>/dev/null || echo "?")
+        fi
+        # Strip IPv4-mapped prefix
+        ip="${ip#::ffff:}"
+        # Enrich
+        geo="—"
+        if [[ "$ip" =~ ^[0-9]+\. ]]; then
+            short=$(enrich_ip_short "$ip")
+            geo="$short"
+        fi
+        printf "  ${C_BOLD}%-7s${C_RESET} ${C_CYAN}%-7s${C_RESET} ${C_MAGENTA}%-22s${C_RESET} ${C_DIM}%-45s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
+            "$pid" "$proc" "$ip" "$proc_path" "$geo"
+    done
+    set -e -o pipefail
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 8: USER FILTER (--user)
+# ───────────────────────────────────────────────────────────────────────────
+if [[ -n "$USER_ARG" ]]; then
+    section "8. USER '$USER_ARG' — PROCESSES & LIMITS"
+    subsec "Processes owned by $USER_ARG"
+    set +e +o pipefail
+    ps -eo pid,stat,pcpu,pmem,etime,comm --sort=-pcpu 2>/dev/null \
+        | tail -n +2 \
+        | while IFS= read -r line; do
+            proc_user=$(getent passwd "$(awk '/^Uid:/{print $2; exit}' "/proc/$(awk '{print $1}' <<< "$line")/status" 2>/dev/null)" 2>/dev/null | cut -d: -f1)
+            [[ "$proc_user" == "$USER_ARG" ]] && echo "$line"
+        done \
+        | head -15 \
+        | sed 's/^/  /'
+    set -e -o pipefail
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 9: --debug (re-run script under bash -x)
+# ───────────────────────────────────────────────────────────────────────────
+if [[ -n "$DEBUG_TARGET" ]]; then
+    section "9. TRACE $DEBUG_TARGET"
+    if [[ ! -r "$DEBUG_TARGET" ]]; then
+        warn "Target script not found: $DEBUG_TARGET"
+    else
+        info "Re-executing with 'bash -x' (controlled subset; first 60s)..."
+        printf "${C_DIM}"
+        timeout 60 bash -x "$DEBUG_TARGET" 2>&1 | head -200 \
+            | head -50
+        printf "${C_RESET}\n"
+    fi
+fi
+
+# ───────────────────────────────────────────────────────────────────────────
+# SECTION 10: SECURITY POSTURE — ptrace / strace / kernel-symbol exposure
+# ───────────────────────────────────────────────────────────────────────────
+section "10. DEBUG SECURITY POSTURE"
+
+# 1. ptrace_scope (Yama LSM): how aggressive is process-trace restriction?
+#    0 = classic (any uid can ptrace same-uid) — too permissive
+#    1 = restricted (only direct ancestor) — typical
+#    2 = admin-only — recommended
+#    3 = no ptrace at all — paranoid
+PTRACE=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)
+if [[ -n "$PTRACE" ]]; then
+    case "$PTRACE" in
+        0) crit "ptrace_scope = 0 (any process can ptrace any other same-uid process)" ;;
+        1) info "ptrace_scope = 1 (restricted to direct ancestors)" ;;
+        2) info "ptrace_scope = 2 (admin-only — recommended)" ;;
+        3) info "ptrace_scope = 3 (no ptrace at all)" ;;
+        *) info "ptrace_scope = $PTRACE" ;;
+    esac
+fi
+
+# 2. perf_event_paranoid: how locked-down is perf for unprivileged users?
+#    ≤2 = OK-ish; >2 means unprivileged users can read perf data (kernel info leak)
+PERF=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)
+if [[ -n "$PERF" ]]; then
+    if (( PERF >= 3 )); then
+        warn "perf_event_paranoid = $PERF — unprivileged users can read perf data (kernel pointer leak risk)"
+    else
+        info "perf_event_paranoid = $PERF"
+    fi
+fi
+
+# 3. kptr_restrict: should be 2 (kernel pointers hidden) — caught here too
+KPTR=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)
+if [[ "$KPTR" == "0" ]]; then
+    crit "kptr_restrict = 0 — kernel pointers visible in /proc/kallsyms to unprivileged users"
+    info "  Set: 'sudo sysctl -w kernel.kptr_restrict=2'"
+fi
+
+# 4. /proc/kallsyms: even when kptr_restrict is 0, check that %pK is being used
+#    in dmesg; here we just surface the symbol availability.
+if [[ -r /proc/kallsyms ]]; then
+    if [[ "$KPTR" == "0" ]]; then
+        SYMS=$(wc -l < /proc/kallsyms 2>/dev/null)
+        info "/proc/kallsyms readable: $SYMS symbol lines exposed"
+    fi
+fi
+
+# 5. /proc/sys/kernel/core_pattern — should not contain | (pipe to program)
+#    A pipe-to-program core handler can be exploited to execute arbitrary code
+#    as root when a SUID process crashes.
+CORE_PAT=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)
+if [[ -n "$CORE_PAT" ]]; then
+    if [[ "$CORE_PAT" == *"|"* ]]; then
+        crit "core_pattern = '$CORE_PAT' — piped core handler (arbitrary root code on SUID crash)"
+        info "  Disable: 'echo core > /proc/sys/kernel/core_pattern'"
+    else
+        info "core_pattern = '$CORE_PAT' (no pipe — safe)"
+    fi
+fi
+
+# 6. dmesg_restrict: only root should be able to read kernel ring buffer
+DMESG_R=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)
+if [[ "$DMESG_R" != "1" ]]; then
+    crit "dmesg_restrict = ${DMESG_R:-0} — any user can read kernel logs (info leak)"
+    info "  Set: 'sudo sysctl -w kernel.dmesg_restrict=1'"
+fi
+
+# 7. kexec: can root load arbitrary kernels? should be disabled in production
+KEXEC=$(cat /proc/sys/kernel/kexec_load_disabled 2>/dev/null)
+if [[ "$KEXEC" == "0" ]]; then
+    warn "kexec_load_disabled = 0 — root can load arbitrary kernel (persistence / bypass)"
+    info "  Set: 'sudo sysctl -w kernel.kexec_load_disabled=1'"
+fi
+
+# 8. User-namespaced ptrace / proc — check unprivileged userns restrictions
+USERNS=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null \
+    || cat /proc/sys/usermodehelper/bset 2>/dev/null \
+    || echo "n/a")
+info "unprivileged_userns_clone = $USERNS"
+
+# 9. coredump: do we have systemd-coredump running?
+if systemctl is-active systemd-coredump.socket >/dev/null 2>&1; then
+    info "systemd-coredump active — coredumps land in /var/lib/systemd/coredump (owner: root, restricted perms)"
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "debugz complete: pid=$PID_ARG bin=$BIN_ARG user=$USER_ARG since=$SINCE" 2>/dev/null || true
+fi

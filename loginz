@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# loginz - Bad-login analyst: who knocked, did they get in, what next
+# ----------------------------------------------------------------------------
+# The suite's login-security lens (merges the old checkz live monitor and
+# abusez SSH forensics into one tool). Reads the journal / auth logs,
+# classifies every authentication event, and answers the three questions
+# that matter:
+#
+#   1. Are we being brute-forced right now?   (rate, top IPs, cadence)
+#   2. Did anyone actually get in?            (accepted from attack IPs)
+#   3. What should I do about it?             (block list, dossiers, abuse)
+#
+# Usage:
+#   ./loginz                   Bad-login summary (default: last 72h)
+#   ./loginz --since 24h       Journal window (7d, 12h, "2026-09-01", …)
+#   ./loginz --watch           Live color-coded login stream (Ctrl+C quits)
+#   ./loginz --ip 1.2.3.4      Full forensic card for one source IP
+#   ./loginz --dossier 5       Evidence dossiers for top N attackers
+#   ./loginz --json            Machine-readable summary
+#   ./loginz --no-color        Plain output
+#
+# Reports land in loginz-reports/ (git-ignored). --dossier/whois lookups are
+# PASSIVE (never probes the attacker's services). Optional identity for
+# complaint drafts: LOGINZ_NAME / LOGINZ_EMAIL / LOGINZ_LOCATION / LOGINZ_VICTIM
+#
+# Requires: bash 4+, gawk; optional: journalctl, lastb, faillock, whois, dig
+# Exit: 0 quiet · 1 warnings (failures only) · 2 critical (break-in suspects)
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || {
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'
+    C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; C_MAGENTA=$'\033[35m'
+    section(){ printf "\n  ━━ %s ━━\n" "$1"; }; ok(){ printf "  ✓ %s\n" "$1"; }
+    warn(){ printf "  ! %s\n" "$1"; }; crit(){ printf "  ✗ %s\n" "$1"; }
+    emit(){ printf "$@"; }; critf(){ crit "$2"; }; warnf(){ warn "$2"; }
+    kpi(){ printf "  %s: %s\n" "$2" "$1"; }; hr(){ echo "  ----"; }
+    emit_verdict(){ :; }; bar(){ :; }
+}
+[[ -f "$SCRIPT_DIR/lib/ai.sh" ]] && source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+
+MODE="summary"; SINCE="72h"; FILTER_IP=""; DOSSIER_N=0; AI_VERDICT=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --watch)    MODE="watch" ;;
+        --ip)       MODE="ip"; FILTER_IP="${2:-}"; shift ;;
+        --dossier)  MODE="dossier"; DOSSIER_N="${2:-5}"; shift ;;
+        --since)    SINCE="${2:-72h}"; shift ;;
+        --since=*)  SINCE="${1#--since=}" ;;
+        --json)     JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        --ai)       AI_VERDICT=1 ;;
+        --no-ai)    AI_VERDICT=0 ;;
+        -h|--help)  awk 'NR>1 && /^# ===/{exit} NR>=5 && /^#/{print substr($0,3)}' "$0"; exit 0 ;;
+        *)          echo "loginz: unknown option $1 (try --help)" >&2; exit 64 ;;
+    esac
+    shift
+done
+[[ "$MODE" == "ip" && -z "$FILTER_IP" ]] && { echo "loginz: --ip needs an address" >&2; exit 64; }
+
+REPORTS_DIR="$SCRIPT_DIR/loginz-reports"
+LOG_TEMP=$(mktemp /tmp/loginz_events.XXXXXX); trap 'rm -f "$LOG_TEMP"' EXIT
+
+# ────────────────────────── event collection ───────────────────────────────
+collect_events() {   # -> TSV rows: epoch<TAB>kind<TAB>ip<TAB>user<TAB>raw-ts
+    local raw
+    raw=$(mktemp /tmp/loginz_raw.XXXXXX)
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl --since "$SINCE" -u ssh -u sshd -u sshd.service -o short-iso --no-pager 2>/dev/null > "$raw" || true
+    fi
+    [[ -s "$raw" ]] || { for f in /var/log/auth.log /var/log/secure; do [[ -r "$f" ]] && { cat "$f" >> "$raw" 2>/dev/null; break; }; done; }
+    [[ -r "$raw" ]] || : > "$raw"
+    gawk -v OFS='\t' '
+    function epoch(ts,   a, b) {            # "2026-09-26T13:44:02" → secs
+        if (match(ts, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+            split(substr(ts,1,19), a, /[-T:]/)
+            return mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "a[6])
+        }
+        return 0
+    }
+    {
+        ts = $1 " " $2 " " $3
+        ip=""; user=""; kind=""
+        if (match($0, /Failed password for (invalid user )?([^ ]+) from ([0-9.]+)/, m)) {
+            kind = (m[1]!="" ? "invfail" : "fail"); user=m[2]; ip=m[3]
+        } else if (match($0, /Accepted (password|publickey|keyboard-interactive[^ ]*) for (invalid user )?([^ ]+) from ([0-9.]+)/, m)) {
+            kind="accept"; user=m[3]; ip=m[4]
+        } else if (match($0, /Invalid user ([^ ]+) from ([0-9.]+)/, m)) {
+            kind="invprobe"; user=m[1]; ip=m[2]
+        } else if (match($0, /authentication failure.*rhost=([0-9.]+).*user=([^ ]+)/, m)) {
+            kind="pamfail"; user=m[2]; ip=m[1]
+        }
+        if (ip != "") print epoch($1), kind, ip, user, $1
+    }' "$raw" > "$LOG_TEMP"
+    rm -f "$raw"
+}
+
+N_FAIL=0; N_INV=0; N_ACCEPT=0; UNIQUE_IPS=0
+summarize_counts() {
+    N_FAIL=$(awk -F'\t' '$2=="fail"||$2=="pamfail"{c++}END{print c+0}' "$LOG_TEMP")
+    N_INV=$(awk -F'\t' '$2 ~ /^inv/{c++}END{print c+0}' "$LOG_TEMP")
+    N_ACCEPT=$(awk -F'\t' '$2=="accept"{c++}END{print c+0}' "$LOG_TEMP")
+    UNIQUE_IPS=$(awk -F'\t' '{print $3}' "$LOG_TEMP" | sort -u | wc -l | tr -d ' ')
+}
+
+# IPs that FAILED and later ACCCEPTED — the break-in watch list
+breakins() {
+    local ips a
+    for ips in $(awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort -u); do
+        a=$(awk -F'\t' -v ip="$ips" '$2=="accept" && $3==ip' "$LOG_TEMP" | head -1)
+        [[ -n "$a" ]] && printf '%s\t%s\n' "$ips" "$a"
+    done
+}
+
+user_valid() { getent passwd "$1" >/dev/null 2>&1 && echo real || echo invalid; }
+
+heat() { local p=$1; (( p>=85 )) && printf '%s' "$C_RED"; (( p>=60 && p<85 )) && printf '%s' "$C_YELLOW"; (( p<60 )) && printf '%s' "$C_GREEN"; }
+
+# ══════════════════════════ MODE: watch (live stream) ══════════════════════
+watch_stream() {
+    emit "\n  ${C_BOLD}${C_MAGENTA}loginz --watch${C_RESET}  ${C_DIM}live auth events — Ctrl+C to quit${C_RESET}\n\n"
+    local line user
+    trap 'printf "\n  ${C_DIM}— watched —${C_RESET}\n"; exit 0' INT TERM
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -f -q -o short-iso --no-pager 2>/dev/null | while IFS= read -r line; do
+            [[ "$line" == *"Failed password"* ]] && { printf '%s[FAIL]%s %s\n' "$C_CYAN$C_BOLD" "$C_RESET" "$line"; continue; }
+            [[ "$line" == *"Invalid user"* ]] && { user=$(awk '/Invalid user/{for(i=1;i<=NF;i++)if($i=="user")print $(i+1)}' <<<"$line")
+                printf '%s[PROBE]%s %s %s(%s)%s\n' "$C_MAGENTA$C_BOLD" "$C_RESET" "$line" "$C_YELLOW" "user: $user" "$C_RESET"; continue; }
+            [[ "$line" == *"Accepted"* && "$line" == *sshd* ]] && { printf '%s[OK LOGIN]%s %s\n' "$C_GREEN$C_BOLD" "$C_RESET" "$line"; continue; }
+            [[ "$line" == *"authentication failure"* ]] && { printf '%s[PAM FAIL]%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$line"; continue; }
+            emit "  ${C_DIM}%s${C_RESET}\n" "$line"
+        done
+    else
+        tail -F /var/log/auth.log /var/log/secure 2>/dev/null | grep --line-buffered -E "Failed|Invalid|Accepted|authentication failure"
+    fi
+}
+
+# ══════════════════════════ forensic helpers ═══════════════════════════════
+who_card() {   # ip -> prints org / abuse / rdns lines (passive only)
+    local ip="$1" w rdns
+    rdns=$(timeout 3 dig -x "$ip" +short +time=2 +tries=1 2>/dev/null | sed 's/\.$//' | head -1)
+    printf '  %sreverse-dns:%s %s\n' "$C_BOLD" "$C_RESET" "${rdns:-(none)}"
+    if command -v whois >/dev/null 2>&1; then
+        w=$(timeout 6 whois "$ip" 2>/dev/null | grep -Ei "^(org-name|organization|descr|abuse-mailbox|netname|country)" | head -6 | sed 's/^[[:space:]]*/    /')
+        printf '  %swhois:%s\n%s\n' "$C_BOLD" "$C_RESET" "${w:-    (no whois output)}"
+    else
+        printf '  %swhois:%s not installed — see https://www.abuseipdb.com/check/%s\n' "$C_BOLD" "$C_RESET" "$ip"
+    fi
+}
+
+ip_forensics() {   # one IP, everything we have
+    local ip="$1" rows first last fails invs accepts users
+    rows=$(awk -F'\t' -v ip="$ip" '$3==ip' "$LOG_TEMP")
+    [[ -z "$rows" ]] && { warn "no $SINCE events recorded for $ip in journal/auth logs"; return 1; }
+    fails=$(awk -F'\t' '$2!="accept"{c++}END{print c+0}' <<<"$rows")
+    accepts=$(awk -F'\t' '$2=="accept"{c++}END{print c+0}' <<<"$rows")
+    first=$(awk -F'\t' 'NR==1{print $1}' <<<"$rows"); last=$(awk -F'\t' 'END{print $1}' <<<"$rows")
+    emit "\n  ${C_BOLD}${C_CYAN}forensic card — $ip${C_RESET}\n"
+    hr
+    if (( accepts > 0 )); then
+        critf "break_in_watch" "$ip failed $fails times yet was ACCEPTED $accepts time(s)" "rotate its keys/passwords NOW, review sessions: who / last $ip"
+        printf "  ${C_RED}${C_BOLD}⚠ ACCEPTED LOGINS FROM THIS IP (${accepts}×)${C_RESET}\n"
+        awk -F'\t' '$2=="accept"{print "      " $5 "  user=" $4}' <<<"$rows" | head -5
+    fi
+    printf "  failures: %s  probes(invalid): %s  window: %s → %s\n\n" "$fails" \
+        "$(awk -F'\t' '$2 ~ /^inv/{c++}END{print c+0}' <<<"$rows")" \
+        "$(date -d "@$first" '+%m-%d %H:%M')" "$(date -d "@$last" '+%m-%d %H:%M')"
+    printf '  %stargeted users:%s\n' "$C_BOLD" "$C_RESET"
+    awk -F'\t' '{print $4}' <<<"$rows" | sort | uniq -c | sort -rn | head -8 | while read -r n u; do
+        local tag; tag=$(user_valid "$u")
+        local col="$C_MAGENTA"; [[ "$tag" == real ]] && col="$C_YELLOW"
+        printf "    %4s × %s%s%s  ${C_DIM}(%s account)${C_RESET}\n" "$n" "$col" "$u" "$C_RESET" "$tag"
+    done
+    who_card "$ip"
+    return 0
+}
+
+# ══════════════════════════ MODE: summary ══════════════════════════════════
+run_summary() {   # $1=1 if called from --dossier (adds report files)
+    local want_files="${1:-0}"
+    collect_events; summarize_counts
+    local breach_rows breach_n=0
+    breach_rows=$(breakins || true); [[ -n "$breach_rows" ]] && breach_n=$(wc -l <<<"$breach_rows")
+
+    if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        local topj="" t
+        t=$(awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -8 | awk '{printf "\"%s\":%s,", $2, $1}' | sed 's/,$//')
+        printf '{"tool":"loginz","since":"%s","failures":%d,"invalid_probes":%d,"accepted_logins":%d,"unique_source_ips":%d,"accepted_from_attack_ips":%d,"top_fail_ips":{%s}}\n' \
+            "$SINCE" "$N_FAIL" "$N_INV" "$N_ACCEPT" "$UNIQUE_IPS" "$breach_n" "$t"
+        exit $(( breach_n > 0 ? 2 : (N_FAIL > 0 ? 1 : 0) ))
+    fi
+
+    emit "\n  ${C_BOLD}${C_MAGENTA}╭─ loginz ─ bad-login analyst${C_RESET}  ${C_DIM}(window: $SINCE · $(hostname -s))${C_RESET}\n"; hr
+    kpi "$N_FAIL" "failed logins" "$([ "$N_FAIL" -gt 0 ] && echo "$C_YELLOW" || echo "$C_GREEN")"
+    kpi "$N_INV" "invalid-user probes" "$C_MAGENTA"
+    kpi "$N_ACCEPT" "accepted logins" "$C_CYAN"
+    kpi "$UNIQUE_IPS" "unique source IPs" "$C_DIM"
+
+    if (( N_FAIL + N_INV == 0 )); then
+        ok "no failed logins in window — quiet box"; hr; emit_verdict; return 0
+    fi
+
+    section "TOP KNOCKERS (failed)"
+    local max=0
+    max=$(awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
+    awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -10 | while read -r n ip; do
+        local pct=$(( n * 100 / (max>0?max:1) )) w=$(( pct * 24 / 100 )); (( w < 1 )) && w=1
+        local col; col=$(heat "$pct")
+        printf "  %s%-16s${C_RESET} %s%s%s %s\n" "$C_BOLD" "$ip" "$col" "$(printf '█%.0s' $(seq 1 $w))" "$C_RESET" "$n"
+    done
+
+    section "TARGETED ACCOUNTS"
+    awk -F'\t' '$2!="accept" && $4!=""{print $4}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -8 | while read -r n u; do
+        local tag col
+        tag=$(user_valid "$u"); col="$C_MAGENTA"; [[ "$tag" == real ]] && col="$C_YELLOW"
+        printf "  %4s × %s%-14s${C_RESET} ${C_DIM}%s account${C_RESET}\n" "$n" "$col" "$u" "$tag"
+    done
+    if awk -F'\t' '$2!="accept" && $4=="root"{c++}END{exit !(c>0)}' "$LOG_TEMP"; then
+        warnf "ssh_root_login" "root was directly attacked — set PermitRootLogin no (sshauditz shows the diff)" ""
+    fi
+
+    section "ATTACK RHYTHM (hour of day)"
+    awk -F'\t' '$2!="accept" && $1>0{print strftime("%H", $1)}' "$LOG_TEMP" | sort | uniq -c | while read -r n hh; do
+        local w=$(( n * 30 / (max>0?max:1) )); (( w < 1 )) && w=1
+        printf "  %s:00 %s%s%s %s\n" "$hh" "$C_BLUE" "$(printf '▂%.0s' $(seq 1 $w))" "$C_RESET" "$n"
+    done
+
+    if (( breach_n > 0 )); then
+        section "⚠ ACCEPTED LOGINS FROM ATTACK SOURCES"
+        while IFS=$'\t' read -r ip row; do
+            critf "break_in_watch" "source $ip was accepted after failing (user $(awk -F'\t' '{print $4}' <<<"$row"))" \
+                  "rotate credentials for that account, kill sessions: pkill -U <user>; review: loginz --ip $ip"
+        done <<< "$breach_rows"
+    fi
+
+    if command -v faillock >/dev/null 2>&1; then
+        section "LOCKOUT STATUS (faillock)"
+        local fl; fl=$(faillock --user root 2>/dev/null | grep -cE "^\s+V" || true)
+        (( fl > 0 )) && warn "root has $fl recorded failure entries (sudo faillock --user root)" || ok "no lockout pile-up for root"
+    fi
+
+    hr
+    if (( breach_n > 0 )); then crit "break-in suspects above — act now"; exit 2
+    elif (( N_FAIL > 50 )); then warn "sustained brute-force noise — consider firewallz + fail2ban-style blocking"; exit 1
+    else warn "some failed logins (${N_FAIL}) — normal internet background"; exit 1; fi
+}
+
+# ══════════════════════════ MODE: dossier ══════════════════════════════════
+run_dossier() {
+    mkdir -p "$REPORTS_DIR"
+    collect_events; summarize_counts
+    (( N_FAIL + N_INV == 0 )) && { ok "nothing to write up — no failures in $SINCE"; exit 0; }
+    emit "\n  ${C_BOLD}dossiers for top $DOSSIER_N attacker IPs → $REPORTS_DIR/${C_RESET}\n"
+    local victim hostip
+    victim="${LOGINZ_VICTIM:-$(hostname -f 2>/dev/null || hostname)}"
+    hostip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local n=0 ip fails
+    while read -r fails ip; do
+        [[ -z "$ip" ]] && continue
+        n=$((n+1)); (( n > DOSSIER_N )) && break
+        local out="$REPORTS_DIR/attacker-${ip}-$(date +%Y%m%d).txt"
+        {
+            echo "ATTACK DOSSIER — $ip   generated $(date '+%F %T %Z')"
+            echo "Victim: $victim (${hostip:-unknown}) · window: $SINCE"
+            echo
+            awk -F'\t' -v ip="$ip" '$3==ip && $2!="accept"{print "  " strftime("%F %T", $1) "  " $2 "  user=" $4}' "$LOG_TEMP" | head -50
+            echo "  ... total failures: $fails"
+            echo
+            command -v dig >/dev/null 2>&1 && echo "reverse-dns: $(timeout 3 dig -x "$ip" +short +time=2 +tries=1 | head -1)"
+            [[ -n "${LOGINZ_NAME:-}${LOGINZ_EMAIL:-}" ]] && {
+                echo
+                echo "TO: (abuse contact from whois below)"
+                echo "FROM: ${LOGINZ_EMAIL:-<set LOGINZ_EMAIL>}"
+                echo "SUBJECT: SSH brute force from your IP $ip ($fails attempts) — please investigate"
+                echo
+                echo "Hello, my name is ${LOGINZ_NAME:-the administrator} of $victim."
+                echo "Your IP made $fails failed authentication attempts between $(awk -F'\t' -v ip="$ip" '$3==ip && $1>0{print $1}' <<<"$(head -1 "$LOG_TEMP")" ) and $(date '+%F %T')."
+                echo "Details above. May be a compromised host on your network; please check."
+                echo "Independent reports: https://www.abuseipdb.com/check/$ip"
+            } || echo "(set LOGINZ_NAME/LOGINZ_EMAIL to include a complaint letter)"
+            echo; echo "WHOIS (passive):"
+            timeout 6 whois "$ip" 2>/dev/null | grep -Ei "org-name|organization|abuse-mailbox|abuse-c|descr|country" | head -8
+        } > "$out" 2>&1
+        printf "  ${C_GREEN}✓${C_RESET} %s ${C_DIM}(%s failures)${C_RESET}\n" "${out##*/}" "$fails"
+    done < <(awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort | uniq -c | sort -rn | awk '{print $1, $2}')
+    ok "wrote $n dossier file(s)"; exit 0
+}
+
+# ══════════════════════════ dispatch ═══════════════════════════════════════
+case "$MODE" in
+    watch) watch_stream ;;
+    ip)    collect_events; ip_forensics "$FILTER_IP" ;;
+    dossier) run_dossier ;;
+    summary) run_summary; emit_verdict ;;
+esac
+
+if (( AI_VERDICT == 1 )) && declare -F ai_emit_verdict >/dev/null 2>&1; then
+    ai_emit_verdict "loginz" "$(tail -c 1500 "$LOG_TEMP" 2>/dev/null)" 2>/dev/null || true
+fi

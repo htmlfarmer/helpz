@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# topz - A modern, readable "what is my computer doing right now" monitor
+# ----------------------------------------------------------------------------
+# Designed to be understood at a glance, unlike top/htop wall-of-numbers:
+# gradient bars for CPU/RAM, PSI pressure (is anything WAITING?), per-second
+# CPU cost per process (not lifetime totals), disk/net throughput since the
+# last sample, and ranked tables. --watch refreshes like a dashboard;
+# --json for scripts.
+#
+# Usage:
+#   ./topz                       One snapshot (samples for ~1.5s)
+#   ./topz --watch               Refresh every 2s (Ctrl+C to exit)
+#   ./topz --watch=5             Refresh every 5s
+#   ./topz --top 15              Show 15 processes (default 10)
+#   ./topz --json                Machine-readable single snapshot
+#   ./topz --no-color            Plain output
+#
+# Requires: /proc only — no dependencies
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+WATCH=0; INTERVAL=2; TOPN=10; JSON_OUT="${JSON_OUT:-0}"; NO_COLOR="${NO_COLOR:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --watch)     WATCH=1 ;;
+        --watch=*)   WATCH=1; INTERVAL="${1#--watch=}" ;;
+        --top=*)     TOPN="${1#--top=}" ;;
+        --top)       shift; TOPN="${1:-10}" ;;
+        --json)      JSON_OUT=1 ;;
+        --no-color)  NO_COLOR=1; init_colors ;;
+        -h|--help)   sed -n '6,22p' "$0"; exit 0 ;;
+        *) echo "topz: unknown option $1 (try --help)" >&2; exit 64 ;;
+    esac
+    shift
+done
+if [[ "$WATCH" -eq 1 && "$JSON_OUT" -eq 1 ]]; then JSON_OUT=0; fi
+
+SAMPLE_SECS=1.5
+if [[ "$WATCH" -eq 0 && "$JSON_OUT" -eq 0 ]]; then
+    init_colors
+    printf "\n  ${C_BOLD}${C_MAGENTA}╭─ topz ─ ${C_RESET}${C_DIM}%s · %s · up %s${C_RESET}\n" "$(date '+%H:%M:%S')" "$(hostname -s)" "$(uptime -p 2>/dev/null | sed 's/^up //;s/ hours\?/h/;s/ minutes\?/m/;s/ days\?/d/;s/ seconds\?/s/;s/, //g')"
+fi
+
+# ---------- sample helpers ----------
+snap_cpu() { awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat; }   # u ni sy id wa irq sirq st
+proc_snap() {
+    local p
+    for p in /proc/[0-9]*/stat; do
+        [[ -r "$p" ]] || continue
+        awk '{ i=index($0,")"); ppid=substr($0,1,index($0," ")-1); s=substr($0,i+2); split(s,f," "); print ppid, f[12]+f[13] }' "$p" 2>/dev/null || true
+    done
+}
+proc_names() {
+    local p
+    for p in /proc/[0-9]*; do
+        [[ -r "$p/stat" ]] || continue
+        read -r pid comm rest < "$p/stat" 2>/dev/null || continue
+        comm=${comm#\(}; comm=${comm%\)}
+        printf '%s %s\n' "${p##*/}" "$comm"
+    done | sort -n -u -k1,1
+}
+kb() { awk -v k="$1" 'BEGIN{ if (k>=1048576) printf "%.1fG", k/1048576; else if (k>=1024) printf "%.0fM", k/1024; else printf "%dK", k }'; }
+pctbar() { local v=$1; v=${v%.*}; (( v > 100 )) && v=100; (( v < 0 )) && v=0; bar "$v" 24; emit "\n"; }
+psi() { [[ -r /proc/pressure/$1 ]] && grep -oE 'some avg10=[0-9.]+' "/proc/pressure/$1" | head -1 | cut -d= -f2 || echo 0; }
+
+# ═════════════════════════ 1. gather two samples ═════════════════════════
+C1=($(snap_cpu)); P1=$(proc_snap); D1=$(date +%s%N)
+DISK1=$(awk '$3!~/ram|loop/ {print $1":"$3" "$4+$6" "$10+$11}' /proc/diskstats 2>/dev/null)   # dev io_ticks-ish, sectors
+NET1=$(awk -F'[: ]+' 'NR>2 && $1!="lo" && $2!="" {print $1" "$3" "$11}' /proc/net/dev 2>/dev/null)
+sleep "$SAMPLE_SECS"
+C2=($(snap_cpu)); P2=$(proc_snap); D2=$(date +%s%N)
+DISK2=$(awk '$3!~/ram|loop/ {print $1":"$3" "$4+$6" "$10+$11}' /proc/diskstats 2>/dev/null)
+NET2=$(awk -F'[: ]+' 'NR>2 && $1!="lo" && $2!="" {print $1" "$3" "$11}' /proc/net/dev 2>/dev/null)
+ELAPSED_NS=$((D2 - D1))
+CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)
+NAMES=$(proc_names)
+
+# fields: 1=user 2=nice 3=system 4=idle 5=iowait 6=irq 7=softirq 8=steal
+BUSY=$(awk -v a="${C1[*]}" -v b="${C2[*]}" 'BEGIN{split(a,x," ");split(b,y," ");
+    t1=0;t2=0; for(i=1;i<=8;i++){t1+=x[i];t2+=y[i]}
+    d=t2-t1; if(d<=0){print "0";exit}
+    idle=y[4]-x[4]; iow=y[5]-x[5];
+    printf "%.1f", (d-idle-iow)/d*100}')
+CPU_IOW=$(awk -v a="${C1[*]}" -v b="${C2[*]}" 'BEGIN{split(a,x," ");split(b,y," ");
+    t1=0;t2=0;for(i=1;i<=8;i++){t1+=x[i];t2+=y[i]}; d=t2-t1; if(d<=0){print"0";exit}
+    printf "%.1f", (y[5]-x[5])/d*100}')
+
+read -r MEM_T MEM_F MEM_B MEM_C <<<"$(awk '/MemTotal/{t=$2}/MemFree/{f=$2}/MemAvailable/{a=$2}/Buffers/{b=$2}/Cached/{c=$2}END{print t,f,b,c}' /proc/meminfo)"
+[[ -z "$MEM_T" ]] && { MEM_T=1; MEM_F=0; MEM_B=0; MEM_C=0; }
+MEM_USED=$((MEM_T - MEM_F - MEM_B - MEM_C)); (( MEM_USED < 0 )) && MEM_USED=$((MEM_T - MEM_F))
+MEM_PCT=$(( MEM_USED * 100 / MEM_T ))
+SW_T=$(awk '/SwapTotal/{print $2}' /proc/meminfo); SW_F=$(awk '/SwapFree/{print $2}' /proc/meminfo)
+LOAD1=$(awk '{print $1}' /proc/loadavg); NPROC=$(nproc 2>/dev/null || echo 1)
+
+# per-process CPU% delta
+CPUJ=$(awk -v e="$ELAPSED_NS" -v c="$CLK" 'BEGIN{printf "%.6f", e/1000000000*c}')
+TOPROWS=$(join -a1 -a2 <(printf '%s\n' "$P1" | sort -k1,1n) <(printf '%s\n' "$P2" | sort -k1,1n) 2>/dev/null | awk -v cj="$CPUJ" '$1 ~ /^[0-9]+$/ {d=($3-$2); if(d<0)d=0; printf "%d %.1f\n", $1, d/cj*100}' | sort -k2 -rn | head -"$TOPN")
+
+# net & disk rates
+NETROWS=$(join -a1 -a2 <(printf '%s\n' "$NET1"|sort) <(printf '%s\n' "$NET2"|sort) 2>/dev/null | awk -v e="$ELAPSED_NS" '{ri=($4-$3); ro=($6-$5); if(ri<0)ri=0; if(ro<0)ro=0; if(ri==0&&ro==0)next; printf "%s %.1f %.1f\n", $1, ri*8/e*1e9/1e6, ro*8/e*1e9/1e6}' | sort -k2 -rn | head -6)
+DISKROWS=$(join -a1 -a2 <(printf '%s\n' "$DISK1"|sort) <(printf '%s\n' "$DISK2"|sort) 2>/dev/null | awk -v e="$ELAPSED_NS" '{rd=($4-$3);wr=($6-$5); if(rd<0)rd=0; if(wr<0)wr=0; if(rd==0&&wr==0)next; printf "%s %.1f %.1f\n", $2, rd*512/e*1e9/1e6, wr*512/e*1e9/1e6}' | sort -k2,2 -k3,3 -rn | head -6)
+
+# ─────────────────────────── JSON mode ───────────────────────────
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"ts":"%s","host":"%s","cpu_busy_pct":%s,"cpu_iowait_pct":%s,"load1":"%s","cores":%d,"mem_used_mb":%d,"mem_total_mb":%d,"mem_pct":%d,"psi_cpu":"%s","psi_io":"%s","top":[\n' \
+        "$(date '+%F %T')" "$HOSTNAME_SHORT" "$BUSY" "$CPU_IOW" "$LOAD1" "$NPROC" $((MEM_USED/1024)) $((MEM_T/1024)) "$MEM_PCT" "$(psi cpu)" "$(psi io)"
+    first=1
+    while read -r pid pc; do
+        name=$(awk -v p="$pid" '$1==p{print $2; exit}' <<< "$NAMES"); [[ -z "$name" ]] && name="?"
+        [[ $first -eq 0 ]] && printf ','
+        first=0
+        printf '{"pid":%s,"cpu_pct":%s,"name":"%s"}' "$pid" "$pc" "${name//\"/}"
+    done <<< "$TOPROWS"
+    printf ']}\n'
+    exit 0
+fi
+
+# ═════════════════════════ 2. render ═════════════════════════
+section "SYSTEM VITALS   (${SAMPLE_SECS}s sample)"
+hr
+emit "  ${C_BOLD}CPU${C_RESET}   ${C_DIM}%s cores${C_RESET}  " "$NPROC"; pctbar "${BUSY%.*}"
+(( ${CPU_IOW%.*} > 5 )) && printf "      ${C_RED}▲ %s%% of that is I/O-WAIT — processes are blocked on disk/net, not computing${C_RESET}\n" "$CPU_IOW"
+emit "  ${C_BOLD}MEM${C_RESET}   ${C_DIM}%s / %s used${C_RESET}  " "$(kb $((MEM_USED)))" "$(kb $((MEM_T)))"; pctbar "$MEM_PCT"
+if [[ "$SW_T" != "0" && -n "$SW_T" ]]; then
+    SWU=$((SW_T - SW_F)); emit "  ${C_BOLD}SWP${C_RESET}   ${C_DIM}%s / %s${C_RESET}  " "$(kb $((SWU)))" "$(kb $((SW_T)))"; pctbar $(( SWU * 100 / SW_T ))
+fi
+# PSI — the modern "is it hurting?" metric
+PC=$(psi cpu); PM=$(psi memory); PIO=$(psi io)
+emit "  ${C_BOLD}PRESSURE${C_RESET} ${C_DIM}some avg10:${C_RESET} cpu ${C_BOLD}%s%%${C_RESET} · mem ${C_BOLD}%s%%${C_RESET} · io ${C_BOLD}%s%%${C_RESET}" "$PC" "$PM" "$PIO"
+awk -v p="$PC" 'BEGIN{exit !(p+0>10)}' && printf "  ${C_RED}← CPU contention${C_RESET}"
+awk -v p="$PM" 'BEGIN{exit !(p+0>10)}' && printf "  ${C_RED}← memory pressure${C_RESET}"
+awk -v p="$PIO" 'BEGIN{exit !(p+0>10)}' && printf "  ${C_YELLOW}← I/O pressure${C_RESET}"
+printf "\n"
+
+# ── processes ──
+subsec "busiest processes (${SAMPLE_SECS}s window — % of one core)"
+table_begin "PID" "CPU%" "PROCESS"
+while read -r pid pc; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    name=$(awk -v p="$pid" '$1==p{print $2; exit}' <<< "$NAMES"); [[ -z "$name" ]] && name="?"
+    col="$C_GREEN"; awk -v x="$pc" 'BEGIN{exit !(x+0>=50)}' && col="$C_RED"
+    awk -v x="$pc" 'BEGIN{exit !(x+0>=15 && x+0<50)}' && col="$C_YELLOW"
+    table_row "$pid" "${col}${pc}${C_RESET}" "$name"
+done <<< "$TOPROWS"
+table_end
+
+# ── disk ──
+if [[ -n "$DISKROWS" ]]; then
+    subsec "disk activity"
+    table_begin "device" "read MB/s" "write MB/s"
+    while read -r dev r w; do
+        table_row "$dev" "$r" "$w"
+    done <<< "$DISKROWS"
+    table_end
+else
+    info "disk: no measurable activity in this window (idle)"
+fi
+
+# ── network ──
+if [[ -n "$NETROWS" ]]; then
+    subsec "network throughput"
+    table_begin "iface" "RX MB/s" "TX MB/s"
+    while read -r ifc rx tx; do
+        table_row "$ifc" "$rx" "$tx"
+    done <<< "$NETROWS"
+    table_end
+else
+    info "net: no traffic on any interface in this window"
+fi
+
+# ── one-line verdict ──
+hr
+V=""; awk -v b="$BUSY" 'BEGIN{exit !(b+0>85)}' && V="${V}${C_RED}CPU saturated · "
+awk -v m="$MEM_PCT" 'BEGIN{exit !(m>90)}' && V="${V}${C_RED}memory critical · "
+awk -v p="$PIO" 'BEGIN{exit !(p+0>15)}' && V="${V}${C_YELLOW}I/O pressure · "
+[[ -z "$V" ]] && V="${C_GREEN}nothing is struggling — load ${LOAD1} across ${NPROC} cores${C_RESET}"
+printf "  ${C_BOLD}VERDICT:${C_RESET} %b\n\n" "${V% · }"
+
+# ── watch loop ──
+if [[ "$WATCH" -eq 1 ]]; then
+    trap 'printf "\n  ${C_DIM}[topz stopped]${C_RESET}\n"; exit 0' INT TERM
+    while true; do
+        sleep "$INTERVAL"
+        clear 2>/dev/null || true
+        exec "$0" --watch=0 --top "$TOPN"
+    done
+fi

@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# memoryz - RAM / memory subsystem diagnostic
+# ----------------------------------------------------------------------------
+# Inspects physical memory, swap, caches/buffers, top memory consumers,
+# kernel memory, PSI pressure, huge pages, overcommit policy, and OOM history.
+# Uses /proc/meminfo, /proc/pressure, ps, and /sys where available.
+#
+# Usage:
+#   ./memoryz                 # full probe
+#   ./memoryz --no-color      # plain output
+#   ./memoryz --json          # machine-readable summary
+#   ./memoryz --watch 2       # re-run every 2 seconds (Ctrl+C to stop)
+#   ./memoryz --top 25        # show 25 memory-hungry processes (default 15)
+#
+# Requires: ps (procps)
+# Optional: bc
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+WATCH_INTERVAL=0
+NO_COLOR=0
+JSON_OUT=0
+TOP_N=15
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+SCRIPT_VERSION="1.0.0"
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --watch=*)    WATCH_INTERVAL="${arg#--watch=}" ;;
+    --watch)      i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-2}" ;;
+    --top=*)      TOP_N="${arg#--top=}" ;;
+    --top)        i=$((i+1)); TOP_N="${ARGS[$i]:-15}" ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    --ai)         AI_VERDICT=1 ;;
+    --no-ai)      AI_VERDICT=0 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          memoryz — RAM / Memory Subsystem Diagnostic          ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects physical memory, swap, caches/buffers, top memory consumers,
+  kernel memory, PSI pressure, huge pages, overcommit policy, OOM history.
+
+USAGE
+  ./memoryz                 Full probe
+  ./memoryz --no-color      Plain output
+  ./memoryz --json          Machine-readable summary
+  ./memoryz --watch 2       Re-run every 2 seconds
+  ./memoryz --top 25        Show 25 memory-hungry processes (default 15)
+
+OPTIONS
+  --watch[=N]     Re-run every N seconds (default 2)
+  --top[=N]       Show top N memory consumers (default 15)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  free -h                          Human-readable memory overview
+  cat /proc/meminfo                Full kernel memory info
+  vmstat                           Virtual memory statistics
+  top / htop                       Interactive process viewer
+  smem -t -k -p                    Proportional/set-unique memory (PSS/USS)
+  cat /proc/pressure/memory        PSI memory pressure stalls
+  cat /proc/swaps                  Swap device details
+
+WARNING → INVESTIGATION COMMANDS
+  RAM >90% used                   →  ps aux --sort=-%mem | head -20
+  Swap nearly full                →  free -h  and  cat /proc/swaps
+  OOM kills detected              →  sudo dmesg | grep -i oom  or  sudo journalctl -k | grep -i oom
+  Memory pressure high (PSI)      →  cat /proc/pressure/memory
+  Top consumer using >40% RAM     →  pmap -x <PID> | tail -1
+  Slab unreclaimable >70%         →  watch -n5 'grep -E "Slab|SUnreclaim" /proc/meminfo'
+  tmpfs nearly full               →  df -t tmpfs
+  No swap configured              →  sudo fallocate -l 4G /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+
+HELPEOF
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_init "memoryz"
+fi
+
+# /proc/meminfo values are in kB
+kb_to_b() { echo $(( $1 * 1024 )); }
+
+mem_kb() { awk -v k="$1" '$1 == k":" {print $2; exit}' /proc/meminfo 2>/dev/null; }
+
+# Stacked bar: segments as "pctA:pctB:pctC..." with matching colors
+stacked_bar() {
+  local width=${2:-30}
+  local colors=("$C_RED" "$C_CYAN" "$C_GREEN" "$C_MAGENTA" "$C_YELLOW" "$C_DIM")
+  local ci=0 printed=0
+  IFS=':' read -ra parts <<< "$1"
+  local n=${#parts[@]}
+  for idx in "${!parts[@]}"; do
+    local seg=$(( parts[idx] * width / 100 ))
+    (( idx == n - 1 )) && seg=$(( width - printed ))   # last segment absorbs rounding
+    (( seg < 0 )) && seg=0
+    printf "${colors[ci % ${#colors[@]}]}"
+    printf '█%.0s' $(seq 1 $seg 2>/dev/null) 2>/dev/null
+    printed=$(( printed + seg ))
+    ci=$(( ci + 1 ))
+  done
+  printf "${C_RESET}"
+}
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "${C_BOLD}${C_MAGENTA}"
+  cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  MEMORY.SH — RAM & Swap Diagnostic                           ║
+   ║  Memory Pressure · Top Consumers · PSI · OOM                 ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+  printf "${C_RESET}\n"
+  printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- Preconditions ----------
+if [[ ! -r /proc/meminfo ]]; then
+  crit "/proc/meminfo not readable — this tool requires Linux procfs"
+  exit 1
+fi
+HAVE_PS=0; command -v ps >/dev/null 2>&1 && HAVE_PS=1
+
+# ============================================================================
+# SECTION 1: Physical memory overview
+# ============================================================================
+section "PHYSICAL MEMORY"
+
+MEMTOTAL_KB=$(mem_kb MemTotal)
+MEMFREE_KB=$(mem_kb MemFree)
+MEMAVAIL_KB=$(mem_kb MemAvailable)
+BUFFERS_KB=$(mem_kb Buffers)
+CACHED_KB=$(mem_kb Cached)
+SRECLAIM_KB=$(mem_kb SReclaimable)
+SHMEM_KB=$(mem_kb Shmem)
+[[ -z "$CACHED_KB" ]] && CACHED_KB=0
+[[ -z "$BUFFERS_KB" ]] && BUFFERS_KB=0
+[[ -z "$SRECLAIM_KB" ]] && SRECLAIM_KB=0
+[[ -z "$MEMAVAIL_KB" ]] && MEMAVAIL_KB=$MEMFREE_KB
+
+MEMTOTAL_KB=${MEMTOTAL_KB:-0}
+# "Used" the way htop counts it: total - free - buffers - cache - reclaimable
+USED_KB=$(( MEMTOTAL_KB - MEMFREE_KB - BUFFERS_KB - CACHED_KB - SRECLAIM_KB ))
+(( USED_KB < 0 )) && USED_KB=0
+
+USE_PCT=0
+[[ "$MEMTOTAL_KB" -gt 0 ]] && USE_PCT=$(( USED_KB * 100 / MEMTOTAL_KB ))
+AVAIL_PCT=0
+[[ "$MEMTOTAL_KB" -gt 0 ]] && AVAIL_PCT=$(( MEMAVAIL_KB * 100 / MEMTOTAL_KB ))
+
+emit "  ${C_DIM}%-14s${C_RESET} %10s\n" "Total"     "$(humansize $(kb_to_b $MEMTOTAL_KB))"
+emit "  ${C_DIM}%-14s${C_RESET} %10s  "  "Used"      "$(humansize $(kb_to_b $USED_KB))"
+if [[ $JSON_OUT -eq 0 ]]; then bar "$USE_PCT" 30; printf " ${C_BOLD}%d%%${C_RESET}\n" "$USE_PCT"; fi
+emit "  ${C_DIM}%-14s  %10s  ${C_DIM}(app memory, excluding cache/buffers)${C_RESET}\n" "" ""
+emit "  ${C_DIM}%-14s${C_RESET} %10s\n" "Free"      "$(humansize $(kb_to_b $MEMFREE_KB))"
+emit "  ${C_DIM}%-14s${C_RESET} %10s  ${C_DIM}(reclaimable cache/buffers included)${C_RESET}\n" "Available" "$(humansize $(kb_to_b $MEMAVAIL_KB))"
+emit "  ${C_DIM}%-14s${C_RESET} %10s\n" "Buffers"   "$(humansize $(kb_to_b $BUFFERS_KB))"
+emit "  ${C_DIM}%-14s${C_RESET} %10s\n" "Cache"     "$(humansize $(kb_to_b $CACHED_KB))"
+emit "  ${C_DIM}%-14s${C_RESET} %10s\n" "Shmem"     "$(humansize $(kb_to_b ${SHMEM_KB:-0}))"
+
+if (( USE_PCT >= 90 )); then
+  crit "RAM ${USE_PCT}% used — pressure likely, watch swap activity"
+elif (( USE_PCT >= 75 )); then
+  warn "RAM ${USE_PCT}% used — busy"
+else
+  ok "RAM ${USE_PCT}% used — healthy"
+fi
+if (( AVAIL_PCT < 10 )); then
+  crit "Only ${AVAIL_PCT}% available — OOM risk"
+elif (( AVAIL_PCT < 20 )); then
+  warn "Only ${AVAIL_PCT}% available — low headroom"
+fi
+
+JSON_FIELDS+=("\"mem_total_kb\":$MEMTOTAL_KB")
+JSON_FIELDS+=("\"mem_used_kb\":$USED_KB")
+JSON_FIELDS+=("\"mem_free_kb\":$MEMFREE_KB")
+JSON_FIELDS+=("\"mem_available_kb\":$MEMAVAIL_KB")
+JSON_FIELDS+=("\"mem_used_pct\":$USE_PCT")
+
+# Memory composition bar
+if [[ $JSON_OUT -eq 0 ]] && (( MEMTOTAL_KB > 0 )); then
+  subsec "Composition"
+  P_USED=$(( USED_KB * 100 / MEMTOTAL_KB ))
+  P_CACHE=$(( (CACHED_KB + BUFFERS_KB + SRECLAIM_KB) * 100 / MEMTOTAL_KB ))
+  P_FREE=$(( 100 - P_USED - P_CACHE )); (( P_FREE < 0 )) && P_FREE=0
+  printf "  ${C_RED}████${C_RESET} used ${C_CYAN}████${C_RESET} cache/buffers ${C_GREEN}████${C_RESET} free\n"
+  printf "  "
+  stacked_bar "$P_USED:$P_CACHE:$P_FREE" 40
+  printf "  ${C_DIM}%d%% / %d%% / %d%%${C_RESET}\n" "$P_USED" "$P_CACHE" "$P_FREE"
+fi
+
+# ============================================================================
+# SECTION 2: Swap
+# ============================================================================
+section "SWAP"
+
+SWTOTAL_KB=$(mem_kb SwapTotal)
+SFREE_KB=$(mem_kb SwapFree)
+SWTOTAL_KB=${SWTOTAL_KB:-0}
+SFREE_KB=${SFREE_KB:-0}
+SWUSED_KB=$(( SWTOTAL_KB - SFREE_KB ))
+SW_PCT=0
+
+if (( SWTOTAL_KB == 0 )); then
+  info "No swap configured — RAM exhaustion means instant OOM kills"
+  if (( AVAIL_PCT < 25 )); then
+    warn "Low memory and no swap — consider adding swap or zram"
+  fi
+else
+  SW_PCT=$(( SWUSED_KB * 100 / SWTOTAL_KB ))
+  emit "  ${C_DIM}%-14s${C_RESET} %10s  " "Swap used" "$(humansize $(kb_to_b $SWUSED_KB))"
+  if [[ $JSON_OUT -eq 0 ]]; then bar "$SW_PCT" 30; printf " ${C_BOLD}%d%%${C_RESET} of $(humansize $(kb_to_b $SWTOTAL_KB))\n" "$SW_PCT"; fi
+  if (( SW_PCT >= 80 )); then crit "Swap ${SW_PCT}% full"
+  elif (( SW_PCT >= 50 )); then warn "Swap ${SW_PCT}% used"
+  else ok "Swap usage low (${SW_PCT}%)"
+  fi
+
+  subsec "Swap devices"
+  if [[ -r /proc/swaps ]] && [[ $JSON_OUT -eq 0 ]]; then
+    while read -r fname ftype fsize fused fprio; do
+      [[ "$fname" == "Filename" || -z "$fname" ]] && continue
+      fpct=0; (( fsize > 0 )) && fpct=$(( fused * 100 / fsize ))
+      printf "  ${C_DIM}%-24s${C_RESET} %-8s %8s %8s %4d%%  prio %s\n" \
+        "$fname" "$ftype" "$(humansize $((fsize*1024)))" "$(humansize $((fused*1024)))" "$fpct" "$fprio"
+    done < /proc/swaps
+  fi
+  JSON_FIELDS+=("\"swap_total_kb\":$SWTOTAL_KB")
+  JSON_FIELDS+=("\"swap_used_kb\":$SWUSED_KB")
+  JSON_FIELDS+=("\"swap_used_pct\":$SW_PCT")
+fi
+
+# zram / zswap
+ZRAM_USED=$(mem_kb ZramUsed)
+if [[ -n "$ZRAM_USED" ]]; then
+  info "zram compressed swap in use: $(humansize $(kb_to_b $ZRAM_USED))"
+fi
+ZSWAP_ENABLED=""
+[[ -r /sys/module/zswap/parameters/enabled ]] && ZSWAP_ENABLED=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)
+[[ -n "$ZSWAP_ENABLED" ]] && info "zswap frontswap: $ZSWAP_ENABLED"
+
+SWAPPINESS=$(cat /proc/sys/vm/swappiness 2>/dev/null)
+[[ -n "$SWAPPINESS" ]] && info "vm.swappiness: ${C_BOLD}${SWAPPINESS}${C_RESET}  ${C_DIM}(0=avoid swap, 100=aggressive)${C_RESET}"
+JSON_FIELDS+=("\"swappiness\":${SWAPPINESS:-0}")
+
+# ============================================================================
+# SECTION 3: Top memory consumers
+# ============================================================================
+section "TOP MEMORY CONSUMERS"
+
+TOP_PID=""; TOP_RSS=""; TOP_COMM=""; TOP_PCT=0
+
+if [[ $HAVE_PS -eq 1 ]]; then
+  # RSS in KiB, sorted descending
+  PS_OUT=$(ps -eo pid=,rss=,pmem=,comm= --sort=-rss 2>/dev/null | head -n "$TOP_N")
+  if [[ -n "$PS_OUT" ]]; then
+    declare -a CONSUMER_ROWS=()
+    if [[ $JSON_OUT -eq 0 ]]; then
+      printf "  ${C_DIM}%7s %10s %6s %5s  %-16s %s${C_RESET}\n" "PID" "RSS" "%MEM" "BAR" "COMM" "CMDLINE (/proc/PID/cmdline)"
+      printf "  ${C_DIM}%7s %10s %6s %5s  %-16s %s${C_RESET}\n" "-------" "----------" "-----" "-----" "----------------" "--------------------------------------"
+      while read -r pid rss pmem comm; do
+        [[ -z "$pid" || ! "$rss" =~ ^[0-9]+$ ]] && continue
+        p=${pmem%.*}
+        [[ -z "$p" || ! "$p" =~ ^[0-9]+$ ]] && p=0
+        # Pull the full argv so users see the actual binary + args, not just
+        # `comm` (which the kernel truncates to 15 chars).
+        cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//')
+        [[ -z "$cmdline" ]] && cmdline="$comm"
+        printf "  ${C_DIM}%7s${C_RESET} %10s ${C_CYAN}%5s%%${C_RESET}  " "$pid" "$(humansize $(kb_to_b $rss))" "$pmem"
+        bar $(( p * 2 > 100 ? 100 : p * 2 )) 5
+        printf " ${C_DIM}%-16s${C_RESET} %s\n" "$comm" "$(truncate "$cmdline" 90)"
+        CONSUMER_ROWS+=("${pmem} ${cmdline}")
+      done <<< "$PS_OUT"
+
+      # Bar chart visualizing RSS% column
+      subsec "RSS% distribution"
+      if (( ${#CONSUMER_ROWS[@]} > 0 )); then
+        local_m_max=0 local_m_total=0
+        for r in "${CONSUMER_ROWS[@]}"; do
+          v=${r%% *}
+          [[ "$v" =~ ^[0-9]+\.?[0-9]*$ ]] || v=0
+          vi=${v%.*}
+          (( vi > local_m_max )) && local_m_max=$vi
+          local_m_total=$(( local_m_total + vi ))
+        done
+        printf "${C_BOLD}${C_CYAN}  Top memory consumers (bar chart, total=%d%%):${C_RESET}\n" "$local_m_total"
+        local_m_w=40
+        for r in "${CONSUMER_ROWS[@]}"; do
+          v=${r%% *}
+          lbl=${r#* }
+          [[ "$v" =~ ^[0-9]+\.?[0-9]*$ ]] || v=0
+          vi=${v%.*}
+          pct=$(( vi * 100 / (local_m_max > 0 ? local_m_max : 1) ))
+          col="$C_GREEN"; (( pct >= 60 )) && col="$C_YELLOW"; (( pct >= 85 )) && col="$C_RED"
+          filled=$(( pct * local_m_w / 100 ))
+          bar_s=""
+          for (( j=0; j<filled; j++ )); do bar_s+="█"; done
+          printf "  %-30s ${col}%-40s${C_RESET} %s%%\n" "${lbl:0:30}" "$bar_s" "$v"
+        done
+      fi
+    fi
+
+    TOP_PID=$(echo "$PS_OUT" | head -1 | awk '{print $1}')
+    TOP_RSS=$(echo "$PS_OUT" | head -1 | awk '{print $2}')
+    TOP_COMM=$(echo "$PS_OUT" | head -1 | awk '{print $4}')
+    if [[ -n "$TOP_RSS" ]] && (( MEMTOTAL_KB > 0 )); then
+      TOP_PCT=$(( TOP_RSS * 100 / MEMTOTAL_KB ))
+      if (( TOP_PCT >= 40 )); then
+        warn "Top consumer '${TOP_COMM}' (PID $TOP_PID) holds ${TOP_PCT}% of RAM"
+      else
+        info "Largest single process: ${TOP_COMM} (PID $TOP_PID) — $(humansize $(kb_to_b $TOP_RSS))"
+      fi
+      JSON_FIELDS+=("\"top_process\":\"${TOP_COMM}\"")
+      JSON_FIELDS+=("\"top_rss_kb\":$TOP_RSS")
+    fi
+  fi
+
+  subsec "Process totals"
+  PROC_COUNT=$(ps -e --no-headers 2>/dev/null | wc -l)
+  THREAD_COUNT=$(ps -eLf --no-headers 2>/dev/null | wc -l)
+  RSS_SUM=$(ps -eo rss= 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  info "Processes: ${C_BOLD}${PROC_COUNT}${C_RESET}  Threads: ${C_BOLD}${THREAD_COUNT}${C_RESET}"
+  info "Sum of RSS: $(humansize $(kb_to_b ${RSS_SUM:-0})) ${C_DIM}(shared pages counted multiple times)${C_RESET}"
+  JSON_FIELDS+=("\"processes\":${PROC_COUNT:-0}")
+  JSON_FIELDS+=("\"threads\":${THREAD_COUNT:-0}")
+else
+  crit "ps not found (procps) — cannot list process memory"
+fi
+
+# ============================================================================
+# SECTION 4: Kernel & unreclaimable memory
+# ============================================================================
+section "KERNEL MEMORY"
+
+K_UNRECLAIM=$(mem_kb SUnreclaim)
+SLAB_KB=$(mem_kb Slab)
+PAGE_TABLES=$(mem_kb PageTables)
+KERNEL_STACK=$(mem_kb KernelStack)
+VMALLOC_USED=$(mem_kb VmallocUsed)
+PUKB=$(mem_kb Percpu)
+for kv in "Slab:$SLAB_KB" "SUnreclaim:$K_UNRECLAIM" "PageTables:$PAGE_TABLES" \
+          "KernelStack:$KERNEL_STACK" "VmallocUsed:$VMALLOC_USED" "Percpu:$PUKB"; do
+  name=${kv%%:*}; val=${kv##*:}
+  [[ -z "$val" ]] && continue
+  emit "  ${C_DIM}%-14s${C_RESET} %10s\n" "$name" "$(humansize $(kb_to_b $val))"
+done
+if [[ -n "$SLAB_KB" && -n "$K_UNRECLAIM" ]] && (( SLAB_KB > 0 )); then
+  ur_pct=$(( K_UNRECLAIM * 100 / SLAB_KB ))
+  if (( ur_pct > 70 )); then
+    warn "Slab is ${ur_pct}% unreclaimable — possible kernel memory leak (dentry/inode caches)"
+  fi
+  JSON_FIELDS+=("\"slab_unreclaim_kb\":$K_UNRECLAIM")
+fi
+
+# Huge pages
+HP_TOTAL=$(mem_kb HugePages_Total)
+HP_FREE=$(mem_kb HugePages_Free)
+if [[ -n "$HP_TOTAL" ]] && (( HP_TOTAL > 0 )); then
+  HP_SIZE_KB=$(mem_kb Hugepagesize); HP_SIZE_KB=${HP_SIZE_KB:-2048}
+  info "Hugepages: ${C_BOLD}$(( HP_TOTAL - ${HP_FREE:-0} ))/${HP_TOTAL}${C_RESET} reserved ($(humansize $(kb_to_b $(( HP_TOTAL * HP_SIZE_KB )))))"
+fi
+
+# ============================================================================
+# SECTION 5: Memory pressure (PSI) & vmstat
+# ============================================================================
+section "PRESSURE & PAGING"
+
+if [[ -r /proc/pressure/memory ]]; then
+  subsec "PSI (avg10 / avg60)"
+  while IFS= read -r line; do
+    grp=$(echo "$line" | awk '{print $1}')
+    a10=$(echo "$line" | grep -oE 'avg10=[0-9.]+' | cut -d= -f2)
+    a60=$(echo "$line" | grep -oE 'avg60=[0-9.]+' | cut -d= -f2)
+    emit "  ${C_DIM}%-6s${C_RESET} %8s %8s\n" "$grp" "${a10:-?}" "${a60:-?}"
+    if [[ "$grp" == "some" && -n "$a10" ]]; then
+      PSI_MEM=$a10
+      if is_gt "$a10" 25; then crit "Memory pressure avg10 ${a10}% — thrashing"
+      elif is_gt "$a10" 10; then warn "Memory pressure avg10 ${a10}% — elevated"
+      else ok "Memory pressure low (avg10 ${a10}%)"
+      fi
+      JSON_FIELDS+=("\"psi_mem_some_avg10\":$a10")
+    fi
+  done < /proc/pressure/memory
+else
+  info "PSI unavailable (/proc/pressure) — kernel < 4.20 or CONFIG_PSI=n"
+fi
+
+OOM_KILL=0
+if [[ -r /proc/vmstat ]]; then
+  PGIN=$(awk '/^pswpin /{print $2}' /proc/vmstat)
+  PGOUT=$(awk '/^pswpout /{print $2}' /proc/vmstat)
+  OOM_KILL=$(awk '/^oom_kill /{print $2}' /proc/vmstat)
+  OOM_KILL=${OOM_KILL:-0}
+  info "Swap I/O since boot: ${C_CYAN}${PGIN:-0}${C_RESET} in / ${C_CYAN}${PGOUT:-0}${C_RESET} out (pages)"
+  if (( OOM_KILL > 0 )); then
+    crit "Kernel has OOM-killed ${OOM_KILL} task(s) since boot"
+  else
+    ok "No OOM kills recorded in vmstat"
+  fi
+  JSON_FIELDS+=("\"oom_kill\":$OOM_KILL")
+fi
+
+# OOM mentions in dmesg (best-effort, needs root on some distros)
+OOM_MSGS=0
+if command -v dmesg >/dev/null 2>&1; then
+  OOM_MSGS=$(dmesg 2>/dev/null | grep -ciE 'out of memory|oom-kill|killed process' | head -1)
+  [[ "$OOM_MSGS" =~ ^[0-9]+$ ]] || OOM_MSGS=0
+  if (( OOM_MSGS > 0 )); then
+    warn "${OOM_MSGS} OOM message(s) in dmesg — run: sudo dmesg | grep -i oom"
+  fi
+fi
+
+# ============================================================================
+# SECTION 6: tmpfs & shared memory
+# ============================================================================
+section "TMPFS / SHMEM"
+
+if command -v df >/dev/null 2>&1; then
+  TMPFS_OUT=$(df -P -t tmpfs 2>/dev/null | tail -n +2)
+  [[ -z "$TMPFS_OUT" ]] && TMPFS_OUT=$(df -P 2>/dev/null | awk 'NR>1 && ($1 ~ /tmpfs|shm/)')
+  if [[ -n "$TMPFS_OUT" ]]; then
+    while read -r fs blocks used avail pct mnt; do
+      [[ -z "$fs" ]] && continue
+      p=${pct%\%}
+      if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 80 )); then
+        if [[ "$fs" == "/dev/shm" || "$mnt" == "/tmp" || "$mnt" == "/run"* ]]; then
+          warn "${mnt} is ${p}% full (tmpfs counts against RAM!)"
+        fi
+      fi
+      emit "  ${C_DIM}%-24s${C_RESET} %8s / %-8s %5s\n" "$mnt" \
+        "$(humansize $((used*1024)))" "$(humansize $((blocks*1024)))" "$pct"
+    done <<< "$TMPFS_OUT"
+  else
+    info "No tmpfs mounts found"
+  fi
+fi
+
+# ============================================================================
+# SECTION 7: Tunables
+# ============================================================================
+section "VM TUNABLES"
+
+show_sysctl() {
+  local path="$1" label="$2" hint="$3"
+  local val
+  val=$(cat "$path" 2>/dev/null)
+  [[ -z "$val" ]] && return
+  emit "  ${C_DIM}%-24s${C_RESET} ${C_BOLD}%-14s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$label" "$val" "$hint"
+}
+show_sysctl /proc/sys/vm/overcommit_memory  "overcommit_memory"  "0=heuristic 1=always 2=strict"
+show_sysctl /proc/sys/vm/overcommit_ratio   "overcommit_ratio"   "used when mode=2"
+show_sysctl /proc/sys/vm/vfs_cache_pressure "vfs_cache_pressure" "100=default; higher=dentries reclaimed faster"
+show_sysctl /proc/sys/vm/dirty_ratio        "dirty_ratio"        "% dirty pages before writers block"
+show_sysctl /proc/sys/vm/dirty_background_ratio "dirty_bg_ratio" "% dirty pages before flusher threads start"
+show_sysctl /proc/sys/vm/min_free_kbytes    "min_free_kbytes"    "emergency free-page reserve"
+
+# ASLR + kernel hardening flags (depth: memoryz didn't cover these — security-relevant)
+ASLR=$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null)
+if [[ -n "$ASLR" ]]; then
+    case "$ASLR" in
+        2) emit "  ${C_DIM}%-24s${C_RESET} ${C_GREEN}%-14s${C_RESET} ${C_DIM}%s${C_RESET}\n" "randomize_va_space" "$ASLR" "full ASLR (kernel+stack)";;
+        1) emit "  ${C_DIM}%-24s${C_RESET} ${C_YELLOW}%-14s${C_RESET} ${C_DIM}%s${C_RESET}\n" "randomize_va_space" "$ASLR" "PARTIAL ASLR — kernel mappings NOT randomized";
+           emit "  ${C_RED}✗${C_RESET} Set to 2 for full ASLR: 'sudo sysctl -w kernel.randomize_va_space=2'";;
+        0) emit "  ${C_DIM}%-24s${C_RESET} ${C_RED}%-14s${C_RESET} ${C_DIM}%s${C_RESET}\n" "randomize_va_space" "$ASLR" "ASLR DISABLED — ROP/buffer-overflow easier";
+           emit "  ${C_RED}✗${C_RESET} Enable immediately: 'sudo sysctl -w kernel.randomize_va_space=2'";;
+    esac
+fi
+KPTR=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)
+[[ -n "$KPTR" ]] && show_sysctl /proc/sys/kernel/kptr_restrict "kptr_restrict" "2=hide kernel pointers from unprivileged users"
+DMESG_R=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)
+[[ -n "$DMESG_R" ]] && show_sysctl /proc/sys/kernel/dmesg_restrict "dmesg_restrict" "1=unprivileged can't read dmesg"
+
+# ============================================================================
+# SECTION 8: Headline box
+# ============================================================================
+section "MEMORY HEADLINE"
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  BOX_W=58
+  printf "  ${C_BOLD}${C_MAGENTA}╔$(printf '═%.0s' $(seq 1 $BOX_W))╗${C_RESET}\n"
+  hline() {
+    local vis plain pad
+    vis="   $1:  $2"
+    plain=$(printf '%s' "$vis" | sed 's/\x1b\[[0-9;]*m//g')
+    pad=$(( BOX_W - ${#plain} )); (( pad < 0 )) && pad=0
+    printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${pad}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$vis"
+  }
+  ucolor="$C_GREEN"; (( USE_PCT >= 75 )) && ucolor="$C_YELLOW"; (( USE_PCT >= 90 )) && ucolor="$C_RED"
+  hline "RAM"      "${C_BOLD}${ucolor}${USE_PCT}%${C_RESET} used of $(humansize $(kb_to_b $MEMTOTAL_KB))"
+  hline "Avail"    "${C_BOLD}${C_CYAN}$(humansize $(kb_to_b $MEMAVAIL_KB))${C_RESET} (${AVAIL_PCT}%)"
+  if (( SWTOTAL_KB > 0 )); then
+    hline "Swap"   "${C_BOLD}${C_CYAN}${SW_PCT}%${C_RESET} of $(humansize $(kb_to_b $SWTOTAL_KB))"
+  else
+    hline "Swap"   "${C_DIM}none${C_RESET}"
+  fi
+  hline "Top proc" "${C_BOLD}${TOP_COMM:-?}${C_RESET} (PID ${TOP_PID:-?}) ${C_CYAN}${TOP_PCT}%${C_RESET}"
+  hline "OOM kills" "${C_BOLD}${OOM_KILL}${C_RESET} since boot"
+  printf "  ${C_BOLD}${C_MAGENTA}╚$(printf '═%.0s' $(seq 1 $BOX_W))╝${C_RESET}\n"
+  printf "\n"
+fi
+
+# ============================================================================
+# SECTION 9: Recommendations + Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+REC_NUM=0
+rec() { REC_NUM=$((REC_NUM+1)); emit "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"; }
+
+(( USE_PCT >= 85 )) && rec "Identify leaks: watch with ${C_BOLD}./memoryz --watch 5${C_RESET} and check PSS via smem/htop"
+(( SWTOTAL_KB == 0 )) && rec "No swap — consider zram: ${C_BOLD}sudo apt install zram-tools${C_RESET} (or systemd zram-generator)"
+[[ -n "$SWAPPINESS" ]] && is_gt "$SWAPPINESS" 80 && rec "Swappiness ${SWAPPINESS} is high — try vm.swappiness=10 on desktops"
+(( TOP_PCT >= 30 )) && rec "Investigate '${TOP_COMM}': ${C_BOLD}pmap -x $TOP_PID | tail -1${C_RESET} for detailed mappings"
+(( OOM_MSGS > 0 )) && rec "Review OOM events: ${C_BOLD}sudo journalctl -k | grep -i oom${C_RESET}"
+rec "Per-process real memory: ${C_BOLD}ps -eo pid,rss,comm --sort=-rss | head${C_RESET} (RSS) or ${C_BOLD}smem -t -k -p${C_RESET} (PSS/USS)"
+rec "Cache pressure: ${C_BOLD}echo 3 | sudo tee /proc/sys/vm/drop_caches${C_RESET} frees page cache (temporary, hurts perf — diagnostic only)"
+rec "Leak hunting over time: ${C_BOLD}watch -n5 'grep -E \"Slab|SUnreclaim\" /proc/meminfo'${C_RESET}"
+
+section "VERDICT"
+END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
+
+if [[ $JSON_OUT -eq 1 ]]; then
+  printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+  for f in "${JSON_FIELDS[@]}"; do printf ',%s' "$f"; done
+  printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$ELAPSED"
+else
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+    exit_code=2
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    exit_code=1
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    exit_code=0
+  fi
+  printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+fi
+
+# Watch loop
+if [[ $WATCH_INTERVAL -gt 0 ]] && [[ $JSON_OUT -eq 0 ]]; then
+  trap 'exit 0' INT TERM
+  while true; do
+    sleep "$WATCH_INTERVAL"
+    clear
+    START_TS=$(date +%s)
+    exec "$0" "${ARGS[@]}"
+  done
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summary" "memoryz complete: exit_code=${exit_code:-0} watch=${WATCH_INTERVAL:-0} top=${TOP_N:-15}" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_finalize
+fi
+
+exit "${exit_code:-0}"

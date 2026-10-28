@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# aiz - AI server status monitor
+# ----------------------------------------------------------------------------
+# Reads ./ai.json (or ~/.config/ai-servers/ai.json) and probes each configured
+# server. Supports a mix of:
+#   - LLM API endpoints (OpenAI-compatible /v1/models, /health, latency)
+#   - Ollama local servers (/api/tags, /api/ps)
+#   - Generic HTTP services (port open, status, response time)
+#
+# Usage:
+#   ./aiz                        # probe every server in ai.json
+#   ./aiz --host 127.0.0.1     # probe a single host by IP/name
+#   ./aiz --name ollama-main     # probe a single host by label
+#   ./aiz --quick                # skip slow checks (latency probes)
+#   ./aiz --no-color             # plain output
+#   ./aiz --json                 # machine-readable summary
+#   ./aiz --config PATH          # use a different ai.json
+#
+# Requires: curl, ping, bc
+# Optional: dig (for rDNS), jq (for cleaner JSON parsing)
+#
+# ai.json format (see ./ai.json.example):
+#   {
+#     "servers": [
+#       {
+#         "name": "ollama-main",
+#         "host": "127.0.0.1",
+#         "type": "ollama",
+#         "port": 11434,
+#         "checks": ["ping", "http", "models", "ps"]
+#       },
+#       ...
+#     ]
+#   }
+#
+# Exits 0 if all healthy, 1 if warnings, 2 if critical.
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+SCRIPT_VERSION="1.0.0"
+CONFIG_PATH=""
+FILTER_HOST=""
+FILTER_NAME=""
+QUICK=0
+NO_COLOR=0
+JSON_OUT=0
+# LLM interpretation toggle. Default: ON if stdout is a TTY and `--json` not set,
+# OFF otherwise (JSON / pipe consumers want raw data, not chatty prose).
+if [[ -z "${INTERPRET+x}" ]]; then
+  if [[ -t 1 && $JSON_OUT -eq 0 ]]; then
+    INTERPRET=1
+  else
+    INTERPRET=0
+  fi
+fi
+ASK_TIMEOUT=8
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+OK_COUNT=0
+# Per-server ping latency samples ("<ms> <server-name>") used for the bar chart
+LAT_ROWS=()
+
+# Source verdict logging helper
+SCRIPT_DIR_AI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR_AI/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_AI/lib/verdict_log.sh"
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --host=*)   FILTER_HOST="${arg#--host=}"; i=$((i+1)) ;;
+    --host)     FILTER_HOST="${ARGS[$((i+1))]:-}"; i=$((i+2)) ;;
+    --name=*)   FILTER_NAME="${arg#--name=}"; i=$((i+1)) ;;
+    --name)     FILTER_NAME="${ARGS[$((i+1))]:-}"; i=$((i+2)) ;;
+    --config=*) CONFIG_PATH="${arg#--config=}"; i=$((i+1)) ;;
+    --config)   CONFIG_PATH="${ARGS[$((i+1))]:-}"; i=$((i+2)) ;;
+    --quick)        QUICK=1; i=$((i+1)) ;;
+    --no-color)     NO_COLOR=1; i=$((i+1)) ;;
+    --json)         JSON_OUT=1; i=$((i+1)) ;;
+    --interpret)    INTERPRET=1; i=$((i+1)) ;;
+    --no-interpret) INTERPRET=0; i=$((i+1)) ;;
+    --ask-timeout)  i=$((i+1)); ASK_TIMEOUT="${ARGS[$i]:-8}"; i=$((i+1)) ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          aiz — AI Server Status Monitor                       ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Reads ./ai.json (or ~/.config/ai-servers/ai.json) and probes each
+  configured server. Supports LLM API endpoints (OpenAI-compatible),
+  Ollama local servers, and generic HTTP services.
+
+USAGE
+  ./aiz                        Probe every server in ai.json
+  ./aiz --host 127.0.0.1     Probe a single host by IP/name
+  ./aiz --name ollama-main     Probe a single host by label
+  ./aiz --quick                Skip slow checks (latency probes)
+  ./aiz --no-color             Plain output
+  ./aiz --json                 Machine-readable summary
+  ./aiz --config PATH          Use a different ai.json
+
+OPTIONS
+  --host=HOST     Filter to a single host by IP/hostname
+  --name=NAME     Filter to a single server by label
+  --config=PATH   Path to a different ai.json config file
+  --quick         Skip latency probes (faster)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  --interpret     Ask local LLM for a 1-paragraph interpretation (uses `ask`)
+  --no-interpret  Skip the LLM interpretation (default in non-TTY / --json)
+  --ask-timeout=N Seconds to wait on the LLM before giving up (default 8)
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  curl http://<host>:<port>/v1/models    Check OpenAI-compatible model list
+  curl http://<host>:11434/api/tags      Ollama model list
+  curl http://<host>:11434/api/ps        Ollama running models
+  ping <host>                            Basic reachability
+  dig <host>                             DNS resolution
+  nc -zv <host> <port>                   TCP port check
+  curl -w '%{time_total}' -o /dev/null -s http://<host>:<port>/
+                                         HTTP response time
+
+WARNING → INVESTIGATION COMMANDS
+  Server unreachable (ping fail)    →  ping -c 5 <host>  and  traceroute <host>
+  Port closed                       →  nc -zv <host> <port>  and  sudo nmap <host>
+  HTTP error (4xx/5xx)              →  curl -v http://<host>:<port>/
+  Slow response (>2s)               →  curl -w '%{time_total}' -o /dev/null -s http://<host>:<port>/
+  No models available               →  curl -s http://<host>:<port>/v1/models | head
+  High latency on completions       →  curl -w '%{time_total}' -X POST http://<host>:<port>/v1/chat/completions
+
+HELPEOF
+      exit 0
+      ;;
+    *) echo "Unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "aiz" "JSON_OUT=$JSON_OUT QUICK=$QUICK" 2>/dev/null; fi
+
+# ---------- Colors ----------
+# (sourced from lib/common.sh above)
+
+# ---------- Helpers ----------
+# section/subsec/ok/info/warn/crit/is_gt/is_lt provided by lib/common.sh
+
+# JSON parsing — prefer jq if available
+has_jq=0
+command -v jq >/dev/null 2>&1 && has_jq=1
+
+json_get() {
+  # json_get <json> <key> — extract top-level key value
+  local json="$1" key="$2"
+  if [[ $has_jq -eq 1 ]]; then
+    printf '%s' "$(printf '%s' "$json" | jq -r ".$key // empty" 2>/dev/null)"
+  else
+    printf '%s' "$json" | grep -oE "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed -E "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/"
+  fi
+}
+
+# ---------- Resolve config path ----------
+resolve_config() {
+  if [[ -n "$CONFIG_PATH" ]]; then
+    [[ -f "$CONFIG_PATH" ]] && { printf '%s' "$CONFIG_PATH"; return; }
+    crit "Config not found: $CONFIG_PATH"; exit 2
+  fi
+  for p in "$SCRIPT_DIR/ai.json" "$HOME/.config/ai-servers/ai.json"; do
+    [[ -f "$p" ]] && { printf '%s' "$p"; return; }
+  done
+  crit "No ai.json found (looked in $SCRIPT_DIR and ~/.config/ai-servers/)"
+  exit 2
+}
+
+CONFIG_FILE=$(resolve_config)
+[[ $JSON_OUT -eq 0 ]] && info "Config: ${C_DIM}${CONFIG_FILE}${C_RESET}"
+
+RAW_JSON=$(cat "$CONFIG_FILE" 2>/dev/null)
+if [[ -z "$RAW_JSON" ]]; then
+  crit "ai.json is empty or unreadable"
+  exit 2
+fi
+
+# Extract servers array
+if [[ $has_jq -eq 1 ]]; then
+  SERVER_COUNT=$(printf '%s' "$RAW_JSON" | jq '.servers | length' 2>/dev/null || echo 0)
+else
+  SERVER_COUNT=$(printf '%s' "$RAW_JSON" | grep -cE '"name"[[:space:]]*:')
+fi
+
+if [[ "$SERVER_COUNT" -eq 0 ]]; then
+  crit "No servers defined in ai.json"; exit 1
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+  printf "${C_BOLD}${C_MAGENTA}"
+  cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  AI.SH — AI Server Status Monitor                             ║
+   ║  LLM APIs · Ollama · Latency & Models                         ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+  printf "${C_RESET}\n"
+  printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s  [servers: %d]${C_RESET}\n\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT" "$SERVER_COUNT"
+fi
+
+# ---------- Probe functions ----------
+# Each returns a status string ("OK" | "WARN" | "CRIT" | "SKIP") and
+# optionally prints result lines via global arrays.
+
+# --- ping check: latency in ms ---
+do_ping() {
+  local host="$1" label="$2"
+  local result
+  result=$(ping -c 3 -W 2 "$host" 2>/dev/null | tail -1)
+  if [[ -z "$result" ]]; then
+    crit "${label}: ${C_BOLD}${host}${C_RESET} ping failed (host down or ICMP blocked)"
+    return 1
+  fi
+  local avg
+  avg=$(printf '%s\n' "$result" | awk -F'/' '/rtt/ {print $5}')
+  if [[ -z "$avg" ]]; then
+    # Loss shown but no rtt — packet loss
+    local loss
+    loss=$(ping -c 3 -W 2 "$host" 2>/dev/null | grep -oE '[0-9.]+% packet loss' | head -1)
+    warn "${label}: ${C_BOLD}${host}${C_RESET} ping partial — ${loss:-unknown loss}"
+    return 1
+  fi
+  local loss_pct
+  loss_pct=$(ping -c 3 -W 2 "$host" 2>/dev/null | grep -oE '[0-9.]+% packet loss' | head -1 | tr -d '%')
+  loss_pct=${loss_pct:-0}
+  # Record the latency for the end-of-run bar chart.
+  # Stored as "<hundredths-of-ms> <display-ms> <name>" so sub-ms LAN hosts
+  # still get a meaningful bar while the printed value stays exact.
+  local lat_scaled
+  lat_scaled=$(awk -v v="$avg" 'BEGIN{printf "%.0f", v*100}' 2>/dev/null || echo 1)
+  (( lat_scaled == 0 )) && lat_scaled=1
+  LAT_ROWS+=("$lat_scaled $avg ${label//[\[\]]/}")
+  if is_gt "${avg}" 100; then
+    warn "${label}: ${C_BOLD}${host}${C_RESET} ping ${avg}ms (high latency)"
+  elif is_gt "${loss_pct}" 0; then
+    warn "${label}: ${C_BOLD}${host}${C_RESET} ping ${avg}ms with ${loss_pct}% loss"
+  else
+    ok "${label}: ${C_BOLD}${host}${C_RESET} ping ${avg}ms"
+  fi
+}
+
+# --- port check: TCP connect ---
+do_port() {
+  local host="$1" port="$2" label="$3"
+  if timeout 3 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
+    ok "${label}: ${C_BOLD}${host}:${port}${C_RESET} port open"
+  else
+    crit "${label}: ${C_BOLD}${host}:${port}${C_RESET} port closed/unreachable"
+    return 1
+  fi
+}
+
+# --- HTTP probe: status + response time ---
+do_http() {
+  local host="$1" port="$2" path="$3" label="$4" scheme="${5:-http}"
+  local url="${scheme}://${host}:${port}${path}"
+  local start end elapsed code
+  start=$(date +%s%N)
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
+  end=$(date +%s%N)
+  elapsed=$(( (end - start) / 1000000 ))
+  if [[ -z "$code" ]] || [[ "$code" == "000" ]]; then
+    crit "${label}: ${C_BOLD}${url}${C_RESET} no response (${elapsed}ms)"
+    return 1
+  fi
+  if [[ "$code" -ge 500 ]]; then
+    crit "${label}: ${C_BOLD}${url}${C_RESET} HTTP ${code} (${elapsed}ms)"
+    return 1
+  elif [[ "$code" -ge 400 ]]; then
+    warn "${label}: ${C_BOLD}${url}${C_RESET} HTTP ${code} (${elapsed}ms)"
+    return 1
+  fi
+  if is_gt "$elapsed" 2000; then
+    warn "${label}: ${C_BOLD}${url}${C_RESET} HTTP ${code} but slow (${elapsed}ms)"
+  else
+    ok "${label}: ${C_BOLD}${url}${C_RESET} HTTP ${code} (${elapsed}ms)"
+  fi
+}
+
+# --- Ollama: list models ---
+do_ollama_tags() {
+  local host="$1" port="$2" label="$3"
+  local resp
+  resp=$(curl -sS --max-time 5 "http://${host}:${port}/api/tags" 2>/dev/null)
+  if [[ -z "$resp" ]]; then
+    crit "${label}: ${C_BOLD}/api/tags${C_RESET} no response"
+    return 1
+  fi
+  local count
+  if [[ $has_jq -eq 1 ]]; then
+    count=$(printf '%s' "$resp" | jq '.models | length' 2>/dev/null || echo 0)
+  else
+    count=$(printf '%s' "$resp" | grep -oE '"name"' | wc -l)
+  fi
+  ok "${label}: ${C_BOLD}/api/tags${C_RESET} ${count} model(s) available"
+}
+
+# --- Ollama: currently running models ---
+do_ollama_ps() {
+  local host="$1" port="$2" label="$3"
+  local resp
+  resp=$(curl -sS --max-time 5 "http://${host}:${port}/api/ps" 2>/dev/null)
+  if [[ -z "$resp" ]]; then
+    crit "${label}: ${C_BOLD}/api/ps${C_RESET} no response"
+    return 1
+  fi
+  if [[ $has_jq -eq 1 ]]; then
+    local running
+    running=$(printf '%s' "$resp" | jq '.models | length' 2>/dev/null || echo 0)
+    if [[ "$running" == "0" ]]; then
+      info "${label}: ${C_DIM}no models currently loaded${C_RESET}"
+    else
+      ok "${label}: ${C_BOLD}/api/ps${C_RESET} ${running} model(s) loaded"
+      printf '%s' "$resp" | jq -r '.models[]? | "    · \(.name)  vram=\(.size_vram // 0)  expires=\(.expires_at // "-")"' 2>/dev/null \
+        | while IFS= read -r line; do
+            [[ -n "$line" ]] && info "$line"
+          done
+    fi
+  else
+    info "${label}: ${C_DIM}/api/ps responded (jq not installed for full parse)${C_RESET}"
+  fi
+}
+
+# --- OpenAI-compatible: list models ---
+do_openai_models() {
+  local host="$1" port="$2" label="$3"
+  local resp
+  resp=$(curl -sS --max-time 5 "http://${host}:${port}/v1/models" 2>/dev/null)
+  if [[ -z "$resp" ]]; then
+    crit "${label}: ${C_BOLD}/v1/models${C_RESET} no response"
+    return 1
+  fi
+  if [[ $has_jq -eq 1 ]]; then
+    local count
+    count=$(printf '%s' "$resp" | jq '.data | length' 2>/dev/null || echo 0)
+    ok "${label}: ${C_BOLD}/v1/models${C_RESET} ${count} model(s) advertised"
+    printf '%s' "$resp" | jq -r '.data[]? | "    · \(.id)"' 2>/dev/null \
+      | head -10 \
+      | while IFS= read -r line; do
+          [[ -n "$line" ]] && info "$line"
+        done
+  else
+    info "${label}: ${C_DIM}/v1/models responded${C_RESET}"
+  fi
+}
+
+# --- OpenAI-compatible: latency via minimal completion ---
+do_openai_latency() {
+  [[ $QUICK -eq 1 ]] && { info "${C_DIM}latency probe skipped (--quick)${C_RESET}"; return; }
+  local host="$1" port="$2" label="$3"
+  local start end elapsed code
+  start=$(date +%s%N)
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"any","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"stream":false}' \
+    "http://${host}:${port}/v1/chat/completions" 2>/dev/null)
+  end=$(date +%s%N)
+  elapsed=$(( (end - start) / 1000000 ))
+  if [[ -z "$code" ]] || [[ "$code" == "000" ]]; then
+    crit "${label}: ${C_BOLD}/v1/chat/completions${C_RESET} no response (${elapsed}ms)"
+    return 1
+  fi
+  if [[ "$code" -ge 400 ]]; then
+    warn "${label}: ${C_BOLD}/v1/chat/completions${C_RESET} HTTP ${code} (${elapsed}ms)"
+    return 1
+  fi
+  if is_gt "$elapsed" 3000; then
+    warn "${label}: ${C_BOLD}/v1/chat/completions${C_RESET} HTTP ${code} (${elapsed}ms — slow)"
+  else
+    ok "${label}: ${C_BOLD}/v1/chat/completions${C_RESET} HTTP ${code} (${elapsed}ms)"
+  fi
+}
+
+# --- MCP: probe a port for standard MCP endpoints ---
+# Looks for /mcp, /sse, /v1/tools — anything that responds is interesting.
+# Port being CLOSED is fine (no MCP server), OPEN-but-no-MCP is a warning.
+do_mcp_probe() {
+  local host="$1" port="$2" label="$3"
+  # First: is the port even open?
+  if ! timeout 3 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
+    # Port closed is the normal "no MCP here" case — info, not warn
+    info "${label}: ${C_DIM}port ${port} closed (no MCP)${C_RESET}"
+    return 0
+  fi
+  ok "${label}: ${C_BOLD}${host}:${port}${C_RESET} port open (possible MCP)"
+
+  # Port is open — try standard MCP paths
+  local paths=("/mcp" "/sse" "/v1/tools" "/messages" "/")
+  local hit=0
+  for p in "${paths[@]}"; do
+    local code
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 \
+      -H 'Accept: application/json, text/event-stream' \
+      "http://${host}:${port}${p}" 2>/dev/null)
+    case "$code" in
+      2*|3*)
+        ok "${label}: ${C_BOLD}http://${host}:${port}${p}${C_RESET} HTTP ${code} (MCP-shaped)"
+        hit=1
+        ;;
+      405)  # Method Not Allowed = endpoint exists, just wrong verb
+        ok "${label}: ${C_BOLD}http://${host}:${port}${p}${C_RESET} HTTP 405 (endpoint exists)"
+        hit=1
+        ;;
+    esac
+  done
+
+  # If port is open but nothing responded, it might be MCP-over-something-else
+  if [[ $hit -eq 0 ]]; then
+    info "${label}: ${C_DIM}port open but no MCP-shaped responses on ${paths[*]}${C_RESET}"
+  fi
+}
+
+# ---------- Per-server probe loop ----------
+JSON_RESULTS=()
+
+probe_server() {
+  local entry="$1"
+  local name host type port
+  local extra_ports=()
+  if [[ $has_jq -eq 1 ]]; then
+    name=$(printf '%s' "$entry" | jq -r '.name')
+    host=$(printf '%s' "$entry" | jq -r '.host')
+    type=$(printf '%s' "$entry" | jq -r '.type // "generic"')
+    port=$(printf '%s' "$entry" | jq -r '.port // empty')
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && extra_ports+=("$p")
+    done < <(printf '%s' "$entry" | jq -r '.extra_ports[]? // empty' 2>/dev/null)
+  else
+    name=$(printf '%s' "$entry" | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+    host=$(printf '%s' "$entry" | grep -oE '"host"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"host"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+    type=$(printf '%s' "$entry" | grep -oE '"type"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"type"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+    type=${type:-generic}
+    port=$(printf '%s' "$entry" | grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | sed -E 's/.*"port"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/')
+    # Fallback: extract extra_ports array
+    if [[ "$entry" =~ \"extra_ports\"[[:space:]]*:[[:space:]]*\[([0-9,\ ]+)\] ]]; then
+      local raw="${BASH_REMATCH[1]}"
+      IFS=',' read -ra extra_ports <<< "$raw"
+    fi
+  fi
+
+  [[ $JSON_OUT -eq 0 ]] && printf "\n${C_BOLD}${C_MAGENTA}━━ %s ━━${C_RESET} ${C_DIM}(%s @ ${host}${port:+:$port})${C_RESET}\n" "$name" "$type"
+  local label="[${name}]"
+
+  # Default port by type
+  case "$type" in
+    ollama)        [[ -z "$port" ]] && port=11434 ;;
+    openai)        [[ -z "$port" ]] && port=8000 ;;
+    llama.cpp)     [[ -z "$port" ]] && port=8080 ;;
+    vllm)          [[ -z "$port" ]] && port=8000 ;;
+    *)             [[ -z "$port" ]] && port=80 ;;
+  esac
+
+  local before_warns=$WARNINGS before_crits=$CRITICAL
+
+  # Always run ping + port unless explicitly disabled
+  do_ping "$host" "$label"
+  do_port "$host" "$port" "$label"
+
+  # Type-specific probes
+  case "$type" in
+    ollama)
+      do_http "$host" "$port" "/" "$label"
+      do_ollama_tags "$host" "$port" "$label"
+      do_ollama_ps "$host" "$port" "$label"
+      ;;
+    openai|vllm|llama.cpp|text-generation-inference)
+      do_http "$host" "$port" "/" "$label"
+      do_http "$host" "$port" "/v1/models" "$label"
+      do_openai_models "$host" "$port" "$label"
+      do_openai_latency "$host" "$port" "$label"
+      ;;
+    generic|http)
+      do_http "$host" "$port" "/" "$label"
+      ;;
+    *)
+      do_http "$host" "$port" "/" "$label"
+      ;;
+  esac
+
+  # Extra ports (MCP / sidecar services) — probe each with MCP-shaped paths
+  if [[ ${#extra_ports[@]} -gt 0 ]]; then
+    [[ $JSON_OUT -eq 0 ]] && printf "  ${C_BOLD}${C_DIM}── MCP / extra ports ──${C_RESET}\n"
+    for ep in "${extra_ports[@]}"; do
+      do_mcp_probe "$host" "$ep" "$label"
+    done
+  fi
+
+  local new_warns=$((WARNINGS - before_warns))
+  local new_crits=$((CRITICAL - before_crits))
+  local status="OK"
+  [[ $new_crits -gt 0 ]] && status="CRIT"
+  [[ $new_warns -gt 0 ]] && [[ "$status" != "CRIT" ]] && status="WARN"
+  JSON_RESULTS+=("{\"name\":\"$name\",\"host\":\"$host\",\"type\":\"$type\",\"port\":$port,\"status\":\"$status\",\"warnings\":$new_warns,\"criticals\":$new_crits}")
+}
+
+# ---------- Iterate servers ----------
+if [[ $has_jq -eq 1 ]]; then
+  ENTRIES=$(printf '%s' "$RAW_JSON" | jq -c '.servers[]' 2>/dev/null)
+else
+  # Fallback: split by top-level objects
+  ENTRIES=$(printf '%s' "$RAW_JSON" \
+    | tr -d '\n' \
+    | sed -E 's/.*"servers"[[:space:]]*:[[:space:]]*\[//; s/\].*//' \
+    | awk 'BEGIN{RS="},"} {print $0 "}"}')
+fi
+
+while IFS= read -r entry; do
+  [[ -z "$entry" ]] && continue
+  # Apply filters
+  if [[ -n "$FILTER_HOST" ]]; then
+    echo "$entry" | grep -q "\"host\"[[:space:]]*:[[:space:]]*\"$FILTER_HOST\"" || continue
+  fi
+  if [[ -n "$FILTER_NAME" ]]; then
+    echo "$entry" | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$FILTER_NAME\"" || continue
+  fi
+  probe_server "$entry"
+done <<< "$ENTRIES"
+
+# ---------- Headline box ----------
+[[ $JSON_OUT -eq 0 ]] && section "AI STATUS HEADLINE"
+[[ $JSON_OUT -eq 0 ]] && printf "  ${C_BOLD}Servers:${C_RESET} ${SERVER_COUNT}  ${C_DIM}|${C_RESET}  ${C_GREEN}${C_BOLD}%d OK${C_RESET}  ${C_DIM}|${C_RESET}  ${C_YELLOW}%d warnings${C_RESET}  ${C_DIM}|${C_RESET}  ${C_RED}%d critical${C_RESET}\n" \
+  "$OK_COUNT" "$WARNINGS" "$CRITICAL"
+
+# ─── Bar Chart: ping latency per server ────────────────────────────────────
+if [[ $JSON_OUT -eq 0 ]] && [[ ${#LAT_ROWS[@]} -gt 0 ]]; then
+  lat_max=$(printf '%s\n' "${LAT_ROWS[@]}" | awk '{print $1}' | sort -rn | head -1)
+  lat_total=$(printf '%s\n' "${LAT_ROWS[@]}" | awk '{s+=$2} END {printf "%.2f", s}')
+  printf "\n  ${C_BOLD}${C_CYAN}Ping latency by server (total=%s ms):${C_RESET}\n" "$lat_total"
+  lat_width=40
+  while read -r lat_val lat_disp lat_label; do
+    [[ -z "$lat_label" ]] && continue
+    lat_pct=$(( lat_val * 100 / (lat_max > 0 ? lat_max : 1) ))
+    lat_color="$C_GREEN"; (( lat_pct >= 60 )) && lat_color="$C_YELLOW"; (( lat_pct >= 85 )) && lat_color="$C_RED"
+    lat_filled=$(( lat_pct * lat_width / 100 ))
+    (( lat_filled == 0 )) && lat_filled=1
+    lat_bar=""
+    for (( j=0; j<lat_filled; j++ )); do lat_bar+="█"; done
+    for (( j=lat_filled; j<lat_width; j++ )); do lat_bar+=" "; done
+    printf "    %-25s ${lat_color}%s${C_RESET} %s ms\n" "${lat_label:0:25}" "$lat_bar" "$lat_disp"
+  done < <(printf '%s\n' "${LAT_ROWS[@]}" | sort -rn | head -10)
+fi
+
+# ---------- Recommendations ----------
+[[ $JSON_OUT -eq 0 ]] && section "RECOMMENDATIONS"
+if [[ $CRITICAL -gt 0 ]]; then
+  [[ $JSON_OUT -eq 0 ]] && printf "  ${C_RED}${C_BOLD}→ %d server(s) critical — investigate immediately${C_RESET}\n" "$CRITICAL"
+fi
+if [[ $WARNINGS -gt 0 ]]; then
+  [[ $JSON_OUT -eq 0 ]] && printf "  ${C_YELLOW}→ %d warning(s) — review above${C_RESET}\n" "$WARNINGS"
+fi
+[[ $OK_COUNT -eq $SERVER_COUNT && $JSON_OUT -eq 0 ]] && printf "  ${C_GREEN}${C_BOLD}→ All configured servers healthy${C_RESET}\n"
+[[ $has_jq -eq 0 && $JSON_OUT -eq 0 ]] && printf "  ${C_DIM}→ Install jq for richer model listings${C_RESET}\n"
+[[ $QUICK -eq 1 && $JSON_OUT -eq 0 ]] && printf "  ${C_DIM}→ Re-run without --quick for full latency probes${C_RESET}\n"
+
+# ---------- LLM interpretation (opt-in via --interpret / interactive TTY) ----------
+ai_interpret() {
+  # Only run if explicitly enabled, not in JSON mode, and stdout is a TTY
+  [[ $INTERPRET -eq 0 ]] && return
+  [[ $JSON_OUT -eq 1 ]] && return
+
+  # Locate a usable `ask`. Prefer the bashrc function (faster, chat-completions
+  # endpoint with thinking disabled), fall back to the standalone binary.
+  local ask_cmd=""
+  if declare -F ask >/dev/null 2>&1; then
+    ask_cmd="ask"
+  elif command -v ask >/dev/null 2>&1; then
+    # Standalone binary — set a short max-tokens default since the model is small
+    ask_cmd="ask --max-tokens 180 --temp 0.2"
+  else
+    printf "  ${C_DIM}(`ask` not available — install it or add to PATH for AI interpretation)${C_RESET}\n"
+    return
+  fi
+
+  # Build a compact, structured summary of probe findings
+  local summary=""
+  summary+="AI server status summary at $TIMESTAMP:\n"
+  summary+="- $SERVER_COUNT server(s) configured, $OK_COUNT OK, $WARNINGS warnings, $CRITICAL critical.\n"
+  for r in "${JSON_RESULTS[@]}"; do
+    [[ -z "$r" ]] && continue
+    summary+="- $r\n"
+  done
+  if (( CRITICAL > 0 )); then
+    summary+="\nQuestions:\n"
+    summary+="1) What is the most likely root cause of the critical issues?\n"
+    summary+="2) Which server(s) should I restart first to recover service?\n"
+    summary+="3) Is there anything in this picture I should NOT ignore?\n"
+  else
+    summary+="\nQuestion: Which server(s) look healthiest for routing requests right now?\n"
+  fi
+
+  local prompt="You are reading a compact status report from an AI-server health monitor.
+The report lists each server (name, host, port, type) with status=OK|WARN|CRIT and counts of warnings and criticals.
+Write ONE short paragraph (3-6 sentences, plain prose, no bullet points, no markdown headings) telling the operator what is broken, what is healthy, and the single most important next step.
+Do NOT invent facts not present in the report. If something is unclear, say so.
+REPORT:
+$summary"
+
+  printf "\n${C_BOLD}${C_CYAN}━━━ LLM INTERPRETATION (local model) ━━━${C_RESET}\n"
+  printf "  ${C_DIM}asking %s … (timeout %ds)${C_RESET}\n" "$ask_cmd" "$ASK_TIMEOUT"
+
+  local reply
+  local ask_t0 ask_t1
+  ask_t0=$(date +%s)
+  # Run `ask` with a hard timeout. If it stalls past ASK_TIMEOUT, kill it.
+  reply=$(timeout "$ASK_TIMEOUT" bash -c "$ask_cmd \"\$1\"" _ "$prompt" 2>&1)
+  local rc=$?
+  ask_t1=$(date +%s)
+  local ask_elapsed=$((ask_t1 - ask_t0))
+
+  if [[ $rc -ne 0 ]]; then
+    printf "  ${C_YELLOW}⚠ ask returned non-zero (rc=%d, %ds elapsed) — skipping interpretation${C_RESET}\n" "$rc" "$ask_elapsed"
+    return
+  fi
+  if [[ -z "${reply// /}" ]]; then
+    printf "  ${C_YELLOW}⚠ ask returned empty content — local model may be busy or template mismatch${C_RESET}\n"
+    return
+  fi
+  printf "  ${C_DIM}(%ds)${C_RESET}\n" "$ask_elapsed"
+  printf "  ${reply}\n"
+}
+
+ai_interpret
+
+# ---------- JSON output ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+  printf '{"timestamp":"%s","servers":[' "$TIMESTAMP"
+  first=1
+  for r in "${JSON_RESULTS[@]}"; do
+    [[ -z "$r" ]] && continue
+    if [[ $first -eq 1 ]]; then
+      printf '%s' "$r"
+      first=0
+    else
+      printf ',%s' "$r"
+    fi
+  done
+  printf '],"warnings":%d,"critical":%d}\n' "$WARNINGS" "$CRITICAL"
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- Verdict ----------
+[[ $JSON_OUT -eq 0 ]] && section "VERDICT"
+END_TS=$(date +%s)
+ELAPSED=$((END_TS - START_TS))
+if [[ $CRITICAL -gt 0 ]]; then
+  [[ $JSON_OUT -eq 0 ]] && printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical issue(s) — servers need attention\n" "$CRITICAL"
+  [[ $JSON_OUT -eq 0 ]] && show_verdict_one_liners
+  exit 2
+elif [[ $WARNINGS -gt 0 ]]; then
+  [[ $JSON_OUT -eq 0 ]] && printf "  ${C_YELLOW}WARNING${C_RESET}: %d warning(s), no critical issues\n" "$WARNINGS"
+  [[ $JSON_OUT -eq 0 ]] && show_verdict_one_liners
+  exit 1
+else
+  [[ $JSON_OUT -eq 0 ]] && printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: all %d servers responding cleanly\n" "$SERVER_COUNT"
+  exit 0
+fi

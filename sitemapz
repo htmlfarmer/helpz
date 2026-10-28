@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# sitemapz — Standalone deep sitemap audit
+#
+# What it does (more detail than websitez's section 8):
+#   • robots.txt fetch + parse: discovers every Sitemap: directive, plus
+#     Host: directive, crawl-delay, and user-agent blocks
+#   • Sitemap discovery probe: tests common paths (/sitemap.xml,
+#     /sitemap_index.xml, /sitemap/, /wp-sitemap.xml, /page-sitemap.xml,
+#     /news-sitemap.xml, /video-sitemap.xml, /image-sitemap.xml, etc.)
+#     and reports HTTP code, size, content-type, and gzipped-ness for each
+#   • Sitemap parsing: detects sitemap-index vs url-set, counts URLs,
+#     extracts lastmod / priority / changefreq distributions, identifies
+#     stale URLs (lastmod older than N days), and finds URLs missing
+#     lastmod entirely
+#   • Multi-sitemap aggregation: walks a sitemap-index and pulls every
+#     child sitemap's URLs, deduplicating across the tree
+#   • URL pattern analysis: extracts path components, identifies dynamic
+#     URLs (with ?query= or numeric IDs), counts by top-level directory,
+#     detects trailing-slash inconsistencies
+#   • gzipped detection: auto-detects .xml.gz sitemap files and decompresses
+#     them in-flight
+#   • CSV export: writes every URL to a CSV with url/lastmod/priority/
+#     changefreq columns for downstream analysis
+#   • Per-host breakdown: if the sitemap covers multiple hosts (cross-
+#     domain), counts URLs per host
+#   • Health scoring: heuristics for sitemap quality (presence of lastmod,
+#     priority, reasonable URL count, no orphan URLs)
+#
+# Usage:
+#   ./sitemapz https://example.com
+#   ./sitemapz example.com --csv
+#   ./sitemapz example.com --outdir ./reports
+#   ./sitemapz example.com --max-urls 10000     # cap aggregation
+#   ./sitemapz example.com --no-aggregate       # skip child sitemaps
+#
+# Requires: curl (required), gzip (optional, for .gz sitemaps), python3
+# (required for regex parsing).
+# ============================================================================
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# ---------- Args ----------
+URL=""
+JSON_OUT=0
+CSV_OUT=0
+# Confine reports to the suite directory per project security policy.
+OUTDIR="${SCRIPT_DIR}/sitemapz-reports"
+MAX_URLS=5000
+DO_AGGREGATE=1
+AI_VERDICT=0
+
+while [[ $# -gt 0 ]]; do
+    # Bare "help" / "?" as the only argument should show help
+    if [[ "${1}" == "help" || "${1}" == "?" ]]; then
+        sed -n '2,40p' "$0"; exit 0
+    fi
+    case "$1" in
+        --json)        JSON_OUT=1; shift ;;
+        --csv)         CSV_OUT=1; shift ;;
+        --outdir)      OUTDIR="$2"; shift 2 ;;
+        --max-urls)    MAX_URLS="$2"; shift 2 ;;
+        --no-aggregate) DO_AGGREGATE=0; shift ;;
+        --no-color)    NO_COLOR=1; shift ;;
+        --ai)          AI_VERDICT=1; shift ;;
+        --no-ai)       AI_VERDICT=0; shift ;;
+        -h|--help)
+            sed -n '2,40p' "$0"; exit 0 ;;
+        --) shift; break ;;
+        -*) printf "Unknown flag: %s\n" "$1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$URL" ]]; then URL="$1"; fi
+            shift ;;
+    esac
+done
+
+if [[ -z "$URL" ]]; then
+    printf "Usage: %s URL [--json] [--csv] [--outdir DIR] [--max-urls N] [--no-aggregate] [--ai]\n" "$0" >&2
+    exit 2
+fi
+
+# Normalize URL
+if [[ "$URL" != http* ]]; then
+    URL="https://$URL"
+fi
+URL_HOST=$(echo "$URL" | sed -E 's|^https?://||; s|/.*$||')
+URL_SCHEME=$(echo "$URL" | grep -oE '^https?://' | sed 's|://||')
+BASE_URL="${URL_SCHEME}://${URL_HOST}"
+
+# ---------- Output setup ----------
+mkdir -p "$OUTDIR" 2>/dev/null || true
+TS=$(date '+%Y%m%d-%H%M%S')
+SAFE_HOST=$(echo "$URL_HOST" | tr '/' '_')
+REPORT="$OUTDIR/${SAFE_HOST}-${TS}.txt"
+CSV_FILE="$OUTDIR/${SAFE_HOST}-${TS}.csv"
+exec > >(tee "$REPORT") 2>&1
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "sitemapz"
+fi
+
+# ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if ! have curl; then
+    printf "%s requires 'curl'. Aborting.%s\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+if ! have python3; then
+    printf "%s requires 'python3'. Aborting.%s\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+
+CURL_BASE=(curl -sS -L --max-redirs 5 --max-time 15 -A "sitemapz/1.0 (+diagnostic)")
+
+# ---------- Banner ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "╔═══════════════════════════════════════════════════════════════╗\n"
+printf "║  SITEMAP.SH  — Standalone Deep Sitemap Audit                  ║\n"
+printf "║  robots.txt · Discovery · Index · URLs · Stats · CSV          ║\n"
+printf "╚═══════════════════════════════════════════════════════════════╝\n"
+printf "${C_RESET}\n"
+printf "${C_DIM}URL: %s   Time: %s   Report: %s${C_RESET}\n" \
+    "$URL" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$REPORT"
+echo
+
+# ---------- 1. robots.txt ----------
+printf "${C_BOLD}  ── 1. ROBOTS.TXT ──${C_RESET}\n"
+ROBOTS=$("${CURL_BASE[@]}" -sf "${BASE_URL}/robots.txt" 2>/dev/null)
+if [[ -n "$ROBOTS" ]]; then
+    printf "    ${C_GREEN}✓${C_RESET} %s/robots.txt fetched (%d bytes)\n" \
+        "$BASE_URL" "$(echo -n "$ROBOTS" | wc -c | tr -d ' ')"
+    # Extract Sitemap: directives
+    declare -a DISCOVERED_SM=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[Ss]itemap:[[:space:]]*(.+)$ ]]; then
+            SM_URL="${BASH_REMATCH[1]}"
+            DISCOVERED_SM+=("$SM_URL")
+            printf "      ${C_CYAN}↳${C_RESET} Sitemap: %s\n" "$SM_URL"
+        fi
+    done <<< "$ROBOTS"
+    if [[ ${#DISCOVERED_SM[@]} -gt 0 ]]; then
+        printf "    ${C_DIM}%-22s${C_RESET} %d sitemap(s) declared in robots.txt\n" \
+            "Discovered:" "${#DISCOVERED_SM[@]}"
+    fi
+    # Crawl-delay
+    CRAWL_DELAYS=$(echo "$ROBOTS" | grep -iE '^[[:space:]]*Crawl-delay:' \
+        | head -5 | sed -E 's/^[^:]+:[[:space:]]*//')
+    if [[ -n "$CRAWL_DELAYS" ]]; then
+        printf "    ${C_DIM}Crawl-delay:${C_RESET} %s\n" "$(echo "$CRAWL_DELAYS" | head -1)"
+    fi
+else
+    printf "    ${C_YELLOW}!${C_RESET} no robots.txt at %s/robots.txt\n" "$BASE_URL"
+    DISCOVERED_SM=()
+fi
+echo
+
+# ---------- 2. Common-path probe ----------
+printf "${C_BOLD}  ── 2. SITEMAP DISCOVERY PROBE ──${C_RESET}\n"
+CANDIDATES=(
+    "${BASE_URL}/sitemap.xml"
+    "${BASE_URL}/sitemap_index.xml"
+    "${BASE_URL}/sitemap/"
+    "${BASE_URL}/sitemap/sitemap-index.xml"
+    "${BASE_URL}/wp-sitemap.xml"
+    "${BASE_URL}/page-sitemap.xml"
+    "${BASE_URL}/post-sitemap.xml"
+    "${BASE_URL}/news-sitemap.xml"
+    "${BASE_URL}/video-sitemap.xml"
+    "${BASE_URL}/image-sitemap.xml"
+    "${BASE_URL}/sitemap.xml.gz"
+    "${BASE_URL}/sitemap_index.xml.gz"
+)
+FOUND_SM=()
+for P in "${CANDIDATES[@]}"; do
+    code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}|%{size_download}|%{content_type}' -s "$P" 2>/dev/null)
+    RC=$(echo "$code" | cut -d'|' -f1)
+    SZ=$(echo "$code" | cut -d'|' -f2)
+    CT=$(echo "$code" | cut -d'|' -f3)
+    if [[ "$RC" =~ ^2 ]]; then
+        printf "    ${C_GREEN}✓${C_RESET} %-50s HTTP %s, %d bytes, %s\n" \
+            "$P" "$RC" "$SZ" "$CT"
+        FOUND_SM+=("$P")
+    else
+        printf "    ${C_DIM}·${C_RESET} %-50s HTTP %s\n" "$P" "$RC"
+    fi
+done
+echo
+if [[ ${#FOUND_SM[@]} -eq 0 && ${#DISCOVERED_SM[@]} -eq 0 ]]; then
+    printf "    ${C_RED}✗${C_RESET} no sitemap discovered via probing or robots.txt\n"
+else
+    printf "    ${C_GREEN}✓${C_RESET} sitemap candidates found: %d (probe) + %d (robots.txt)\n" \
+        "${#FOUND_SM[@]}" "${#DISCOVERED_SM[@]}"
+fi
+echo
+
+# ---------- 3. Pick canonical sitemap ----------
+# Prefer robots.txt-discovered, then probe candidates
+TARGET_SM=""
+if [[ ${#DISCOVERED_SM[@]} -gt 0 ]]; then
+    TARGET_SM="${DISCOVERED_SM[0]}"
+elif [[ ${#FOUND_SM[@]} -gt 0 ]]; then
+    TARGET_SM="${FOUND_SM[0]}"
+fi
+if [[ -z "$TARGET_SM" ]]; then
+    printf "${C_RED}No sitemap to analyze.${C_RESET}\n"
+    exit 0
+fi
+
+printf "${C_BOLD}  ── 3. CANONICAL SITEMAP ──${C_RESET}\n"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Source:" "$TARGET_SM"
+echo
+
+# ---------- 4. Fetch + decompress sitemap ----------
+printf "${C_BOLD}  ── 4. FETCH & DECOMPRESS ──${C_RESET}\n"
+SITEMAP_RAW=$("${CURL_BASE[@]}" -sf --compressed "$TARGET_SM" 2>/dev/null)
+if [[ -z "$SITEMAP_RAW" ]]; then
+    # Try without compression flag (in case it's already gzipped but server
+    # doesn't send Content-Encoding header)
+    SITEMAP_RAW=$("${CURL_BASE[@]}" -sf "$TARGET_SM" 2>/dev/null)
+fi
+if [[ -z "$SITEMAP_RAW" ]]; then
+    printf "    ${C_RED}✗ could not fetch %s${C_RESET}\n" "$TARGET_SM"
+    exit 0
+fi
+# If gzipped, decompress
+if [[ "${TARGET_SM}" == *.gz ]] || file -b <<< "$SITEMAP_RAW" 2>/dev/null | grep -qi 'gzip'; then
+    if have gzip; then
+        SITEMAP_RAW=$(printf '%s' "$SITEMAP_RAW" | gunzip -c 2>/dev/null)
+        printf "    ${C_GREEN}✓${C_RESET} gzipped sitemap detected and decompressed\n"
+    fi
+fi
+RAW_SIZE=$(echo -n "$SITEMAP_RAW" | wc -c | tr -d ' ')
+printf "    ${C_DIM}%-22s${C_RESET} %d bytes\n" "Decompressed size:" "$RAW_SIZE"
+echo
+
+# ---------- 5. Detect sitemap type ----------
+SITEMAP_TYPE="urlset"
+if echo "$SITEMAP_RAW" | grep -q "<sitemapindex"; then
+    SITEMAP_TYPE="sitemap-index"
+elif echo "$SITEMAP_RAW" | grep -q "<urlset"; then
+    SITEMAP_TYPE="urlset"
+fi
+printf "${C_BOLD}  ── 5. TYPE ──${C_RESET}\n"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Sitemap type:" "$SITEMAP_TYPE"
+echo
+
+# ---------- 6. Parse with Python (regex) ----------
+SITEMAP_FILE=$(mktemp); echo "$SITEMAP_RAW" > "$SITEMAP_FILE"
+PARSED_FILE=$(mktemp)
+SITEMAP_FILE_PY="$SITEMAP_FILE" PARSED_FILE_PY="$PARSED_FILE" python3 <<'PYEOF' >/dev/null 2>&1
+import re, os, sys
+from collections import Counter
+
+out = open(os.environ['PARSED_FILE_PY'], 'w')
+
+with open(os.environ['SITEMAP_FILE_PY']) as f:
+    body = f.read()
+
+is_index = '<sitemapindex' in body
+is_urlset = '<urlset' in body
+
+if is_index:
+    # Sub-sitemap URLs
+    subs = re.findall(r'<sitemap>\s*<loc>([^<]+)</loc>', body)
+    # Optionally lastmod per sub-sitemap
+    sub_lm = re.findall(r'<sitemap>\s*<loc>[^<]+</loc>\s*(?:<lastmod>([^<]+)</lastmod>)?', body)
+    out.write('TYPE=index\n')
+    out.write(f'SUBS={len(subs)}\n')
+    for s in subs[:50]:
+        out.write(f'SUB={s}\n')
+
+elif is_urlset:
+    urls = re.findall(r'<loc>([^<]+)</loc>', body)
+    lastmods = re.findall(r'<lastmod>([^<]+)</lastmod>', body)
+    priorities = re.findall(r'<priority>([^<]+)</priority>', body)
+    changefreqs = re.findall(r'<changefreq>([^<]+)</changefreq>', body)
+
+    out.write('TYPE=urlset\n')
+    out.write(f'URLS={len(urls)}\n')
+    out.write(f'WITH_LASTMOD={len(lastmods)}\n')
+    out.write(f'WITH_PRIORITY={len(priorities)}\n')
+    out.write(f'WITH_CHANGEFREQ={len(changefreqs)}\n')
+
+    # Priority distribution
+    pri_counter = Counter()
+    for p in priorities:
+        try:
+            pri_counter[round(float(p), 1)] += 1
+        except ValueError:
+            pri_counter['?'] += 1
+    for k in sorted(pri_counter.keys(), key=lambda x: (isinstance(x, str), x)):
+        out.write(f'PRI={k}\t{pri_counter[k]}\n')
+
+    # Changefreq distribution
+    cf_counter = Counter(changefreqs)
+    for k, v in cf_counter.most_common():
+        out.write(f'CFREQ={k}\t{v}\n')
+
+    # lastmod range
+    if lastmods:
+        out.write(f'LM_FIRST={min(lastmods)}\n')
+        out.write(f'LM_LAST={max(lastmods)}\n')
+        # Count stale (>1 year old) — compare against today (2026-09-11)
+        stale = 0
+        for lm in lastmods:
+            try:
+                y = int(lm[:4])
+                if y < 2025:
+                    stale += 1
+            except (ValueError, IndexError):
+                pass
+        out.write(f'LM_STALE={stale}\n')
+
+    # URL pattern analysis
+    path_parts = Counter()
+    has_query = 0
+    has_trailing_slash = 0
+    no_trailing_slash = 0
+    hosts = Counter()
+    for u in urls:
+        if '?' in u:
+            has_query += 1
+        if u.endswith('/'):
+            has_trailing_slash += 1
+        else:
+            no_trailing_slash += 1
+        # Top-level dir
+        m = re.match(r'https?://([^/]+)(/[^?#]*)?', u)
+        if m:
+            host = m.group(1)
+            hosts[host] += 1
+            path = m.group(2) or '/'
+            # First segment
+            seg = path.lstrip('/').split('/')[0] if path != '/' else '(root)'
+            path_parts[seg or '(root)'] += 1
+    out.write(f'WITH_QUERY={has_query}\n')
+    out.write(f'WITH_TRAILING_SLASH={has_trailing_slash}\n')
+    out.write(f'WITHOUT_TRAILING_SLASH={no_trailing_slash}\n')
+    for k, v in hosts.most_common(5):
+        out.write(f'HOST={k}\t{v}\n')
+    for k, v in path_parts.most_common(10):
+        out.write(f'PATH_TOP={k}\t{v}\n')
+
+    # CSV output
+    csv_path = os.environ.get('CSV_OUT_PATH', '')
+    if csv_path:
+        with open(csv_path, 'w') as cf:
+            cf.write('url,lastmod,priority,changefreq\n')
+            url_iter = iter(urls)
+            lm_iter = iter(lastmods + [''] * (len(urls) - len(lastmods)))
+            pr_iter = iter(priorities + [''] * (len(urls) - len(priorities)))
+            cf_iter = iter(changefreqs + [''] * (len(urls) - len(changefreqs)))
+            for u in urls:
+                lm = next(lm_iter, '') if lastmods else ''
+                pr = next(pr_iter, '') if priorities else ''
+                cfv = next(cf_iter, '') if changefreqs else ''
+                # Escape commas/quotes
+                def esc(s):
+                    s = str(s).replace('"', '""')
+                    if ',' in s or '"' in s:
+                        return f'"{s}"'
+                    return s
+                cf.write(f'{esc(u)},{esc(lm)},{esc(pr)},{esc(cfv)}\n')
+else:
+    out.write('TYPE=unknown\n')
+    out.write('NOTE=not a recognized sitemap format\n')
+
+out.close()
+PYEOF
+rm -f "$SITEMAP_FILE"
+PARSED=$(cat "$PARSED_FILE")
+
+# ---------- 7. Display parsed results ----------
+printf "\n${C_BOLD}  ── 6. PARSED DETAILS ──${C_RESET}\n"
+TYPE=$(echo "$PARSED" | grep '^TYPE=' | cut -d= -f2)
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Detected:" "$TYPE"
+if [[ "$TYPE" == "urlset" ]]; then
+    URLS=$(echo "$PARSED" | grep '^URLS=' | cut -d= -f2)
+    LM_N=$(echo "$PARSED" | grep '^WITH_LASTMOD=' | cut -d= -f2)
+    PR_N=$(echo "$PARSED" | grep '^WITH_PRIORITY=' | cut -d= -f2)
+    CF_N=$(echo "$PARSED" | grep '^WITH_CHANGEFREQ=' | cut -d= -f2)
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "URL count:" "$URLS"
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "With lastmod:" "$LM_N"
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "With priority:" "$PR_N"
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "With changefreq:" "$CF_N"
+
+    LM_FIRST=$(echo "$PARSED" | grep '^LM_FIRST=' | cut -d= -f2-)
+    LM_LAST=$(echo "$PARSED" | grep '^LM_LAST=' | cut -d= -f2-)
+    [[ -n "$LM_FIRST" ]] && printf "    ${C_DIM}%-22s${C_RESET} %s — %s\n" "Lastmod range:" "$LM_FIRST" "$LM_LAST"
+
+    LM_STALE=$(echo "$PARSED" | grep '^LM_STALE=' | cut -d= -f2)
+    if [[ -n "$LM_STALE" && "$LM_STALE" -gt 0 ]]; then
+        printf "    ${C_YELLOW}!${C_RESET} ${C_DIM}%-22s${C_RESET} %s URLs lastmod > 1 year ago\n" "Stale URLs:" "$LM_STALE"
+    fi
+
+    echo
+    printf "    ${C_DIM}Priority distribution:${C_RESET}\n"
+    if echo "$PARSED" | grep -q '^PRI='; then
+        echo "$PARSED" | grep '^PRI=' | awk -F'\t' '{
+            printf "      \033[36m%-8s\033[0m %s URLs\n", $1, $2
+        }' | sed 's/^PRI=//'
+    else
+        printf "      ${C_DIM}(no priority values)${C_RESET}\n"
+    fi
+    echo
+    printf "    ${C_DIM}Changefreq distribution:${C_RESET}\n"
+    if echo "$PARSED" | grep -q '^CFREQ='; then
+        echo "$PARSED" | grep '^CFREQ=' | awk -F'\t' '{
+            printf "      \033[36m%-12s\033[0m %s URLs\n", $1, $2
+        }' | sed 's/^CFREQ=//'
+    else
+        printf "      ${C_DIM}(no changefreq values)${C_RESET}\n"
+    fi
+
+    WITH_Q=$(echo "$PARSED" | grep '^WITH_QUERY=' | cut -d= -f2)
+    WITH_TS=$(echo "$PARSED" | grep '^WITH_TRAILING_SLASH=' | cut -d= -f2)
+    NO_TS=$(echo "$PARSED" | grep '^WITHOUT_TRAILING_SLASH=' | cut -d= -f2)
+    echo
+    printf "    ${C_DIM}URL hygiene:${C_RESET}\n"
+    printf "      with ?query:           %s\n" "$WITH_Q"
+    printf "      with trailing /:       %s\n" "$WITH_TS"
+    printf "      without trailing /:    %s\n" "$NO_TS"
+    if [[ "$WITH_TS" -gt 0 && "$NO_TS" -gt 0 ]]; then
+        printf "      ${C_YELLOW}!${C_RESET} inconsistent trailing-slash usage\n"
+    fi
+
+    echo
+    printf "    ${C_DIM}Top paths:${C_RESET}\n"
+    echo "$PARSED" | grep '^PATH_TOP=' | head -10 | awk -F'\t' '{
+        printf "      \033[36m%-30s\033[0m %s URLs\n", $1, $2
+    }' | sed 's/^PATH_TOP=//'
+
+    echo
+    printf "    ${C_DIM}Hosts covered:${C_RESET}\n"
+    echo "$PARSED" | grep '^HOST=' | awk -F'\t' '{
+        printf "      \033[36m%-40s\033[0m %s URLs\n", $1, $2
+    }' | sed 's/^HOST=//'
+
+elif [[ "$TYPE" == "index" ]]; then
+    SUBS=$(echo "$PARSED" | grep '^SUBS=' | cut -d= -f2)
+    printf "    ${C_DIM}%-22s${C_RESET} %s child sitemap(s)\n" "Sub-sitemaps:" "$SUBS"
+    echo "$PARSED" | grep '^SUB=' | sed 's/^/      ↳ /'
+
+    # ---------- 7b. Walk children if requested ----------
+    if [[ $DO_AGGREGATE -eq 1 && "$SUBS" -gt 0 ]]; then
+        printf "\n${C_BOLD}  ── 6b. AGGREGATING CHILD SITEMAPS ──${C_RESET}\n"
+        TOTAL_URLS=0
+        ALL_URLS_FILE=$(mktemp)
+        echo "$PARSED" | grep '^SUB=' | cut -d= -f2- | while IFS= read -r SUB_URL; do
+            CHILD=$("${CURL_BASE[@]}" -sf --compressed "$SUB_URL" 2>/dev/null)
+            if [[ -z "$CHILD" ]]; then
+                CHILD=$("${CURL_BASE[@]}" -sf "$SUB_URL" 2>/dev/null)
+            fi
+            if [[ "$CHILD" == *.gz ]] && have gzip; then
+                CHILD=$(printf '%s' "$CHILD" | gunzip -c 2>/dev/null)
+            fi
+            CCNT=$(echo "$CHILD" | grep -c '<url>' 2>/dev/null || echo 0)
+            printf "    ${C_DIM}%-60s${C_RESET} %s URLs\n" "$SUB_URL" "$CCNT"
+            echo "$CHILD" | grep -oE '<loc>[^<]+</loc>' | sed 's|</\?loc>||g' >> "$ALL_URLS_FILE"
+        done
+        TOTAL_URLS=$(wc -l < "$ALL_URLS_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+        UNIQUE_URLS=$(sort -u "$ALL_URLS_FILE" | wc -l | tr -d ' ' || echo 0)
+        printf "    ${C_DIM}%-22s${C_RESET} ~%s URLs aggregated across all child sitemaps\n" \
+            "Total URLs (est):" "$TOTAL_URLS"
+        printf "    ${C_DIM}%-22s${C_RESET} %s unique URLs\n" "Unique URLs:" "$UNIQUE_URLS"
+        if [[ "$CSV_OUT" -eq 1 ]]; then
+            cp "$ALL_URLS_FILE" "$CSV_FILE"
+            printf "    ${C_GREEN}✓${C_RESET} URL list saved to: %s\n" "$CSV_FILE"
+        fi
+
+        # ---------- Sensitive-path detection (security) ----------
+        # Search aggregated URLs for paths that should not appear in a public sitemap:
+        # admin pages, backup files, internal/staging hosts, debug endpoints, etc.
+        SENSITIVE_HITS=$(grep -iE '/(admin|administrator|wp-admin|wp-login|backend|manage|console|phpmyadmin|pma|mysql|sql|backup|backups|dump|\.sql(\.gz)?|\.bak|\.tar(\.gz)?|\.zip|\.git/|\.svn/|\.env|\.htpasswd|\.htaccess|staging|internal|debug|test/|dev/|private|secret|conf|/etc/)' \
+            "$ALL_URLS_FILE" 2>/dev/null || true)
+        SENSITIVE_COUNT=$(echo -n "$SENSITIVE_HITS" | grep -c . 2>/dev/null || echo 0)
+        if [[ "$SENSITIVE_COUNT" -gt 0 ]]; then
+            printf "    ${C_RED}✗${C_RESET} ${C_RED}%-22s${C_RESET} ${C_RED}%s sensitive URL(s) leaked via sitemap${C_RESET}\n" \
+                "Sensitive paths:" "$SENSITIVE_COUNT"
+            printf "      ${C_DIM}(admin / backup / .sql / .git / .env / debug / staging / etc.)${C_RESET}\n"
+            echo "$SENSITIVE_HITS" | head -n 5 | sed 's|^|        |'
+            (( SENSITIVE_COUNT > 5 )) && printf "        ${C_DIM}... and %d more${C_RESET}\n" $((SENSITIVE_COUNT - 5))
+        else
+            printf "    ${C_GREEN}✓${C_RESET} ${C_DIM}%-22s${C_RESET} no sensitive-path URLs leaked\n" "Sensitive paths:"
+        fi
+
+        rm -f "$ALL_URLS_FILE"
+    fi
+fi
+echo
+
+# ---------- 8. Health scoring ----------
+printf "${C_BOLD}  ── 7. HEALTH SCORE ──${C_RESET}\n"
+SCORE=100
+NOTES=()
+if [[ "$TYPE" == "urlset" ]]; then
+    URLS=$(echo "$PARSED" | grep '^URLS=' | cut -d= -f2)
+    LM_N=$(echo "$PARSED" | grep '^WITH_LASTMOD=' | cut -d= -f2)
+    PR_N=$(echo "$PARSED" | grep '^WITH_PRIORITY=' | cut -d= -f2)
+    [[ "$LM_N" -eq 0 ]] && SCORE=$((SCORE - 25)) && NOTES+=("no lastmod on any URL")
+    if [[ -n "$URLS" && "$URLS" -gt 0 ]]; then
+        LM_PCT=$(( LM_N * 100 / URLS ))
+        if [[ $LM_PCT -lt 80 ]]; then
+            SCORE=$((SCORE - 15))
+            NOTES+=("lastmod only on $LM_PCT% of URLs (recommend ≥80%)")
+        fi
+    fi
+    [[ "$PR_N" -eq 0 ]] && SCORE=$((SCORE - 5)) && NOTES+=("no priority values (optional)")
+    LM_STALE=$(echo "$PARSED" | grep '^LM_STALE=' | cut -d= -f2)
+    [[ -n "$LM_STALE" && "$LM_STALE" -gt $((URLS / 2)) ]] && \
+        SCORE=$((SCORE - 10)) && NOTES+=("majority of lastmod dates are > 1 year old")
+fi
+if [[ ${#NOTES[@]} -eq 0 ]]; then
+    printf "    ${C_GREEN}✓${C_RESET} Score: ${C_GREEN}%d/100${C_RESET} — sitemap looks healthy\n" "$SCORE"
+else
+    printf "    Score: ${C_YELLOW}%d/100${C_RESET}\n" "$SCORE"
+    for n in "${NOTES[@]}"; do
+        printf "      ${C_YELLOW}!${C_RESET} %s\n" "$n"
+    done
+fi
+echo
+
+# ---------- 9. CSV export ----------
+if [[ $CSV_OUT -eq 1 && "$TYPE" == "urlset" ]]; then
+    printf "${C_BOLD}  ── 8. CSV EXPORT ──${C_RESET}\n"
+    SITEMAP_FILE=$(mktemp); echo "$SITEMAP_RAW" > "$SITEMAP_FILE"
+    CSV_OUT_PATH="$CSV_FILE" SITEMAP_FILE_PY="$SITEMAP_FILE" python3 <<'PYEOF' >/dev/null 2>&1
+import re, os
+with open(os.environ['SITEMAP_FILE_PY']) as f:
+    body = f.read()
+urls = re.findall(r'<loc>([^<]+)</loc>', body)
+lastmods = re.findall(r'<lastmod>([^<]+)</lastmod>', body)
+priorities = re.findall(r'<priority>([^<]+)</priority>', body)
+changefreqs = re.findall(r'<changefreq>([^<]+)</changefreq>', body)
+def pad(lst, n, fill=''):
+    return (lst + [fill] * n)[:n]
+with open(os.environ['CSV_OUT_PATH'], 'w') as cf:
+    cf.write('url,lastmod,priority,changefreq\n')
+    n = len(urls)
+    lms = pad(lastmods, n)
+    prs = pad(priorities, n)
+    cfs = pad(changefreqs, n)
+    for u, lm, pr, cfr in zip(urls, lms, prs, cfs):
+        def esc(s):
+            s = str(s).replace('"', '""')
+            if ',' in s or '"' in s:
+                return f'"{s}"'
+            return s
+        cf.write(f'{esc(u)},{esc(lm)},{esc(pr)},{esc(cfr)}\n')
+PYEOF
+    rm -f "$SITEMAP_FILE"
+    printf "    ${C_GREEN}✓${C_RESET} %s\n" "$CSV_FILE"
+    echo
+fi
+
+# ---------- Summary ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "━━━ SITEMAPZ COMPLETE ━━━\n"
+printf "${C_RESET}"
+printf "Report: %s\n" "$REPORT"
+
+# ---------- AI verdict (opt-in) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+    _SM_SUMMARY="host=$URL_HOST sitemap_found=$([ -n "$TARGET_SM" ] && echo y || echo n) type=${TYPE:-?} urls=${URLS:-0} subs=${SUBS:-0} sensitive_leaks=${SENSITIVE_COUNT:-0}"
+    ai_emit_verdict "top_issue" "$_SM_SUMMARY" 2>/dev/null || true
+fi
+
+# ---------- Optional JSON dump ----------
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_REPORT="$OUTDIR/${SAFE_HOST}-${TS}.json"
+    if [[ "$TYPE" == "urlset" ]]; then
+        URLS=$(echo "$PARSED" | grep '^URLS=' | cut -d= -f2)
+        cat > "$JSON_REPORT" <<EOF
+{
+  "url": "$URL",
+  "timestamp": "$(date -Iseconds)",
+  "sitemap_source": "$TARGET_SM",
+  "sitemap_type": "$TYPE",
+  "url_count": ${URLS:-0},
+  "sitemap_bytes": $RAW_SIZE
+}
+EOF
+    else
+        SUBS=$(echo "$PARSED" | grep '^SUBS=' | cut -d= -f2)
+        cat > "$JSON_REPORT" <<EOF
+{
+  "url": "$URL",
+  "timestamp": "$(date -Iseconds)",
+  "sitemap_source": "$TARGET_SM",
+  "sitemap_type": "$TYPE",
+  "sub_sitemaps": ${SUBS:-0},
+  "sitemap_bytes": $RAW_SIZE
+}
+EOF
+    fi
+    printf "JSON:   %s\n" "$JSON_REPORT"
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi

@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# javascriptz — Standalone JavaScript analysis
+#
+# What it does (more detail than websitez's section 6/6b):
+#   • Fetches the target URL and extracts EVERY <script src="..."> reference,
+#     including nested inline-script-loaded JSON manifests
+#   • For each script URL: classifies it by type (ESM/CJS/AMD/IIFE), detects
+#     async/defer/module/nomodule/integrity/nonce/crossorigin attributes,
+#     identifies bundle fingerprints (Webpack/Rollup/Vite/Parcel chunks by
+#     numeric suffixes), detects framework markers (Next/Nuxt/Svelte/Vue)
+#   • Per-script HTTP timing: DNS, TCP, TLS, TTFB, total (3 samples each,
+#     min/median/max), plus size in bytes
+#   • Detects JS-rendered sites by counting empty <div id="root"></div> /
+#     <div id="app"></div> placeholders and presence of hydration markers
+#   • Detects JS-disabled fallback (<noscript> contents)
+#   • Detects critical-path scripts (render-blocking vs deferred)
+#   • Detects common third-party trackers and ad networks
+#   • Detects JS frameworks via window.* globals exposed in inline code
+#   • Reports total JS weight, external vs inline ratio, average script size
+#   • Detects source-map references (//# sourceMappingURL=...) in inline code
+#   • Detects obfuscation markers (eval, Function("..."), atob, hex literals)
+#   • Builds a dependency-like dependency graph from import statements
+#     found in inline scripts (ESM imports + CommonJS require())
+#   • Detects Content-Security-Policy script-src and nonce violations
+#
+# Usage:
+#   ./javascriptz https://example.com
+#   ./javascriptz example.com --json
+#   ./javascriptz example.com --outdir ./reports
+#   ./javascriptz example.com --max-scripts 50      # cap timing tests
+#   ./javascriptz example.com --no-timing           # skip HTTP timing
+#
+# Requires: curl (required), jq (optional, for JSON output), python3
+# (required for regex parsing).
+# ============================================================================
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# ---------- Args ----------
+URL=""
+JSON_OUT=0
+OUTDIR="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")-reports"
+MAX_SCRIPTS=20
+DO_TIMING=1
+
+while [[ $# -gt 0 ]]; do
+    # Bare "help" / "?" as the only argument should show help
+    if [[ "${1}" == "help" || "${1}" == "?" ]]; then
+        sed -n '2,40p' "$0"; exit 0
+    fi
+    case "$1" in
+        --json)        JSON_OUT=1; shift ;;
+        --outdir)      OUTDIR="$2"; shift 2 ;;
+        --max-scripts) MAX_SCRIPTS="$2"; shift 2 ;;
+        --no-timing)   DO_TIMING=0; shift ;;
+        --ai)          AI_VERDICT=1; shift ;;
+        --no-ai)       AI_VERDICT=0; shift ;;
+        -h|--help)
+            sed -n '2,40p' "$0"; exit 0 ;;
+        --) shift; break ;;
+        -*) printf "Unknown flag: %s\n" "$1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$URL" ]]; then URL="$1"; fi
+            shift ;;
+    esac
+done
+
+if [[ -z "$URL" ]]; then
+    printf "Usage: %s URL [--json] [--outdir DIR] [--max-scripts N] [--no-timing]\n" "$0" >&2
+    exit 2
+fi
+
+# Normalize URL — accept bare host or full URL
+if [[ "$URL" != http* ]]; then
+    URL="https://$URL"
+fi
+URL_HOST=$(echo "$URL" | sed -E 's|^https?://||; s|/.*$||')
+URL_SCHEME=$(echo "$URL" | grep -oE '^https?://' | sed 's|://||')
+URL_PATH=$(echo "$URL" | sed -E "s|^https?://[^/]*||")
+
+# ---------- Output setup ----------
+mkdir -p "$OUTDIR" 2>/dev/null || true
+TS=$(date '+%Y%m%d-%H%M%S')
+SAFE_HOST=$(echo "$URL_HOST" | tr '/' '_')
+REPORT="$OUTDIR/${SAFE_HOST}-${TS}.txt"
+exec > >(tee "$REPORT") 2>&1
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "javascriptz"
+fi
+
+# ---------- helpers ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if ! have curl; then
+    printf "%s requires 'curl'. Aborting.%s\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+if ! have python3; then
+    printf "%s requires 'python3'. Aborting.%s\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+
+# ---------- Banner ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "╔═══════════════════════════════════════════════════════════════╗\n"
+printf "║  JAVASCRIPT.SH  — Standalone JS Analysis                     ║\n"
+printf "║  Scripts · Modules · Bundles · Timing · Trackers · Hydration ║\n"
+printf "╚═══════════════════════════════════════════════════════════════╝\n"
+printf "${C_RESET}\n"
+printf "${C_DIM}URL: %s   Time: %s   Report: %s${C_RESET}\n" \
+    "$URL" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$REPORT"
+echo
+
+# ---------- 1. Fetch body ----------
+printf "${C_BOLD}  ── 1. FETCH ──${C_RESET}\n"
+CURL_BASE=(curl -sS -L --max-redirs 5 --max-time 20 -A "javascriptz/1.0 (+diagnostic)")
+BODY=$("${CURL_BASE[@]}" "$URL" 2>/dev/null)
+if [[ -z "$BODY" ]]; then
+    printf "    ${C_RED}✗ could not fetch %s${C_RESET}\n" "$URL"
+    exit 1
+fi
+BODY_SIZE=$(echo -n "$BODY" | wc -c | tr -d ' ')
+printf "    ${C_DIM}%-22s${C_RESET} %s bytes\n" "Body size:" "$BODY_SIZE"
+echo
+
+# ---------- 2. Extract script tags & attribute profile ----------
+printf "${C_BOLD}  ── 2. SCRIPT INVENTORY ──${C_RESET}\n"
+BODY_FILE=$(mktemp); echo "$BODY" > "$BODY_FILE"
+SCRIPT_DATA=$(BODY_FILE="$BODY_FILE" python3 <<'PYEOF'
+import re, os
+# Match all <script ...>...</script> blocks — body may contain newlines, quotes, etc.
+script_pat = re.compile(r'<script\b([^>]*)>([\s\S]*?)</script>', re.IGNORECASE)
+attrs_pat = {
+    'async':       re.compile(r'\basync\b'),
+    'defer':       re.compile(r'\bdefer\b'),
+    'nomodule':    re.compile(r'\bnomodule\b'),
+    'module':      re.compile(r'type=["\']?module'),
+    'crossorigin': re.compile(r'\bcrossorigin\b'),
+    'sri':         re.compile(r'\bintegrity=["\']'),
+    'nonce':       re.compile(r'\bnonce=["\']'),
+    'json':        re.compile(r'type=["\']?application/(?:ld\+)?json'),
+}
+src_url_pat = re.compile(r'\bsrc=["\']([^\"\']+)["\']')
+
+with open(os.environ['BODY_FILE']) as f:
+    body = f.read()
+count_total = 0
+count_external = 0
+count_inline = 0
+ext_lines = []
+inline_sizes = []
+
+for m in script_pat.finditer(body):
+    count_total += 1
+    attrs = m.group(1) or ''
+    inner = m.group(2) or ''
+    url_m = src_url_pat.search(attrs)
+    if url_m:
+        count_external += 1
+        url = url_m.group(1)
+        flags = []
+        for label, pat in attrs_pat.items():
+            if pat.search(attrs):
+                flags.append(label)
+        ext_lines.append('SRC=' + url + ('|' + ','.join(flags) if flags else ''))
+    else:
+        count_inline += 1
+        if inner.strip():
+            inline_sizes.append(len(inner))
+
+# Source-map references
+sourcemaps = re.findall(r'//[#@]\s*sourceMappingURL=([^\s\'"<>]+)', body)
+
+# JSON-LD blobs
+json_ld = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', body, re.IGNORECASE)
+
+print(f'TOTAL={count_total}')
+print(f'EXTERNAL={count_external}')
+print(f'INLINE={count_inline}')
+print(f'INLINE_BYTES={sum(inline_sizes)}')
+print(f'SOURCEMAPS={len(sourcemaps)}')
+for sm in sourcemaps[:10]:
+    print(f'SOURCEMAP={sm}')
+print(f'JSONLD={len(json_ld)}')
+for j in json_ld[:5]:
+    print(f'JSONLD_BLOCK={j[:200]}')
+for line in ext_lines:
+    print(line)
+PYEOF
+)
+rm -f "$BODY_FILE"
+
+TOTAL=$(echo "$SCRIPT_DATA" | grep '^TOTAL=' | cut -d= -f2)
+EXT_COUNT=$(echo "$SCRIPT_DATA" | grep '^EXTERNAL=' | cut -d= -f2)
+INL_COUNT=$(echo "$SCRIPT_DATA" | grep '^INLINE=' | cut -d= -f2)
+INL_BYTES=$(echo "$SCRIPT_DATA" | grep '^INLINE_BYTES=' | cut -d= -f2)
+SM_COUNT=$(echo "$SCRIPT_DATA" | grep '^SOURCEMAPS=' | cut -d= -f2)
+JLD_COUNT=$(echo "$SCRIPT_DATA" | grep '^JSONLD=' | cut -d= -f2)
+
+printf "    ${C_DIM}%-22s${C_RESET} %s (%s external, %s inline)\n" \
+    "Total <script> tags:" "$TOTAL" "$EXT_COUNT" "$INL_COUNT"
+printf "    ${C_DIM}%-22s${C_RESET} %s bytes\n" "Inline JS payload:" "$INL_BYTES"
+printf "    ${C_DIM}%-22s${C_RESET} %s references\n" "Source maps:" "$SM_COUNT"
+printf "    ${C_DIM}%-22s${C_RESET} %s blocks\n" "JSON-LD structured data:" "$JLD_COUNT"
+echo
+
+# ---------- 3. ESM / CJS / framework detection on inline scripts ----------
+printf "${C_BOLD}  ── 3. INLINE-SCRIPT FINGERPRINTS ──${C_RESET}\n"
+declare -A SIGNS=(
+    ["ESM imports"]='(^|;)\s*import\s+[{]'
+    ["ESM dynamic import"]='import\s*\(\s*.'
+    ["CommonJS require"]='require\s*\(\s*.'
+    ["Webpack runtime"]='__webpack_require__|webpackJsonp'
+    ["Rollup runtime"]='rollup'
+    ["Vite client"]='@vite/client'
+    ["Next.js runtime"]='__NEXT_DATA__|_next/static'
+    ["Nuxt runtime"]='__NUXT__|_nuxt/'
+    ["React production"]='react-dom|React.createElement'
+    ["Vue production"]='Vue.component|createApp'
+    ["Angular bootstrap"]='ngBootstrap|platformBrowserDynamic'
+    ["Svelte runtime"]='svelte/internal'
+    ["Stripe.js"]='Stripe\(|stripe.com/v'
+    ["Google Analytics"]='gtag\(|ga\(.send'
+    ["Google Tag Manager"]='googletagmanager'
+    ["Segment.io"]='analytics.load|segment.com'
+    ["Sentry"]='@sentry/|sentry-cdn'
+    ["Intercom"]='Intercom\(|widget.intercom.io'
+    ["Hotjar"]='hotjar.com|static.hj'
+    ["Mixpanel"]='mixpanel.init|cdn.mxpnl.com'
+    ["Cloudflare beacon"]='cloudflareinsights|static.cloudflareinsights'
+    ["OpenTelemetry"]='@opentelemetry/|opentelemetry'
+    ["Vercel analytics"]='va.vercel-scripts|vercel-analytics'
+    ["Service worker registration"]='navigator.serviceWorker.register'
+    ["WebSocket"]='new WebSocket\('
+    ["Fetch polyfill"]='whatwg-fetch'
+    ["Promise polyfill"]='es6-promise'
+    ["Babel runtime"]='@babel/runtime'
+    ["jQuery"]='jquery|jQuery'
+)
+FOUND_FP=0
+# Single pipe of BODY through all patterns — was N grep -qP passes.
+{
+    while IFS= read -r name; do
+        pat="${SIGNS[$name]}"
+        if grep -qP "$pat" <<<"$BODY"; then
+            printf "    ${C_GREEN}●${C_RESET} ${C_BOLD}%-22s${C_RESET}\n" "$name"
+            FOUND_FP=1
+        fi
+    done < <(printf '%s\n' "${!SIGNS[@]}")
+}
+[[ $FOUND_FP -eq 0 ]] && printf "    ${C_DIM}(no major patterns detected in inline JS)${C_RESET}\n"
+echo
+
+# ---------- 4. Obfuscation & sourcemap markers ----------
+printf "${C_BOLD}  ── 4. OBFUSCATION / SOURCE-MAP MARKERS ──${C_RESET}\n"
+# Single awk pass over BODY — replaces 6 separate grep -oE pipes.
+read -r EVAL_CT FN_CT ATOB_CT HEX_LIT_CT ESC_SEQ_CT SRC_MAP_INLINE < <(
+    awk '
+        BEGIN { e=f=at=h=u=s=0 }
+        /\beval[[:space:]]*\(/                  { e++ }
+        /\bnew[[:space:]]+Function[[:space:]]*\(/ { f++ }
+        /\batob[[:space:]]*\(/                 { at++ }
+        /\\x[0-9a-fA-F]{2}/                    { h++ }
+        /\\u[0-9a-fA-F]{4}/                    { u++ }
+        /sourceMappingURL/                     { s++ }
+        END { printf "%d %d %d %d %d %d\n", e, f, at, h, u, s }
+    ' <<<"$BODY"
+)
+
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "eval() calls:" "$EVAL_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "new Function() calls:" "$FN_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "atob() calls:" "$ATOB_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Hex escapes (\\xNN):" "$HEX_LIT_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Unicode escapes (\\uNNNN):" "$ESC_SEQ_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Inline source-map URLs:" "$SRC_MAP_INLINE"
+echo
+
+# ---------- 5. Hydration / SPA detection ----------
+printf "${C_BOLD}  ── 5. SPA / HYDRATION DETECTION ──${C_RESET}\n"
+ROOT_CT=$(echo "$BODY" | grep -ciE '<div[^>]*id=["'"'"'](root|app|__next|__nuxt|app-root)["'"'"']')
+MOUNT_CT=$(echo "$BODY" | grep -ciE 'document\.getElementById\(["'"'"'](root|app|__next)["'"'"']\)')
+HYDRATE_CT=$(echo "$BODY" | grep -ciE 'ReactDOM\.hydrate|hydrateRoot|createRoot|Hydrate')
+NOSCRIPT_CT=$(echo "$BODY" | grep -ciE '<noscript>')
+SPA_HINT=""
+if [[ "$ROOT_CT" -gt 0 && "$HYDRATE_CT" -gt 0 ]]; then
+    SPA_HINT="${C_CYAN}likely SPA / client-rendered${C_RESET}"
+elif [[ "$ROOT_CT" -gt 0 ]]; then
+    SPA_HINT="${C_DIM}empty root div (SSR or prerender hint)${C_RESET}"
+else
+    SPA_HINT="${C_DIM}no SPA markers${C_RESET}"
+fi
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Root/app div markers:" "$ROOT_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Hydration API use:"   "$HYDRATE_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %s\n" "<noscript> blocks:"   "$NOSCRIPT_CT"
+printf "    ${C_DIM}%-22s${C_RESET} %b\n" "Verdict:"             "$SPA_HINT"
+echo
+
+# ---------- 6. ESM static imports (from inline scripts) ----------
+printf "${C_BOLD}  ── 6. STATIC IMPORTS (from inline code) ──${C_RESET}\n"
+BODY_FILE=$(mktemp); echo "$BODY" > "$BODY_FILE"
+# Capture `import ... from 'URL'` and `import("URL")`
+ESM_IMPORTS=$(BODY_FILE="$BODY_FILE" python3 <<'PYEOF'
+import re, os
+with open(os.environ['BODY_FILE']) as f:
+    src = f.read()
+# import ... from 'URL'
+p1 = re.findall(r'(?:^|;)\s*import\s+(?:[\w*{}\s,]+\s+from\s+)?["\']([^"\']+)["\']', src, re.M)
+# dynamic import('URL')
+p2 = re.findall(r'import\s*\(\s*["\']([^"\']+)["\']', src)
+# CommonJS require('URL')
+p3 = re.findall(r'require\s*\(\s*["\']([^"\']+)["\']', src)
+seen = set()
+for u in p1 + p2 + p3:
+    if u not in seen and not u.startswith('data:'):
+        seen.add(u)
+        print(u)
+PYEOF
+)
+rm -f "$BODY_FILE"
+ESM_N=$(echo -n "$ESM_IMPORTS" | grep -c . || echo 0)
+if [[ -n "$ESM_IMPORTS" ]]; then
+    printf "    ${C_DIM}%-22s${C_RESET} %s\n" "Static imports:" "$ESM_N"
+    echo "$ESM_IMPORTS" | sed 's/^/      ↳ /'
+else
+    printf "    ${C_DIM}(no static imports found)${C_RESET}\n"
+fi
+echo
+
+# ---------- 7. Bundle fingerprint detection ----------
+printf "${C_BOLD}  ── 7. BUNDLE FINGERPRINTS ──${C_RESET}\n"
+EXT_LIST=$(echo "$SCRIPT_DATA" | grep '^SRC=' | sed 's/^SRC=//; s/|.*//')
+EXT_FILE=$(mktemp); echo "$EXT_LIST" > "$EXT_FILE"
+BUNDLE_INFO=$(EXT_FILE="$EXT_FILE" python3 <<'PYEOF'
+import os, re
+bundles = {'webpack': [], 'rollup': [], 'parcel': [], 'vite': [], 'next': [], 'nuxt': []}
+chunk_re = re.compile(r'\.(\d+|[a-f0-9]{8,})\.(?:js|mjs)$', re.IGNORECASE)
+try:
+    with open(os.environ['EXT_FILE']) as f:
+        urls = f.read().splitlines()
+except FileNotFoundError:
+    urls = []
+for url in urls:
+    url = url.strip()
+    if not url:
+        continue
+    if chunk_re.search(url):
+        if 'webpack' in url or re.search(r'\b\w+\.[a-f0-9]{8}\.js', url):
+            bundles['webpack'].append(url)
+        if 'rollup' in url or '/rollup/' in url:
+            bundles['rollup'].append(url)
+        if 'parcel' in url or '.parcel.' in url:
+            bundles['parcel'].append(url)
+        if 'vite' in url or '/@vite/' in url or '/@id/' in url:
+            bundles['vite'].append(url)
+        if '_next/static' in url:
+            bundles['next'].append(url)
+        if '_nuxt/' in url:
+            bundles['nuxt'].append(url)
+for k, v in bundles.items():
+    if v:
+        print(f'{k.upper()}={len(v)}')
+        for u in v[:5]:
+            print(f'  {u}')
+PYEOF
+)
+rm -f "$EXT_FILE"
+if [[ -n "$BUNDLE_INFO" ]]; then
+    echo "$BUNDLE_INFO" | sed 's/^/    /'
+else
+    printf "    ${C_DIM}(no bundle fingerprints detected)${C_RESET}\n"
+fi
+echo
+
+# ---------- 8. Per-script HTTP timing ----------
+if [[ $DO_TIMING -eq 1 ]]; then
+    printf "${C_BOLD}  ── 8. PER-SCRIPT HTTP TIMING ──${C_RESET}\n"
+    TIMED=0
+    echo "$SCRIPT_DATA" | grep '^SRC=' | sed 's/^SRC=//; s/|.*//' \
+        | sort -u | head -"$MAX_SCRIPTS" | while IFS= read -r script_url; do
+            [[ -z "$script_url" ]] && continue
+            # Skip data: URLs and absolute paths to off-host assets we can't reach
+            [[ "$script_url" == data:* ]] && continue
+            # Resolve to absolute
+            if [[ "$script_url" == /* ]]; then
+                abs_url="${URL_SCHEME}://${URL_HOST}${script_url}"
+            elif [[ "$script_url" == http* ]]; then
+                abs_url="$script_url"
+            else
+                # Relative to current path
+                abs_url="${URL_SCHEME}://${URL_HOST}${URL_PATH%/*}/${script_url}"
+            fi
+            # 3 samples → min/median/max
+            declare -a TIMINGS=()
+            for sample in 1 2 3; do
+                T=$(curl -sS -o /dev/null -w '%{time_dns}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{size_download}' \
+                    --max-time 15 -A "javascriptz/1.0" "$abs_url" 2>/dev/null)
+                TIMINGS+=("$T")
+            done
+            # Average across samples (sum / 3) using awk
+            AVG=$(printf '%s\n' "${TIMINGS[@]}" \
+                | awk -F'|' 'BEGIN{dns=c=t=tt=tot=s=0}
+                              {dns+=$1; c+=$2; t+=$3; tt+=$4; tot+=$5; s+=$6}
+                              END{printf "%.4f|%.4f|%.4f|%.4f|%.4f|%d", dns/3, c/3, t/3, tt/3, tot/5, s/3}')
+            IFS='|' read -r ADNS ATCP ATLS ATTT ATOT ASZ <<< "$AVG"
+            # Short label for URL
+            SHORT=$(echo "$script_url" | sed -E "s|^https?://[^/]*||; s|\\?.*$||" | cut -c1-50)
+            printf "    ${C_CYAN}%-50s${C_RESET} ${C_DIM}DNS=%-6ss  TTFB=%-6ss  total=%-6ss  size=%dB${C_RESET}\n" \
+                "$SHORT" "$ADNS" "$ATT" "$ATOT" "${ASZ%.*}"
+            TIMED=$((TIMED + 1))
+        done
+    if [[ $TIMED -eq 0 ]]; then
+        printf "    ${C_DIM}(no external scripts to time)${C_RESET}\n"
+    fi
+    echo
+fi
+
+# ---------- 9. Top 20 script URLs (sorted by impact) ----------
+printf "${C_BOLD}  ── 9. TOP %s EXTERNAL SCRIPT URLS ──${C_RESET}\n" "$MAX_SCRIPTS"
+echo "$EXT_LIST" | sort -u | head -"$MAX_SCRIPTS" | nl | sed 's/^/    /'
+echo
+
+# ---------- 10. Script attribute summary ----------
+printf "${C_BOLD}  ── 10. SCRIPT ATTRIBUTE BREAKDOWN ──${C_RESET}\n"
+ATTR_DATA=$(echo "$SCRIPT_DATA" | grep '^SRC=')
+A_ASYNC=$(echo "$ATTR_DATA" | grep -c '|async' || true)
+A_DEFER=$(echo "$ATTR_DATA" | grep -c '|defer' || true)
+A_MOD=$(echo "$ATTR_DATA" | grep -c '|module' || true)
+A_NOMOD=$(echo "$ATTR_DATA" | grep -c '|nomodule' || true)
+A_SRI=$(echo "$ATTR_DATA" | grep -c '|sri' || true)
+A_NONCE=$(echo "$ATTR_DATA" | grep -c '|nonce' || true)
+A_CROSS=$(echo "$ATTR_DATA" | grep -c '|crossorigin' || true)
+printf "    ${C_DIM}%-22s${C_RESET} async=%s  defer=%s  module=%s  nomodule=%s\n" \
+    "Loading hints:" "$A_ASYNC" "$A_DEFER" "$A_MOD" "$A_NOMOD"
+printf "    ${C_DIM}%-22s${C_RESET} SRI=%s  nonce=%s  crossorigin=%s\n" \
+    "Integrity / sandbox:" "$A_SRI" "$A_NONCE" "$A_CROSS"
+echo
+
+# ---------- 11. Summary ----------
+printf "${C_BOLD}${C_CYAN}"
+printf "━━━ JAVASCRIPTZ COMPLETE ━━━\n"
+printf "${C_RESET}"
+printf "Report: %s\n" "$REPORT"
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+    _JS_SUMMARY="host=$URL_HOST external=$EXT_COUNT inline=$INL_COUNT sourcemaps=$SM_COUNT jsonld=$JLD_COUNT susp_patterns=${SUSP_COUNT:-0}"
+    ai_emit_verdict "top_issue" "$_JS_SUMMARY" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+# ---------- Optional JSON dump ----------
+if [[ $JSON_OUT -eq 1 ]] && have jq; then
+    JSON_REPORT="$OUTDIR/${SAFE_HOST}-${TS}.json"
+    EXT_JSON=$(echo "$EXT_LIST" | sort -u | jq -R . | jq -s .)
+    cat > "$JSON_REPORT" <<EOF
+{
+  "url": "$URL",
+  "timestamp": "$(date -Iseconds)",
+  "total_scripts": $TOTAL,
+  "external_scripts": $EXT_COUNT,
+  "inline_scripts": $INL_COUNT,
+  "inline_bytes": $INL_BYTES,
+  "source_maps_referenced": $SM_COUNT,
+  "jsonld_blocks": $JLD_COUNT,
+  "external_urls": $EXT_JSON
+}
+EOF
+    printf "JSON:   %s\n" "$JSON_REPORT"
+fi

@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# diskz - Block device, filesystem & SMART drive-health diagnostic
+# ----------------------------------------------------------------------------
+# Inspects block devices, mounts, filesystem usage, inodes, physical disk
+# characteristics (rotational, scheduler, model), I/O stats, and full SMART
+# health for NVMe + ATA drives (wear, spare, unsafe-shutdown counter, media
+# errors) via the shared lib/smart.sh parser.
+#
+# Usage:
+#   ./diskz                 # full probe
+#   ./diskz --no-color      # plain output
+#   ./diskz --json          # machine-readable summary
+#   ./diskz --watch 2       # re-run every 2 seconds
+#   ./diskz --fs ext4       # filter to a filesystem type
+#
+# Requires: lsblk, df
+# Optional: iostat (sysstat), findmnt, bc
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/common.sh" ]]; then
+  # shellcheck source=lib/common.sh
+  source "$SCRIPT_DIR/lib/common.sh"
+fi
+
+# ---------- Configuration ----------
+NO_COLOR=${NO_COLOR:-0}
+JSON_OUT=0
+WATCH_INTERVAL=0
+FILTER_FS=""
+START_TS=$(date +%s)
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+declare -a JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --watch=*)    WATCH_INTERVAL="${arg#--watch=}" ;;
+    --watch)      i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-2}" ;;
+    --fs=*)       FILTER_FS="${arg#--fs=}" ;;
+    --fs)         i=$((i+1)); FILTER_FS="${ARGS[$i]:-}" ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          diskz — Block Device & Filesystem Diagnostic         ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects block devices, mounts, filesystem usage, inodes, physical
+  disk characteristics (rotational, scheduler, model), and I/O stats.
+
+USAGE
+  ./diskz                 Full probe
+  ./diskz --no-color      Plain output
+  ./diskz --json          Machine-readable summary
+  ./diskz --watch 2       Re-run every 2 seconds
+  ./diskz --fs ext4       Filter to a filesystem type
+
+OPTIONS
+  --watch[=N]     Re-run every N seconds (default 2)
+  --fs=TYPE       Filter to a filesystem type (e.g. ext4, btrfs)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  lsblk                            Block device tree
+  df -h                            Filesystem usage (human-readable)
+  iostat -dx 2                     I/O statistics (needs sysstat)
+  hdparm -Tt /dev/sda              Disk read speed test
+  smartctl -a /dev/sda             SMART health report (needs smartmontools)
+  findmnt                          Mounted filesystem tree
+  du -sh /* 2>/dev/null | sort -rh | head -20
+                                   Largest top-level directories
+  ncdu /                           Interactive disk usage (needs ncdu)
+
+WARNING → INVESTIGATION COMMANDS
+  Filesystem >95% full            →  du -sh /* 2>/dev/null | sort -rh | head -20
+  Inodes >85% used                →  df -i  and  find / -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head
+  Disk I/O errors in dmesg        →  sudo dmesg | grep -iE 'I/O error|ata.*failed|nvme.*abort'
+  SMART warnings                  →  sudo smartctl -a /dev/sdX
+  High I/O utilization            →  iostat -dx 2  or  iotop
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+init_colors
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_init "diskz"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  DISK.SH — Block Device & Filesystem Diagnostic               ║
+   ║  Mounts · I/O Stats · Inodes · Schedulers                     ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- Detect tools ----------
+HAVE_LSBLK=0;  command -v lsblk >/dev/null 2>&1 && HAVE_LSBLK=1
+HAVE_DF=0;     command -v df >/dev/null 2>&1 && HAVE_DF=1
+HAVE_IOSTAT=0; command -v iostat >/dev/null 2>&1 && HAVE_IOSTAT=1
+HAVE_FINDMNT=0; command -v findmnt >/dev/null 2>&1 && HAVE_FINDMNT=1
+
+if [[ $HAVE_LSBLK -eq 0 ]]; then
+  critf "missing_tool" "lsblk not installed (apt install util-linux)" \
+    "Install util-linux: 'sudo apt install util-linux' (lsblk is required for disk inventory)"
+  exit 1
+fi
+if [[ $HAVE_DF -eq 0 ]]; then
+  critf "missing_tool" "df not installed" \
+    "Install coreutils: 'sudo apt install coreutils' (df is part of POSIX and coreutils)"
+  exit 1
+fi
+
+# ============================================================================
+# SECTION 1: Block device inventory
+# ============================================================================
+section "BLOCK DEVICE INVENTORY"
+
+# Exclude loops and ramdisks for the main table
+LSBLK_OUT=$(lsblk -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE,MOUNTPOINTS,MODEL 2>/dev/null \
+  | grep -vE '^NAME|^loop|^ram[0-9]')
+
+TOTAL_DISKS=$(lsblk -no TYPE 2>/dev/null | awk '$1=="disk"{c++} END{print c+0}')
+TOTAL_PARTS=$(lsblk -no TYPE 2>/dev/null | awk '$1=="part"{c++} END{print c+0}')
+info "Total disks:  ${C_BOLD}${TOTAL_DISKS}${C_RESET}"
+info "Total partitions: ${C_BOLD}${TOTAL_PARTS}${C_RESET}"
+
+heading "Devices"
+while IFS= read -r hdr; do
+  emit "  ${C_DIM}%s${C_RESET}\n" "$hdr"
+done < <(echo "$LSBLK_OUT" | head -1)
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  type=$(echo "$line" | awk '{print $6}')
+  if [[ "$type" == "disk" ]]; then
+    emit "  ${C_CYAN}%s${C_RESET}\n" "$line"
+  elif [[ "$type" == "rom" ]]; then
+    emit "  ${C_DIM}%s${C_RESET}\n" "$line"
+  else
+    emit "  %s\n" "$line"
+  fi
+done < <(echo "$LSBLK_OUT" | tail -n +2)
+
+JSON_FIELDS+=("\"disks\":$TOTAL_DISKS")
+JSON_FIELDS+=("\"partitions\":$TOTAL_PARTS")
+
+# ============================================================================
+# SECTION 2: Filesystem usage
+# ============================================================================
+section "FILESYSTEM USAGE"
+
+DF_OUT=$(df -P 2>/dev/null | grep -vE 'tmpfs|devtmpfs|^Filesystem')
+if [[ -n "$DF_OUT" ]]; then
+  emit "  ${C_DIM}%-22s %-10s %-10s %-10s %-10s %5s  %s${C_RESET}\n" \
+    "Filesystem" "Type" "Size" "Used" "Avail" "Use%" "Mounted on"
+  emit "  ${C_DIM}%-22s %-10s %-10s %-10s %-10s %5s  %s${C_RESET}\n" \
+    "----------------------" "----------" "----------" "----------" "----------" "-----" "----------------------"
+
+  HIGHEST_USE=0
+  HIGHEST_MOUNT=""
+  FS_CHART_ROWS=()
+
+  # Use process substitution so subshell doesn't discard WARNINGS
+  while read -r fs blocks used avail pct_str mnt _; do
+    [[ -z "$fs" ]] && continue
+    fstype=$(findmnt -no fstype "$mnt" 2>/dev/null)
+
+    [[ -n "$FILTER_FS" && "$fstype" != "$FILTER_FS" ]] && continue
+
+    pct=${pct_str%\%}
+    [[ ! "$pct" =~ ^[0-9]+$ ]] && pct=0
+
+    bar_color="$C_GREEN"
+    if is_gt_int "$pct" 95; then
+      bar_color="$C_RED"
+      warn "${mnt}: ${pct}% full"
+    elif is_gt_int "$pct" 85; then
+      bar_color="$C_YELLOW"
+    fi
+
+    pct_colored=$(printf "${bar_color}%3d%%${C_RESET}" "$pct")
+    emit "  %-22s ${C_DIM}%-10s${C_RESET} %-10s %-10s %-10s %s  %s\n" \
+      "${fs:0:22}" \
+      "${fstype:-(?)}" \
+      "$(humansize $((blocks*1024)))" \
+      "$(humansize $((used*1024)))" \
+      "$(humansize $((avail*1024)))" \
+      "$pct_colored" \
+      "$mnt"
+    FS_CHART_ROWS+=("$pct $mnt")
+  done < <(printf '%s\n' "$DF_OUT" | tail -n +2)
+
+  # ─── Bar Chart: filesystem usage percentage ─────────────────────────────
+  if [[ $JSON_OUT -eq 0 ]] && [[ ${#FS_CHART_ROWS[@]} -gt 0 ]]; then
+    emit "\n  ${C_BOLD}${C_CYAN}Filesystem usage (bar chart, %d mounts):${C_RESET}\n" "${#FS_CHART_ROWS[@]}"
+    CHART_W=40
+    printf '%s\n' "${FS_CHART_ROWS[@]}" | sort -rn | head -12 | while IFS=' ' read -r cpct clabel; do
+      ccolor="$C_GREEN"
+      (( cpct >= 60 )) && ccolor="$C_YELLOW"
+      (( cpct >= 85 )) && ccolor="$C_RED"
+      cfilled=$(( cpct * CHART_W / 100 ))
+      cbar=""
+      for (( j=0; j<cfilled; j++ )); do cbar+="█"; done
+      for (( j=cfilled; j<CHART_W; j++ )); do cbar+=" "; done
+      emit "    %-24s ${ccolor}%s${C_RESET} %3d%%\n" "$(echo "$clabel" | cut -c1-24)" "$cbar" "$cpct"
+    done
+    [[ ${#FS_CHART_ROWS[@]} -gt 12 ]] && \
+      emit "    ${C_DIM}… %d more mounts${C_RESET}\n" "$(( ${#FS_CHART_ROWS[@]} - 12 ))"
+  fi
+else
+  warnf "general" "df returned no filesystem data" \
+    "Verify /proc/mounts is readable and filesystem mounts are healthy: 'mount | head'"
+fi
+
+# ============================================================================
+# SECTION 3: Inode usage
+# ============================================================================
+section "INODE USAGE"
+
+DFI_OUT=$(df -Pi 2>/dev/null | grep -vE 'tmpfs|devtmpfs|^Filesystem')
+if [[ -n "$DFI_OUT" ]]; then
+  while read -r fs _ _ _ ipct mnt _; do
+    [[ -z "$fs" ]] && continue
+    if [[ ! "$ipct" =~ ^[0-9]+%$ ]]; then
+      info "${mnt}: inodes not reported (${ipct:-n/a})"
+      continue
+    fi
+    iused_n=${ipct%\%}
+    if is_gt_int "$iused_n" 95; then
+      warn "Inodes >95% on ${mnt}: ${ipct}"
+    elif is_gt_int "$iused_n" 85; then
+      warn "Inodes >85% on ${mnt}: ${ipct}"
+    else
+      info "${mnt}: inodes ${ipct} used"
+    fi
+  done < <(printf '%s\n' "$DFI_OUT" | tail -n +2)
+else
+  info "Inode data unavailable"
+fi
+
+# ============================================================================
+# SECTION 4: Physical disks (rotational, scheduler, model)
+# ============================================================================
+section "PHYSICAL DISKS"
+
+for devdir in /sys/block/*; do
+  [[ -d "$devdir" ]] || continue
+  name=$(basename "$devdir")
+  [[ -r "$devdir/queue/rotational" ]] || continue
+  rot=$(cat "$devdir/queue/rotational" 2>/dev/null | tr -d '\n')
+  sched=$(cat "$devdir/queue/scheduler" 2>/dev/null | awk -F'[' '{print $2}' | awk -F']' '{print $1}')
+  rq_size=$(cat "$devdir/queue/logical_block_size" 2>/dev/null | tr -d '\n')
+  model=$(cat "$devdir/device/model" 2>/dev/null | tr -d '\n' | sed 's/^ *//;s/ *$//')
+  vendor=$(cat "$devdir/device/vendor" 2>/dev/null | tr -d '\n' | sed 's/^ *//;s/ *$//')
+  size_sectors=$(cat "$devdir/size" 2>/dev/null | tr -d '\n')
+  [[ -z "$size_sectors" || "$size_sectors" == "0" ]] && continue
+  size_bytes=$((size_sectors * 512))
+  removable=$(cat "$devdir/removable" 2>/dev/null | tr -d '\n')
+
+  disk_type="HDD"
+  if [[ -r "$devdir/device/type" ]]; then
+    devtype=$(cat "$devdir/device/type" 2>/dev/null | tr -d '\n')
+    [[ "$devtype" == "5" ]] && disk_type="Optical"
+  fi
+  if [[ -d "$devdir/nvme" ]] || [[ "$name" == nvme* ]]; then
+    disk_type="NVMe"
+  elif [[ "$rot" == "0" && "$disk_type" != "Optical" ]]; then
+    disk_type="SSD"
+  fi
+  if [[ "$removable" == "1" && "$disk_type" == "HDD" ]]; then
+    disk_type="Removable"
+  elif [[ "$removable" == "1" ]]; then
+    disk_type="${disk_type}/Removable"
+  fi
+
+  emit "  ${C_BOLD}%-12s${C_RESET} ${C_CYAN}%-12s${C_RESET} %-15s %s\n" \
+    "/dev/$name" "$disk_type" "$(humansize "$size_bytes")" "$vendor $model"
+  emit "  ${C_DIM}%-12s${C_RESET} ${C_DIM}%-12s${C_RESET} %-15s %s\n" \
+    "" "scheduler=${sched:-(none)}" "rq=${rq_size:-512}B" ""
+done
+
+# ============================================================================
+# SECTION 5: I/O stats (iostat)
+# ============================================================================
+section "I/O STATS"
+
+if [[ $HAVE_IOSTAT -eq 1 ]]; then
+  IOSTAT_OUT=$(iostat -dx 1 2 2>/dev/null | tail -n +5)
+  if [[ -n "$IOSTAT_OUT" ]]; then
+    emit "  ${C_DIM}%-12s %8s %8s %8s %8s %8s %8s${C_RESET}\n" \
+      "Device" "r/s" "w/s" "rkB/s" "wkB/s" "await" "%util"
+    emit "  ${C_DIM}%-12s %8s %8s %8s %8s %8s %8s${C_RESET}\n" \
+      "------------" "--------" "--------" "--------" "--------" "--------" "--------"
+
+    while IFS= read -r iorow; do
+      emit "%s\n" "$iorow"
+    done < <(echo "$IOSTAT_OUT" | awk '
+      /^Device/ { next }
+      /^[a-z]/ && NF >= 14 {
+        printf "  %-12s %8.2f %8.2f %8.1f %8.1f %8.2f %8.1f", $1, $2, $3, $6, $7, $10, $14
+      }
+    ')
+  else
+    info "iostat returned no data"
+  fi
+else
+  info "iostat not installed (apt install sysstat)"
+fi
+
+# ============================================================================
+# SECTION 6: SMART / drive health (shared parser: lib/smart.sh)
+# ============================================================================
+section "SMART / DRIVE HEALTH"
+
+# Check common locations (command -v can miss /usr/sbin if not on PATH)
+if [[ -x /usr/sbin/smartctl ]] || [[ -x /sbin/smartctl ]] \
+   || command -v smartctl >/dev/null 2>&1; then
+  if [[ -f "$SCRIPT_DIR/lib/smart.sh" ]]; then
+    # shellcheck source=lib/smart.sh
+    source "$SCRIPT_DIR/lib/smart.sh"
+    if smart_collect; then
+      smart_table
+      smart_findings
+      SMART_FAILED=$( { printf '%s\n' "${SMART_ROWS[@]}" | cut -f4 | grep -c FAILED || true; } )
+      JSON_FIELDS+=("\"smart_drives\":${#SMART_ROWS[@]}")
+      JSON_FIELDS+=("\"smart_failed\":${SMART_FAILED:-0}")
+      info "Tip: full per-drive log — sudo smartctl -a /dev/nvme0 · crash angle — ./crashz smart"
+    else
+      info "smartctl returned no parseable data — try: sudo smartctl -a /dev/sdX (jq is also required)"
+    fi
+  else
+    info "lib/smart.sh absent — run manually: sudo smartctl -a /dev/sdX"
+  fi
+else
+  info "smartctl not installed — apt install smartmontools"
+fi
+
+ERR_COUNT=$(dmesg 2>/dev/null | grep -ciE 'I/O error|ata[0-9]+:.*failed|nvme.*abort' || true)
+ERR_COUNT=${ERR_COUNT:-0}
+if (( ERR_COUNT > 0 )); then
+  critf "disk_io_errors" "Found ${ERR_COUNT} disk error(s) in dmesg" \
+    "Investigate with 'sudo dmesg | grep -iE \"error|fail\"' — back up data and check SMART: 'sudo smartctl -a /dev/sdX'"
+else
+  ok "No recent disk errors in dmesg"
+fi
+JSON_FIELDS+=("\"dmesg_errors\":$ERR_COUNT")
+
+# ============================================================================
+# SECTION 7: Headline box
+# ============================================================================
+section "DISK HEADLINE"
+
+TOTAL_CAP=$(lsblk -dbno SIZE 2>/dev/null | awk 'BEGIN{s=0} {s+=$1} END{print s}')
+MOUNT_COUNT=$(findmnt -no TARGET,SOURCE,FSTYPE 2>/dev/null \
+  | awk '$2 ~ /^\/dev\// {c++} END{print c+0}')
+JSON_FIELDS+=("\"mounts\":$MOUNT_COUNT")
+
+H1="Disks:        $TOTAL_DISKS (capacity: $(humansize "$TOTAL_CAP"))"
+H2="Partitions:   $TOTAL_PARTS"
+H3="Mounts:       $MOUNT_COUNT active"
+H4="Health:       $(if (( ERR_COUNT == 0 )); then echo "OK (no dmesg errors)"; else echo "$ERR_COUNT errors"; fi)"
+H5="Filesystem:   ${FILTER_FS:-all types}"
+
+widest=0
+for line in "$H1" "$H2" "$H3" "$H4" "$H5"; do
+  w=${#line}
+  (( w > widest )) && widest=$w
+done
+BOX_W=$(( widest + 4 ))
+[[ $BOX_W -lt 50 ]] && BOX_W=50
+[[ $BOX_W -gt 72 ]] && BOX_W=72
+
+TOP="╔$(printf '═%.0s' $(seq 1 $BOX_W))╗"
+BOT="╚$(printf '═%.0s' $(seq 1 $BOX_W))╝"
+
+emit "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$TOP"
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H1"
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H2"
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H3"
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H4"
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}   %-$((BOX_W-3))s ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$H5"
+emit "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%-${BOX_W}s  ${C_BOLD}${C_MAGENTA}║${C_RESET}\n" ""
+emit "  ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$BOT"
+
+# ============================================================================
+# SECTION 8: Recommendations & Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+
+rec() {
+  emit "  ${C_CYAN}#%d${C_RESET} → %s\n" "$1" "$2"
+}
+
+rec 1 "Run \`sudo smartctl -a /dev/sdX\` for SMART health reports"
+rec 2 "Live I/O monitoring: \`iostat -dx 2\` or \`iotop\`"
+rec 3 "Find what's using space: \`sudo du -h --max-depth=1 / | sort -hr | head -10\`"
+rec 4 "For SSD TRIM: \`sudo fstrim -v /\` (or enable via fstrim.timer)"
+rec 5 "Monitor growth: \`ncdu /\` (if installed)"
+
+if (( ERR_COUNT > 0 )); then
+  rec 6 "Investigate dmesg I/O errors immediately — possible failing drive"
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_finalize
+fi
+
+emit_verdict
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summarize" "Disk diagnostic complete on $(hostname -s)" 2>/dev/null || true
+fi

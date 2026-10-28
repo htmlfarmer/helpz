@@ -1,0 +1,627 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# gpuz - GPU diagnostic
+# ----------------------------------------------------------------------------
+# Inspects GPUs via nvidia-smi (NVIDIA), lspci (all), and /sys/class/drm
+# (fallback for AMD/Intel). Reports temperatures, VRAM, utilization, processes.
+#
+# Usage:
+#   ./gpuz                 # full probe
+#   ./gpuz --no-color      # plain output
+#   ./gpuz --json          # machine-readable summary
+#   ./gpuz --id N          # focus on GPU N (NVIDIA index)
+#
+# Requires: lspci
+# Optional: nvidia-smi, sensors, jq
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+NO_COLOR=0
+JSON_OUT=0
+GPU_ID=""
+START_TS=$(date +%s)
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --id=*)       GPU_ID="${arg#--id=}" ;;
+    --id)         i=$((i+1)); GPU_ID="${ARGS[$i]:-}" ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          gpuz — GPU Diagnostic                                ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects GPUs via nvidia-smi (NVIDIA), lspci (all), and /sys/class/drm
+  (fallback for AMD/Intel). Reports temperatures, VRAM, utilization,
+  processes. Also uses nvtop for vendor-neutral live usage snapshot.
+
+USAGE
+  ./gpuz                 Full probe
+  ./gpuz --no-color      Plain output
+  ./gpuz --json          Machine-readable summary
+  ./gpuz --id N          Focus on GPU N (NVIDIA index)
+
+OPTIONS
+  --id=N          Focus on a specific GPU (NVIDIA index)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  nvidia-smi                         NVIDIA GPU status (needs nvidia-driver)
+  lspci | grep VGA                   List all GPUs via PCI
+  glxinfo | grep 'OpenGL renderer'   OpenGL driver info
+  nvtop                              Interactive GPU monitor (apt install nvtop)
+  radeontop                          AMD GPU monitor (apt install radeontop)
+  intel_gpu_top                      Intel GPU monitor (needs intel-gpu-tools)
+  watch -n1 nvidia-smi               Live NVIDIA GPU monitoring
+
+WARNING → INVESTIGATION COMMANDS
+  GPU temperature >85°C             →  nvidia-smi --query-gpu=temperature.gpu --format=csv
+  GPU utilization >90%              →  nvidia-smi  or  nvtop
+  VRAM nearly full                  →  nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+  Too many GPU processes            →  nvidia-smi pmon -c 1
+  Driver not detected               →  lspci -k | grep -i vga
+  GPU not recognized by nvidia-smi  →  sudo apt install nvidia-driver-XXX
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "gpuz"
+fi
+
+temp_color() {
+  local t=$1
+  if [[ -z "$t" ]] || ! [[ "$t" =~ ^[0-9]+\.?[0-9]*$ ]]; then echo "$C_DIM"
+  elif is_gt "$t" 85; then echo "$C_RED"
+  elif is_gt "$t" 70; then echo "$C_YELLOW"
+  else echo "$C_GREEN"
+  fi
+}
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+if [[ ${JSON_OUT:-0} -eq 0 ]]; then
+    printf "${C_BOLD}${C_MAGENTA}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  GPU.SH — GPU Diagnostic                                      ║
+   ║  nvidia-smi · VRAM · Sensors · Processes                      ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+    printf "${C_DIM}  v${SCRIPT_VERSION} — %s on %s${C_RESET}\n\n" \
+        "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- Detect tools ----------
+HAVE_NVIDIA=0; command -v nvidia-smi >/dev/null 2>&1 && HAVE_NVIDIA=1
+HAVE_LSPCI=0; command -v lspci >/dev/null 2>&1 && HAVE_LSPCI=1
+HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+
+# ============================================================================
+# SECTION 1: GPU Inventory
+# ============================================================================
+section "GPU INVENTORY"
+
+GPU_COUNT=0
+NVIDIA_COUNT=0
+TOTAL_VRAM_MB=0
+HOTTEST_T=0
+HOTTEST_NAME=""
+
+if [[ $HAVE_LSPCI -eq 1 ]]; then
+  GPU_PCI=$(lspci 2>/dev/null | grep -iE 'VGA|3D|Display')
+  if [[ -n "$GPU_PCI" ]]; then
+    GPU_COUNT=$(printf '%s\n' "$GPU_PCI" | wc -l)
+    info "Found ${C_BOLD}${GPU_COUNT}${C_RESET} GPU(s) via lspci:"
+    while IFS= read -r line; do
+      printf "  ${C_DIM}·${C_RESET} %s\n" "$line"
+    done <<< "$GPU_PCI"
+  else
+    info "No GPUs detected via lspci"
+  fi
+fi
+
+# ============================================================================
+# SECTION 2: NVIDIA detail
+# ============================================================================
+section "NVIDIA DETAIL"
+
+if [[ $HAVE_NVIDIA -eq 1 ]]; then
+  NVIDIA_COUNT=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 0)
+  if [[ "$NVIDIA_COUNT" -gt 0 ]]; then
+    info "Found ${C_BOLD}${NVIDIA_COUNT}${C_RESET} NVIDIA GPU(s)"
+
+    # Driver / CUDA versions
+    DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+    [[ -n "$DRIVER" ]] && info "Driver:       ${C_CYAN}${DRIVER}${C_RESET}"
+    if [[ -f /usr/local/cuda/version.json ]] || [[ -f /usr/local/cuda/version.txt ]]; then
+      CUDA_VER=$(cat /usr/local/cuda/version.txt 2>/dev/null | grep -oE 'CUDA Version [0-9.]+' | head -1)
+      [[ -n "$CUDA_VER" ]] && info "CUDA:         ${CUDA_VER}"
+    fi
+    JSON_FIELDS+=("\"driver\":\"$DRIVER\"")
+
+    # Per-GPU query
+    QUERY_OUT=$(nvidia-smi --query-gpu=index,name,driver_version,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,power.draw,power.limit,clocks.gr,clocks.mem,clocks.sm,fan.speed --format=csv,noheader,nounits 2>/dev/null)
+    if [[ -n "$QUERY_OUT" ]]; then
+      printf "\n  ${C_DIM}%-3s %-22s %5s %5s %5s %10s %10s %8s %8s${C_RESET}\n" \
+        "ID" "Name" "Temp" "GPU%" "Mem%" "VRAM-tot" "VRAM-used" "Power" "Fan"
+      printf "  ${C_DIM}%-3s %-22s %5s %5s %5s %10s %10s %8s %8s${C_RESET}\n" \
+        "---" "---------------------" "-----" "-----" "-----" "---------" "----------" "-------" "----"
+
+      while IFS=',' read -r idx name drv temp gpu_util mem_util vram_tot vram_used vram_free power power_limit clk_gr clk_mem clk_sm fan; do
+        # Trim leading whitespace from each field
+        idx="${idx// /}"; name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
+        drv="${drv#"${drv%%[![:space:]]*}"}"; drv="${drv%"${drv##*[![:space:]]}"}"
+        temp="${temp#"${temp%%[![:space:]]*}"}"; temp="${temp%"${temp##*[![:space:]]}"}"
+        gpu_util="${gpu_util#"${gpu_util%%[![:space:]]*}"}"; gpu_util="${gpu_util%"${gpu_util##*[![:space:]]}"}"
+        mem_util="${mem_util#"${mem_util%%[![:space:]]*}"}"; mem_util="${mem_util%"${mem_util##*[![:space:]]}"}"
+        vram_tot="${vram_tot#"${vram_tot%%[![:space:]]*}"}"; vram_tot="${vram_tot%"${vram_tot##*[![:space:]]}"}"
+        vram_used="${vram_used#"${vram_used%%[![:space:]]*}"}"; vram_used="${vram_used%"${vram_used##*[![:space:]]}"}"
+        vram_free="${vram_free#"${vram_free%%[![:space:]]*}"}"; vram_free="${vram_free%"${vram_free##*[![:space:]]}"}"
+        power="${power#"${power%%[![:space:]]*}"}"; power="${power%"${power##*[![:space:]]}"}"
+        fan="${fan#"${fan%%[![:space:]]*}"}"; fan="${fan%"${fan##*[![:space:]]}"}"
+
+        # Skip empty / mismatched lines
+        [[ -z "$idx" ]] && continue
+
+        # Color temperature
+        tcolor=$(temp_color "$temp")
+        # Color utilization
+        ucolor="$C_GREEN"
+        is_gt "$gpu_util" 70 && ucolor="$C_YELLOW"
+        is_gt "$gpu_util" 90 && ucolor="$C_RED"
+        # VRAM humanized (values are in MiB)
+        vram_tot_h=$(humansize "$((vram_tot * 1024 * 1024))")
+        vram_used_h=$(humansize "$((vram_used * 1024 * 1024))")
+        # Power
+        power_str="${power}W"
+        [[ "$power" == "[Not Supported]" ]] && power_str="N/A"
+
+        printf "  ${C_CYAN}%-3s${C_RESET} ${C_BOLD}%-22s${C_RESET} ${tcolor}%5s${C_RESET}° ${ucolor}%5s${C_RESET}%% ${ucolor}%5s${C_RESET}%% ${C_CYAN}%10s${C_RESET} ${C_CYAN}%10s${C_RESET} ${C_YELLOW}%8s${C_RESET} ${C_DIM}%8s${C_RESET}\n" \
+          "$idx" "$(echo "$name" | cut -c1-22)" "$temp" "$gpu_util" "$mem_util" "$vram_tot_h" "$vram_used_h" "$power_str" "${fan}%"
+
+        # Track hottest
+        if is_gt "$temp" "$HOTTEST_T"; then
+          HOTTEST_T="$temp"
+          HOTTEST_NAME="GPU $idx ($name)"
+        fi
+        TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + vram_tot))
+        # Warnings
+        is_gt "$temp" 85 && warn "GPU $idx hot: ${temp}°C"
+        is_gt "$gpu_util" 90 && warn "GPU $idx busy: ${gpu_util}% utilization"
+      done <<< "$QUERY_OUT"
+
+      # ─── Bar Chart: GPU utilization & VRAM utilization ────────────────────
+      if [[ $JSON_OUT -eq 0 ]]; then
+        printf "\n  ${C_BOLD}${C_CYAN}Utilization (bar chart, 0-100%%):${C_RESET}\n"
+        while IFS=',' read -r c_idx c_name _c_drv _c_temp c_gutil c_mutil _c_rest; do
+          c_idx="${c_idx// /}"
+          [[ -z "$c_idx" ]] && continue
+          c_name="${c_name#"${c_name%%[![:space:]]*}"}"; c_name="${c_name%"${c_name##*[![:space:]]}"}"
+          c_gutil="${c_gutil// /}"; c_mutil="${c_mutil// /}"
+          [[ "$c_gutil" =~ ^[0-9]+$ ]] || c_gutil=0
+          [[ "$c_mutil" =~ ^[0-9]+$ ]] || c_mutil=0
+          for metric in "GPU ${c_gutil}" "MEM ${c_mutil}"; do
+            m_label="${metric%% *}"; m_val="${metric##* }"
+            m_color="$C_GREEN"
+            (( m_val >= 60 )) && m_color="$C_YELLOW"
+            (( m_val >= 85 )) && m_color="$C_RED"
+            m_filled=$(( m_val * 40 / 100 ))
+            m_bar=""
+            for (( j=0; j<m_filled; j++ )); do m_bar+="█"; done
+            for (( j=m_filled; j<40; j++ )); do m_bar+=" "; done
+            printf "    ${C_CYAN}%-3s${C_RESET} %-3s ${m_color}%s${C_RESET} %3d%%\n" \
+              "$c_idx" "$m_label" "$m_bar" "$m_val"
+          done
+        done <<< "$QUERY_OUT"
+      fi
+
+      # Memory total across all GPUs
+      TOTAL_VRAM_H=$(humansize "$((TOTAL_VRAM_MB * 1024 * 1024))")
+      info "Total VRAM:  ${C_CYAN}${TOTAL_VRAM_H}${C_RESET} across ${NVIDIA_COUNT} GPU(s)"
+      JSON_FIELDS+=("\"total_vram_mb\":$TOTAL_VRAM_MB")
+      JSON_FIELDS+=("\"temp_peak_c\":$HOTTEST_T")
+    fi
+  else
+    info "No NVIDIA GPUs detected by nvidia-smi"
+  fi
+else
+  info "nvidia-smi not installed (skipping NVIDIA-specific checks)"
+  info "Install with: sudo apt install nvidia-driver-X (or visit nvidia.com)"
+fi
+
+# ============================================================================
+# SECTION 3: GPU processes (NVIDIA)
+# ============================================================================
+section "GPU PROCESSES"
+
+if [[ $HAVE_NVIDIA -eq 1 ]] && [[ "$NVIDIA_COUNT" -gt 0 ]]; then
+  # nvidia-smi pmon style output
+  PMON_OUT=$(nvidia-smi pmon -c 1 2>/dev/null)
+  if [[ -n "$PMON_OUT" ]] && [[ "$PMON_OUT" != *"No running processes"* ]]; then
+    info "Currently using GPU:"
+    while IFS= read -r line; do
+      printf "  ${C_DIM}%s${C_RESET}\n" "$line"
+    done <<< "$PMON_OUT"
+
+    # Warn if too many processes
+    PROC_COUNT=$(printf '%s\n' "$PMON_OUT" | tail -n +2 | grep -c . || echo 0)
+    if (( PROC_COUNT > 8 )); then
+      warn "${PROC_COUNT} processes on GPU — high contention"
+    fi
+  else
+    info "No processes currently using GPU"
+  fi
+
+  # nvidia-smi --query-compute-apps for memory usage
+  APP_OUT=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null)
+  if [[ -n "$APP_OUT" ]]; then
+    subsec "Top processes by GPU memory"
+    printf "  ${C_DIM}%-8s %-30s %10s${C_RESET}\n" "PID" "Process" "GPU mem"
+    printf "  ${C_DIM}%-8s %-30s %10s${C_RESET}\n" "--------" "------------------------------" "----------"
+    while IFS=',' read -r pid pname mem; do
+      pid="${pid#"${pid%%[![:space:]]*}"}"; pid="${pid%"${pid##*[![:space:]]}"}"
+      mem="${mem#"${mem%%[![:space:]]*}"}"; mem="${mem%"${mem##*[![:space:]]}"}"
+      [[ -z "$pid" ]] && continue
+      # mem is MiB
+      [[ "$mem" =~ ^[0-9]+$ ]] || continue
+      mem_h=$(humansize "$((mem * 1024 * 1024))")
+      printf "  ${C_CYAN}%-8s${C_RESET} ${C_BOLD}%-30s${C_RESET} ${C_YELLOW}%10s${C_RESET}\n" \
+        "$pid" "$(echo "$pname" | cut -c1-30)" "$mem_h"
+    done <<< "$APP_OUT" | head -10
+  fi
+else
+  info "GPU process info requires nvidia-smi"
+fi
+
+# ============================================================================
+# SECTION 4: nvtop snapshot — vendor-neutral live usage (NVIDIA + Intel + AMD)
+# ============================================================================
+section "NVTOP SNAPSHOT (vendor-neutral)"
+
+HAVE_NVTOP=0; command -v nvtop >/dev/null 2>&1 && HAVE_NVTOP=1
+
+if [[ $HAVE_NVTOP -eq 0 ]]; then
+  info "nvtop not installed (apt install nvtop) — skipping"
+else
+  # nvtop -s prints one JSON array with one object per GPU, processes nested.
+  # timeout guards against ncurses-mode fallback if -s is misparsed.
+  NVTOP_JSON=$(timeout 3 nvtop -s -i 2>/dev/null)
+  if [[ -z "$NVTOP_JSON" || "$NVTOP_JSON" != "["* ]]; then
+    warn "nvtop snapshot returned no usable JSON"
+  else
+    NVTOP_GPU_COUNT=$(printf '%s' "$NVTOP_JSON" | tr -d '\n ' | grep -o '"device_name"' | wc -l)
+    info "Devices reported: ${C_BOLD}${NVTOP_GPU_COUNT}${C_RESET}"
+
+    heading "Memory & utilization (per device)"
+    printf "  ${C_DIM}%-26s %-8s %-8s %-10s %-10s %-9s${C_RESET}\n" \
+      "Device" "GPU%" "Mem%" "VRAM used" "VRAM tot" "Temp"
+    printf "  ${C_DIM}%-26s %-8s %-8s %-10s %-10s %-9s${C_RESET}\n" \
+      "--------------------------" "------" "------" "----------" "----------" "---------"
+
+    # Track highest VRAM user + top GPU consumer across all devices
+    TOP_VRAM_PID=""
+    TOP_VRAM_PROC=""
+    TOP_VRAM_BYTES=0
+
+    if [[ $HAVE_JQ -eq 1 ]]; then
+      # Clean path: parse JSON with jq
+      while IFS=$'\t' read -r name gpu_util mem_util mem_used mem_total temp power fan enc dec procs; do
+        [[ -z "$name" ]] && continue
+
+        # Strip trailing decimals like "5%" / "50C" / "22W"
+        gpu_pct=${gpu_util%\%}
+        mem_pct=${mem_util%\%}
+        mem_used_b=${mem_used:-0}
+        mem_total_b=${mem_total:-0}
+        temp_c=${temp%C}
+        # mem_used may be "null" if device doesn't report
+        [[ "$mem_used_b" == "null" ]] && mem_used_b=0
+        [[ "$mem_total_b" == "null" ]] && mem_total_b=0
+
+        # Color the GPU%
+        gpu_color="$C_GREEN"
+        is_gt "${gpu_pct:-0}" 80 && gpu_color="$C_RED"
+        is_gt "${gpu_pct:-0}" 50 && [[ "$gpu_color" == "$C_GREEN" ]] && gpu_color="$C_YELLOW"
+        temp_colored="$C_DIM"
+        [[ -n "$temp_c" && "$temp_c" != "null" ]] && temp_colored="$(temp_color "$temp_c")"
+
+        # Color mem%
+        mem_color="$C_GREEN"
+        is_gt "${mem_pct:-0}" 80 && mem_color="$C_RED"
+        is_gt "${mem_pct:-0}" 50 && [[ "$mem_color" == "$C_GREEN" ]] && mem_color="$C_YELLOW"
+
+        printf "  ${C_CYAN}%-26s${C_RESET} ${gpu_color}%6s%%${C_RESET} ${mem_color}%6s%%${C_RESET} %-10s %-10s ${temp_colored}%5s°C${C_RESET}\n" \
+          "$(echo "$name" | cut -c1-26)" \
+          "${gpu_pct:-0}" \
+          "${mem_pct:-0}" \
+          "$([ "$mem_used_b" -gt 0 ] && humansize "$mem_used_b" || echo "-")" \
+          "$([ "$mem_total_b" -gt 0 ] && humansize "$mem_total_b" || echo "-")" \
+          "${temp_c:-0}"
+      done < <(printf '%s' "$NVTOP_JSON" | jq -r '
+        .[] |
+        [
+          .device_name,
+          (.gpu_util // "0%"),
+          (.mem_util // "0%"),
+          (.mem_used // "0"),
+          (.mem_total // "0"),
+          (.temp // "0C"),
+          (.power_draw // ""),
+          (.fan_speed // ""),
+          (.encode // "0%"),
+          (.decode // "0%")
+        ] | @tsv
+      ')
+    else
+      # Fallback: regex extraction (less robust, but works without jq)
+      warn "jq not installed — using regex parser (install jq for cleaner output)"
+      # Print device-name lines with their block (until next "device_name" or end)
+      printf '%s' "$NVTOP_JSON" | tr '}' '\n' | while IFS= read -r block; do
+        echo "$block" | grep -q '"device_name"' || continue
+        name=$(echo "$block" | grep -oE '"device_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+        gpu_util=$(echo "$block" | grep -oE '"gpu_util"[[:space:]]*:[[:space:]]*"[0-9]+%"' | head -1 | grep -oE '[0-9]+')
+        mem_util=$(echo "$block" | grep -oE '"mem_util"[[:space:]]*:[[:space:]]*"[0-9]+%"' | head -1 | grep -oE '[0-9]+')
+        mem_used=$(echo "$block" | grep -oE '"mem_used"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+')
+        mem_total=$(echo "$block" | grep -oE '"mem_total"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+')
+        temp=$(echo "$block" | grep -oE '"temp"[[:space:]]*:[[:space:]]*"[0-9]+C"' | head -1 | grep -oE '[0-9]+')
+        [[ -z "$name" ]] && continue
+        gpu_pct=${gpu_util:-0}
+        mem_pct=${mem_util:-0}
+        [[ -z "$mem_used" ]] && mem_used=0
+        [[ -z "$mem_total" ]] && mem_total=0
+        temp_c=${temp:-0}
+        gpu_color="$C_GREEN"
+        is_gt "$gpu_pct" 80 && gpu_color="$C_RED"
+        is_gt "$gpu_pct" 50 && [[ "$gpu_color" == "$C_GREEN" ]] && gpu_color="$C_YELLOW"
+        mem_color="$C_GREEN"
+        is_gt "$mem_pct" 80 && mem_color="$C_RED"
+        is_gt "$mem_pct" 50 && [[ "$mem_color" == "$C_GREEN" ]] && mem_color="$C_YELLOW"
+        temp_colored="$C_DIM"
+        [[ -n "$temp_c" ]] && temp_colored="$(temp_color "$temp_c")"
+        printf "  ${C_CYAN}%-26s${C_RESET} ${gpu_color}%6s%%${C_RESET} ${mem_color}%6s%%${C_RESET} %-10s %-10s ${temp_colored}%5s°C${C_RESET}\n" \
+          "$(echo "$name" | cut -c1-26)" "$gpu_pct" "$mem_pct" \
+          "$([ "$mem_used" -gt 0 ] && humansize "$mem_used" || echo "-")" \
+          "$([ "$mem_total" -gt 0 ] && humansize "$mem_total" || echo "-")" \
+          "$temp_c"
+      done
+    fi
+
+    # ----- Per-process detail (top consumers by GPU mem) -----
+    if [[ $HAVE_JQ -eq 1 ]]; then
+      heading "Top GPU-memory consumers (from nvtop)"
+      printf "  ${C_DIM}%-7s %-7s %-8s %-10s %-40s${C_RESET}\n" \
+        "PID" "Device" "GPU%" "GPU mem" "Process"
+      printf "  ${C_DIM}%-7s %-7s %-8s %-10s %-40s${C_RESET}\n" \
+        "-------" "-------" "------" "----------" "----------------------------------------"
+
+      # Flatten processes across all devices with a per-device index
+      PROCS_TSV=$(printf '%s' "$NVTOP_JSON" | jq -r '
+        to_entries[] |
+        .key as $dev | .value.device_name as $devname |
+        (.value.processes // [])[] |
+        select(. != null) |
+        [
+          (.pid // "?"),
+          ($devname | .[0:18]),
+          (.gpu_usage // "0%"),
+          (.gpu_mem_bytes_alloc // "0"),
+          ((.cmdline // "") | split(" ") | .[0])
+        ] | @tsv
+      ' 2>/dev/null | sort -t$'\t' -k4 -nr | head -10)
+
+      while IFS=$'\t' read -r pid dev gpu_use mem_b proc; do
+        [[ -z "$pid" ]] && continue
+        gpct=${gpu_use%\%}
+        gpct=${gpct:-0}
+        gpu_color="$C_GREEN"
+        is_gt "$gpct" 50 && gpu_color="$C_YELLOW"
+        is_gt "$gpct" 80 && gpu_color="$C_RED"
+        mlabel="0"
+        [[ "$mem_b" =~ ^[0-9]+$ ]] && (( mem_b > 0 )) && mlabel=$(humansize "$mem_b")
+        printf "  ${C_CYAN}%-7s${C_RESET} %-7s ${gpu_color}%6s%%${C_RESET} %-10s ${C_DIM}%s${C_RESET}\n" \
+          "$pid" "$(echo "$dev" | cut -c1-7)" "$gpct" "$mlabel" "$(echo "$(basename "$proc" 2>/dev/null)" | cut -c1-40)"
+      done <<< "$PROCS_TSV"
+    fi
+
+    # Warn on high utilization
+    if [[ $HAVE_JQ -eq 1 ]]; then
+      HIGH_GPU=$(printf '%s' "$NVTOP_JSON" | jq -r '
+        [.[] | (.gpu_util // "0%") | sub("%$"; "") | tonumber] | max // 0
+      ' 2>/dev/null)
+      HIGH_MEM=$(printf '%s' "$NVTOP_JSON" | jq -r '
+        [.[] | (.mem_util // "0%") | sub("%$"; "") | tonumber] | max // 0
+      ' 2>/dev/null)
+      is_gt "${HIGH_GPU:-0}" 90 && warn "GPU utilization exceeds 90% — likely bottleneck"
+      is_gt "${HIGH_MEM:-0}" 90 && warn "VRAM utilization exceeds 90% — OOM risk"
+    fi
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: Non-NVIDIA fallback (AMD/Intel via /sys/class/drm)
+# ============================================================================
+section "AMD/INTEL FALLBACK"
+
+if [[ -d /sys/class/drm ]]; then
+  CARDS=$(find /sys/class/drm -maxdepth 1 -name 'card[0-9]*' -type d 2>/dev/null | grep -v -- '-')
+  if [[ -n "$CARDS" ]]; then
+    CARD_COUNT=$(printf '%s\n' "$CARDS" | wc -l)
+    info "Found ${C_BOLD}${CARD_COUNT}${C_RESET} display card(s) via /sys/class/drm:"
+    for card in $CARDS; do
+      [[ -d "$card" ]] || continue
+      cname=$(basename "$card")
+      # Try to get card name
+      driver=""
+      if [[ -L "$card/device/driver" ]]; then
+        driver=$(basename "$(readlink "$card/device/driver" 2>/dev/null)" 2>/dev/null)
+      fi
+      vendor=$(cat "$card/device/vendor" 2>/dev/null | sed 's/^0x//')
+      device=$(cat "$card/device/device" 2>/dev/null | sed 's/^0x//')
+      printf "  ${C_DIM}·${C_RESET} ${C_CYAN}${cname}${C_RESET}  vendor=${vendor:-?} device=${device:-?} driver=${driver:-N/A}\n"
+
+      # Try hwmon temp
+      if [[ -d "$card/device/hwmon" ]]; then
+        for hm in "$card/device/hwmon/hwmon"*; do
+          [[ -r "$hm/temp1_input" ]] || continue
+          t_raw=$(cat "$hm/temp1_input" 2>/dev/null)
+          if [[ "$t_raw" =~ ^[0-9]+$ ]]; then
+            t_c=$((t_raw / 1000))
+            tcolor=$(temp_color "$t_c")
+            printf "      ${C_DIM}temp:${C_RESET} ${tcolor}${t_c}°C${C_RESET}\n"
+            is_gt "$t_c" "$HOTTEST_T" && HOTTEST_T="$t_c" && HOTTEST_NAME="$cname"
+          fi
+        done
+      fi
+    done
+  else
+    info "No display cards found in /sys/class/drm"
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: GPU headline box
+# ============================================================================
+section "GPU HEADLINE"
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  BOX_W=64
+  printf "\n"
+  printf "  ${C_BOLD}${C_MAGENTA}╔%${BOX_W}s╗${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+
+  # Line 1: GPU count
+  GPU1_VIS="   GPUs:          ${GPU_COUNT} total (${NVIDIA_COUNT} NVIDIA)"
+  GPU1_COLORED=$(printf "   ${C_BOLD}GPUs:${C_RESET}          ${C_CYAN}${C_BOLD}%s${C_RESET} total (${C_CYAN}%s${C_RESET} NVIDIA)" "$GPU_COUNT" "$NVIDIA_COUNT")
+  P1=$(( BOX_W - ${#GPU1_VIS} )); (( P1 < 0 )) && P1=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${P1}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$GPU1_COLORED" ""
+
+  # Line 2: Total VRAM
+  if [[ "$TOTAL_VRAM_MB" -gt 0 ]]; then
+    TVRAM_H=$(humansize "$((TOTAL_VRAM_MB * 1024 * 1024))")
+    GPU2_VIS="   Total VRAM:    ${TVRAM_H}"
+    GPU2_COLORED=$(printf "   ${C_BOLD}Total VRAM:${C_RESET}    ${C_CYAN}${C_BOLD}%s${C_RESET}" "$TVRAM_H")
+  else
+    GPU2_VIS="   Total VRAM:    unknown"
+    GPU2_COLORED="   ${C_BOLD}Total VRAM:${C_RESET}    unknown"
+  fi
+  P2=$(( BOX_W - ${#GPU2_VIS} )); (( P2 < 0 )) && P2=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${P2}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$GPU2_COLORED" ""
+
+  # Line 3: Hottest temp
+  if [[ "$HOTTEST_T" -gt 0 ]]; then
+    tcolor=$(temp_color "$HOTTEST_T")
+    GPU3_VIS="   Peak temp:     ${HOTTEST_T}°C (${HOTTEST_NAME})"
+    GPU3_COLORED=$(printf "   ${C_BOLD}Peak temp:${C_RESET}     ${tcolor}${C_BOLD}%s°C${C_RESET} (%s)" "$HOTTEST_T" "$HOTTEST_NAME")
+  else
+    GPU3_VIS="   Peak temp:     unknown"
+    GPU3_COLORED="   ${C_BOLD}Peak temp:${C_RESET}     unknown"
+  fi
+  P3=$(( BOX_W - ${#GPU3_VIS} )); (( P3 < 0 )) && P3=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${P3}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$GPU3_COLORED" ""
+
+  # Line 4: Driver
+  GPU4_VIS="   Driver:        ${DRIVER:-N/A}"
+  GPU4_COLORED=$(printf "   ${C_BOLD}Driver:${C_RESET}        ${C_CYAN}%s${C_RESET}" "${DRIVER:-N/A}")
+  P4=$(( BOX_W - ${#GPU4_VIS} )); (( P4 < 0 )) && P4=0
+  printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${P4}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$GPU4_COLORED" ""
+
+  printf "  ${C_BOLD}${C_MAGENTA}║%${BOX_W}s║${C_RESET}\n" ""
+  printf "  ${C_BOLD}${C_MAGENTA}╚%${BOX_W}s╝${C_RESET}\n" "$(printf '═%.0s' $(seq 1 $BOX_W))"
+  printf "\n"
+fi
+
+# ============================================================================
+# SECTION 6: Recommendations + Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+REC_NUM=0
+rec() { REC_NUM=$((REC_NUM+1)); printf "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"; }
+
+[[ $HAVE_NVIDIA -eq 0 ]] && [[ $HAVE_LSPCI -eq 0 ]] && rec "Install nvidia-smi and lspci for full GPU diagnostics"
+[[ $NVIDIA_COUNT -eq 0 ]] && [[ -n "$GPU_PCI" ]] && rec "GPUs detected by lspci but not nvidia-smi — install NVIDIA driver"
+[[ "$HOTTEST_T" -gt 0 ]] && is_gt "$HOTTEST_T" 85 && rec "GPU running hot (${HOTTEST_T}°C) — check airflow, fans, thermal paste"
+[[ "$GPU_COUNT" -eq 0 ]] && rec "No GPUs detected — running headless or virtualized?"
+[[ -n "$DRIVER" ]] && rec "For real-time monitoring, try: ${C_BOLD}watch -n 1 nvidia-smi${C_RESET}"
+rec "Run ${C_BOLD}glxinfo | grep 'OpenGL renderer'${C_RESET} for OpenGL driver info"
+rec "For CUDA toolkit install: ${C_BOLD}https://developer.nvidia.com/cuda-downloads${C_RESET}"
+
+section "VERDICT"
+END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
+
+if [[ $JSON_OUT -eq 1 ]]; then
+  printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+  for f in "${JSON_FIELDS[@]}"; do
+    key="${f%%\":*}"; key="${key#\"}"
+    val="${f#*\"}"; val="${val%\"}"
+    printf ',"%s":"%s"' "$key" "$val"
+  done
+  printf ',"gpus_total":%d,"nvidia_count":%d,"warnings":%d,"critical":%d,"duration_s":%d}\n' \
+    "$GPU_COUNT" "$NVIDIA_COUNT" "$WARNINGS" "$CRITICAL" "$ELAPSED"
+else
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+    exit_code=2
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    exit_code=1
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    exit_code=0
+  fi
+  printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summarize" "GPU diagnostic complete on $(hostname -s)" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+exit "${exit_code:-0}"

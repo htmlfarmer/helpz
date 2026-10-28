@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# runz - Run a suite tool THROUGH the trust gate
+# ----------------------------------------------------------------------------
+# runz refuses to launch a tool if the code set has changed since your last
+# trustz approval (fresh pull, edit, new file). This is the "you just pulled
+# from GitHub — have you scanned this?" guard made automatic: every launch
+# hashes the tools+libs and compares against the approved manifest.
+#
+#   runz ./diskz --json        # gated launch of any script
+#   runz kernelz status        # auto-prepends ./ and finds the tool
+#   runz --allow-changed ...   # bypass once, with a loud warning
+#
+# A tool can also self-check (used by helpz): runz --check
+# Requires: ./trustz in the same directory
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; }
+
+BYPASS=0
+if [[ "${1:-}" == "--allow-changed" ]]; then BYPASS=1; shift; fi
+if [[ "${1:-}" == "--check" ]]; then
+    exec "$SCRIPT_DIR/trustz" --check
+fi
+
+[[ $# -eq 0 ]] && { echo "usage: runz <tool> [args]" >&2; exit 64; }
+
+tool="$1"; shift
+# normalize: strip leading ./ and locate
+name="${tool#./}"
+path="$SCRIPT_DIR/$name"
+[[ ! -f "$path" ]] && { command -v "$name" >/dev/null 2>&1 && path="$(command -v "$name")"; }
+if [[ ! -f "$path" ]]; then
+    printf "${C_RED}runz: no such tool:${C_RESET} %s (looked in %s)\n" "$name" "$SCRIPT_DIR" >&2
+    exit 64
+fi
+[[ -x "$path" ]] || chmod +x "$path" 2>/dev/null || true
+
+# consult the gate
+if [[ "$BYPASS" -ne 1 ]]; then
+    if ! "$SCRIPT_DIR/trustz" --check >/dev/null 2>&1; then
+        printf "\n  ${C_YELLOW}${C_BOLD}⚠ CODE HAS CHANGED SINCE YOUR LAST TRUST REVIEW${C_RESET}\n"
+        printf "  ${C_DIM}You may have just pulled from GitHub, or a file was edited.\n  This repo does NOT auto-run: it asks you to scan first.${C_RESET}\n\n"
+        printf "  Run the layered review (secrets + danger grep + AI):\n"
+        printf "    ${C_CYAN}./trustz${C_RESET}\n\n"
+        printf "  Then rerun: ${C_DIM}runz %s %s${C_RESET}\n" "$name" "$*"
+        printf "  ${C_DIM}(or one-off: runz --allow-changed %s %s)${C_RESET}\n\n" "$name" "$*"
+        # interactive fast-path: offer to review now
+        if [[ -t 0 ]]; then
+            read -r -p "  Review now with trustz? [Y/n] " a || a="y"
+            if [[ "${a,,}" != n* ]]; then
+                "$SCRIPT_DIR/trustz" && exec "$path" "$@"
+                exit $?
+            fi
+        fi
+        exit 2
+    fi
+else
+    printf "  ${C_RED}${C_BOLD}runz: trust gate BYPASSED (--allow-changed) — running unaudited code${C_RESET}\n" >&2
+fi
+
+exec "$path" "$@"

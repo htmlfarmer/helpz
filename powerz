@@ -1,0 +1,986 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# powerz - Battery & power subsystem diagnostic
+# ----------------------------------------------------------------------------
+# Inspects AC adapter, battery health (wear, cycle count, voltage), charge/
+# discharge power rates, runtime estimates, suspend modes (s2idle vs deep),
+# power-management daemons (TLP / power-profiles-daemon), AND discrete GPU
+# power draw (NVIDIA via nvidia-smi, AMD/Intel via sysfs hwmon).
+# Uses /sys/class/power_supply, /sys/power, /proc/uptime, nvidia-smi.
+#
+# Usage:
+#   ./powerz                 # full probe
+#   ./powerz --accuracy      # audit our watt/cost estimates against real counters
+#   ./powerz --no-color      # plain output
+#   ./powerz --json          # machine-readable summary
+#   ./powerz --watch 5       # refresh every 5 seconds (Ctrl+C to stop)
+#
+# Requires: none (sysfs only)
+# Optional: nvidia-smi (NVIDIA GPUs), bc
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+WATCH_INTERVAL=0
+NO_COLOR=0
+JSON_OUT=0
+ACCURACY=0
+MEASURE_SECS=10
+
+# Default electricity rate (cents per kilowatt-hour).
+# Override with --rate=11  or --rate=20  (cents/kWh)
+RATE_CENTS_KWH=11
+START_TS=$(date +%s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --watch=*)    WATCH_INTERVAL="${arg#--watch=}" ;;
+    --watch)      i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-5}" ;;
+    --rate=*)     RATE_CENTS_KWH="${arg#--rate=}" ;;
+    --rate)       i=$((i+1)); RATE_CENTS_KWH="${ARGS[$i]:-11}" ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)       JSON_OUT=1 ;;
+    --accuracy)   ACCURACY=1 ;;
+    --measure=*)  MEASURE_SECS="${arg#--measure=}" ;;
+    --measure)    i=$((i+1)); MEASURE_SECS="${ARGS[i]:-10}" ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          powerz — Battery & Power Subsystem Diagnostic        ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Inspects AC adapter, battery health (wear, cycle count, voltage),
+  charge/discharge power rates, runtime estimates, suspend modes
+  (s2idle vs deep), power-management daemons (TLP/ppd), AND GPU power
+  draw (NVIDIA via nvidia-smi, AMD/Intel via sysfs hwmon).
+
+USAGE
+  ./powerz                 Full probe
+  ./powerz --accuracy      Audit estimate accuracy vs real hardware counters
+  ./powerz --no-color      Plain output
+  ./powerz --json          Machine-readable summary
+  ./powerz --watch 5       Refresh every 5 seconds (Ctrl+C to stop)
+
+OPTIONS
+  --watch[=N]     Re-run every N seconds (default 5)
+  --accuracy      Compare power/cost estimates against RAPL/battery counters,
+                  log history to ~/.powerz/accuracy.tsv, grade the guesses
+  --measure[=N]   Sampling window for --accuracy in seconds (default 10)
+  --rate[=N]      Electricity rate in cents/kWh (default 11)
+  --no-color      Disable colors
+  --json          Output JSON summary
+  -h, --help      Show this help
+
+ALTERNATIVE COMMANDS
+  upower -i $(upower -e | grep BAT)   Detailed battery info (needs upower)
+  acpi -V                             All ACPI/power info
+  cat /sys/class/power_supply/*/*     Raw power supply data
+  powertop                            Interactive power monitor (apt install powertop)
+  sudo tlp-stat -s                    TLP power stats (needs TLP)
+  powerprofilesctl                    power-profiles-daemon status
+  cat /proc/acpi/wakeup               Wake source configuration
+  nvidia-smi                          NVIDIA GPU status (one-shot)
+  watch -n2 nvidia-smi                NVIDIA GPU live monitor
+  sudo intel_gpu_top                  Intel GPU live monitor (install intel-gpu-tools)
+  sudo cat /sys/class/drm/card*/device/hwmon/hwmon*/power1_input  Raw GPU power (µW)
+
+WARNING → INVESTIGATION COMMANDS
+  Battery health <80%               →  cat /sys/class/power_supply/BAT*/charge_full*
+  Battery health <60%               →  Order a replacement battery pack
+  High cycle count (>800)           →  cat /sys/class/power_supply/BAT*/cycle_count
+  s2idle drain (modern standby)     →  cat /sys/power/mem_sleep
+  No power daemon detected          →  sudo apt install tlp  or  sudo apt install power-profiles-daemon
+  Battery critical (<10%)           →  systemctl hibernate
+
+HELPEOF
+      exit 0 ;;
+    --ai)        AI_VERDICT=1 ;;
+    --no-ai)     AI_VERDICT=0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 64 ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# Initialize run comparison (skip for JSON/watch modes)
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_init "powerz"
+fi
+
+bar() {
+  local pct=$1 width=${2:-20}
+  [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+  (( pct < 0 )) && pct=0; (( pct > 100 )) && pct=100
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local color="$C_RED"
+  (( pct >= 20 )) && color="$C_YELLOW"
+  (( pct >= 50 )) && color="$C_GREEN"
+  printf "${color}"
+  printf '█%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null
+  printf "${C_DIM}"
+  printf '░%.0s' $(seq 1 $empty 2>/dev/null) 2>/dev/null
+  printf "${C_RESET}"
+}
+
+# Read a sysfs file safely (returns empty on failure)
+sysval() { cat "$1" 2>/dev/null | tr -d '\n'; }
+
+# microWatts -> human W
+microwatts() {
+  local uw=${1#-}
+  [[ "$uw" =~ ^[0-9]+$ ]] || { echo "?"; return; }
+  if (( uw >= 1000000 )); then echo "$(( uw / 1000000 ))W"
+  else echo "$(echo "scale=1; $uw / 1000000" | bc 2>/dev/null)W"
+  fi
+}
+
+fmt_secs() {
+  local s=$1
+  [[ "$s" =~ ^[0-9]+$ ]] || { echo "?"; return; }
+  printf '%dh %02dm' $((s/3600)) $(( (s%3600)/60 ))
+}
+
+# ---------- Banner ----------
+if [[ $JSON_OUT -eq 0 ]]; then
+  printf "${C_BOLD}${C_YELLOW}"
+  cat << 'EOF'
+  ____  _        _
+  |  _ \| | _____| |
+  | |_) | |/ / _ \ |
+  |  __/|   <  __/ |
+  |_|   |_|\_\___|_|
+
+EOF
+  printf "${C_RESET}${C_DIM}  Power diagnostic — %s on %s${C_RESET}\n" \
+    "$TIMESTAMP" "$HOSTNAME_SHORT"
+  echo
+fi
+
+# ---------- Discover supplies ----------
+PS_DIR=/sys/class/power_supply
+HAVE_AC=0; HAVE_BAT=0
+AC_DEV=""; BAT_DEV=""; PHANTOM_DEV=""
+if [[ -d "$PS_DIR" ]]; then
+  for d in "$PS_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    t=$(sysval "$d/type")
+    case "$t" in
+      Mains) HAVE_AC=1; AC_DEV="$d" ;;
+      Battery|UPS)
+        # Some drivers register type=Battery without any charge data
+        # (e.g. apple_mfi_fastcharge). Only treat it as a real battery
+        # if it exposes capacity or charge values.
+        if [[ -r "$d/capacity" || -r "$d/charge_now" || -r "$d/energy_now" ]]; then
+          HAVE_BAT=1; [[ -z "$BAT_DEV" ]] && BAT_DEV="$d"
+        else
+          PHANTOM_DEV="$(basename "$d")"
+        fi ;;
+    esac
+  done
+fi
+
+# ============================================================================
+# SECTION 1: AC Adapter
+# ============================================================================
+section "AC ADAPTER"
+
+PLUGGED=0
+if [[ $HAVE_AC -eq 1 ]]; then
+  ONLINE=$(sysval "$AC_DEV/online")
+  VOLT_IN=$(sysval "$AC_DEV/voltage_now")
+  CURRENT_IN=$(sysval "$AC_DEV/current_now")
+  WATTS_IN=$(sysval "$AC_DEV/power_now")
+  if [[ "$ONLINE" == "1" ]]; then
+    PLUGGED=1
+    ok "AC ${C_BOLD}connected${C_RESET} ($(basename "$AC_DEV"))"
+    [[ -n "$VOLT_IN" ]] && info "Input voltage: $(( VOLT_IN / 1000000 ))V"
+    if [[ -n "$WATTS_IN" ]]; then
+      info "Input power: ${C_CYAN}$(microwatts "$WATTS_IN")${C_RESET}"
+    elif [[ -n "$VOLT_IN" && -n "$CURRENT_IN" ]]; then
+      info "Input power: ${C_CYAN}$(echo "scale=1; $CURRENT_IN * $VOLT_IN / 1000000000000" | bc 2>/dev/null)W${C_RESET} (computed V×I)"
+    fi
+  else
+    info "AC adapter present but ${C_BOLD}unplugged${C_RESET} — running on battery"
+  fi
+else
+  info "No AC adapter exposed in sysfs (desktop or VM)"
+fi
+JSON_FIELDS+=("\"ac_online\":$PLUGGED")
+
+# ============================================================================
+# SECTION 2: Battery
+# ============================================================================
+section "BATTERY"
+
+BAT_PCT=-1; BAT_STATUS=""; HEALTH_PCT=""
+if [[ $HAVE_BAT -eq 1 ]]; then
+  CAP=$(sysval "$BAT_DEV/capacity")
+  STATUS=$(sysval "$BAT_DEV/status")
+  TECH=$(sysval "$BAT_DEV/technology")
+  CHG_FULL=$(sysval "$BAT_DEV/charge_full")
+  CHG_FULL_DESIGN=$(sysval "$BAT_DEV/charge_full_design")
+  CHG_NOW=$(sysval "$BAT_DEV/charge_now")
+  VOLT=$(sysval "$BAT_DEV/voltage_now")
+  CURR=$(sysval "$BAT_DEV/current_now")
+  POW=$(sysval "$BAT_DEV/power_now")
+  CYCLES=$(sysval "$BAT_DEV/cycle_count")
+  ENERGY_NOW=$(sysval "$BAT_DEV/energy_now")
+  ENERGY_FULL=$(sysval "$BAT_DEV/energy_full")
+  ENERGY_RATE=$(sysval "$BAT_DEV/power_now")
+  PRESENT=$(sysval "$BAT_DEV/present")
+
+  BAT_PCT=${CAP:--1}
+  BAT_STATUS=${STATUS:-unknown}
+  [[ "$PRESENT" == "0" ]] && warn "Battery reports itself absent"
+
+  emit "  ${C_DIM}%-16s${C_RESET} " "Charge"
+  if [[ $JSON_OUT -eq 0 ]]; then bar "${CAP:-0}" 30; printf " ${C_BOLD}%s%%${C_RESET}  (%s)\n" "${CAP:-?}" "${STATUS:-?}"; fi
+  [[ -n "$TECH" ]] && info "Technology: $TECH"
+  if [[ -n "$VOLT" ]]; then
+    mv=$((VOLT/1000)); info "Voltage: ${mv:0:1}.${mv:1:3}V"
+  fi
+  if [[ -n "$POW" ]]; then
+    info "Power: ${C_CYAN}$(microwatts "$POW")${C_RESET} $( [[ ${POW:0:1} == "-" ]] && echo "(charging)" || echo "(discharging)" )"
+  elif [[ -n "$CURR" ]]; then
+    info "Current: ${C_CYAN}$(( ${CURR#-} / 1000 ))mA${C_RESET} $( [[ ${CURR:0:1} == "-" ]] && echo "(charging)" || echo "(discharging)" )"
+  fi
+
+  # Runtime estimate from energy/current or charge rate
+  RUNTIME=""
+  if [[ "$STATUS" == "Discharging" ]]; then
+    if [[ -n "$ENERGY_NOW" && -n "$ENERGY_RATE" && "$ENERGY_RATE" != "0" ]]; then
+      RUNTIME=$(( ENERGY_NOW * 3600 / ${ENERGY_RATE#-} ))
+    elif [[ -n "$CHG_NOW" && -n "$CURR" && "${CURR#-}" != "0" ]]; then
+      RUNTIME=$(( CHG_NOW * 3600 / ${CURR#-} ))
+    fi
+    [[ -n "$RUNTIME" ]] && info "Est. runtime: ${C_YELLOW}$(fmt_secs "$RUNTIME")${C_RESET}"
+  elif [[ "$STATUS" == "Charging" ]]; then
+    if [[ -n "$ENERGY_FULL" && -n "$ENERGY_NOW" && -n "$ENERGY_RATE" && "$ENERGY_RATE" != "0" ]]; then
+      RUNTIME=$(( (ENERGY_FULL - ENERGY_NOW) * 3600 / ${ENERGY_RATE#-} ))
+      (( RUNTIME < 0 )) && RUNTIME=""
+    fi
+    [[ -n "$RUNTIME" ]] && info "Est. time to full: ${C_GREEN}$(fmt_secs "$RUNTIME")${C_RESET}"
+  fi
+
+  # Wear level: charge_full vs design
+  if [[ -n "$CHG_FULL" && -n "$CHG_FULL_DESIGN" ]] && (( CHG_FULL_DESIGN > 0 )); then
+    HEALTH_PCT=$(( CHG_FULL * 100 / CHG_FULL_DESIGN ))
+    emit "  ${C_DIM}%-16s${C_RESET} " "Battery health"
+    if [[ $JSON_OUT -eq 0 ]]; then bar "$HEALTH_PCT" 30; printf " ${C_BOLD}%d%%${C_RESET} of design\n" "$HEALTH_PCT"; fi
+    if (( HEALTH_PCT < 60 )); then
+      crit "Battery health ${HEALTH_PCT}% — significantly degraded, consider replacement"
+    elif (( HEALTH_PCT < 80 )); then
+      warn "Battery health ${HEALTH_PCT}% — worn (typical replacement threshold is 80%)"
+    else
+      ok "Battery health ${HEALTH_PCT}% — good"
+    fi
+    info "Design capacity: $(( CHG_FULL_DESIGN / 1000 ))mAh · currently capable: $(( CHG_FULL / 1000 ))mAh"
+    JSON_FIELDS+=("\"battery_health_pct\":$HEALTH_PCT")
+  fi
+
+  if [[ -n "$CYCLES" ]]; then
+    info "Cycle count: ${C_BOLD}${CYCLES}${C_RESET}"
+    (( CYCLES > 800 )) && warn "${CYCLES} charge cycles — beyond typical Li-ion rated life"
+    JSON_FIELDS+=("\"cycles\":$CYCLES")
+  fi
+
+  if [[ $PLUGGED -eq 0 && "$CAP" =~ ^[0-9]+$ ]]; then
+    if (( CAP <= 10 )); then crit "Battery critical: ${CAP}% — plug in now"
+    elif (( CAP <= 20 )); then warn "Battery low: ${CAP}%"
+    fi
+  fi
+  if [[ "$STATUS" == "Full" || ( "$STATUS" == "Not charging" && "${CAP:-0}" -ge 80 ) ]]; then
+    ok "Charge threshold / conservation mode appears active (${CAP:-?}%)"
+  fi
+
+  JSON_FIELDS+=("\"battery_pct\":${CAP:--1}")
+  JSON_FIELDS+=("\"battery_status\":\"${STATUS:-unknown}\"")
+  [[ -n "$RUNTIME" ]] && JSON_FIELDS+=("\"est_runtime_s\":$RUNTIME")
+else
+  info "No usable battery found in /sys/class/power_supply — likely a desktop/server/VM"
+  [[ -n "$PHANTOM_DEV" ]] && info "Ignoring data-less battery device: ${PHANTOM_DEV} (charger driver stub)"
+  [[ ! -d "$PS_DIR" ]] && info "power_supply class missing entirely"
+fi
+
+# ============================================================================
+# SECTION 3: Power management daemons
+# ============================================================================
+section "POWER MANAGEMENT"
+
+PM_FOUND=0
+if command -v powerprofilesctl >/dev/null 2>&1; then
+  PROF=$(powerprofilesctl get 2>/dev/null)
+  [[ -n "$PROF" ]] && { ok "power-profiles-daemon active: ${C_BOLD}${PROF}${C_RESET}"; PM_FOUND=1; }
+fi
+if systemctl is-active --quiet tlp 2>/dev/null; then
+  ok "TLP active ${C_DIM}(sudo tlp-stat -s for details)${C_RESET}"; PM_FOUND=1
+fi
+if systemctl is-active --quiet cpupower 2>/dev/null; then
+  ok "cpupower.service active"; PM_FOUND=1
+fi
+[[ $PM_FOUND -eq 0 ]] && info "No power-management daemon detected (TLP / power-profiles-daemon / cpupower)"
+
+# ============================================================================
+# SECTION 4: Suspend / sleep posture
+# ============================================================================
+section "SUSPEND MODES"
+
+MEM_SLEEP=""
+if [[ -r /sys/power/state ]]; then
+  info "Kernel sleep states: ${C_BOLD}$(sysval /sys/power/state)${C_RESET}"
+fi
+if [[ -r /sys/power/mem_sleep ]]; then
+  MEM_SLEEP=$(sysval /sys/power/mem_sleep)
+  info "Suspend-to-RAM mode: ${C_BOLD}${MEM_SLEEP}${C_RESET}  ${C_DIM}([deep] = S3, [s2idle] = modern standby)${C_RESET}"
+  case "$MEM_SLEEP" in
+    *"[s2idle]"*)
+      warn "s2idle active — RAM stays powered during 'sleep': cold-boot DMA attacks still possible after lid-close"
+      ;;
+    *"[deep]"*)
+      ok "deep (S3) suspend — RAM self-refresh; lower idle drain"
+      ;;
+  esac
+else
+  info "mem_sleep not exposed (older kernel)"
+fi
+if [[ -r /sys/power/disk ]]; then
+  info "Hibernation modes: $(sysval /sys/power/disk)"
+fi
+
+if [[ -r /proc/uptime ]]; then
+  UP=$(awk '{print int($1)}' /proc/uptime)
+  info "Uptime: $(fmt_secs "$UP")"
+fi
+
+# ============================================================================
+# SECTION 4b: GPU power draw (NVIDIA via nvidia-smi, AMD/Intel via sysfs)
+# ============================================================================
+section "GPU POWER DRAW"
+
+GPU_FOUND=0
+GPU_VENDOR=""
+GPU_NAME=""
+GPU_POWER_DRAW_W=""
+GPU_POWER_LIMIT_W=""
+GPU_TEMP_C=""
+GPU_UTIL_PCT=""
+GPU_MEM_USED_MIB=""
+GPU_MEM_TOTAL_MIB=""
+GPU_FAN_PCT=""
+GPU_PSTATE=""
+GPU_CLOCK_GRAPH_MHZ=""
+GPU_CLOCK_MEM_MHZ=""
+GPU_CLOCK_SM_MHZ=""
+
+# ----- NVIDIA path -----
+if command -v nvidia-smi >/dev/null 2>&1; then
+  # Query a wide set of fields in one shot; tolerate older drivers that lack some keys.
+  NVIDIA_QUERY=$(timeout 8 nvidia-smi \
+      --query-gpu=index,name,power.draw,power.limit,temperature.gpu,utilization.gpu,\
+memory.used,memory.total,fan.speed,pstate,clocks.current.graphics,clocks.current.memory,clocks.current.sm \
+      --format=csv,noheader,nounits 2>/dev/null | head -1)
+  if [[ -n "$NVIDIA_QUERY" ]]; then
+    GPU_FOUND=1
+    GPU_VENDOR="NVIDIA"
+    # Parse 13-field CSV
+    IFS=',' read -r _IDX GPU_NAME GPU_POWER_DRAW_W GPU_POWER_LIMIT_W GPU_TEMP_C \
+        GPU_UTIL_PCT GPU_MEM_USED_MIB GPU_MEM_TOTAL_MIB GPU_FAN_PCT GPU_PSTATE \
+        GPU_CLOCK_GRAPH_MHZ GPU_CLOCK_MEM_MHZ GPU_CLOCK_SM_MHZ <<< "$NVIDIA_QUERY"
+    # Trim whitespace from each
+    for v in GPU_NAME GPU_POWER_DRAW_W GPU_POWER_LIMIT_W GPU_TEMP_C GPU_UTIL_PCT \
+             GPU_MEM_USED_MIB GPU_MEM_TOTAL_MIB GPU_FAN_PCT GPU_PSTATE \
+             GPU_CLOCK_GRAPH_MHZ GPU_CLOCK_MEM_MHZ GPU_CLOCK_SM_MHZ; do
+      eval "${v}=\$(echo \"\${${v}}\" | xargs 2>/dev/null)"
+    done
+    # [N/A] is what nvidia-smi prints when a field doesn't apply (e.g. fan on a blower-less card)
+    [[ "$GPU_FAN_PCT" == "[N/A]" || "$GPU_FAN_PCT" == "N/A" ]] && GPU_FAN_PCT=""
+    [[ "$GPU_PSTATE"  == "[N/A]" || "$GPU_PSTATE"  == "N/A" ]] && GPU_PSTATE=""
+  fi
+fi
+
+# ----- AMD path (amdgpu driver exposes hwmon via /sys/class/drm/card*/device/hwmon/) -----
+if [[ $GPU_FOUND -eq 0 ]]; then
+  for card in /sys/class/drm/card*/device; do
+    [[ -e "$card/vendor" ]] || continue
+    vendor_id=$(sysval "$card/vendor" 2>/dev/null)
+    case "$vendor_id" in
+      0x1002) GPU_VENDOR="AMD"; break ;;   # Advanced Micro Devices
+      0x8086) GPU_VENDOR="Intel"; break ;; # Intel corp
+      *) continue ;;
+    esac
+  done
+  if [[ "$GPU_VENDOR" == "AMD" || "$GPU_VENDOR" == "Intel" ]]; then
+    # Find the matching hwmon directory
+    for hw in "$card/hwmon"/hwmon*; do
+      [[ -e "$hw/name" ]] || continue
+      hw_name=$(sysval "$hw/name")
+      if [[ "$GPU_VENDOR" == "AMD" && "$hw_name" == "amdgpu" ]] || \
+         [[ "$GPU_VENDOR" == "Intel" && "$hw_name" == "i915" ]]; then
+        # power1_input is in microwatts. Convert to watts.
+        if [[ -r "$hw/power1_input" ]]; then
+          GPU_POWER_DRAW_W=$(awk '{printf "%.2f", $1/1000000}' "$hw/power1_input")
+          GPU_FOUND=1
+        fi
+        GPU_NAME=$(sysval "$card/product_name" 2>/dev/null)
+        [[ -z "$GPU_NAME" ]] && GPU_NAME="$GPU_VENDOR GPU"
+        # temp1_input is millidegrees C
+        [[ -r "$hw/temp1_input" ]] && GPU_TEMP_C=$(awk '{printf "%d", $1/1000}' "$hw/temp1_input")
+        break
+      fi
+    done
+    # GPU utilization requires a separate mechanism; skip on AMD/Intel sysfs path.
+  fi
+fi
+
+if [[ $GPU_FOUND -eq 1 ]]; then
+  if [[ $JSON_OUT -eq 0 ]]; then
+    info "Vendor:    ${C_BOLD}${GPU_VENDOR}${C_RESET}  ${C_DIM}${GPU_NAME}${C_RESET}"
+    if [[ -n "$GPU_POWER_DRAW_W" ]]; then
+      # Build a bar showing draw vs limit (so you can see throttle headroom at a glance)
+      bar=""
+      bar_len=0
+      bar_w=40
+      if [[ -n "$GPU_POWER_LIMIT_W" ]] && awk -v l="$GPU_POWER_LIMIT_W" 'BEGIN{exit!(l>0)}'; then
+        bar_len=$(awk -v d="$GPU_POWER_DRAW_W" -v l="$GPU_POWER_LIMIT_W" -v w="$bar_w" \
+                  'BEGIN{len=d*w/l; if(len<0)len=0; if(len>w)len=w; printf "%d", len}')
+        bar_pct=$(awk -v d="$GPU_POWER_DRAW_W" -v l="$GPU_POWER_LIMIT_W" \
+                  'BEGIN{printf "%.0f", d*100/l}')
+      else
+        # No limit known — fall back to absolute scaling assuming 200W TDP
+        bar_len=$(awk -v d="$GPU_POWER_DRAW_W" -v w="$bar_w" \
+                  'BEGIN{len=d*w/200; if(len<0)len=0; if(len>w)len=w; printf "%d", len}')
+        bar_pct="?"
+      fi
+      [[ $bar_len -lt 1 && "${GPU_POWER_DRAW_W%.*}" != "0" ]] && bar_len=1
+      color="$C_GREEN"
+      awk -v p="${bar_pct%.*}" 'BEGIN{exit!(p>=80)}' && color="$C_YELLOW"
+      awk -v p="${bar_pct%.*}" 'BEGIN{exit!(p>=95)}' && color="$C_RED"
+      j=0; while (( j < bar_len )); do bar+="█"; j=$((j+1)); done
+      pad=$(( bar_w - bar_len ))
+      [[ $pad -lt 0 ]] && pad=0
+      printf "  ${C_DIM}%-14s${C_RESET} ${color}%-*s${C_RESET} ${C_BOLD}%sW${C_RESET}" \
+          "Power draw" "$bar_w" "$bar" "$GPU_POWER_DRAW_W"
+      if [[ -n "$GPU_POWER_LIMIT_W" ]]; then
+        printf " ${C_DIM}/ %sW limit  (${bar_pct}%%)${C_RESET}\n" "$GPU_POWER_LIMIT_W"
+      else
+        printf " ${C_DIM}(no limit reported)${C_RESET}\n"
+      fi
+    fi
+  fi
+  # Throttle warning (always fires — even in JSON mode it's recorded as a warning count)
+  if [[ -n "$GPU_POWER_DRAW_W" && -n "$GPU_POWER_LIMIT_W" ]] && \
+     awk -v d="$GPU_POWER_DRAW_W" -v l="$GPU_POWER_LIMIT_W" 'BEGIN{exit!(d/l>=0.95)}'; then
+    warn "GPU power" "GPU at ≥95%% of power limit" "Improve case airflow, raise power limit (sudo nvidia-smi -pl <watts>), or undervolt"
+  fi
+  if [[ $JSON_OUT -eq 0 ]]; then
+    [[ -z "$GPU_POWER_DRAW_W" ]] && info "Power draw:  ${C_DIM}driver did not report power (older NVIDIA / no hwmon)${C_RESET}"
+    if [[ -n "$GPU_TEMP_C" ]]; then
+      tcolor="$C_GREEN"
+      (( GPU_TEMP_C >= 80 )) && tcolor="$C_YELLOW"
+      (( GPU_TEMP_C >= 90 )) && tcolor="$C_RED"
+      info "Temperature: ${C_BOLD}${tcolor}${GPU_TEMP_C}°C${C_RESET}"
+      (( GPU_TEMP_C >= 90 )) && warn "GPU thermals" "GPU ≥90°C" "Check fan curve / case airflow"
+    fi
+    if [[ -n "$GPU_UTIL_PCT" && "$GPU_UTIL_PCT" != "[N/A]" ]]; then
+      info "Utilization: ${C_BOLD}${GPU_UTIL_PCT}%${C_RESET}"
+    fi
+    if [[ -n "$GPU_MEM_USED_MIB" && -n "$GPU_MEM_TOTAL_MIB" && "$GPU_MEM_TOTAL_MIB" != "[N/A]" ]]; then
+      mem_pct=$(awk -v u="$GPU_MEM_USED_MIB" -v t="$GPU_MEM_TOTAL_MIB" 'BEGIN{printf "%.0f", u*100/t}')
+      info "VRAM:       ${C_BOLD}${GPU_MEM_USED_MIB} / ${GPU_MEM_TOTAL_MIB} MiB${C_RESET} ${C_DIM}(${mem_pct}%)${C_RESET}"
+    fi
+    if [[ -n "$GPU_FAN_PCT" ]]; then
+      info "Fan speed:  ${C_BOLD}${GPU_FAN_PCT}%${C_RESET}"
+    fi
+    if [[ -n "$GPU_PSTATE" ]]; then
+      info "Perf state: ${C_BOLD}${GPU_PSTATE}${C_RESET} ${C_DIM}(P0=highest, P12=lowest)${C_RESET}"
+    fi
+    if [[ -n "$GPU_CLOCK_GRAPH_MHZ" && "$GPU_CLOCK_GRAPH_MHZ" != "[N/A]" ]]; then
+      extra=""
+      [[ -n "$GPU_CLOCK_MEM_MHZ" && "$GPU_CLOCK_MEM_MHZ" != "[N/A]" ]] && extra="  ${C_DIM}mem ${GPU_CLOCK_MEM_MHZ} MHz${C_RESET}"
+      [[ -n "$GPU_CLOCK_SM_MHZ"  && "$GPU_CLOCK_SM_MHZ"  != "[N/A]" ]] && extra="${extra}  ${C_DIM}SM ${GPU_CLOCK_SM_MHZ} MHz${C_RESET}"
+      info "Clocks:     ${C_BOLD}${GPU_CLOCK_GRAPH_MHZ} MHz${C_RESET}${extra}"
+    fi
+    # Cost contribution: at current draw, 24/7, at the configured rate
+    if [[ -n "$GPU_POWER_DRAW_W" ]]; then
+      gpu_year=$(awk -v w="$GPU_POWER_DRAW_W" -v r="$RATE_CENTS_KWH" \
+                 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+      info "GPU cost:   ${C_BOLD}\$${gpu_year}/year${C_RESET} ${C_DIM}(at current draw, ${RATE_CENTS_KWH}¢/kWh)${C_RESET}"
+    fi
+  fi
+  # VRAM warning (always — needs to land in JSON warning count)
+  if [[ -n "$GPU_MEM_USED_MIB" && -n "$GPU_MEM_TOTAL_MIB" && "$GPU_MEM_TOTAL_MIB" != "[N/A]" ]]; then
+    awk -v u="$GPU_MEM_USED_MIB" -v t="$GPU_MEM_TOTAL_MIB" 'BEGIN{exit!(u/t>=0.9)}' && \
+      warn "GPU memory" "VRAM ≥90%% (${GPU_MEM_USED_MIB}/${GPU_MEM_TOTAL_MIB} MiB)" \
+        "Large models / textures may evict or fail to allocate — close other GPU users"
+  fi
+else
+  if [[ $JSON_OUT -eq 0 ]]; then
+    info "${C_DIM}no discrete GPU detected (nvidia-smi missing and no AMD/Intel hwmon found)${C_RESET}"
+    info "${C_DIM}  → install nvidia-smi: ${C_RESET}sudo apt install nvidia-smi${C_DIM} (proprietary driver users)${C_RESET}"
+  fi
+fi
+
+# ============================================================================
+# SECTION 5: Headline box
+# ============================================================================
+section "POWER HEADLINE"
+
+if [[ $JSON_OUT -eq 0 ]]; then
+  BOX_W=56
+  printf "  ${C_BOLD}${C_MAGENTA}╔$(printf '═%.0s' $(seq 1 $BOX_W))╗${C_RESET}\n"
+  hline() {
+    local vis plain pad
+    vis="   $1:  $2"
+    plain=$(printf '%s' "$vis" | sed 's/\x1b\[[0-9;]*m//g')
+    pad=$(( BOX_W - ${#plain} )); (( pad < 0 )) && pad=0
+    printf "  ${C_BOLD}${C_MAGENTA}║${C_RESET}%s%${pad}s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" "$vis"
+  }
+  pcolor="$C_GREEN"; [[ $PLUGGED -eq 0 ]] && pcolor="$C_YELLOW"
+  hline "Source"  "${C_BOLD}${pcolor}$( ((PLUGGED)) && echo 'AC' || echo 'BATTERY')${C_RESET}"
+  if [[ $BAT_PCT -ge 0 ]]; then
+    bcolor="$C_GREEN"; (( BAT_PCT <= 20 )) && bcolor="$C_YELLOW"; (( BAT_PCT <= 10 )) && bcolor="$C_RED"
+    hline "Battery" "${C_BOLD}${bcolor}${BAT_PCT}%${C_RESET} (${BAT_STATUS})"
+    [[ -n "$HEALTH_PCT" ]] && hline "Health" "${C_BOLD}${HEALTH_PCT}%${C_RESET} of design capacity"
+    [[ -n "$RUNTIME" ]] && hline "Est. runtime" "$(fmt_secs "$RUNTIME")"
+  else
+    hline "Battery" "${C_DIM}none detected${C_RESET}"
+  fi
+  SUSP_DISP="${MEM_SLEEP:-}"
+  [[ -z "$SUSP_DISP" ]] && SUSP_DISP="$(sysval /sys/power/state)"
+  [[ -z "$SUSP_DISP" ]] && SUSP_DISP="n/a"
+  hline "Suspend" "${SUSP_DISP}"
+  printf "  ${C_BOLD}${C_MAGENTA}╚$(printf '═%.0s' $(seq 1 $BOX_W))╝${C_RESET}\n"
+  printf "\n"
+fi
+
+# ============================================================================
+# SECTION 6: ENERGY COST ANALYSIS  — dollars per hour / day / month / year
+# ============================================================================
+section "ENERGY COST ANALYSIS — \$${RATE_CENTS_KWH}¢/kWh"
+
+# Best-effort power measurement (watts).  When on battery, the discharge
+# rate is a direct read; when on AC, we use the same reading but flipped
+# to "system is drawing" and supplemented by component estimates.
+SYSTEM_WATTS=0
+SOURCE_LABEL=""
+if [[ $HAVE_BAT -eq 1 ]]; then
+    for f in /sys/class/power_supply/BAT[0-9]*; do
+        [[ -d "$f" ]] || continue
+        pd=$(sysval "$f/power_now")
+        # Skip if status is not discharging (or charging + plugged)
+        st=$(sysval "$f/status")
+        if [[ -n "$pd" ]] && [[ "$pd" != "0" ]] && [[ "$st" == "Discharging" ]]; then
+            SYSTEM_WATTS=$(awk -v p="$pd" 'BEGIN{printf "%.2f", p/1000000}')
+            SOURCE_LABEL="battery discharge"
+        elif [[ -n "$pd" ]]; then
+            SYSTEM_WATTS=$(awk -v p="$pd" 'BEGIN{printf "%.2f", p/1000000}')
+            SOURCE_LABEL="battery ($st)"
+        fi
+        break
+    done
+fi
+# Fallback: estimate from a small lookup keyed on machine type
+if [[ -z "$SYSTEM_WATTS" || "$SYSTEM_WATTS" == "0.00" || "$SYSTEM_WATTS" == "0" ]]; then
+    model=""
+    if [[ -r /proc/cpuinfo ]]; then
+        model=$(awk -F': ' '/^model name/ {sub(/^[^:]*:[ \t]*/,""); print; exit}' /proc/cpuinfo 2>/dev/null)
+    fi
+    case "$model" in
+        *Intel*Core*i9*|*Xeon*)      SYSTEM_WATTS=95; SOURCE_LABEL="estimate: high-end CPU" ;;
+        *Intel*Core*i7*)             SYSTEM_WATTS=65; SOURCE_LABEL="estimate: i7-class laptop" ;;
+        *Intel*Core*i5*)             SYSTEM_WATTS=45; SOURCE_LABEL="estimate: i5-class laptop" ;;
+        *Intel*Core*i3*)             SYSTEM_WATTS=35; SOURCE_LABEL="estimate: i3-class" ;;
+        *Intel*Atom*|*Celeron*)      SYSTEM_WATTS=15; SOURCE_LABEL="estimate: low-power" ;;
+        *AMD*Ryzen*9*|*Threadripper*) SYSTEM_WATTS=105; SOURCE_LABEL="estimate: high-end AMD" ;;
+        *AMD*Ryzen*7*)               SYSTEM_WATTS=75; SOURCE_LABEL="estimate: Ryzen 7" ;;
+        *AMD*Ryzen*5*)               SYSTEM_WATTS=55; SOURCE_LABEL="estimate: Ryzen 5" ;;
+        *Apple*M1*|*Apple*M2*)       SYSTEM_WATTS=20; SOURCE_LABEL="estimate: Apple Silicon" ;;
+        *QEMU*Virtual*|*KVM*)        SYSTEM_WATTS=30; SOURCE_LABEL="estimate: virtual machine" ;;
+        *)                           SYSTEM_WATTS=50; SOURCE_LABEL="estimate: typical PC" ;;
+    esac
+    [[ -n "$model" ]] && SOURCE_LABEL="$SOURCE_LABEL (${model:0:35})"
+fi
+
+# Sleep (suspend) watt estimate — varies with S3 vs s2idle
+SLEEP_WATTS=3.0
+[[ -r /sys/power/mem_sleep ]] && grep -q "\[deep\]" /sys/power/mem_sleep 2>/dev/null && SLEEP_WATTS=0.7
+
+# Idle vs load heuristics
+IDLE_WATTS=$(awk -v w="$SYSTEM_WATTS" 'BEGIN{printf "%.2f", w*0.55}')
+PEAK_WATTS=$(awk -v w="$SYSTEM_WATTS" 'BEGIN{printf "%.2f", w*1.45}')
+
+# Convert watt-hours to kWh; cost = kWh * $rate / 100
+# hours per: 1, 24, 730 (avg month), 8760
+calc_cost() {
+    awk -v w="$1" -v rate="$RATE_CENTS_KWH" '
+        BEGIN {
+            h1   = w / 1000.0
+            hd   = h1 * 24
+            hm   = hd * 365 / 12
+            hy   = hd * 365
+            c1   = h1 * rate / 100
+            cd   = hd * rate / 100
+            cm   = hm * rate / 100
+            cy   = hy * rate / 100
+            printf "  %-14s %6.3f kWh   $ %8.4f\n", "Per hour:   ", h1, c1
+            printf "  %-14s %6.3f kWh   $ %8.4f\n", "Per day:    ", hd, cd
+            printf "  %-14s %6.3f kWh   $ %8.4f\n", "Per month:  ", hm, cm
+            printf "  %-14s %6.3f kWh   $ %8.4f\n", "Per year:   ", hy, cy
+        }'
+}
+
+if [[ $JSON_OUT -eq 0 ]]; then
+    info "Rate: ${C_BOLD}\$${RATE_CENTS_KWH}/kWh${C_RESET}  (override: --rate=N)"
+    info "Source: ${C_DIM}${SOURCE_LABEL}${C_RESET} → ${C_BOLD}${SYSTEM_WATTS}W${C_RESET}"
+    echo ""
+    printf "  ${C_CYAN}${C_BOLD}╭─ Current draw ───────────────────────────╮${C_RESET}\n"
+    calc_cost "$SYSTEM_WATTS"
+    printf "  ${C_CYAN}╰───────────────────────────────────────────╯${C_RESET}\n"
+    echo ""
+    printf "  ${C_CYAN}${C_BOLD}╭─ Idle (low-load) ─ ~55%% of current ──────╮${C_RESET}\n"
+    calc_cost "$IDLE_WATTS"
+    printf "  ${C_CYAN}╰───────────────────────────────────────────╯${C_RESET}\n"
+    echo ""
+    printf "  ${C_CYAN}${C_BOLD}╭─ Peak (full load) ─ ~145%% of current ────╮${C_RESET}\n"
+    calc_cost "$PEAK_WATTS"
+    printf "  ${C_CYAN}╰───────────────────────────────────────────╯${C_RESET}\n"
+    echo ""
+    printf "  ${C_CYAN}${C_BOLD}╭─ Suspended / sleep ───────────────────────╮${C_RESET}\n"
+    calc_cost "$SLEEP_WATTS"
+    printf "  ${C_CYAN}╰───────────────────────────────────────────╯${C_RESET}\n"
+    echo ""
+
+    # ─── Visual: bar chart of weekly cost scenarios ─────────────────────────
+    subsec "Bar chart: weekly / monthly / yearly cost by scenario"
+    # We compare across the four scenarios for a *year*.
+    # Use awk to compute cents/y then render bars scaled to max.
+    ratem=$RATE_CENTS_KWH
+    sleep_year=$(awk -v w="$SLEEP_WATTS"    -v r="$ratem" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+    idle_year=$(awk  -v w="$IDLE_WATTS"     -v r="$ratem" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+    cur_year=$(awk   -v w="$SYSTEM_WATTS"   -v r="$ratem" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+    peak_year=$(awk  -v w="$PEAK_WATTS"     -v r="$ratem" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+
+    # Find max for scaling
+    max_year=$(awk -v a="$sleep_year" -v b="$idle_year" -v c="$cur_year" -v d="$peak_year" \
+        'BEGIN { m = a; if (b > m) m = b; if (c > m) m = c; if (d > m) m = d; print m }')
+    width=40
+    scale_bar() {
+        local val="$1" lbl="$2"
+        local len=0
+        if [[ "$max_year" =~ ^[0-9.]+$ ]] && awk -v v="$val" 'BEGIN{exit!(v>0)}'; then
+            len=$(awk -v v="$val" -v mx="$max_year" -v w="$width" 'BEGIN{printf "%d", v*w/mx}')
+            [[ $len -lt 1 ]] && len=1
+        fi
+        local bar=""
+        local j
+        for (( j=0; j<len; j++ )); do bar+="█"; done
+        printf "  ${C_DIM}%-12s${C_RESET} ${C_GREEN}%s${C_RESET} ${C_BOLD}\$%5.2f${C_RESET}/yr\n" "$lbl" "$bar" "$val"
+    }
+    # Color the bars by intensity
+    scale_bar_colored() {
+        local val="$1" lbl="$2"
+        local len=0
+        if [[ "$max_year" =~ ^[0-9.]+$ ]] && awk -v v="$val" 'BEGIN{exit!(v>0)}'; then
+            len=$(awk -v v="$val" -v mx="$max_year" -v w="$width" 'BEGIN{printf "%d", v*w/mx}')
+            [[ $len -lt 1 ]] && len=1
+        fi
+        local bar=""
+        local j
+        local color
+        case "$lbl" in
+            *suspend*) color=$C_CYAN ;;
+            *Idle*)    color=$C_BLUE ;;
+            *Current*) color=$C_GREEN ;;
+            *Peak*)    color=$C_RED ;;
+            *)         color=$C_RESET ;;
+        esac
+        for (( j=0; j<len; j++ )); do bar+="█"; done
+        printf "  ${C_DIM}%-12s${C_RESET} ${color}%-*s${C_RESET} ${C_BOLD}\$%5.2f${C_RESET}/yr\n" \
+            "$lbl" "$width" "$bar" "$val"
+    }
+    scale_bar_colored "$sleep_year" "Suspended"
+    scale_bar_colored "$idle_year" "Idle"
+    scale_bar_colored "$cur_year" "Current"
+    scale_bar_colored "$peak_year" "Peak"
+
+    # ─── Differential box: delta between peak and current ─────────────────
+    delta_year=$(awk -v p="$peak_year" -v c="$cur_year" 'BEGIN{printf "%.2f", p-c}')
+    delta_day=$(awk -v y="$delta_year" 'BEGIN{printf "%.2f", y/365}')
+    delta_hour=$(awk -v y="$delta_year" 'BEGIN{printf "%.4f", y/8760}')
+    subsec "Optimization payoff: how much you save by NOT running at peak"
+    printf "  ${C_DIM}%-22s${C_RESET} %s\$/hour\n" "Per hour saved:" "$delta_hour"
+    printf "  ${C_DIM}%-22s${C_RESET} %s\$/day\n"  "Per day saved: " "$delta_day"
+    printf "  ${C_DIM}%-22s${C_RESET} %s\$/year\n" "Per year saved:" "$delta_year"
+
+    # ─── Component breakdown (estimates) ──────────────────────────────────
+    subsec "Component draw estimates (aggregated typical power)"
+    declare -A COMP_WATTS=(
+        ["CPU idle"]         8
+        ["CPU load"]         35
+        ["GPU idle"]         5
+        ["GPU load"]         60
+        ["Memory (DDR4)"]    5
+        ["Storage SSD"]      3
+        ["Storage HDD"]      8
+        ["USB 2.0 ports"]    2
+        ["USB 3.0 ports"]    4
+        ["Display (laptop)"] 6
+        ["Display ext"]      25
+        ["Wi-Fi radio"]      1
+        ["Fans x2"]          3
+        ["VRM/MOSFET"]       6
+    )
+    # Pretty right-aligned table
+    W=50
+    for label in "${!COMP_WATTS[@]}"; do
+        : # Print sorted at end
+    done
+    while IFS= read -r label; do
+        [[ -z "$label" ]] && continue
+        watts=${COMP_WATTS[$label]}
+        yr=$(awk -v w="$watts" -v r="$ratem" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+        bar_len=$(( watts * W / 100 ))
+        [[ $bar_len -lt 1 ]] && bar_len=1
+        bar=""
+        j=0
+        for (( j=0; j<bar_len; j++ )); do bar+="▌"; done
+        printf "  ${C_DIM}%-20s${C_RESET} ${C_CYAN}%-*s${C_RESET} ${C_BOLD}%2dW${C_RESET} ${C_DIM}/yr \$${yr}${C_RESET}\n" \
+            "$label" "$W" "$bar" "$watts"
+    done < <(printf '%s\n' "${!COMP_WATTS[@]}" | sort)
+fi
+
+# ============================================================================
+# SECTION 6.5: ESTIMATE ACCURACY AUDIT (opt-in: --accuracy)
+# ============================================================================
+if [[ "$ACCURACY" -eq 1 ]]; then
+  section "ESTIMATE ACCURACY — measured vs assumed"
+  ACC_DIR="$HOME/.powerz"
+  ACC_TSV="$ACC_DIR/accuracy.tsv"
+  MEAS_W=""; MEAS_SRC=""
+
+  rapl_energy() {   # $1=powercap domain -> integer µJ (or nothing)
+      local f="$1/energy_uj" v=""
+      if [[ -r "$f" ]]; then v=$(cat "$f" 2>/dev/null)
+      elif command -v sudo >/dev/null 2>&1; then v=$(sudo -n cat "$f" 2>/dev/null)
+      fi
+      [[ "$v" =~ ^[0-9]+$ ]] && printf '%s' "$v"
+  }
+
+  RAPL_DEV=""
+  for d in /sys/class/powercap/intel-rapl:* /sys/class/powercap/*; do
+      [[ -d "$d" ]] || continue
+      nm=$(cat "$d/name" 2>/dev/null) || continue
+      case "$nm" in
+          package-0|tdm_main-power|AMDcpu*) RAPL_DEV="$d"; break ;;
+      esac
+  done
+
+  if [[ -n "$RAPL_DEV" ]]; then
+      e1=$(rapl_energy "$RAPL_DEV")
+      if [[ -n "$e1" ]]; then
+          emit "  ${C_DIM}sampling ${C_RESET}${C_BOLD}%s${C_RESET}${C_DIM} for %ss (keep the machine doing what you normally do)…${C_RESET}\n" "${RAPL_DEV##*/}" "$MEASURE_SECS"
+          t1=$(date +%s%N); sleep "$MEASURE_SECS"; t2=$(date +%s%N)
+          e2=$(rapl_energy "$RAPL_DEV")
+          if [[ -n "$e2" ]]; then
+              maxr=$(cat "$RAPL_DEV/max_energy_range_uj" 2>/dev/null || echo 0)
+              MEAS_W=$(awk -v e1="$e1" -v e2="$e2" -v m="$maxr" -v t1="$t1" -v t2="$t2" '
+                  BEGIN{ if (e2<e1) e2+=m; dt=(t2-t1)/1e9; if (dt<=0){printf "0"; exit} printf "%.2f", (e2-e1)/1e6/dt }')
+              MEAS_SRC="RAPL ${RAPL_DEV##*/}"
+          fi
+      else
+          warn "RAPL counter exists but is root-only — run: sudo ./powerz --accuracy"
+      fi
+  fi
+
+  # Battery discharge is its own ground truth when present
+  if [[ -z "$MEAS_W" ]]; then
+      for f in /sys/class/power_supply/BAT[0-9]*; do
+          [[ -d "$f" ]] || continue
+          [[ "$(sysval "$f/status")" == "Discharging" ]] || continue
+          p=$(sysval "$f/power_now")
+          [[ -n "$p" && "$p" != "0" ]] && {
+              MEAS_W=$(awk -v p="${p#-}" 'BEGIN{printf "%.2f", p/1000000}')
+              MEAS_SRC="battery power_now"
+          }
+          break
+      done
+  fi
+
+  if [[ -n "$MEAS_W" ]]; then
+      NPROC=$(nproc 2>/dev/null || echo 4)
+      STATE_LBL=$(awk '{printf "%s", ($1<=0.5*'"$NPROC"') ? "idle-ish" : (($1<='"$NPROC"') ? "mixed" : "loaded")}' /proc/loadavg)
+      ERR_PCT=$(awk -v e="$SYSTEM_WATTS" -v m="$MEAS_W" 'BEGIN{ if (m+0<=0){printf "0"; exit} printf "%+.1f", (e-m)/m*100 }')
+      if [[ "$JSON_OUT" -eq 0 ]]; then
+          subsec "wattage: what we guess vs what the silicon says"
+          printf "  ${C_DIM}%-28s %-10s %-10s %s${C_RESET}\n" "source" "watts" "vs guess" "state"
+          printf "  ${C_DIM}%-28s${C_RESET} ${C_YELLOW}%-10s${C_RESET} ${C_DIM}(reference)${C_RESET}     %s\n" "$SOURCE_LABEL" "$SYSTEM_WATTS" "$STATE_LBL"
+          printf "  ${C_DIM}%-28s${C_RESET} ${C_GREEN}%-10s${C_RESET} ${C_BOLD}%s%%${C_RESET}            %s\n" "$MEAS_SRC" "$MEAS_W" "$ERR_PCT" "$STATE_LBL"
+          [[ "${GPU_FOUND:-0}" -eq 1 && -n "${GPU_POWER_DRAW_W:-}" ]] && \
+            printf "  ${C_DIM}%-28s${C_RESET} ${C_CYAN}%-10s${C_RESET} ${C_DIM}(nvidia-smi power.draw — already measured)${C_RESET}\n" "GPU now" "${GPU_POWER_DRAW_W}W"
+      fi
+
+      if [[ "$JSON_OUT" -eq 0 ]]; then
+          subsec "what the error does to your \$ figures (they scale 1:1 with watts)"
+          COST_Q=$(awk -v w="$SYSTEM_WATTS" -v r="$RATE_CENTS_KWH" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+          COST_M=$(awk -v w="$MEAS_W"     -v r="$RATE_CENTS_KWH" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+          COST_D=$(awk -v q="$COST_Q" -v m="$COST_M" 'BEGIN{printf "%+.2f", q-m}')
+          printf "  quoted/yr (lookup): ${C_YELLOW}\$%s${C_RESET}   grounded/yr (measured): ${C_GREEN}\$%s${C_RESET}   delta: ${C_BOLD}\$%s${C_RESET}\n" "$COST_Q" "$COST_M" "$COST_D"
+          kpi "estimated" "${SYSTEM_WATTS} W" "$C_YELLOW"
+          kpi "measured" "${MEAS_W} W" "$C_GREEN"
+          kpi "estimate err" "${ERR_PCT}%" "$( (( $(awk -v x="$ERR_PCT" 'BEGIN{print (x<0?-x:x)>25)?1:0}') )) && echo "$C_RED" || echo "$C_GREEN" )"
+      fi
+      abs=$(awk -v x="$ERR_PCT" 'BEGIN{printf "%.0f", (x<0)?-x:x}')
+      if (( abs > 25 )); then
+          warn "CPU-model lookup is off by ${ERR_PCT}% on this machine — trust measured watts, or pass --rate plus keep this window open on 'normal' work"
+      elif (( abs > 10 )); then
+          warn "lookup estimate is ${ERR_PCT}% off — decent ballpark, not a billing figure"
+      else
+          ok "lookup estimate lands within ${ERR_PCT}% of reality — your \$ figures are trustworthy"
+      fi
+
+      if [[ "$JSON_OUT" -eq 0 ]]; then
+          subsec "price-rate sensitivity (\$ cost scales 1:1 with your utility rate too)"
+          WREF=${MEAS_W:-$SYSTEM_WATTS}
+          for r in 8 11 16 20 25; do
+              y=$(awk -v w="$WREF" -v r="$r" 'BEGIN{printf "%.2f", w*24*365*r/1000/100}')
+              star=" "; [[ "$r" == "$RATE_CENTS_KWH" ]] && star="${C_GREEN}*${C_RESET}"
+              printf "  ${star} %-3s¢/kWh → ${C_BOLD}\$%s${C_RESET}/yr @ %sW\n" "$r" "$y" "$WREF"
+          done
+      fi
+
+      # ledger + rolling accuracy grade
+      mkdir -p "$ACC_DIR"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$SYSTEM_WATTS" "$MEAS_W" "$MEAS_SRC" "$RATE_CENTS_KWH" "$ERR_PCT" >> "$ACC_TSV"
+      STATS=$(awk -F'\t' '{n++; s+=$6; a+=($6<0?-$6:$6)} END{ if(!n){print "0 0 0"; exit} printf "%d %.1f %+.1f", n, a/n, s/n }' "$ACC_TSV" 2>/dev/null)
+      read -r ACC_N ACC_MAE ACC_BIAS <<< "$STATS"
+      GRADE="D"; awk -v x="$ACC_MAE" 'BEGIN{exit !(x<=25)}' && GRADE="C"
+      awk -v x="$ACC_MAE" 'BEGIN{exit !(x<=10)}' && GRADE="B"
+      awk -v x="$ACC_MAE" 'BEGIN{exit !(x<=5)}'  && GRADE="A"
+      if [[ "$JSON_OUT" -eq 0 ]]; then
+          subsec "accuracy ledger (${ACC_TSV}) — ${ACC_N} samples"
+          printf "  mean |error|: ${C_BOLD}%s%%${C_RESET}   bias: ${C_BOLD}%s%%${C_RESET}   grade: ${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$ACC_MAE" "$ACC_BIAS" "$GRADE"
+      fi
+      if awk -v b="$ACC_BIAS" 'BEGIN{exit !(b>10)}'; then
+          info "bias ${ACC_BIAS}% → the lookup OVERESTIMATES this box: your cost figures run high"
+      elif awk -v b="$ACC_BIAS" 'BEGIN{exit !(b<-10)}'; then
+          info "bias ${ACC_BIAS}% → the lookup UNDERESTIMATES: real bills will exceed the quotes"
+      else
+          ok "no systematic bias — estimates center on reality"
+      fi
+      add_json_field measured_watts "$MEAS_W" 1
+      add_json_field meas_source "$MEAS_SRC"
+      add_json_field est_err_pct "$(awk -v p="$ERR_PCT" 'BEGIN{printf "%.1f", p}')" 1
+      add_json_field accuracy_samples "$ACC_N" 1
+      add_json_field accuracy_grade "$GRADE"
+  else
+      info "no measurable power source found (no readable RAPL counters, no discharging battery) — accuracy mode needs bare-metal Intel/AMD powercap or a laptop on battery"
+      add_json_field measured_watts "null" 1
+  fi
+fi
+
+# Track the dominant number so JSON consumers get it.
+JSON_FIELDS+=("\"rate_cents_per_kwh\":${RATE_CENTS_KWH}")
+JSON_FIELDS+=("\"system_watts\":$(awk -v w="$SYSTEM_WATTS" 'BEGIN{printf "%.2f", w}')")
+JSON_FIELDS+=("\"idle_watts\":$(awk -v w="$IDLE_WATTS" 'BEGIN{printf "%.2f", w}')")
+JSON_FIELDS+=("\"peak_watts\":$(awk -v w="$PEAK_WATTS" 'BEGIN{printf "%.2f", w}')")
+JSON_FIELDS+=("\"sleep_watts\":$(awk -v w="$SLEEP_WATTS" 'BEGIN{printf "%.2f", w}')")
+JSON_FIELDS+=("\"cost_usd_per_year\":$(awk -v w="$SYSTEM_WATTS" -v r="$RATE_CENTS_KWH" \
+    'BEGIN{printf "%.4f", w*24*365*r/1000/100}')")
+if [[ $GPU_FOUND -eq 1 ]]; then
+  JSON_FIELDS+=("\"gpu_vendor\":\"${GPU_VENDOR}\"")
+  JSON_FIELDS+=("\"gpu_name\":\"${GPU_NAME}\"")
+  [[ -n "$GPU_POWER_DRAW_W"  ]] && JSON_FIELDS+=("\"gpu_power_draw_w\":${GPU_POWER_DRAW_W}")
+  [[ -n "$GPU_POWER_LIMIT_W" ]] && JSON_FIELDS+=("\"gpu_power_limit_w\":${GPU_POWER_LIMIT_W}")
+  [[ -n "$GPU_TEMP_C"        ]] && JSON_FIELDS+=("\"gpu_temp_c\":${GPU_TEMP_C}")
+  [[ -n "$GPU_UTIL_PCT"      && "$GPU_UTIL_PCT" != "[N/A]" ]] && JSON_FIELDS+=("\"gpu_util_pct\":${GPU_UTIL_PCT}")
+  [[ -n "$GPU_MEM_USED_MIB"  ]] && JSON_FIELDS+=("\"gpu_mem_used_mib\":${GPU_MEM_USED_MIB}")
+  [[ -n "$GPU_MEM_TOTAL_MIB" ]] && JSON_FIELDS+=("\"gpu_mem_total_mib\":${GPU_MEM_TOTAL_MIB}")
+  [[ -n "$GPU_FAN_PCT"       ]] && JSON_FIELDS+=("\"gpu_fan_pct\":${GPU_FAN_PCT}")
+  [[ -n "$GPU_PSTATE"        ]] && JSON_FIELDS+=("\"gpu_pstate\":\"${GPU_PSTATE}\"")
+fi
+
+# ============================================================================
+# SECTION 7: Recommendations + Verdict
+# ============================================================================
+section "RECOMMENDATIONS"
+REC_NUM=0
+rec() { REC_NUM=$((REC_NUM+1)); emit "  ${C_CYAN}#${REC_NUM}${C_RESET} ${C_DIM}→${C_RESET} %s\n" "$1"; }
+
+[[ $HAVE_BAT -eq 0 && $HAVE_AC -eq 0 && -z "${MEAS_W:-}" ]] && rec "No power data — run on bare metal (or a laptop) for full output"
+[[ -n "$HEALTH_PCT" ]] && (( HEALTH_PCT < 80 )) && rec "Battery wear ${HEALTH_PCT}% — order a replacement pack"
+[[ $PM_FOUND -eq 0 && $HAVE_BAT -eq 1 ]] && rec "Install TLP (${C_BOLD}sudo apt install tlp${C_RESET}) or power-profiles-daemon for better runtime"
+(( PLUGGED == 0 && BAT_PCT >= 0 && BAT_PCT < 20 )) && rec "Low battery — hibernate now: ${C_BOLD}systemctl hibernate${C_RESET}"
+rec "Live monitor: ${C_BOLD}watch -n5 'cat /sys/class/power_supply/BAT*/{capacity,status,current_now}'${C_RESET}"
+rec "Deep battery stats: ${C_BOLD}upower -i \$(upower -e | grep BAT)${C_RESET} (if upower installed)"
+rec "Check wake sources: ${C_BOLD}cat /proc/acpi/wakeup${C_RESET} — toggle noisy USB wake with ${C_BOLD}sudo sh -c 'echo XHC > /proc/acpi/wakeup'${C_RESET}"
+
+section "VERDICT"
+END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
+
+if [[ $JSON_OUT -eq 1 ]]; then
+  printf '{"script":"power","timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+  for f in "${JSON_FIELDS[@]}"; do printf ',%s' "$f"; done
+  printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$ELAPSED"
+else
+  if (( CRITICAL > 0 )); then
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+    exit_code=2
+  elif (( WARNINGS > 0 )); then
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    exit_code=1
+  else
+    printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
+    exit_code=0
+  fi
+  printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+fi
+
+# Watch loop
+if [[ $WATCH_INTERVAL -gt 0 ]] && [[ $JSON_OUT -eq 0 ]]; then
+  trap 'exit 0' INT TERM
+  while true; do
+    sleep "$WATCH_INTERVAL"
+    clear
+    START_TS=$(date +%s)
+    exec "$0" "${ARGS[@]}"
+  done
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summarize" "Power diagnostic complete on $(hostname -s)" 2>/dev/null || true
+fi
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
+    run_comparison_finalize
+fi
+
+exit "${exit_code:-0}"

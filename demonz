@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# demonz — Systemd Service Summoner & Banisher
+# ----------------------------------------------------------------------------
+# Comprehensive audit and control surface for the daemons that haunt your
+# machine. Shows:
+#   - Currently summoned daemons with PID, memory, CPU, and uptime
+#   - Failed rituals (daemons that fell at the threshold)
+#   - Possessed daemons (autostart-bound but banished)
+#   - Recently conjured (last 24h — likely fresh from the abyss)
+#   - Bound/sealed daemons (masked — locked in /dev/null)
+#   - Sigil locations for every daemon so you can edit them
+#   - Unholy patterns (daemons running from /tmp, /dev/shm — possessed!)
+#
+# Modes:
+#   ./demonz                       Summon + audit (default)
+#   ./demonz --json                Machine-readable JSON
+#   ./demonz --banish NAME         Banish a daemon (stop it)
+#   ./demonz --bind NAME           Bind (disable autostart)
+#   ./demonz --summon NAME         Summon (enable autostart)
+#   ./demonz --seal NAME           Deep-bind (mask → /dev/null)
+#   ./demonz --unseal NAME         Unseal a daemon
+#   ./demonz --show-sigil NAME     Show the daemon's sigil (unit file)
+#   ./demonz --show-state NAME     Show daemon state details
+#   ./demonz --recent [N]          Show N most recently conjured units
+#
+# All binding actions create a backup in /var/backups/demons-sh/<name>.<ts>.bak
+# and refuse to bind protected wardens (ssh, dbus, journald) without --force.
+# ============================================================================
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -f "$SCRIPT_DIR/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR/lib/verdict_log.sh"
+
+# ─── The Sigil ─────────────────────────────────────────────────────────────
+print_sigil() {
+    local blood="\033[31m" dim="\033[2m" reset="\033[0m"
+    [[ $JSON_OUT -eq 1 ]] && return 0
+    cat << 'SIGIL'
+                ▲
+               ▲ ▲
+              ▲   ▲
+             ▲ ▲ ▲ ▲
+            ▲       ▲
+           ▲ ▲     ▲ ▲
+          ▲   ▲   ▲   ▲
+         ▲ ▲   ▲ ▲   ▲ ▲
+        ▲   ▲   ▲   ▲   ▲
+       ▲ ▲   ▲   ▲   ▲   ▲ ▲
+      ▲   ▲ ▲ ▲   ▲   ▲ ▲   ▲
+     ▲ ▲   ▲   ▲ ▲ ▲   ▲   ▲ ▲
+    ▲   ▲ ▲ ▲ ▲   ▲   ▲ ▲   ▲   ▲
+            (circle)
+SIGIL
+    printf "             ${blood}DEMON CONTROL${reset}  ${dim}— systemd summoner & banisher${reset}\n\n"
+}
+
+show_help() {
+    print_sigil
+    cat << 'HELPEOF'
+DESCRIPTION
+  Every process on your system was conjured by something. This script lets
+  you see, audit, banish, bind, seal, and inspect them. Built for learning
+  systemd inside-out — not just running commands, but understanding the
+  sigils (unit files) that bind each daemon to the mortal realm.
+
+USAGE
+  ./demonz                              Summon + audit all daemons
+  ./demonz --recent 10                  Show 10 most recently conjured
+  ./demonz --json                       Machine-readable JSON
+  ./demonz --banish <name>              Banish a running daemon (with backup)
+  ./demonz --bind <name>                Bind autostart (disable, with backup)
+  ./demonz --summon <name>              Conjure at boot (enable, with backup)
+  ./demonz --seal <name>                Seal into /dev/null (mask)
+  ./demonz --unseal <name>              Break the seal (unmask)
+  ./demonz --show-sigil <name>          Print the daemon's sigil (unit file)
+  ./demonz --show-state <name>          Print daemon state details
+  ./demonz --force                      Override the Wardens (protected svcs)
+
+OPTIONS
+  --json                JSON output
+  --no-color            Disable ANSI colors
+  --banish NAME         systemctl stop + create backup of unit file
+  --bind NAME           systemctl disable + create backup of unit file
+  --summon NAME         systemctl enable + create backup of unit file
+  --seal NAME           systemctl mask (deep-bind, blocks symlinks)
+  --unseal NAME         systemctl unmask
+  --show-sigil NAME     Print the unit file contents to stdout
+  --show-state NAME     Print systemctl status output
+  --recent [N=20]       Show N most recently changed unit files
+  --force               Allow binding actions on Wardens (protected svcs)
+  --sigil-path NAME     Print the path(s) of a daemon's sigil (unit file)
+  -h, --help            Show this help
+
+THE WARDENS — PROTECTED SERVICES (require --force to bind)
+  sshd, ssh, networking, NetworkManager, systemd-resolved, systemd-networkd,
+  systemd-journald, dbus, getty, systemd, systemd-timesyncd
+  These are the demons you don't banish lightly. They hold the realm together.
+
+SIGIL HIERARCHY (lowest power → highest)
+  /usr/lib/systemd/system/      Vendor sigils (DO NOT EDIT — overwritten on update)
+  /etc/systemd/system/          Admin sigils (edit these — your authority)
+  /run/systemd/system/          Ephemeral sigils (transient, runtime-only)
+  ~/.config/systemd/user/       Mortal-level sigils (user services)
+
+INVESTIGATION COMMANDS
+  systemctl status <name>           Live state, last log lines, PID
+  systemctl cat <name>              Resolved sigil with all drop-ins merged
+  journalctl -u <name> -n 100       Last 100 log lines from this daemon
+  systemctl show <name>             All properties in KEY=value form
+  systemd-analyze blame             Boot-time cost per daemon
+  systemd-analyze critical-chain    Daemon dependency chain at boot
+
+BINDING RITUAL — BACKUP LOCATION
+  All mutations backup to /var/backups/demons-sh/<name>.<ts>.bak
+  Recover with: sudo cp /var/backups/demons-sh/<name>.<ts>.bak /etc/systemd/system/<name>
+
+HELPEOF
+    exit 0
+}
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+JSON_OUT=0
+NO_COLOR_FLAG=0
+ACTION=""
+ACTION_TARGET=""
+FORCE=0
+RECENT_N=20
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              show_help ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --stop|--banish)        i=$((i+1)); ACTION="stop";    ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --disable|--bind)       i=$((i+1)); ACTION="disable"; ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --enable|--summon)      i=$((i+1)); ACTION="enable";  ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --mask|--seal)          i=$((i+1)); ACTION="mask";    ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --unmask|--unseal)      i=$((i+1)); ACTION="unmask";  ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --show-unit|--show-sigil) i=$((i+1)); ACTION="show-unit";  ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --show-state)           i=$((i+1)); ACTION="show-state"; ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --unit-path|--sigil-path) i=$((i+1)); ACTION="unit-path";  ACTION_TARGET="${ARGS[$i]:-}" ;;
+        --recent)               i=$((i+1)); RECENT_N="${ARGS[$i]:-20}" ;;
+        --recent=*)             RECENT_N="${arg#*=}" ;;
+        --force)                FORCE=1 ;;
+        --ai)                   AI_VERDICT=1 ;;
+        --no-ai)                AI_VERDICT=0 ;;
+        *) echo "Unknown incantation: $arg (try --help)" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+# Source run comparison helper
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
+  source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# ─── Color setup ────────────────────────────────────────────────────────────
+if [[ -t 1 ]] && [[ $JSON_OUT -eq 0 ]] && [[ "${NO_COLOR:-0}" -eq 0 ]] && [[ $NO_COLOR_FLAG -eq 0 ]]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'; C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+    C_MAGENTA=""; C_CYAN=""
+fi
+
+# Initialize run comparison (skip for JSON mode)
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_init "demonz"
+fi
+
+# ─── Privileges ─────────────────────────────────────────────────────────────
+SUDO=""
+if [[ $EUID -eq 0 ]]; then SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO="sudo"
+fi
+
+# The Wardens — demons you don't banish lightly
+declare -a WARDENS=(
+    ssh sshd
+    networking NetworkManager systemd-networkd systemd-resolved
+    systemd-journald dbus
+    getty systemd systemd-timesyncd systemd-logind
+    polkit polkitd
+)
+
+is_warden() {
+    local name="$1"
+    if [[ $FORCE -eq 1 ]]; then return 1; fi
+    local p
+    for p in "${WARDENS[@]}"; do
+        [[ "$name" == "$p" ]] && return 0
+    done
+    return 1
+}
+
+# Backup a unit file before any binding
+backup_sigil() {
+    local name="$1"
+    local src
+    src=$(systemctl show -p FragmentPath "$name" 2>/dev/null | awk -F= '{print $2}')
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        echo "  ${C_DIM}No sigil to back up (transient daemon)${C_RESET}"
+        return 0
+    fi
+    local ts bakdir="/var/backups/demons-sh"
+    ts=$(date +%Y%m%d-%H%M%S)
+    $SUDO mkdir -p "$bakdir" 2>/dev/null || mkdir -p "$bakdir" 2>/dev/null || true
+    local bak="$bakdir/$(basename "$src").$ts.bak"
+    if $SUDO cp -a "$src" "$bak" 2>/dev/null || cp -a "$src" "$bak" 2>/dev/null; then
+        echo "  ${C_DIM}Sigil archived: $bak${C_RESET}"
+    fi
+}
+
+# ─── Sigil Print (banner) ──────────────────────────────────────────────────
+
+# In --json mode all human-readable audit text is discarded; only the final
+# JSON verdict line is printed to stdout. Set up the redirect BEFORE any
+# output is produced.
+JSON_CAPTURE=""
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_CAPTURE="$(mktemp)"
+    exec 3>&1
+    exec 1>"$JSON_CAPTURE"
+fi
+
+print_sigil
+
+# ─── Realm Snapshot (visual summary printed up-front) ─────────────────────
+# This block runs once we know the count of TOTAL/ENABLED/RUNNING/FAILED etc.
+# We compute these now (a quick stat) so the header can give an at-a-glance
+# picture of the realm's health before the deep sections.
+_REALM_TOTAL=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | wc -l)
+_REALM_RUNNING=$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | wc -l)
+_REALM_FAILED=$(systemctl list-units --type=service --state=failed --no-legend 2>/dev/null | wc -l)
+_REALM_ENABLED=$(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | wc -l)
+_REALM_MASKED=$(systemctl list-unit-files --type=service --state=masked --no-legend 2>/dev/null | wc -l)
+
+# Pick a health glyph based on failed count
+if   (( _REALM_FAILED == 0 )); then glyph="${C_GREEN}✦${C_RESET}"; realm="STABLE"
+elif (( _REALM_FAILED <= 2 )); then glyph="${C_YELLOW}✦${C_RESET}"; realm="UNSTABLE"
+else                                  glyph="${C_RED}✦${C_RESET}"; realm="CORRUPTED"
+fi
+
+printf "  ${C_DIM}╭─ ${C_BOLD}${C_MAGENTA}REALM SNAPSHOT${C_RESET} ${C_DIM}───────────────────────────────────────────────╮${C_RESET}\n"
+printf "  ${C_DIM}│${C_RESET}  Init: ${C_BOLD}${C_CYAN}systemd${C_RESET}    Host: ${C_BOLD}%-12s${C_RESET}  Health: ${glyph} ${C_BOLD}%-9s${C_RESET} ${C_DIM}│${C_RESET}\n" \
+    "$(hostname -s 2>/dev/null || echo "?")" "$realm"
+printf "  ${C_DIM}│${C_RESET}  ${C_DIM}Total sigils:${C_RESET} ${C_BOLD}%4d${C_RESET}  ${C_DIM}Manifest:${C_RESET} ${C_GREEN}%4d${C_RESET}  ${C_DIM}Conjured:${C_RESET} ${C_GREEN}%4d${C_RESET}  ${C_DIM}Sealed:${C_RESET} ${C_YELLOW}%4d${C_RESET}  ${C_DIM}Fallen:${C_RESET} ${C_RED}%4d${C_RESET} ${C_DIM}│${C_RESET}\n" \
+    "$_REALM_TOTAL" "$_REALM_RUNNING" "$_REALM_ENABLED" "$_REALM_MASKED" "$_REALM_FAILED"
+printf "  ${C_DIM}╰───────────────────────────────────────────────────────────────────────╯${C_RESET}\n\n"
+
+# ─── Init Detection ────────────────────────────────────────────────────────
+section "INIT SYSTEM — WHICH PIT ARE WE IN?"
+if pidof systemd >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    INIT_TYPE="systemd"
+    ok "Init: systemd (PID 1) — the great daemon itself"
+    PID1_CMD=$(cat /proc/1/comm 2>/dev/null || echo "systemd")
+    info "PID 1: $PID1_CMD"
+elif [[ -f /sbin/openrc ]] || pgrep -x openrc >/dev/null 2>&1; then
+    INIT_TYPE="openrc"
+    crit "Init: OpenRC — most rituals in this script require systemd"
+else
+    INIT_TYPE="unknown"
+    crit "Init: unknown — most operations require systemd"
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    crit "systemctl not found — cannot commune with daemons"
+    exit 1
+fi
+
+# ─── Run Action (early-exit modes) ─────────────────────────────────────────
+run_action() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        crit "Ritual $ACTION requires a daemon name"
+        exit 64
+    fi
+    section "RITUAL: $ACTION $name"
+
+    if is_warden "$name" && [[ "$ACTION" != "show-unit" && "$ACTION" != "show-state" && "$ACTION" != "unit-path" ]]; then
+        crit "'$name' is a WARDEN — binding it requires --force"
+        exit 2
+    fi
+
+    case "$ACTION" in
+        stop)
+            backup_sigil "$name"
+            $SUDO systemctl stop "$name" && ok "Banished: $name" || crit "Banishment failed: $name"
+            ;;
+        disable)
+            backup_sigil "$name"
+            $SUDO systemctl disable "$name" && ok "Bound: $name (no longer conjures at boot)" || crit "Binding failed: $name"
+            info "Daemon can still be summoned manually: sudo systemctl start $name"
+            info "To re-conjure at boot: $0 --summon $name"
+            ;;
+        enable)
+            backup_sigil "$name"
+            $SUDO systemctl enable "$name" && ok "Summoned: $name (will conjure at boot)" || crit "Summoning failed: $name"
+            ;;
+        mask)
+            backup_sigil "$name"
+            $SUDO systemctl mask "$name" && ok "Sealed: $name (symlinked to /dev/null — cannot be conjured)" || crit "Sealing failed: $name"
+            warn "To break the seal: $0 --unseal $name"
+            ;;
+        unmask)
+            $SUDO systemctl unmask "$name" && ok "Seal broken: $name" || crit "Unsealing failed: $name"
+            ;;
+        show-unit)
+            $SUDO systemctl cat "$name" 2>&1 | head -200
+            ;;
+        show-state)
+            $SUDO systemctl status "$name" --no-pager 2>&1 | head -50
+            ;;
+        unit-path)
+            local p
+            p=$($SUDO systemctl show -p FragmentPath "$name" 2>/dev/null | awk -F= '{print $2}')
+            [[ -n "$p" ]] && echo "$p" || echo "(no sigil path — transient daemon)"
+            ;;
+    esac
+    exit 0
+}
+
+if [[ -n "$ACTION" ]]; then
+    run_action "$ACTION_TARGET"
+fi
+
+# ─── Demon Census ──────────────────────────────────────────────────────────
+section "DEMON CENSUS"
+TOTAL=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | wc -l)
+ENABLED=$(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | wc -l)
+DISABLED=$(systemctl list-unit-files --type=service --state=disabled --no-legend 2>/dev/null | wc -l)
+STATIC=$(systemctl list-unit-files --type=service --state=static --no-legend 2>/dev/null | wc -l)
+MASKED=$(systemctl list-unit-files --type=service --state=masked --no-legend 2>/dev/null | wc -l)
+RUNNING=$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | wc -l)
+FAILED=$(systemctl list-units --type=service --state=failed --no-legend 2>/dev/null | wc -l)
+
+# Normalize to a 40-wide bar against TOTAL so the chart fills the column.
+bar_width=40
+draw_bar() {
+    local label="$1" value="$2" color="$3"
+    local bar=""
+    local n=0
+    if (( TOTAL > 0 )); then
+        n=$(( value * bar_width / TOTAL ))
+    fi
+    local i
+    for (( i=0; i<n; i++ )); do bar+="█"; done
+    for (( i=n; i<bar_width; i++ )); do bar+="░"; done
+    local pct=0
+    (( TOTAL > 0 )) && pct=$(( value * 100 / TOTAL ))
+    printf "  ${C_DIM}%-22s${C_RESET} ${color}%-40s${C_RESET} ${C_BOLD}%4d${C_RESET} ${C_DIM}(%2d%%)${C_RESET}\n" \
+        "$label" "$bar" "$value" "$pct"
+}
+draw_bar "Conjured (autostart)" "$ENABLED"    "$C_GREEN"
+draw_bar "Manifest (running)"   "$RUNNING"    "$C_GREEN"
+draw_bar "Dormant (no autostart)" "$DISABLED" "$C_DIM"
+draw_bar "Vendor (untouched)"   "$STATIC"     "$C_DIM"
+draw_bar "Sealed (masked)"      "$MASKED"     "$C_YELLOW"
+draw_bar "Fallen (failed)"      "$FAILED"     "$C_RED"
+printf "  ${C_DIM}%-22s${C_RESET} %-40s ${C_BOLD}%4d${C_RESET} ${C_DIM}(100%%)${C_RESET}\n" "TOTAL SIGILS" "$(printf '█%.0s' $(seq 1 $bar_width))" "$TOTAL"
+
+# Compact text fallback for log scrapers
+info "Total=$TOTAL  Conjured=$ENABLED  Manifest=$RUNNING  Dormant=$DISABLED  Vendor=$STATIC  Sealed=$MASKED  Fallen=$FAILED"
+
+# ─── Fallen Daemons ───────────────────────────────────────────────────────
+section "FALLEN DAEMONS — DEMONS THAT FAILED TO CONJURE"
+if (( FAILED == 0 )); then
+    ok "No fallen daemons — the realm is stable"
+else
+    crit "$FAILED daemon(s) failed at the threshold"
+    warn "Investigate each: sudo systemctl status <name> && sudo journalctl -u <name> -n 50"
+    warn "Reset fallen state: sudo systemctl reset-failed"
+    info "The fallen:"
+    systemctl list-units --type=service --state=failed --no-pager 2>/dev/null \
+        | sed 's/^/      /' | head -40
+fi
+
+# ─── Conjured but Not Manifest ────────────────────────────────────────────
+section "CONJURED BUT NOT MANIFEST (autostart problem)"
+ENABLED_NOT_RUNNING=0
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name=$(awk '{print $1}' <<< "$line")
+    state=$(awk '{print $2,$3}' <<< "$line")
+    if [[ "$state" != *"running"* ]]; then
+        ENABLED_NOT_RUNNING=$((ENABLED_NOT_RUNNING + 1))
+        warn "$name — bound to autostart but not manifested"
+        info "  Sigil: $(systemctl show -p FragmentPath "$name" 2>/dev/null | awk -F= '{print $2}')"
+    fi
+done < <(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | head -50)
+
+if (( ENABLED_NOT_RUNNING == 0 )); then
+    ok "Every conjured daemon is manifesting"
+else
+    crit "$ENABLED_NOT_RUNNING conjured daemon(s) are dormant — will retry at next conjuring (boot)"
+    info "Common causes: failed dependency, missing binary, broken sigil"
+    info "Test sigil syntax: sudo systemd-analyze verify <unit>"
+fi
+
+# ─── Manifest Daemons (with metrics) ──────────────────────────────────────
+section "MANIFEST DAEMONS — ALIVE IN THE MORTAL REALM"
+
+# Collect running daemons with PID + RSS for the heatmap.
+# systemd list-units may not include a PID column on every distro, so we
+# ask systemctl show for MainPID directly — much more reliable.
+declare -a MANIFEST=()
+declare -a MANIFEST_RSS=()
+declare -a MANIFEST_PID=()
+max_rss=0
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name=$(awk '{print $1}' <<< "$line")
+    pid=$(systemctl show -p MainPID --value "$name" 2>/dev/null)
+    [[ "$pid" == "0" ]] && pid=""
+    rss=0
+    if [[ -n "$pid" ]] && [[ -r "/proc/$pid/status" ]]; then
+        rss=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+        rss=${rss:-0}
+    fi
+    MANIFEST+=("$name")
+    MANIFEST_RSS+=("$rss")
+    MANIFEST_PID+=("$pid")
+    (( rss > max_rss )) && max_rss=$rss
+done < <(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | head -50)
+
+# Bar scale: 0..max_rss mapped to 20 chars
+bar_w=20
+printf "${C_DIM}  %-32s %-6s %-21s %8s %-7s${C_RESET}\n" "DAEMON" "STATE" "MEMORY" "RSS_MB" "PID"
+printf "  %s\n" "─────────────────────────────────────────────────────────────────────────────────"
+running_idx=0
+for name in "${MANIFEST[@]}"; do
+    [[ -z "$name" ]] && continue
+    rss=${MANIFEST_RSS[$running_idx]}
+    pid=${MANIFEST_PID[$running_idx]}
+    rss_mb=$((rss / 1024))
+    bar=""
+    if (( max_rss > 0 )) && (( rss > 0 )); then
+        n=$(( rss * bar_w / max_rss ))
+        if (( n == 0 )); then n=1; fi
+        for (( i=0; i<n; i++ )); do bar+="▌"; done
+    fi
+    # Color the bar by RSS tier
+    bar_color=$C_GREEN
+    if   (( rss_mb >= 500 )); then bar_color=$C_RED
+    elif (( rss_mb >= 100 )); then bar_color=$C_YELLOW
+    fi
+    printf "  ${C_GREEN}%-32s${C_RESET} ${C_DIM}%-6s${C_RESET} ${bar_color}%-21s${C_RESET} ${C_BOLD}%8d${C_RESET} %s\n" \
+        "$name" "active" "$bar" "$rss_mb" "${pid:-—}"
+    running_idx=$((running_idx + 1))
+done
+info "Memory bar scaled to largest RSS in this list (${C_BOLD}$((max_rss/1024)) MB${C_DIM}).  ${C_GREEN}▌${C_DIM} <100MB   ${C_YELLOW}▌${C_DIM} 100-500MB   ${C_RED}▌${C_DIM} >500MB"
+
+# ─── Recently Conjured ─────────────────────────────────────────────────────
+section "RECENTLY CONJURED (last $RECENT_N)"
+info "Sorted by sigil modification time — newer first"
+info "Use this to spot fresh conjurings — possibly by an intruder"
+printf "${C_DIM}  %-19s %-32s %s${C_RESET}\n" "MODIFIED" "DAEMON" "SIGIL"
+printf "  %s\n" "─────────────────────────────────────────────────────────────────────────────"
+# find -printf '%T@' emits fractional seconds (e.g. 1789082035.1941983400).
+# Strip the fractional part so arithmetic in bash doesn't choke.
+while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    mtime=$(awk '{print $1}' <<< "$entry" | cut -d. -f1)
+    name=$(awk '{print $2}' <<< "$entry")
+    path=$(awk '{print $3}' <<< "$entry")
+    [[ ! "$mtime" =~ ^[0-9]+$ ]] && mtime=""
+    age_color=$C_DIM
+    age_label=""
+    if [[ -n "$mtime" ]]; then
+        now=$(date +%s)
+        age_days=$(( (now - mtime) / 86400 ))
+        if (( age_days < 1 )); then
+            age_color=$C_RED; age_label=" (TODAY — fresh from the pit)"
+        elif (( age_days < 7 )); then
+            age_color=$C_YELLOW; age_label=" (${age_days}d ago)"
+        fi
+    fi
+    printf "  ${age_color}%-19s${C_RESET} %-32s ${C_DIM}%s${C_RESET}${age_color}%s${C_RESET}\n" \
+        "$(date -d @"$mtime" '+%Y-%m-%d %H:%M' 2>/dev/null)" "$name" "$path" "$age_label"
+done < <(find /etc/systemd/system /usr/lib/systemd/system -name '*.service' -printf '%T@ %p %p\n' 2>/dev/null \
+    | sort -rn | head -"$RECENT_N" | awk '{
+        ts=$1; $1=""; path=$2;
+        sub(/^ /,""); print ts, path
+    }')
+
+# ─── Possession Patterns ──────────────────────────────────────────────────
+section "POSSESSION PATTERNS — POSSESSED DAEMONS"
+SUSPECT_FOUND=0
+
+# Daemons conjured from unusual sigils
+while IFS= read -r line; do
+    name=$(awk '{print $1}' <<< "$line")
+    state=$(awk '{print $2}' <<< "$line")
+    if [[ "$state" == "enabled" || "$state" == "static" ]]; then
+        path=$(systemctl show -p FragmentPath "$name" 2>/dev/null | awk -F= '{print $2}')
+        case "$path" in
+            /usr/lib/systemd/system/*|/lib/systemd/system/*)
+                :  # vendor sigil — normal
+                ;;
+            /etc/systemd/system/*)
+                :  # admin override — normal
+                ;;
+            *)
+                if [[ -n "$path" ]]; then
+                    crit "Possession: '$name' conjured from unholy sigil: $path"
+                    SUSPECT_FOUND=$((SUSPECT_FOUND + 1))
+                fi
+                ;;
+        esac
+    fi
+done < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null | head -200)
+
+# Daemons manifesting from /tmp, /dev/shm, /home, /var/tmp
+while IFS= read -r line; do
+    name=$(awk '{print $1}' <<< "$line")
+    pid=$(grep -oE 'pid=[0-9]+' <<< "$line" | head -1 | cut -d= -f2)
+    [[ -z "$pid" ]] && continue
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    case "$exe" in
+        /tmp/*|/dev/shm/*|/home/*|/var/tmp/*)
+            crit "Possession: '$name' (PID $pid) manifests from $exe"
+            warn "This is a classic demon — exorcize immediately"
+            SUSPECT_FOUND=$((SUSPECT_FOUND + 1))
+            ;;
+    esac
+done < <(systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null)
+
+if (( SUSPECT_FOUND == 0 )); then
+    ok "No possession patterns detected — the realm is uncorrupted"
+else
+    crit "$SUSPECT_FOUND possession(s) detected — perform an exorcism before further action"
+    info "Exorcism: kill the PID, audit ps -fp <pid>, find the conjurer (file owner, crontab, timers)"
+fi
+
+# ─── Sigil Locations ──────────────────────────────────────────────────────
+section "SIGIL LOCATIONS — WHERE TO EDIT EACH DAEMON"
+info "Edit ${C_BOLD}/etc/systemd/system/${C_RESET} sigils for admin authority"
+info "Vendor sigils in ${C_DIM}/usr/lib/systemd/system/${C_RESET} are overwritten by package updates"
+info "Safe edit: ${C_CYAN}sudo systemctl edit <name>${C_RESET} → creates /etc/systemd/system/<name>.d/override.conf"
+
+printf "${C_DIM}  %-32s %s${C_RESET}\n" "DAEMON" "SIGIL"
+printf "  %s\n" "─────────────────────────────────────────────────────────────────────────────"
+while IFS= read -r line; do
+    name=$(awk '{print $1}' <<< "$line")
+    path=$(systemctl show -p FragmentPath "$name" 2>/dev/null | awk -F= '{print $2}')
+    if [[ -n "$path" ]]; then
+        if [[ "$path" == /etc/systemd/system/* ]]; then
+            color=$C_YELLOW
+        else
+            color=$C_DIM
+        fi
+        printf "  %-32s ${color}%s${C_RESET}\n" "$name" "$path"
+    fi
+done < <(systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | head -30)
+info "(Showing first 30 conjured daemons. Re-run with --show-sigil <name> for full content)"
+
+# ─── Sealed Daemons ────────────────────────────────────────────────────────
+section "SEALED DAEMONS (masked — locked in /dev/null)"
+if (( MASKED == 0 )); then
+    info "No sealed daemons — nothing is locked away"
+else
+    info "$MASKED daemon(s) sealed (symlinked to /dev/null, cannot be conjured)"
+    info "Usually intentionally sealed — leave alone unless you know why"
+    systemctl list-unit-files --type=service --state=masked --no-legend 2>/dev/null \
+        | awk '{print "      " $1}' | head -20
+fi
+
+# ─── Verdicts & Logging ────────────────────────────────────────────────────
+
+# In JSON mode, restore stdout and emit a single verdict line — discard
+# the captured audit text.
+if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+    [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
+    if (( FAILED > 0 )) || (( SUSPECT_FOUND > 0 )); then
+        status="critical"; exit_code=2
+    elif (( ENABLED_NOT_RUNNING > 0 )); then
+        status="warning"; exit_code=1
+    else
+        status="healthy"; exit_code=0
+    fi
+    printf '{"fallen":%d,"possessed":%d,"dormant":%d,"status":"%s","exit_code":%d}\n' \
+        "$FAILED" "$SUSPECT_FOUND" "$ENABLED_NOT_RUNNING" "$status" "$exit_code"
+    exit "$exit_code"
+fi
+
+section "VERDICT"
+if (( FAILED > 0 )); then
+    crit "Found $FAILED fallen daemon(s) — investigate now"
+elif (( SUSPECT_FOUND > 0 )); then
+    crit "Found $SUSPECT_FOUND possession(s) — likely compromise"
+elif (( ENABLED_NOT_RUNNING > 0 )); then
+    warn "$ENABLED_NOT_RUNNING conjured daemon(s) are dormant"
+else
+    ok "All daemons appear stable — the realm holds"
+fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    _DMZ_SUMMARY="failed=$FAILED suspect=$SUSPECT_FOUND dormant=$ENABLED_NOT_RUNNING total_units=${TOTAL_UNITS:-?}"
+    ai_emit_verdict "top_issue" "$_DMZ_SUMMARY" 2>/dev/null || true
+fi
+
+# Log to errors.txt / warnings.txt
+if (( FAILED > 0 )); then
+    log_verdict_crit "failed_service" "$FAILED systemd service(s) failed at startup" \
+        "Investigate each: 'sudo systemctl status <name> && journalctl -u <name> -n 50'. Reset with 'sudo systemctl reset-failed'"
+fi
+if (( SUSPECT_FOUND > 0 )); then
+    log_verdict_crit "suspicious_service" "$SUSPECT_FOUND service(s) match suspicious patterns" \
+        "Kill the PID, audit the binary origin: 'ls -la <path> && sha256sum <path>'. Check persistence: cron and systemd timers"
+fi
+if (( ENABLED_NOT_RUNNING > 0 )); then
+    log_verdict_warn "enabled_not_running" "$ENABLED_NOT_RUNNING enabled service(s) are not running" \
+        "Verify dependencies with 'systemctl list-dependencies <name>' and check 'sudo journalctl -u <name>'"
+fi
+
+# Always show verdict one-liners if anything was logged
+show_verdict_one_liners
+
+# Finalize and generate comparison report
+if [[ "$JSON_OUT" != "1" ]]; then
+    run_comparison_finalize
+fi
+
+# Exit code
+if (( FAILED > 0 )) || (( SUSPECT_FOUND > 0 )); then exit 2
+elif (( ENABLED_NOT_RUNNING > 0 )); then exit 1
+else exit 0; fi

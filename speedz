@@ -1,0 +1,661 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# speedz — System Speed Consultant
+# ----------------------------------------------------------------------------
+# Profiles your machine and tells you EXACTLY what to do to make it faster.
+# This is opinionated, prioritized advice — not just data.
+#
+# Categories profiled:
+#   - Boot time (which daemons slow startup)
+#   - Background daemons (running services you probably don't need)
+#   - CPU governor & frequency (is your CPU running at full speed?)
+#   - Memory pressure & swap (running out of RAM = thrashing = slow)
+#   - Disk IO & scheduler (rotational disk with deadline scheduler?)
+#   - Filesystem mount options (noatime, etc.)
+#   - Systemd journal / logs eating disk
+#   - Package manager cruft (apt autoremove candidates)
+#   - Kernel tuning (vm.swappiness, dirty ratios)
+#
+# Modes:
+#   ./speedz              Full profile + prioritized advice
+#   ./speedz --top N      Show only top N recommendations
+#   ./speedz --quiet      Profile + summary, no advice details
+#   ./speedz --json       Machine-readable profile
+#   ./speedz --no-color   Plain output
+# ============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+JSON_OUT=0
+NO_COLOR_FLAG=0
+TOP_N=0
+QUIET=0
+
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        -h|--help)              SHOW_HELP=1 ;;
+        --json)                 JSON_OUT=1 ;;
+        --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
+        --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-5}" ;;
+        --quiet)                QUIET=1 ;;
+        --ai)                   AI_VERDICT=1 ;;
+        --no-ai)                AI_VERDICT=0 ;;
+        *) echo "Unknown flag: $arg" >&2; exit 64 ;;
+    esac
+    i=$((i+1))
+done
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "speedz" "JSON_OUT=$JSON_OUT QUIET=$QUIET" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+
+if [[ "${SHOW_HELP:-0}" -eq 1 ]]; then
+    cat << 'EOF'
+speedz — System Speed Consultant
+
+USAGE
+  ./speedz              Profile + ranked advice
+  ./speedz --top 5      Only show top 5 recommendations
+  ./speedz --quiet      Profile summary, no advice details
+  ./speedz --json       Machine-readable profile
+
+ADVICE WEIGHTING
+  Each recommendation gets a "speed-score" (1-10) based on expected
+  improvement. Sorted descending so the biggest wins come first.
+EOF
+    exit 0
+fi
+
+# Helpers
+truncate() {
+    local s="$1" max="$2"
+    if (( ${#s} > max )); then
+        printf "%s…" "${s:0:$max-1}"
+    else
+        printf "%s" "$s"
+    fi
+}
+
+SUDO=""
+if [[ $EUID -eq 0 ]]; then SUDO=""
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO="sudo"
+fi
+
+# ─── Banner ────────────────────────────────────────────────────────────────
+JSON_CAPTURE=""
+if [[ $JSON_OUT -eq 1 ]]; then
+    JSON_CAPTURE="$(mktemp)"
+    exec 3>&1
+    exec 1>"$JSON_CAPTURE"
+fi
+
+if [[ $JSON_OUT -eq 0 ]]; then
+    printf "${C_BOLD}${C_GREEN}"
+    cat << 'BANNER'
+   ╔═══════════════════════════════════════════════════════════════╗
+   ║  SPEED.SH  — System Speed Consultant                          ║
+   ║  Profile · Diagnose · Tell you exactly what to fix            ║
+   ╚═══════════════════════════════════════════════════════════════╝
+BANNER
+    printf "${C_RESET}\n"
+fi
+
+# ─── Stash for advice entries ──────────────────────────────────────────────
+declare -a ADVICE=()      # entries: "score|title|why|fix"
+
+add_advice() {
+    local score="$1" title="$2" why="$3" fix="$4"
+    ADVICE+=("$score|$title|$why|$fix")
+}
+
+# ─── SECTION 1: Boot time ──────────────────────────────────────────────────
+section "BOOT TIME — HOW LONG DOES STARTUP TAKE?"
+boot_total_ms=0
+if has_cmd systemd-analyze; then
+    boot_total=$(systemd-analyze 2>/dev/null | head -1 | awk '{print $NF}')
+    boot_total_ms=$(awk '{print int($1)}' <<< "${boot_total:-0s}" | head -1)
+    boot_total_ms=${boot_total_ms:-0}
+    boot_s=$(( boot_total_ms / 1000 ))
+    boot_ms=$(( boot_total_ms % 1000 ))
+    color=$C_GREEN
+    (( boot_s > 10 )) && color=$C_YELLOW
+    (( boot_s > 30 )) && color=$C_RED
+    info "Total boot: ${color}${boot_s}.${boot_ms}s${C_RESET}"
+
+    if [[ $QUIET -eq 0 ]]; then
+        subsec "Top 10 boot-time hogs (systemd-analyze blame)"
+        systemd-analyze blame 2>/dev/null | head -10 \
+            | awk '{printf "  %s %s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10}' \
+            | sed 's/^/  /'
+
+        # Enrich top offenders with their unit file path, ExecStart, and path of the binary
+        subsec "Per-service enrichment (top 5)"
+        printf "  ${C_DIM}%-22s %-40s %s${C_RESET}\n" "SERVICE" "EXECSTART" "UNIT FILE"
+        printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────────────"
+        set +e +o pipefail
+        systemd-analyze blame 2>/dev/null | head -5 | awk '{print $NF}' \
+        | while IFS= read -r unit; do
+            [[ -z "$unit" ]] && continue
+            # Strip trailing dot for ".service" etc.
+            uname_eff="${unit%.}"
+            # Show full UNIT FILE path
+            unit_path=$(systemctl cat "$uname_eff" 2>/dev/null | head -3 | grep -E "^\/.*run" | head -1 | awk '{print $NF}')
+            [[ -z "$unit_path" ]] && unit_path=$(systemctl show "$uname_eff" -p FragmentPath --value 2>/dev/null)
+            [[ -z "$unit_path" ]] && unit_path="(transient / runtime)"
+            # Show ExecStart (the actual command)
+            exec_start=$(systemctl cat "$uname_eff" 2>/dev/null | grep -E "^ExecStart=" | head -1 | sed 's/^ExecStart=//')
+            [[ -z "$exec_start" ]] && exec_start=$(systemctl show "$uname_eff" -p ExecStart --value 2>/dev/null)
+            # Resolve the binary's actual on-disk path (e.g., python3 → /usr/bin/python3)
+            first_word=$(awk '{print $1}' <<< "$exec_start")
+            resolved=""
+            if [[ -n "$first_word" && "$first_word" != */* ]]; then
+                resolved=" (→$(command -v "$first_word" 2>/dev/null || echo "$first_word"))"
+            fi
+            printf "  ${C_BOLD}%-22s${C_RESET} ${C_CYAN}%-40s${C_RESET} ${C_DIM}%s%s${C_RESET}\n" \
+                "$uname_eff" "$(truncate "$exec_start" 38)" "$(truncate "$unit_path" 30)" "$resolved"
+        done
+        set -e -o pipefail
+    fi
+
+    if (( boot_s > 30 )); then
+        add_advice 9 "Boot takes ${boot_s}s — investigate the top blame entries" \
+            "Long boots delay every reboot (and updates). Each top entry has a known fix." \
+            "Run 'systemd-analyze blame' to find the slowest. Common fixes: mask unused (sudo systemctl mask $0), reduce TimeoutStartSec in the unit, enable 'NetworkManager-wait-online.service' only if you actually need it, or preload with 'systemd-analyze verify' to catch dep cycles."
+    elif (( boot_s > 10 )); then
+        add_advice 6 "Boot is borderline slow (${boot_s}s)" \
+            "Anything over 10s suggests a stuck service or slow filesystem check." \
+            "Run 'systemd-analyze critical-chain' to find the bottleneck. Common: 'plymouth-quit.service' can stall on NVIDIA, NetworkManager-wait-online waits 60s for connectivity."
+    fi
+fi
+
+# ─── SECTION 2: Background daemons ─────────────────────────────────────────
+section "BACKGROUND DAEMONS — WHAT'S RUNNING WHEN YOU DON'T NEED IT"
+total_running=0
+if has_cmd systemctl; then
+    total_running=$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | wc -l | tr -d '[:space:]')
+    total_running=${total_running:-0}
+    [[ "$total_running" =~ ^[0-9]+$ ]] || total_running=0
+    info "${C_BOLD}${total_running}${C_RESET} services currently running"
+fi
+
+# Heuristically bloated services (common offenders)
+declare -a BLOAT_CANDIDATES=(
+    "snapd.service:snapd:Snap is heavy; disable if not using snap packages"
+    "ModemManager.service:ModemManager:Modem manager — disable on desktops"
+    "cups.service:CUPS:CUPS print server — disable if you don't print"
+    "cups-browsed.service:CUPS browsing:Discovers printers — usually unneeded"
+    "avahi-daemon.service:Avahi:Bonjour/mDNS — only needed for local sharing"
+    "bluetooth.service:Bluetooth:BT daemon — disable if no BT devices"
+    "fwupd.service:fwupd:Firmware updater daemon — heavy"
+    "packagekitd.service:PackageKit:PackageKit triggers slow UI updates"
+    "rtkit-daemon.service:rtkit:Realtime scheduling helper — usually unused"
+)
+
+if [[ $QUIET -eq 0 ]]; then
+    subsec "Likely-bloat services running on this host"
+    bloat_running=0
+    for entry in "${BLOAT_CANDIDATES[@]}"; do
+        unit=$(awk -F: '{print $1}' <<< "$entry")
+        nice=$(awk -F: '{print $2}' <<< "$entry")
+        why=$(awk -F: '{print $3}' <<< "$entry")
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            printf "  ${C_YELLOW}●${C_RESET} ${C_BOLD}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$unit" "$why"
+            bloat_running=$((bloat_running + 1))
+        fi
+    done
+    if (( bloat_running == 0 )); then
+        ok "No common bloat services detected running"
+    elif (( bloat_running > 3 )); then
+        add_advice 7 "$bloat_running likely-unneeded services are running" \
+            "Each unused daemon consumes memory and CPU context switches. Together they can waste 200-500MB of RAM." \
+            "Disable them (in order of typical impact): $SUDO systemctl disable --now snapd ModemManager cups cups-browsed avahi-daemon bluetooth fwupd. Use 'systemctl mask' for things you'll never use (snapd,ModemManager,fwupd are common masks)."
+    elif (( bloat_running > 0 )); then
+        add_advice 5 "$bloat_running likely-unneeded services running" \
+            "Trim them to recover memory and reduce startup." \
+            "Disable with: $SUDO systemctl disable --now <name>. Start with the heaviest (snapd, fwupd, ModemManager)."
+    fi
+fi
+
+# ─── SECTION 3: CPU governor & frequency ───────────────────────────────────
+section "CPU GOVERNOR & FREQUENCY — IS YOUR CPU RUNNING AT FULL SPEED?"
+cpu_count=$(nproc 2>/dev/null | head -1)
+cpu_count=${cpu_count:-1}
+cur_freq=$(awk -F'[ .]' '/^cpu MHz/ {sum+=$4; n++} END {if(n>0) printf "%d", sum/n; else print 0}' /proc/cpuinfo 2>/dev/null | head -1)
+cur_freq=${cur_freq:-0}
+[[ "$cur_freq" =~ ^[0-9]+$ ]] || cur_freq=0
+max_freq=$(awk '/^cpu MHz/ {print int($4)}' /proc/cpuinfo 2>/dev/null | head -1)
+[[ -z "$max_freq" ]] && max_freq=0
+[[ "$max_freq" =~ ^[0-9]+$ ]] || max_freq=0
+[[ -z "$max_freq" || "$max_freq" == "0" ]] && max_freq="$cur_freq"
+if (( max_freq > 0 )); then
+    pct=$(( cur_freq * 100 / max_freq ))
+    color=$C_GREEN
+    (( pct < 90 )) && color=$C_YELLOW
+    (( pct < 60 )) && color=$C_RED
+    info "Current avg: ${color}${cur_freq} MHz${C_RESET} / max ${max_freq} MHz (${pct}%)"
+fi
+governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+info "Governor: ${C_BOLD}${governor}${C_RESET}"
+case "$governor" in
+    performance) info "${C_GREEN}✓${C_RESET} Performance governor — full speed" ;;
+    ondemand)    info "${C_GREEN}✓${C_RESET} On-demand governor — scales well" ;;
+    schedutil)   info "${C_GREEN}✓${C_RESET} Schedutil governor — modern default" ;;
+    powersave|conservative)
+        # If we're on intel_pstate, governor name doesn't actually limit us
+        if [[ -r /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+            info "${C_DIM}Note: '${governor}' governor + Intel pstate — turbo boost is the real lever, not governor name${C_RESET}"
+        else
+            add_advice 7 "CPU governor is '$governor' — kernel is throttling CPU" \
+                "Power-saving mode. Great for battery, terrible for speed." \
+                "Switch to performance (or ondemand): 'echo performance | $SUDO tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'. To persist: install 'cpufrequtils' or use TLP without powersave mode."
+        fi
+        ;;
+    *) warn "Unknown governor: $governor" ;;
+esac
+
+# Intel P-state turbo state (real-world impact on Intel CPUs)
+turbo_file="/sys/devices/system/cpu/intel_pstate/no_turbo"
+if [[ -r "$turbo_file" ]]; then
+    no_turbo=$(cat "$turbo_file" 2>/dev/null)
+    if [[ "$no_turbo" == "0" ]]; then
+        info "${C_GREEN}✓${C_RESET} Intel pstate: turbo boost ENABLED (cores can exceed base freq)"
+    else
+        info "${C_YELLOW}!${C_RESET} Intel pstate: turbo boost DISABLED (cores capped at base freq)"
+        add_advice 4 "Intel turbo boost is disabled — cores capped at base frequency" \
+            "Some BIOSes or TLP profiles disable turbo to save power. On a desktop/server this is usually a mistake." \
+            "Re-enable with: $SUDO sh -c 'echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo'. Verify: 'cat /sys/devices/system/cpu/intel_pstate/no_turbo' (should be 0)."
+    fi
+    epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
+    [[ -n "$epp" ]] && info "Energy/Perf preference: ${C_BOLD}$epp${C_RESET} (balance_performance is the sane default)"
+fi
+
+# Thermal throttling — the REAL smoking gun when CPU feels slow
+PKG_THROTTLE=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null | head -1)
+CORE_THROTTLE=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count 2>/dev/null | head -1)
+if [[ -n "$PKG_THROTTLE" && "$PKG_THROTTLE" =~ ^[0-9]+$ ]]; then
+    if (( PKG_THROTTLE > 1000 )); then
+        info "${C_RED}🔥 Package throttle count: ${PKG_THROTTLE}${C_RESET} — CPU has been actively clocking down to cool"
+        add_advice 9 "Thermal throttling is firing — the real reason for slowness" \
+            "Your CPU has been throttled $PKG_THROTTLE times to stay below thermal limits. Switching governors won't help — heat is the problem." \
+            "Quick checks: (1) Clean dust from vents with compressed air. (2) Verify all fans spin: 'sensors | grep RPM'. (3) Cap turbo: $SUDO sh -c 'echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo' to stop the cycle. Long-term: repaste CPU or improve case airflow."
+    elif (( PKG_THROTTLE > 0 )); then
+        info "${C_YELLOW}⚠${C_RESET}  Package throttle count: $PKG_THROTTLE (some throttling)"
+    else
+        info "${C_GREEN}✓${C_RESET} No thermal throttling events recorded"
+    fi
+fi
+if [[ -n "$CORE_THROTTLE" && "$CORE_THROTTLE" =~ ^[0-9]+$ && "$CORE_THROTTLE" -gt 0 ]]; then
+    info "${C_DIM}Core-level throttle count: $CORE_THROTTLE${C_RESET}"
+fi
+
+# ─── SECTION 4: Memory & swap ──────────────────────────────────────────────
+section "MEMORY & SWAP — ARE YOU THRASHING?"
+mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null | head -1)
+mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null | head -1)
+mem_total=${mem_total:-0}; mem_avail=${mem_avail:-0}
+if (( mem_total > 0 )); then
+    mem_used_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+    color=$C_GREEN
+    (( mem_used_pct > 70 )) && color=$C_YELLOW
+    (( mem_used_pct > 90 )) && color=$C_RED
+    info "Memory used: ${color}${mem_used_pct}%${C_RESET} ($((mem_total/1024)) MB total, $((mem_avail/1024)) MB available)"
+fi
+swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null | head -1)
+swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null | head -1)
+swap_total=${swap_total:-0}; swap_free=${swap_free:-0}
+if (( swap_total > 0 )); then
+    swap_used=$((swap_total - swap_free))
+    swap_pct=$(( swap_used * 100 / swap_total ))
+    color=$C_GREEN
+    (( swap_pct > 25 )) && color=$C_YELLOW
+    (( swap_pct > 75 )) && color=$C_RED
+    info "Swap used:   ${color}${swap_pct}%${C_RESET} ($((swap_used/1024)) MB / $((swap_total/1024)) MB)"
+    if (( swap_pct > 25 )); then
+        add_advice 8 "Swap is ${swap_pct}% used — system is RAM-starved and thrashing" \
+            "Every swap read/write is ~1000x slower than RAM. The system is spending more time shuffling pages than running your apps." \
+            "Free RAM: stop a heavy service ('ps aux --sort=-%mem | head'), kill the swap with 'sudo swapoff -a; sudo swapon -a', then either add more RAM or shrink workload. Long-term: lower vm.swappiness to 10 with 'echo vm.swappiness=10 | sudo tee /etc/sysctl.d/99-swappiness.conf && sudo sysctl -p'."
+    fi
+fi
+# vm.swappiness check
+swappiness=$(sysctl -n vm.swappiness 2>/dev/null | head -1 || echo 60)
+swappiness=${swappiness:-60}
+info "vm.swappiness: ${C_BOLD}${swappiness}${C_RESET} (default 60; lower=prefer RAM)"
+if (( swappiness > 30 )) && (( mem_total < 8000000 )); then
+    add_advice 5 "vm.swappiness is high (${swappiness}) on a low-RAM system" \
+        "Linux defaults to swapping too aggressively. For desktops you almost always want 10." \
+        "Lower it: 'echo vm.swappiness=10 | $SUDO tee /etc/sysctl.d/99-swappiness.conf && $SUDO sysctl -p'. Reboot or run 'sudo sysctl -w vm.swappiness=10' for immediate effect."
+fi
+
+# ─── SECTION 5: PSI BOTTLENECK RANKING — WHAT'S ACTUALLY SLOWING YOU DOWN ─
+section "PSI BOTTLENECK RANKING — WHAT'S ACTUALLY SLOWING YOU DOWN?"
+info "${C_DIM}Pressure Stall Information (PSI) tells you exactly how much wall-clock time${C_RESET}"
+info "${C_DIM}at least one task was waiting on each subsystem. Higher % = bigger bottleneck.${C_RESET}"
+echo ""
+
+# Parse PSI files (format: some avg10=X.XX avg60=X.XX avg300=X.XX total=NNN)
+psi_field() {
+    local file="$1" kind="$2"
+    [[ -r "$file" ]] || { echo ""; return; }
+    awk -v k="$kind" '$1==k { for (i=2; i<=NF; i++) if ($i ~ /^avg10=/) { split($i,a,"="); print a[2]; exit } }' "$file"
+}
+psi_pct_color() {
+    local v=$1
+    [[ -z "$v" ]] && { echo "$C_DIM"; return; }
+    local pct=${v%.*}
+    [[ $pct -ge 25 ]] && echo "$C_RED" && return
+    [[ $pct -ge 10 ]] && echo "$C_YELLOW" && return
+    echo "$C_GREEN"
+}
+
+CPU_AVG10=$(psi_field /proc/pressure/cpu  some)
+IO_AVG10=$(psi_field  /proc/pressure/io   some)
+MEM_AVG10=$(psi_field /proc/pressure/memory some)
+CPU_AVG60=$(psi_field /proc/pressure/cpu  avg60)
+IO_AVG60=$(psi_field  /proc/pressure/io   avg60)
+MEM_AVG60=$(psi_field /proc/pressure/memory avg60)
+[[ -z "$CPU_AVG60" ]] && CPU_AVG60="$CPU_AVG10"
+[[ -z "$IO_AVG60"  ]] && IO_AVG60="$IO_AVG10"
+[[ -z "$MEM_AVG60" ]] && MEM_AVG60="$MEM_AVG10"
+
+printf "  ${C_DIM}%-22s  %7s  %7s  %7s${C_RESET}\n" "SUBSYSTEM" "10s" "60s" "300s"
+printf "  ${C_DIM}──────────────────────────────────────────────────${C_RESET}\n"
+printf "  ${C_DIM}%-22s${C_RESET}  " "CPU pressure"
+c=$(psi_pct_color "$CPU_AVG10"); printf "${c}%7s${C_RESET}  " "${CPU_AVG10:-—}%"
+c=$(psi_pct_color "$CPU_AVG60"); printf "${c}%7s${C_RESET}  " "${CPU_AVG60:-—}%"
+c=$(psi_pct_color "$CPU_AVG60"); printf "${c}%7s${C_RESET}\n" "${CPU_AVG60:-—}%"
+printf "  ${C_DIM}%-22s${C_RESET}  " "I/O pressure"
+c=$(psi_pct_color "$IO_AVG10"); printf "${c}%7s${C_RESET}  " "${IO_AVG10:-—}%"
+c=$(psi_pct_color "$IO_AVG60"); printf "${c}%7s${C_RESET}  " "${IO_AVG60:-—}%"
+c=$(psi_pct_color "$IO_AVG60"); printf "${c}%7s${C_RESET}\n" "${IO_AVG60:-—}%"
+printf "  ${C_DIM}%-22s${C_RESET}  " "Memory pressure"
+c=$(psi_pct_color "$MEM_AVG10"); printf "${c}%7s${C_RESET}  " "${MEM_AVG10:-—}%"
+c=$(psi_pct_color "$MEM_AVG60"); printf "${c}%7s${C_RESET}  " "${MEM_AVG60:-—}%"
+c=$(psi_pct_color "$MEM_AVG60"); printf "${c}%7s${C_RESET}\n" "${MEM_AVG60:-—}%"
+echo ""
+
+# Rank them — use awk to sort by avg60 numerically
+RANKING=$(awk -v cpu="${CPU_AVG60:-0}" -v io="${IO_AVG60:-0}" -v mem="${MEM_AVG60:-0}" \
+    'BEGIN {
+        printf "CPU %s\nIO  %s\nMEM %s\n", cpu+0, io+0, mem+0
+    }' | sort -k2 -nr)
+PRIMARY=$(head -1 <<< "$RANKING" | awk '{print $1}')
+PRIMARY_PCT=$(head -1 <<< "$RANKING" | awk '{print $2}')
+info "  ${C_BOLD}Primary bottleneck:${C_RESET} ${C_RED}${PRIMARY}${C_RESET} subsystem at ~${PRIMARY_PCT}% avg60"
+if [[ "$PRIMARY" == "IO" ]]; then
+    info "  ${C_DIM}Most tasks are waiting on storage right now. The CPU is starving.${C_RESET}"
+    info "  ${C_DIM}Suspects: swap traffic, runaway log writes, slow disk (HDD?), DB writes.${C_RESET}"
+elif [[ "$PRIMARY" == "CPU" ]]; then
+    info "  ${C_DIM}CPU is saturated. Most tasks are waiting for compute.${C_RESET}"
+    info "  ${C_DIM}Suspects: a single hot thread, runaway process, missing parallelism.${C_RESET}"
+elif [[ "$PRIMARY" == "MEM" ]]; then
+    info "  ${C_DIM}Most tasks are waiting on memory pages. The system is RAM-starved.${C_RESET}"
+    info "  ${C_DIM}Suspects: heavy process, leaky service, undersized RAM.${C_RESET}"
+fi
+echo ""
+
+# Pre-emptive advice when any single pressure is high
+IO_PCT=${IO_AVG60%.*}
+if [[ -n "$IO_PCT" && "$IO_PCT" -ge 15 ]]; then
+    add_advice 9 "Disk I/O pressure is ${IO_AVG60}% — top wall-clock bottleneck" \
+        "Every second, ~${IO_AVG60}% of time is spent waiting on disk. No amount of CPU tuning fixes this." \
+        "Find the culprit: '$SUDO iotop -aoP' or 'cat /proc/[0-9]*/io | grep write_bytes' (largest writers first). Common causes: runaway logs in /var/log, swap activity, DB write storms, slow HDD on a busy workload. Fix: move journald to a separate disk, set Storage=volatile in /etc/systemd/journald.conf for non-critical logs, or upgrade to SSD/NVMe."
+fi
+MEM_PCT=${MEM_AVG60%.*}
+if [[ -n "$MEM_PCT" && "$MEM_PCT" -ge 10 ]]; then
+    add_advice 7 "Memory pressure is ${MEM_AVG60}% — RAM is the bottleneck" \
+        "Tasks are stalling waiting for memory. Available RAM is low or thrashing is happening." \
+        "Free RAM: identify the top consumers with 'ps aux --sort=-%mem | head' and stop heavy non-essential services. Long-term: lower vm.swappiness (already $swappiness — good), add more RAM, or move heavy workloads to a different machine."
+fi
+CPU_PCT=${CPU_AVG60%.*}
+if [[ -n "$CPU_PCT" && "$CPU_PCT" -ge 15 ]]; then
+    add_advice 7 "CPU pressure is ${CPU_AVG60}% — compute is saturated" \
+        "Tasks are stalling waiting for CPU time. Check who's burning CPU with 'top -bn1' or 'ps aux --sort=-%cpu | head'." \
+        "Common causes: runaway process (kill it), single-threaded workload (parallelize), missing CPU governor (run the previous section), thermal throttling (see CPU governor section)."
+fi
+
+# ─── SECTION 6: Disk IO & scheduler ────────────────────────────────────────
+section "DISK I/O — IS YOUR STORAGE A BOTTLENECK?"
+# Find root filesystem device
+root_dev=$(findmnt -no SOURCE / 2>/dev/null || echo "")
+root_dev=${root_dev#/dev/}
+# Get rotational flag from sysfs (1=HDD, 0=SSD)
+rotational=2
+if [[ -r "/sys/block/$root_dev/queue/rotational" ]]; then
+    rotational=$(cat "/sys/block/$root_dev/queue/rotational" 2>/dev/null || echo 2)
+fi
+[[ -z "$rotational" ]] && rotational=2
+case "$rotational" in
+    0) info "Root disk ${C_BOLD}${root_dev}${C_RESET}: ${C_GREEN}SSD${C_RESET} (non-rotational)" ;;
+    1) info "Root disk ${C_BOLD}${root_dev}${C_RESET}: ${C_RED}HDD${C_RESET} (rotational — IO will be slower)" ;;
+    *) info "Root disk ${C_BOLD}${root_dev}${C_RESET}: unknown type" ;;
+esac
+
+# Scheduler
+sched=$(cat "/sys/block/$root_dev/queue/scheduler" 2>/dev/null || echo "")
+if [[ -n "$sched" ]]; then
+    active=$(grep -oE '\[[a-z-]+\]' <<< "$sched" || true)
+    info "Scheduler: ${C_BOLD}${active:-?}${C_RESET} (available: ${sched})"
+    if [[ "$rotational" == "1" ]]; then
+        case "$active" in
+            *[bfq]*|*[mq-deadline]*)
+                : ;;
+            *)
+                add_advice 6 "HDD with '$active' scheduler — use mq-deadline or bfq for HDDs" \
+                    "On rotational disks, 'mq-deadline' reduces seek thrashing." \
+                    "Switch: 'echo mq-deadline | $SUDO tee /sys/block/${root_dev}/queue/scheduler'. Persist via udev rule in /etc/udev/rules.d/60-scheduler.rules."
+                ;;
+        esac
+    fi
+fi
+
+# Disk usage
+disk_pct=$(df -P / 2>/dev/null | awk 'NR==2 {sub("%","",$5); print $5}' | head -1)
+disk_pct=${disk_pct:-0}
+[[ -z "$disk_pct" ]] && disk_pct=0
+color=$C_GREEN
+(( disk_pct > 80 )) && color=$C_YELLOW
+(( disk_pct > 92 )) && color=$C_RED
+info "Disk usage: ${color}${disk_pct}%${C_RESET}"
+if (( disk_pct > 90 )); then
+    add_advice 8 "Root disk is ${disk_pct}% full — performance collapses above 90%" \
+        "Filesystems slow dramatically when nearly full (ext4 needs ~5% free for block combining)." \
+        "Clean: 'sudo journalctl --vacuum-size=200M' (logs), 'sudo apt autoremove && sudo apt clean' (packages), find big files: 'sudo du -h /var /home 2>/dev/null | sort -h | tail -20'."
+fi
+
+# ─── SECTION 6: Mount options ─────────────────────────────────────────────
+section "FILESYSTEM MOUNT OPTIONS — ARE YOU MISSING noatime?"
+root_opts=$(findmnt -no OPTIONS / 2>/dev/null || echo "")
+if [[ "$root_opts" != *noatime* ]]; then
+    add_advice 4 "Root filesystem doesn't have 'noatime' — every read updates mtime" \
+        "Each file read writes a metadata update. On SSDs this wastes IO and shortens lifespan." \
+        "Add to /etc/fstab for your root line: 'noatime,commit=60'. Or use 'relatime' (default on most modern kernels) which is fine. Reload with 'sudo mount -o remount /'."
+fi
+if [[ "$root_opts" != *commit* ]]; then
+    : # commit= defaults to 5s; not worth complaining
+fi
+
+# ─── SECTION 7: Logs eating disk ───────────────────────────────────────────
+section "LOGS — IS JOURNALD EATING YOUR DISK?"
+journal_size=$(du -sk /var/log/journal 2>/dev/null | awk '{print $1}' | head -1 || echo 0)
+journal_size=${journal_size:-0}
+if [[ -d /var/log/journal ]] && (( journal_size > 0 )); then
+    info "Journal disk usage: ${C_BOLD}$((journal_size/1024)) MB${C_RESET}"
+    if (( journal_size > 500000 )); then
+        add_advice 6 "Systemd journal is using $((journal_size/1024)) MB — clean it up" \
+            "Old logs bloat the journal and slow journal queries." \
+            "Vacuum: 'sudo journalctl --vacuum-size=200M' (keeps 200MB). For persistent limit: edit /etc/systemd/journald.conf and set SystemMaxUse=200M, then 'sudo systemctl restart systemd-journald'."
+    fi
+fi
+
+# ─── SECTION 8: Package manager cruft ──────────────────────────────────────
+section "PACKAGE MANAGER — UNUSED PACKAGES WEIGHING YOU DOWN"
+if has_cmd apt; then
+    auto_count=$(apt list --installed 2>/dev/null | grep -c '^.*' || echo 0)
+    # Try the autoremove hint
+    if command -v apt-get >/dev/null && [[ -n "$SUDO" ]]; then
+        autoremove_count=$($SUDO apt-get -s autoremove 2>/dev/null | awk '/^The following packages will be REMOVED/{flag=1; next} /^$/ && flag {exit} flag' | wc -l | head -1 || echo 0)
+        autoremove_count=${autoremove_count:-0}; [[ "$autoremove_count" =~ ^[0-9]+$ ]] || autoremove_count=0
+        info "${C_BOLD}${autoremove_count}${C_RESET} packages can be auto-removed"
+        if (( autoremove_count > 30 )); then
+            add_advice 5 "${autoremove_count} unused packages installed — they're taking disk and cache space" \
+                "These are leftovers from uninstalled packages or unused dependencies." \
+                "Run: '$SUDO apt autoremove --purge && $SUDO apt clean' (autoremove also purges configs with --purge)."
+        fi
+    else
+        info "Run '$SUDO apt autoremove --dry-run' to see unused packages"
+    fi
+fi
+
+# ─── SECTION 9: Kernel tuning ──────────────────────────────────────────────
+section "KERNEL TUNING — IS THE SYSTEM OPTIMIZED?"
+dirty_ratio=$(sysctl -n vm.dirty_ratio 2>/dev/null | head -1 || echo 20)
+dirty_bg_ratio=$(sysctl -n vm.dirty_background_ratio 2>/dev/null | head -1 || echo 10)
+info "vm.dirty_ratio: ${C_BOLD}${dirty_ratio}${C_RESET}, vm.dirty_background_ratio: ${C_BOLD}${dirty_bg_ratio}${C_RESET}"
+# For desktops, lower dirty_ratio is better — default 20 means up to 20% of RAM
+# can be dirty before sync starts. On big-RAM boxes that stalls apps.
+if [[ "$dirty_ratio" -ge 20 ]] && (( mem_total > 8000000 )); then
+    add_advice 4 "vm.dirty_ratio=${dirty_ratio} on a large-RAM system — stalls when writing" \
+        "When you copy a big file, the OS lets 20% of RAM fill with unwritten data first. On 16GB+ that's 3+ GB — and when it syncs, everything else stalls." \
+        "Lower to 5: 'echo vm.dirty_ratio=5 | $SUDO tee /etc/sysctl.d/99-dirty.conf && echo vm.dirty_background_ratio=2 | $SUDO tee -a /etc/sysctl.d/99-dirty.conf && $SUDO sysctl -p'. Laptops benefit from 'vm.dirty_writeback_centisecs=1500' too."
+fi
+
+# Check THP (transparent hugepages) — sometimes slows DBs/workloads
+thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo "")
+info "Transparent hugepages: ${C_BOLD}${thp}${C_RESET}"
+if [[ "$thp" == "[always]" ]]; then
+    add_advice 3 "Transparent hugepages='always' — can hurt some workloads" \
+        "THP helps some apps, hurts others (databases, large JVMs). Default 'always' is usually fine for desktops." \
+        "If you see stutter or memory bloat, try 'madvise': 'echo madvise | $SUDO tee /sys/kernel/mm/transparent_hugepage/enabled'. Persist via /etc/rc.local or systemd."
+fi
+
+# ─── SECTION 10: Final score & verdict ─────────────────────────────────────
+section "SPEED SCORE — OVERALL HEALTH"
+score=100
+penalty=0
+(( total_running > 80 )) && penalty=$(( penalty + 10 ))
+(( mem_used_pct > 80 )) && penalty=$(( penalty + 15 ))
+(( swap_pct > 25 ))     && penalty=$(( penalty + 20 ))
+(( disk_pct > 90 ))     && penalty=$(( penalty + 15 ))
+(( boot_s > 30 ))       && penalty=$(( penalty + 10 ))
+[[ "$governor" == "powersave" || "$governor" == "conservative" ]] && penalty=$(( penalty + 15 ))
+[[ "$rotational" == "1" ]] && penalty=$(( penalty + 5 ))
+score=$(( 100 - penalty ))
+(( score < 0 )) && score=0
+
+color=$C_GREEN
+(( score < 80 )) && color=$C_YELLOW
+(( score < 60 )) && color=$C_RED
+
+# Bar
+bar=""
+score_filled=$(( score * 40 / 100 ))
+for (( i=0; i<score_filled; i++ )); do bar+="█"; done
+for (( i=score_filled; i<40; i++ )); do bar+="░"; done
+
+printf "  ${color}%s${C_RESET} ${color}${C_BOLD}%d/100${C_RESET}\n" "$bar" "$score"
+if (( score >= 80 )); then
+    info "${C_GREEN}Your system is already pretty fast.${C_RESET}"
+elif (( score >= 60 )); then
+    info "${C_YELLOW}There's room for improvement — see recommendations below.${C_RESET}"
+else
+    info "${C_RED}Significant speed gains available. Start with the top recommendation.${C_RESET}"
+fi
+
+# ─── ADVICE — sorted by score ──────────────────────────────────────────────
+if [[ $QUIET -eq 0 ]] && [[ ${#ADVICE[@]} -gt 0 ]]; then
+    section "RECOMMENDATIONS — SORTED BY IMPACT"
+
+    # Sort ADVICE by score descending (numeric, pipe-safe using sort -t'|' -k1 -rn)
+    sorted_advice=$(printf '%s\n' "${ADVICE[@]}" | sort -t'|' -k1 -rn)
+
+    # If --top N given, only print that many
+    if (( TOP_N > 0 )); then
+        sorted_advice=$(head -n "$TOP_N" <<< "$sorted_advice")
+    fi
+
+    rank=0
+    while IFS='|' read -r sc title why fix; do
+        rank=$((rank + 1))
+        bar=""
+        n=$(( sc * 10 / 10 ))
+        for (( i=0; i<n; i++ )); do bar+="★"; done
+        for (( i=n; i<10; i++ )); do bar+="☆"; done
+        color=$C_GREEN
+        (( sc < 7 )) && color=$C_YELLOW
+        (( sc < 4 )) && color=$C_DIM
+        printf "\n  ${C_BOLD}${C_CYAN}[%d]${C_RESET} ${color}${bar}${C_RESET} ${C_BOLD}%-50s${C_RESET}\n" "$rank" "$title"
+        printf "      ${C_DIM}Why:${C_RESET} %s\n" "$why"
+        printf "      ${C_GREEN}Fix:${C_RESET} %s\n" "$fix"
+    done <<< "$sorted_advice"
+
+    if (( TOP_N == 0 )); then
+        info "${C_DIM}${rank} recommendation(s). Re-run with --top N for fewer.${C_RESET}"
+    fi
+fi
+
+# ─── JSON verdict ──────────────────────────────────────────────────────────
+if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&3
+    exec 3>&-
+    [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
+
+    add_json_field "score" "$score"
+    add_json_field "boot_seconds" "$boot_s"
+    add_json_field "running_services" "$total_running"
+    add_json_field "mem_used_pct" "$mem_used_pct"
+    add_json_field "swap_used_pct" "$swap_pct"
+    add_json_field "disk_used_pct" "$disk_pct"
+    add_json_field "cpu_governor" "$governor"
+    add_json_field "rotational" "$rotational"
+    add_json_field "recommendation_count" "${#ADVICE[@]}"
+
+    # Emit each recommendation as an array (manually JSON-escape strings)
+    if [[ ${#ADVICE[@]} -gt 0 ]]; then
+        rec_json=""
+        for entry in "${ADVICE[@]}"; do
+            IFS='|' read -r sc title why fix <<< "$entry"
+            # Escape backslashes and double-quotes in the strings
+            title_e="${title//\\/\\\\}"; title_e="${title_e//\"/\\\"}"
+            why_e="${why//\\/\\\\}";    why_e="${why_e//\"/\\\"}"
+            fix_e="${fix//\\/\\\\}";    fix_e="${fix_e//\"/\\\"}"
+            [[ -n "$rec_json" ]] && rec_json+=","
+            rec_json+="{\"score\":${sc},\"title\":\"${title_e}\",\"why\":\"${why_e}\",\"fix\":\"${fix_e}\"}"
+        done
+        add_json_field "recommendations" "[$rec_json]" 1
+    else
+        add_json_field "recommendations" "[]" 1
+    fi
+
+    elapsed=$(( $(date +%s) - START_TS ))
+    printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+    for f in "${JSON_FIELDS[@]}"; do
+        printf ',%s' "$f"
+    done
+    printf ',"duration_s":%d}\n' "$elapsed"
+    exit 0
+fi
+
+# ---------- Run Comparison Finalize ----------
+if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
+
+# ---------- AI verdict (opt-in via --ai) ----------
+if [[ "${AI_VERDICT:-}" == "1" ]]; then
+    ai_emit_verdict "summarize" "Speed profile complete on $(hostname -s)" 2>/dev/null || true
+fi
+
+exit 0
