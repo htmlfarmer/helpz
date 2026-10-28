@@ -27,6 +27,7 @@ export PATH="$PWD:$PATH"       # or: ln -s "$PWD" ~/.local/bin/ztools
 | `abusez` | SSH forensic / abuse-pattern report |
 | `aiz` | AI server status monitor |
 | `allz` | Security Script Orchestrator |
+| `bashrcz` | Put the *z suite on your PATH so any tool runs from any directory |
 | `benchmarkz` | System-wide benchmarks and speed tests using Linux commands. |
 | `bootz` | Boot diagnostic |
 | `browserz` | Installed Web Browser & Privacy Audit |
@@ -36,6 +37,7 @@ export PATH="$PWD:$PATH"       # or: ln -s "$PWD" ~/.local/bin/ztools
 | `cronz` | Cron & Scheduled-Task Auditor / Controller |
 | `debugz` | Master "Debug Anything" Diagnostic Tool |
 | `demonz` | Systemd Service Summoner & Banisher |
+| `depz` | Dependency doctor: find what's missing, install what can be installed |
 | `diskz` | Block device, filesystem & SMART drive-health diagnostic |
 | `dnsz` | Standalone deep DNS audit |
 | `downz` | Why is this site down or slow? |
@@ -74,8 +76,6 @@ export PATH="$PWD:$PATH"       # or: ln -s "$PWD" ~/.local/bin/ztools
 | `usbz` | USB bus diagnostic |
 | `websitez` | Universal Website Audit & Diagnostics |
 | `whoisz` | Standalone deep WHOIS audit |
-| `xyzoservicesz` | Mask PM2-managed services and reconfigure Example systemd units |
-| `xyzothinthreadsz` | Reduces app-fast-fetcher.service thread footprint |
 | `helpz` | Cheat-sheet: lists every tool, `helpz <tool>` shows its header docs |
 
 ## Highlights

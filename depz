@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# depz - Dependency doctor: find what's missing, install what can be installed
+# ----------------------------------------------------------------------------
+# Every *z tool probes for optional helpers (jq, bc, lspci, smartctl, tcpdump…)
+# and simply lights up fewer sections when they're absent. That's silent, which
+# means you never find out why a report looked thin.
+#
+# depz scans the whole suite for the binaries it asks for, works out which are
+# missing, maps each to the distro package that provides it, and — with --fix
+# — installs them in one batch. Anything it cannot install automatically (a
+# kernel driver, a package from another distro) is reported with the exact
+# command to run by hand.
+#
+# Usage:
+#   ./depz                 Report missing dependencies (read-only)
+#   ./depz --fix           Install the missing ones that apt can provide
+#   ./depz --fix --yes     Install without the confirmation prompt
+#   ./depz --json          Machine-readable report
+#   ./depz --no-color      Plain output
+#
+# Requires: apt (Debian/Ubuntu) for auto-install. Other distros get a report
+#           with the package names to install via your own package manager.
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+FIX=0; ASSUME_YES=0; JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fix)    FIX=1 ;;
+        --yes|-y) ASSUME_YES=1 ;;
+        --json)   JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,24p' "$0"; exit 0 ;;
+        *) echo "depz: unknown option $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+# ── binary → distro package map ────────────────────────────────────────────
+# Anything not listed here falls back to an apt-cache search by file name.
+declare -A PKG=(
+  [apt]=apt [apt-cache]=apt [apt-get]=apt [bc]=bc [bluetoothctl]=bluetooth
+  [bzip2]=bzip2 [coredumpctl]=systemd-coredump [curl]=curl [dmesg]=util-linux
+  [dmidecode]=dmidecode [docker]=docker.io [edid-decode]=edid-decode
+  [ethtool]=ethtool [faillock]=libpam-pwquality [figlet]=figlet [file]=file
+  [find]=findutils [findmnt]=util-linux [fio]=fio [firewall-cmd]=firewalld
+  [free]=procps [git]=git [glxinfo]=mesa-utils [gzip]=gzip [host]=dnsutils
+  [iostat]=sysstat [ip]=iproute2 [iperf3]=iperf3 [iptables]=iptables
+  [iw]=iw [iwconfig]=wireless-tools [journalctl]=systemd [jq]=jq
+  [ldd]=libc-bin [lsblk]=util-linux [lscpu]=util-linux [lsof]=lsof
+  [lspci]=pciutils [lsusb]=usbutils [mokutil]=mokutil [mpstat]=sysstat
+  [nc]=netcat-openbsd [ncat]=nmap [netstat]=net-tools [nft]=nftables
+  [nm]=network-manager [nmcli]=network-manager [nproc]=coreutils
+  [nvtop]=nvtop [objdump]=binutils [openssl]=openssl [pactl]=pulseaudio-utils
+  [pg_isready]=postgresql-client [pg_lsclusters]=postgresql-client
+  [pgrep]=procps [powerprofilesctl]=power-profiles-daemon [ps]=procps
+  [psql]=postgresql-client [pv]=pv [pw-cli]=pipewire [python3]=python3
+  [resolvectl]=systemd-resolved [rfkill]=rfkill [sensors]=lm-sensors
+  [smartctl]=smartmontools [sqlite3]=sqlite3 [ss]=iproute2 [sshd]=openssh-server
+  [stress-ng]=stress-ng [sudo]=sudo [sysbench]=sysbench [sysctl]=procps
+  [systemctl]=systemd [systemd-analyze]=systemd [tar]=tar [tcpdump]=tcpdump
+  [traceroute]=traceroute [udevadm]=udev [ufw]=ufw [usbguard]=usbguard
+  [wget]=wget [whois]=whois [xrandr]=x11-xserver-utils [zstd]=zstd
+)
+# Binaries that are NOT installable from a normal apt repo — skip with advice.
+declare -A SKIP=(
+  [dnf]="package manager for Fedora/RHEL — not needed on Debian/Ubuntu"
+  [pacman]="package manager for Arch — not needed on Debian/Ubuntu"
+  [pf]="BSD firewall (pf) — no equivalent needed on Linux"
+  [opnsense-bootstrap]="OPNsense-specific bootstrap script — not applicable here"
+  [can]="socketcan utility — only relevant on machines with CAN hardware"
+  [nvidia-smi]="proprietary NVIDIA driver — install from nvidia.com or your distro"
+  [trustz]="part of this suite, not an external dependency"
+)
+
+# ── collect every binary the suite probes for ──────────────────────────────
+collect_deps() {
+    grep -ohE 'command -v [a-zA-Z0-9_.+-]+|has_cmd [a-zA-Z0-9_.+-]+' \
+        "$SCRIPT_DIR"/*z "$SCRIPT_DIR"/lib/*.sh 2>/dev/null \
+    | awk '{print $NF}' \
+    | sed "s/[\"']//g" \
+    | grep -E '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$' \
+    | sort -u
+}
+
+declare -a MISSING=() SKIPPED=() INSTALLABLE=() MANUAL=()
+declare -A MISS_PKG=()
+
+resolve_pkg() {
+    local bin="$1"
+    if [[ -n "${PKG[$bin]:-}" ]]; then printf '%s' "${PKG[$bin]}"; return 0; fi
+    # Fallback: ask apt for a package whose name matches the binary.
+    local p
+    p=$(apt-cache search --names-only "^${bin//./\\.}$" 2>/dev/null | head -1 | cut -d' ' -f1)
+    [[ -n "$p" ]] && { printf '%s' "$p"; return 0; }
+    return 1
+}
+
+apt_has() { apt-cache show "$1" >/dev/null 2>&1; }
+
+while IFS= read -r bin; do
+    [[ -z "$bin" ]] && continue
+    if command -v "$bin" >/dev/null 2>&1; then continue; fi
+    if [[ -n "${SKIP[$bin]:-}" ]]; then
+        SKIPPED+=("$bin|${SKIP[$bin]}")
+        continue
+    fi
+    pkg=$(resolve_pkg "$bin" || true)
+    if [[ -z "$pkg" ]]; then
+        MANUAL+=("$bin|no distro package provides it — install from source or upstream")
+        continue
+    fi
+    if ! apt_has "$pkg"; then
+        MANUAL+=("$bin|package '$pkg' is not in your apt sources")
+        continue
+    fi
+    MISSING+=("$bin")
+    MISS_PKG["$bin"]="$pkg"
+    INSTALLABLE+=("$pkg")
+done < <(collect_deps)
+
+# de-duplicate package list
+declare -A SEEN_PKG=(); UNIQ_PKGS=()
+for p in "${INSTALLABLE[@]:-}"; do
+    [[ -z "$p" ]] && continue
+    [[ -n "${SEEN_PKG[$p]:-}" ]] && continue
+    SEEN_PKG["$p"]=1; UNIQ_PKGS+=("$p")
+done
+
+# ── JSON ───────────────────────────────────────────────────────────────────
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"depz","missing":['
+    first=1
+    for b in "${MISSING[@]:-}"; do
+        [[ -z "$b" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf '{"binary":"%s","package":"%s"}' "$b" "${MISS_PKG[$b]:-}"
+    done
+    printf '],"skipped":['
+    first=1
+    for s in "${SKIPPED[@]:-}"; do
+        [[ -z "$s" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf '{"binary":"%s","reason":"%s"}' "${s%%|*}" "${s#*|}"
+    done
+    printf '],"manual":['
+    first=1
+    for s in "${MANUAL[@]:-}"; do
+        [[ -z "$s" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf '{"binary":"%s","reason":"%s"}' "${s%%|*}" "${s#*|}"
+    done
+    printf '],"installable_packages":['
+    first=1
+    for p in "${UNIQ_PKGS[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf '"%s"' "$p"
+    done
+    printf ']}\n'
+    exit 0
+fi
+
+# ── report ─────────────────────────────────────────────────────────────────
+section "DEPENDENCY REPORT"
+TOTAL_REQ=$(collect_deps | wc -l)
+MISS_N=$(printf '%s\n' "${MISSING[@]:-}" | grep -c . || true)
+info "suite probes for $TOTAL_REQ optional helpers; $MISS_N are missing"
+
+if (( MISS_N == 0 )); then
+    ok "every optional helper the suite knows about is already installed"
+else
+    subsec "MISSING — installable from apt"
+    if [[ ${#UNIQ_PKGS[@]} -eq 0 ]]; then
+        info "none"
+    else
+        for b in "${MISSING[@]}"; do
+            printf "  ${C_YELLOW}%-19s${C_RESET} → ${C_CYyan}apt install %s${C_RESET}\n" "$b" "${MISS_PKG[$b]}"
+        done
+    fi
+fi
+
+if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    subsec "SKIPPED — not applicable or needs a manual install"
+    for s in "${SKIPPED[@]}"; do
+        printf "  ${C_DIM}%-19s${C_RESET} ${s#*|}\n" "${s%%|*}"
+    done
+fi
+
+if [[ ${#MANUAL[@]} -gt 0 ]]; then
+    subsec "MANUAL — no automatic path"
+    for s in "${MANUAL[@]}"; do
+        printf "  ${C_DIM}%-19s${C_RESET} ${s#*|}\n" "${s%%|*}"
+    done
+fi
+
+# ── fix ───────────────────────────────────────────────────────────────────
+if (( FIX )); then
+    section "FIX"
+    if [[ ${#UNIQ_PKGS[@]} -eq 0 ]]; then
+        ok "nothing to install"
+        exit 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        critf "Fix" "apt-get is not available on this system" "install the packages listed above with your package manager"
+        exit 2
+    fi
+    printf "  ${C_BOLD}will install:${C_RESET} %s\n" "${UNIQ_PKGS[*]}"
+    if (( ! ASSUME_YES )); then
+        printf "  ${C_DIM}proceed? [y/N] ${C_RESET}"
+        read -r ans
+        [[ "$ans" =~ ^[Yy]$ ]] || { info "cancelled — nothing installed"; exit 0; }
+    fi
+    if sudo -n true 2>/dev/null; then
+        SUDO=""
+    elif [[ "$(id -u)" -eq 0 ]]; then
+        SUDO=""
+    else
+        SUDO="sudo"
+    fi
+    if $SUDO apt-get install -y --no-install-recommends "${UNIQ_PKGS[@]}" 2>&1 | tail -15; then
+        ok "install finished — re-run the suite to see the new sections light up"
+    else
+        critf "Fix" "apt-get install failed" "check the output above; packages may conflict"
+        exit 2
+    fi
+    # Re-verify
+    local_still_missing=()
+    for b in "${MISSING[@]}"; do
+        command -v "$b" >/dev/null 2>&1 || local_still_missing+=("$b")
+    done
+    if [[ ${#local_still_missing[@]} -eq 0 ]]; then
+        ok "all previously-missing helpers now resolve"
+    else
+        warnf "Fix" "still missing: ${local_still_missing[*]}" "they may ship a differently-named binary"
+    fi
+fi
+
+emit_verdict

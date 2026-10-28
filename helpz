@@ -380,10 +380,137 @@ guard_uninstall() {
     echo "guard hooks removed (per-repo trustz hooks still work: ./trustz --install-hook)"
 }
 
+# ---------- PATH setup: make every *z tool callable from anywhere ----------
+# The suite is one folder of single-file tools. If that folder isn't on PATH,
+# "cpuz" fails with a useless "did you mean cpu?" hint. helpz installs a small
+# marked block into ~/.bashrc with a command_not_found_handle hook: the moment
+# you type a suite tool that isn't on PATH, bash tells you where it really
+# lives — and repairs the PATH block on the spot.
+PATH_HOOK_BEGIN="# >>> helpz suite (auto-added by helpz) >>>"
+PATH_HOOK_END="# <<< helpz suite (auto-added by helpz) <<<"
+PATH_RC="${HELPZ_RC_FILE:-$HOME/.bashrc}"
+
+path_block_present() {
+    [[ -r "$PATH_RC" ]] || return 1
+    grep -qF -- "$PATH_HOOK_BEGIN" "$PATH_RC" && grep -qF -- "$PATH_HOOK_END" "$PATH_RC"
+}
+
+path_hook_present() {
+    [[ -r "$PATH_RC" ]] || return 1
+    grep -qF -- "$PATH_HOOK_BEGIN" "$PATH_RC" && grep -qF -- "$PATH_HOOK_END" "$PATH_RC" \
+      && grep -q 'command_not_found_handle' "$PATH_RC"
+}
+
+# Strip a marked block, leaving everything else byte-identical.
+path_strip_block() {
+    local f="$1" tmp
+    [[ -r "$f" ]] || return 0
+    tmp=$(mktemp) || return 1
+    awk -v b="$PATH_HOOK_BEGIN" -v e="$PATH_HOOK_END" '
+        index($0,b) { skip=1 }
+        !skip      { print }
+        index($0,e) { skip=0 }
+    ' "$f" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+# Install (or refresh) the block. Idempotent — never duplicates.
+# The block puts every known suite copy on PATH: the folder helpz lives in,
+# plus ~/helpz and ~/security when they exist. Both copies are usually the
+# same tools — one is the working source, one the published clone — and
+# having them both callable means "cpuz" never fails depending on where you
+# started the shell.
+path_suite_dirs() {
+    local d
+    for d in "$SCRIPT_DIR" "$HOME/helpz" "$HOME/security"; do
+        [[ -n "$d" && -d "$d" ]] && printf '%s\n' "$d"
+    done | awk '!seen[$0]++'
+}
+
+path_install() {
+    local f="$PATH_RC" quiet="${1:-0}" d
+    [[ -f "$f" ]] || { (( quiet )) || echo "  · no $f — skipping"; return 1; }
+    [[ -w "$f" ]] || { (( quiet )) || echo "  · $f not writable — skipping"; return 1; }
+    [[ -f "$HOME/.bashrc.helpz.bak" ]] || cp -p "$f" "$HOME/.bashrc.helpz.bak" 2>/dev/null
+    path_strip_block "$f"
+    {
+        printf '%s\n' "$PATH_HOOK_BEGIN"
+        printf '%s\n' "# Managed by helpz — the *z tools live in these folders, so put them on PATH."
+        printf '%s\n' "# The hook below turns 'command not found' into a pointer to the real tool."
+        while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            printf 'case ":$PATH:" in\n'
+            printf '    *:%s:*) ;;\n' "$d"
+            printf '    *) export PATH="%s:$PATH" ;;\n' "$d"
+            printf 'esac\n'
+        done < <(path_suite_dirs)
+        printf '%s\n' "command_not_found_handle() {"
+        printf '%s\n' "    local _cmd=\"\${1:-}\" _dir='' _c"
+        printf '%s\n' "    for _c in \"$SCRIPT_DIR\" \"\$HOME/helpz\" \"\$HOME/security\"; do"
+        printf '%s\n' "        [ -n \"\$_c\" ] && [ -x \"\$_c/\$_cmd\" ] && { _dir=\"\$_c\"; break; }"
+        printf '%s\n' "    done"
+        printf '%s\n' "    [ -n \"\$_dir\" ] || return 127"
+        printf '%s\n' "    printf '%s: not on PATH — it lives in %s\\n' \"\$_cmd\" \"\$_dir\" >&2"
+        printf '%s\n' "    printf '  run it now:  %s/%s\\n' \"\$_dir\" \"\$_cmd\" >&2"
+        printf '%s\n' "    printf '  make it permanent: source ~/.bashrc\\n' >&2"
+        printf '%s\n' "    return 127"
+        printf '%s\n' "}"
+        printf '%s\n' "$PATH_HOOK_END"
+    } >> "$f"
+    bash -n "$f" 2>/dev/null || {
+        cp -p "$HOME/.bashrc.helpz.bak" "$f" 2>/dev/null
+        (( quiet )) || echo "  · $f had a syntax error — restored from backup"
+        return 1
+    }
+    (( quiet )) || echo "  ✓ PATH block written to $f"
+    return 0
+}
+
+path_uninstall() {
+    if path_block_present "$PATH_RC"; then
+        path_strip_block "$PATH_RC"
+        echo "  ✓ PATH block removed from $PATH_RC"
+    else
+        echo "  · no helpz PATH block in $PATH_RC"
+    fi
+}
+
+# Detailed status for `helpz --path`
+path_status() {
+    echo "── PATH STATUS ──"
+    local live; live=$(bash -lc 'printf "%s" "$PATH"' 2>/dev/null)
+    if [[ ":$live:" == *":$SCRIPT_DIR:"* ]]; then
+        echo "  ✓ $SCRIPT_DIR is on the live PATH"
+    else
+        echo "  ✗ $SCRIPT_DIR is NOT on the live PATH"
+        echo "    → type the tools as ./<name> for now, or: source ~/.bashrc"
+    fi
+    if path_hook_present "$PATH_RC"; then
+        echo "  ✓ command_not_found_handle hook present in $PATH_RC"
+    else
+        echo "  ✗ no hook in $PATH_RC"
+        echo "    → run: helpz --path --install"
+    fi
+    echo "  · backup kept at: $HOME/.bashrc.helpz.bak"
+    echo
+    echo "  To enable:  helpz --path --install   (then: source ~/.bashrc)"
+    echo "  To remove:   helpz --path --uninstall"
+}
+
 # ---------- main ----------
 if [[ "${1:-}" == "guard" ]]; then
     case "${2:-install}" in
         --status) guard_status ;; --uninstall) guard_uninstall ;; *) guard_install ;;
+    esac
+    exit 0
+fi
+if [[ "${1:-}" == "--path" ]]; then
+    shift
+    case "${1:-}" in
+        --install)   path_install "" ;;
+        --uninstall) path_uninstall ;;
+        "")          path_status ;;
+        *) echo "helpz --path [--install|--uninstall]" >&2; exit 64 ;;
     esac
     exit 0
 fi
@@ -410,7 +537,20 @@ echo
 echo "Usage: <command> <target> [options]"
 echo "      helpz <command>   for detail on a specific script"
 echo "      helpz --json      machine-readable list"
+echo "      helpz --path      make every tool callable from anywhere (PATH)"
 echo
+
+# ── PATH self-heal ─────────────────────────────────────────────────────────
+# Install the command_not_found_handle hook once, up front — that way the NEXT
+# time a suite tool isn't on PATH, bash explains itself instead of suggesting
+# "did you mean cpu?". Then report the PATH state.
+if ! path_hook_present "$PATH_RC"; then
+    path_install "quiet" >/dev/null 2>&1
+fi
+if [[ ":$PATH:" != *":$SCRIPT_DIR:"* ]]; then
+    printf "  ${_Y}⚠${_R}  suite isn't on PATH — run 'source ~/.bashrc' to make every tool work from anywhere\n"
+    echo
+fi
 
 # Recent usage — only shows if there's history
 echo "── SUGGESTED NEXT (quick system scan) ──"
