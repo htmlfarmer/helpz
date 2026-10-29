@@ -96,7 +96,7 @@ else
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"pullz","repo":"%s","branch":"%s","behind":%s,"ahead":%s,"mode":"%s"}\n' \
         "$REPO_DIR" "$BRANCH" "${BEHIND:-0}" "${AHEAD:-0}" "$MODE"
     [[ "${BEHIND:-0}" -eq 0 ]] && exit 0

@@ -190,7 +190,7 @@ backup_rules() {
 # ============================================================================
 JSON_CAPTURE=""
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     JSON_CAPTURE="$(mktemp)"
     exec 3>&1
     exec 1>"$JSON_CAPTURE"
@@ -670,7 +670,7 @@ fi
 
 # In --emergency mode, restore stdout and print ONLY the actionable pieces
 if [[ -n "$EMERGENCY_OUT" && -f "$EMERGENCY_OUT" ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     exec 4>&-
 
     # Grep the actionable sections from the captured output

@@ -645,7 +645,7 @@ printf "\n"
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   FIELDS=$(IFS=,; echo "${JSON_FIELDS[*]}")
   json_emit "$(printf '{"script":"boot","host":"%s","timestamp":"%s","boot":"%s","level":"%s","messages":%d,"issues":%d,"warnings":%d,"critical":%d,"exit":%d}' \
     "$HOSTNAME_SHORT" "$TIMESTAMP" "$BOOT_IDX" "$LEVEL" "$TOTAL_MSG" "$TOTAL_ISSUES" "$WARNINGS" "$CRITICAL" "$EXIT")"

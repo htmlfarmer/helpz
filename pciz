@@ -746,7 +746,7 @@ printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   FIELDS=$(IFS=,; echo "${JSON_FIELDS[*]}")
   printf '{"script":"pci","host":"%s","timestamp":"%s","total_devices":%d,"fastest_gen":%d,"downgraded":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
     "$HOSTNAME_SHORT" "$TIMESTAMP" "$TOTAL_DEVICES" "$FASTEST_GEN" "$DOWNGRADED" "$WARNINGS" "$CRITICAL" "$EXIT"

@@ -106,7 +106,7 @@ top_n() {
 strip_pct() { sed 's/%$//'; }
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"chartz","mode":"%s","title":"%s","data":[' "$MODE" "$TITLE"
     first=1
     while IFS=$'\t' read -r l v; do

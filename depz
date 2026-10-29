@@ -147,7 +147,7 @@ done
 
 # ── JSON ───────────────────────────────────────────────────────────────────
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"depz","missing":['
     first=1
     for b in "${MISSING[@]:-}"; do

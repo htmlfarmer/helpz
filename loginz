@@ -199,7 +199,7 @@ run_summary() {   # $1=1 if called from --dossier (adds report files)
     breach_rows=$(breakins || true); [[ -n "$breach_rows" ]] && breach_n=$(wc -l <<<"$breach_rows")
 
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
-        exec 1>&4
+        [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
         local topj="" t
         t=$(awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -8 | awk '{printf "\"%s\":%s,", $2, $1}' | sed 's/,$//')
         printf '{"tool":"loginz","since":"%s","failures":%d,"invalid_probes":%d,"accepted_logins":%d,"unique_source_ips":%d,"accepted_from_attack_ips":%d,"top_fail_ips":{%s}}\n' \

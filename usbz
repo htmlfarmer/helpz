@@ -652,7 +652,7 @@ chart_findings
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   printf '{"script":"usb","host":"%s","timestamp":"%s","total_devices":%d,"fastest_speed_mbps":%d,"suspended":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
     "$HOSTNAME_SHORT" "$TIMESTAMP" "$TOTAL_DEVICES" "$FASTEST_SPEED_MBPS" "$SUSPENDED" "$WARNINGS" "$CRITICAL" "$EXIT"
     exec 1>&2

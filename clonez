@@ -147,7 +147,7 @@ if [[ "$SCAN" -eq 1 ]]; then
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"clonez","url":"%s","dest":"%s","scanned":%s}\n' "$URL" "$DEST" "$SCAN"
     exit 0
     exec 1>&2

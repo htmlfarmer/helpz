@@ -158,7 +158,7 @@ done
 # An EXIT trap guarantees the object is emitted on EVERY exit path, including
 # the early "no matching attacks found" exits.
 if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     exec 4>&1 1>&2
     _JSON_FD4=1
     trap _abusez_json EXIT

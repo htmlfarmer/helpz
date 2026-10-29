@@ -639,7 +639,7 @@ cmd_why() {
     with_spin "reading the evidence" scan_all
     rank_causes
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
-        exec 1>&4
+        [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
         emit_json_summary
         emit_verdict
         exec 1>&2

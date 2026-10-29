@@ -505,7 +505,7 @@ printf "\n"
 
 # ---------- JSON output ----------
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"filez","host":"%s","timestamp":"%s","path":"%s","depth":%s,"top":%s,"max_files":%s}\n' \
         "$HOSTNAME_SHORT" "$TIMESTAMP" "$SCAN_PATH" "$DEPTH" "$TOP_N" "$MAX_FILES" >&4
     exec 1>&2

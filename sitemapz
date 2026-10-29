@@ -596,7 +596,7 @@ fi
 
 # ---------- Optional JSON dump ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     JSON_REPORT="$OUTDIR/${SAFE_HOST}-${TS}.json"
     if [[ "$TYPE" == "urlset" ]]; then
         URLS=$(echo "$PARSED" | grep '^URLS=' | cut -d= -f2)

@@ -183,7 +183,7 @@ PSQL_PRETTY=(psql "${PSQL_CONN[@]}" --no-psqlrc -P pager=off)
 TEST_CONN=$("${PSQL[@]}" -c "SELECT 1;" 2>&1)
 if [[ "$TEST_CONN" != "1" ]]; then
   if [[ $JSON_OUT -eq 1 ]]; then
-      exec 1>&4
+      [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     err_escaped="${TEST_CONN//\"/\\\"}"
     err_escaped="${err_escaped//$'\n'/\\n}"
     printf '{"timestamp":"%s","hostname":"%s","status":"connection_failed","error":"%s","critical":1,"warnings":0}\n' \
@@ -197,7 +197,7 @@ fi
 
 # If JSON mode is enabled, suppress all stdout during data collection
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   exec 3>&1
   exec 1>/dev/null
     exec 1>&2

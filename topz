@@ -121,7 +121,7 @@ DISKROWS=$(join -a1 -a2 <(printf '%s\n' "$DISK1"|sort) <(printf '%s\n' "$DISK2"|
 
 # ─────────────────────────── JSON mode ───────────────────────────
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"ts":"%s","host":"%s","cpu_busy_pct":%s,"cpu_iowait_pct":%s,"load1":"%s","cores":%d,"mem_used_mb":%d,"mem_total_mb":%d,"mem_pct":%d,"psi_cpu":"%s","psi_io":"%s","top":[\n' \
         "$(date '+%F %T')" "$HOSTNAME_SHORT" "$BUSY" "$CPU_IOW" "$LOAD1" "$NPROC" $((MEM_USED/1024)) $((MEM_T/1024)) "$MEM_PCT" "$(psi cpu)" "$(psi io)"
     first=1

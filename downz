@@ -508,7 +508,7 @@ fi
 
 # ---------- Optional JSON dump ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     JSON_REPORT="$OUTDIR/${SAFE_HOST}-${TS}.json"
     cat > "$JSON_REPORT" <<EOF
 {

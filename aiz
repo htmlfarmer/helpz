@@ -657,7 +657,7 @@ ai_interpret
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   printf '{"timestamp":"%s","servers":[' "$TIMESTAMP"
   first=1
   for r in "${JSON_RESULTS[@]}"; do

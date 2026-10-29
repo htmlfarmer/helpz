@@ -171,6 +171,14 @@ if [[ $LOCAL_MODE -eq 1 ]]; then
 
     # Done
     printf "${C_BOLD}━━━ LOCAL DNS POSTURE COMPLETE ━━━${C_RESET}\n"
+    # JSON mode must still produce an object on stdout, even though local
+    # mode skips the resolver sweep.
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+        printf '{"tool":"dnsz","host":"%s","timestamp":"%s","target":"local","local":true,"posture":"complete"}\n' \
+            "$HOSTNAME_SHORT" "$TIMESTAMP" >&4
+        exec 1>&2
+    fi
     exit 0
 fi
 
@@ -675,7 +683,7 @@ printf "Report: %s\n" "$REPORT"
 
 # ---------- JSON output ----------
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"dnsz","host":"%s","timestamp":"%s","target":"%s","local":%s}\n' \
         "$HOSTNAME_SHORT" "$TIMESTAMP" "${HOST:-}" "$( [[ $LOCAL_MODE -eq 1 ]] && echo true || echo false )" >&4
     exec 1>&2
@@ -695,7 +703,7 @@ fi
 
 # ---------- Optional JSON dump ----------
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     cat > "$JSON_REPORT" <<EOF
 {
   "host": "$URL_HOST",
@@ -711,4 +719,9 @@ $(for k in "${!COUNTS[@]}"; do printf '    "%s": %s,\n' "$k" "${COUNTS[$k]}"; do
 }
 EOF
     printf "JSON:   %s\n" "$JSON_REPORT"
+    # Also emit the object on stdout so `dnsz --json | jq` works like every
+    # other tool in the suite.
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+    cat "$JSON_REPORT" >&4
+    exec 1>&2
 fi

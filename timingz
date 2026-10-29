@@ -813,7 +813,7 @@ esac
 echo -e "  ${C_BOLD}Completed at: $(date '+%Y-%m-%d %H:%M:%S %Z')${C_RESET}"
 # ---------- JSON output ----------
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"timingz","host":"%s","timestamp":"%s","mode":"%s"}\n' \
         "$HOSTNAME_SHORT" "$TIMESTAMP" "${MODE_ARG:-2}" >&4
     exec 1>&2

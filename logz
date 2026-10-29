@@ -222,7 +222,7 @@ fi
 
 # If JSON mode is enabled, suppress all stdout during data collection
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   exec 3>&1
   exec 1>/dev/null
     exec 1>&2

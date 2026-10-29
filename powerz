@@ -955,7 +955,7 @@ section "VERDICT"
 END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
 
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   printf '{"script":"power","timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
   for f in "${JSON_FIELDS[@]}"; do printf ',%s' "$f"; done
   printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$ELAPSED"

@@ -106,7 +106,7 @@ fi
 
 # ---- render ----
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"nextz","since_h":%s,"picks":[' "$SINCE_H"
     first=1
     for t in "${!PICK[@]}"; do

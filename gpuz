@@ -602,7 +602,7 @@ section "VERDICT"
 END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
 
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
   # JSON_FIELDS entries are already complete "key":value fragments —
   # re-wrapping them produced {"driver":"driver":"615.71.09"}.

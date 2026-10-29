@@ -767,7 +767,7 @@ check_suspicious() {
 # into jq or other parsers. Set this up BEFORE any output is produced.
 JSON_CAPTURE=""
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     JSON_CAPTURE="$(mktemp)"
     exec 3>&1
     exec 1>"$JSON_CAPTURE"
@@ -809,7 +809,7 @@ fi
 
 # ─── Verdict ─────────────────────────────────────────────────────────────
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     # Restore stdout, drop captured audit text, emit a single JSON verdict.
     exec 1>&3
     exec 3>&-

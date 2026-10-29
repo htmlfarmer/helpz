@@ -120,7 +120,7 @@ if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   exec 3>&1 1>/dev/null   # cpuz has many raw printfs; send them to the void, keep real stdout on fd 3
     exec 1>&2
 fi

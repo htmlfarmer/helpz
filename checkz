@@ -101,7 +101,7 @@ done
 # fd 4 (not fd 3) — lib/run_comparison.sh claims fd 3 as the real stdout
 # while it tees the report into a capture file.
 if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     exec 4>&1 1>&2
     _JSON_FD4=1
     exec 1>&2
@@ -227,7 +227,7 @@ fi
 # Trap Ctrl+C → AI verdict + exit summary
 _checkz_exit() {
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
-        exec 1>&4
+        [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
         # JSON mode: stdout carries only the object, the report went to stderr.
         printf '{"tool":"checkz","host":"%s","timestamp":"%s","errors":%s,"warnings":%s,"login_events":%s}\n' \
             "$HOSTNAME_SHORT" "$TIMESTAMP" "$_CNT_ERROR" "$_CNT_WARN" "$_CNT_LOGIN" >&4 2>/dev/null || true

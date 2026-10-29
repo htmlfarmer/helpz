@@ -133,7 +133,7 @@ scan_content
 scan_paths
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"pushz","repo":"%s","branch":"%s","remote":"%s","url":"%s","ahead":%s,"blocked":%s,"hits":[%s]}\n' \
         "$REPO_DIR" "$BRANCH" "$REMOTE" "$REMOTE_URL" "${AHEAD:-0}" "$CRIT" \
         "$(printf '%s\n' "$HITS" | sed '/^$/d' | awk '{gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0}')"

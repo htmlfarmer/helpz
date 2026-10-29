@@ -156,7 +156,7 @@ donut_chart() {
 }
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     exec 3>&1
     exec 1>/dev/null
     exec 1>&2
@@ -361,7 +361,7 @@ else
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     exec 1>&3
     exec 3>&-
     exec 1>&2

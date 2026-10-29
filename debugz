@@ -683,7 +683,7 @@ fi
 
 # ---------- JSON output ----------
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"debugz","host":"%s","timestamp":"%s","pid":"%s","binary":"%s","user":"%s","since":"%s"}\n' \
         "$HOSTNAME_SHORT" "$TIMESTAMP" "$PID_ARG" "$BIN_ARG" "$USER_ARG" "$SINCE" >&4
     exec 1>&2

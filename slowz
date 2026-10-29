@@ -278,7 +278,7 @@ should_run() {
 # so the audit text doesn't contaminate the JSON output that callers parse.
 JSON_CAPTURE=""
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     JSON_CAPTURE="$(mktemp)"
     exec 3>&1
     exec 1>"$JSON_CAPTURE"
@@ -1158,7 +1158,7 @@ END_TIME=$(date +%s)
 DURATION=$(( END_TIME - START_TIME ))
 
 if [[ $JSON_OUT -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
   verdict="healthy"
   (( CRITICAL > 0 )) && verdict="critical"
   (( CRITICAL == 0 && WARNINGS > 0 )) && verdict="warning"

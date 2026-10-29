@@ -221,7 +221,7 @@ fi
 
 # ── report ─────────────────────────────────────────────────────────────────
 if [[ "$JSON_OUT" -eq 1 ]]; then
-    exec 1>&4
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
     printf '{"tool":"testz","passed":%d,"failed":%d,"skipped":%d,"failures":[' "$PASS" "$FAIL" "$SKIP"
     first=1
     for f in "${FAILURES[@]:-}"; do
