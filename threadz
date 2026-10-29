@@ -44,9 +44,16 @@ while [[ $i -lt $# ]]; do
     arg="${ARGS[$i]}"
     case "$arg" in
         -h|--help)              SHOW_HELP=1 ;;
-        --json)                 JSON_OUT=1
-            json_stdout_only
-             ;;
+        --json)
+                JSON_OUT=1
+                shift
+                # JSON mode: the human report goes to stderr, stdout carries only
+                # the JSON object. fd 4 is opened HERE — before any output — and is
+                # this tool's own real stdout. It is never inherited from a parent
+                # shell, so a tool that does not source lib/common.sh still writes
+                # its JSON to the right place.
+                exec 4>&1 1>&2
+                ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-15}" ;;
         --pid)                  i=$((i+1)); FOCUS_PID="${ARGS[$i]:-}" ;;

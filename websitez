@@ -83,9 +83,16 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --quick)             QUICK=1; DEPTH="quick"; SAMPLE_N=3 ;;
         --api-only)          API_ONLY=1 ;;
-        --json)              WRITE_JSON=1
-            json_stdout_only
-             ;;
+        --json)
+                JSON_OUT=1
+                shift
+                # JSON mode: the human report goes to stderr, stdout carries only
+                # the JSON object. fd 4 is opened HERE — before any output — and is
+                # this tool's own real stdout. It is never inherited from a parent
+                # shell, so a tool that does not source lib/common.sh still writes
+                # its JSON to the right place.
+                exec 4>&1 1>&2
+                ;;
         --outdir)            OUTDIR="$2"; shift ;;
         --depth)             DEPTH="${2:-quick}"; case "$DEPTH" in
                                  quick)    SAMPLE_N=3 ;;

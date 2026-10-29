@@ -91,9 +91,16 @@ while [[ $i -lt $# ]]; do
     --config)   CONFIG_PATH="${ARGS[$((i+1))]:-}"; i=$((i+2)) ;;
     --quick)        QUICK=1; i=$((i+1)) ;;
     --no-color)     NO_COLOR=1; i=$((i+1)) ;;
-    --json)         JSON_OUT=1; i=$((i+1))
-        json_stdout_only
-         ;;
+        --json)
+            JSON_OUT=1
+            shift
+            # JSON mode: the human report goes to stderr, stdout carries only
+            # the JSON object. fd 4 is opened HERE — before any output — and is
+            # this tool's own real stdout. It is never inherited from a parent
+            # shell, so a tool that does not source lib/common.sh still writes
+            # its JSON to the right place.
+            exec 4>&1 1>&2
+            ;;
     --interpret)    INTERPRET=1; i=$((i+1)) ;;
     --no-interpret) INTERPRET=0; i=$((i+1)) ;;
     --ask-timeout)  i=$((i+1)); ASK_TIMEOUT="${ARGS[$i]:-8}"; i=$((i+1)) ;;

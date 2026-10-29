@@ -49,9 +49,16 @@ while [[ $i -lt $# ]]; do
     --level=*)      LEVEL="${arg#--level=}" ;;
     --level)        i=$((i+1)); LEVEL="${ARGS[$i]:-err}" ;;
     --no-color)     NO_COLOR=1 ;;
-    --json)         JSON_OUT=1
-        json_stdout_only
-         ;;
+        --json)
+            JSON_OUT=1
+            shift
+            # JSON mode: the human report goes to stderr, stdout carries only
+            # the JSON object. fd 4 is opened HERE — before any output — and is
+            # this tool's own real stdout. It is never inherited from a parent
+            # shell, so a tool that does not source lib/common.sh still writes
+            # its JSON to the right place.
+            exec 4>&1 1>&2
+            ;;
     -h|--help)
       cat << 'HELPEOF'
 
