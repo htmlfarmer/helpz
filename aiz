@@ -189,12 +189,13 @@ json_get() {
 resolve_config() {
   if [[ -n "$CONFIG_PATH" ]]; then
     [[ -f "$CONFIG_PATH" ]] && { printf '%s' "$CONFIG_PATH"; return; }
-    crit "Config not found: $CONFIG_PATH"; exit 2
+    crit "Config not found: $CONFIG_PATH" >&2; exit 2
   fi
   for p in "$SCRIPT_DIR/ai.json" "$HOME/.config/ai-servers/ai.json"; do
     [[ -f "$p" ]] && { printf '%s' "$p"; return; }
   done
-  crit "No ai.json found (looked in $SCRIPT_DIR and ~/.config/ai-servers/)"
+  crit "No ai.json found (looked in $SCRIPT_DIR and ~/.config/ai-servers/)" >&2
+  printf '%s' ""   # no config file — CONFIG_FILE stays empty on purpose
   exit 2
 }
 
@@ -203,7 +204,23 @@ CONFIG_FILE=$(resolve_config)
 
 RAW_JSON=$(cat "$CONFIG_FILE" 2>/dev/null)
 if [[ -z "$RAW_JSON" ]]; then
+  # A fresh clone has no ai.json (it is git-ignored on purpose). Say exactly
+  # what to do about it instead of failing silently.
   crit "ai.json is empty or unreadable"
+  if [[ $JSON_OUT -eq 0 ]]; then
+    if [[ -n "$CONFIG_FILE" ]]; then
+      printf "  ${C_DIM}config searched:%s${C_RESET}\n" "$CONFIG_FILE"
+    else
+      printf "  ${C_DIM}config searched: %s and ~/.config/ai-servers/${C_RESET}\n" "$SCRIPT_DIR"
+    fi
+    printf "  ${C_DIM}fix: cp ai.json.example ai.json  then edit the host/port entries${C_RESET}\n"
+    printf "  ${C_DIM}     (or: aiz --config /path/to/ai.json)${C_RESET}\n"
+  else
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+    printf '{"tool":"aiz","host":"%s","timestamp":"%s","config":"%s","servers":0,"error":"ai.json is empty or unreadable"}\n' \
+      "$HOSTNAME_SHORT" "$TIMESTAMP" "$CONFIG_FILE" >&4
+    exec 1>&2
+  fi
   exit 2
 fi
 
