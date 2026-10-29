@@ -116,6 +116,26 @@ info() {
     echo "  · $1"
 }
 
+# ---------- standalone findings breakdown ----------
+# printerz tracks its own CRITICAL/WARNINGS counters and deliberately does
+# not source lib/common.sh, so it draws its own breakdown. lib/chart.sh is
+# side-effect-free and safe to source here.
+PRINTERZ_CHART_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/lib/chart.sh"
+# shellcheck source=lib/chart.sh
+[[ -r "$PRINTERZ_CHART_LIB" ]] && source "$PRINTERZ_CHART_LIB"
+
+printerz_findings() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    (( CRITICAL + WARNINGS == 0 )) && return 0
+    local total=$(( CRITICAL + WARNINGS ))
+    local pct=$(( CRITICAL * 100 / total ))
+    printf "\n  ${C_BOLD}${C_CYAN}━━━ FINDINGS BREAKDOWN ━━━${C_RESET}\n"
+    chart_gauge "$pct" "critical share"
+    printf "  %s%d critical%s  ·  %s%d warning%s  ·  %s%d total%s\n" \
+        "$C_RED" "$CRITICAL" "$C_RESET" "$C_YELLOW" "$WARNINGS" "$C_RESET" \
+        "$C_DIM" "$total" "$C_RESET"
+}
+
 # ---------- Args ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1465,7 +1485,7 @@ main() {
     fi
 
     echo "  Scan completed in $(($(date +%s) - START_TS))s"
-    chart_findings
+    printerz_findings
     echo ""
     echo "  Run './printerz --manual' for testing instructions"
 
