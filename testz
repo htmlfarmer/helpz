@@ -176,7 +176,7 @@ while IFS= read -r t; do
         note_skip; continue
     fi
     # Tools that are filters or need an argument must be fed something.
-    local extra="${TOOL_ARGS[$t]:-}"
+    extra="${TOOL_ARGS[$t]:-}"
     if [[ "$t" == "chartz" ]]; then
         jout=$(printf 'alpha 10\nbeta 20\n' | timeout 300 "$SCRIPT_DIR/$t" $extra --json 2>/dev/null | head -c 400000)
     else
