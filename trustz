@@ -211,8 +211,20 @@ if [[ "${ans,,}" =~ ^y ]]; then
     mkdir -p "$STATE_DIR"
     { printf '#approved:%s\n#manifest:%s\n' "$(date '+%F %T')" "$CURRENT"; } > "$APPROVED_FILE"
     printf "  ${C_GREEN}✓ approved${C_RESET} ${DIM}($AI_NOTE)${C_RESET} — run tools normally or via ./runz\n\n"
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+        printf '{"tool":"trustz","host":"%s","timestamp":"%s","approved":true}\n' \
+            "$HOSTNAME_SHORT" "$TIMESTAMP" >&4
+        exec 1>&2
+    fi
     emit_verdict
 else
     printf "  ${C_RED}✗ NOT approved${C_RESET} — ./runz and trustz --check will refuse until you approve. Re-scan: ./trustz\n\n"
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+        printf '{"tool":"trustz","host":"%s","timestamp":"%s","approved":false}\n' \
+            "$HOSTNAME_SHORT" "$TIMESTAMP" >&4
+        exec 1>&2
+    fi
     exit 2
 fi

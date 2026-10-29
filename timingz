@@ -62,6 +62,12 @@ MODE_ARG=""
 AI_VERDICT=0
 case "${1:-}" in
     -h|--help) show_help ;;
+    --json)
+        JSON_OUT=1
+        # JSON mode: the report goes to stderr, stdout carries only the JSON.
+        exec 4>&1 1>&2
+        _JSON_FD4=1
+        ;;
     1|--bench|--benchmark) MODE_ARG="1" ;;
     2|--guide|--usage) MODE_ARG="2" ;;
     3|--both) MODE_ARG="3" ;;

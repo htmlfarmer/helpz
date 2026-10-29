@@ -92,6 +92,7 @@ declare -A TOOL_ARGS=(
   [publishz]="--dry-run --name testz"
   [dnsz]="--local"
   [allz]="--help"
+  [installz]="--status"
 )
 
 is_slow() {

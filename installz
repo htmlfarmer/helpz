@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
         --uninstall) ACTION="uninstall" ;;
         --status)    ACTION="status" ;;
         --no-completion) COMPLETION=0 ;;
-        --json)   JSON_OUT=1; exec 4>&1 1>&2 ;;
+        --json)   JSON_OUT=1; exec 4>&1 1>&2; _JSON_FD4=1 ;;
         --no-color) NO_COLOR=1; init_colors ;;
         -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
         *) echo "installz: unknown option $1" >&2; exit 64 ;;
@@ -206,4 +206,12 @@ case "$ACTION" in
     uninstall) do_uninstall ;;
     status)    do_status ;;
 esac
+
+if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+    printf '{"tool":"installz","action":"%s","suite_dir":"%s","target":"%s","completion":%s}\n' \
+        "$ACTION" "$SCRIPT_DIR" "$TARGET_DIR" \
+        "$( [[ -e "$COMPLETION_FILE" ]] && echo true || echo false )" >&4
+    exec 1>&2
+fi
 exit 0
