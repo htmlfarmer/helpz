@@ -80,8 +80,6 @@ declare -A SKIP_REASON=(
   [downz]="needs a URL"
   [whoisz]="needs a domain"
   [livez]="never exits (live monitor)"
-  [xyzoservicesz]="personal tool, needs root"
-  [xyzothinthreadsz]="personal tool, needs root"
   [studyz]="needs the AI backend"
   [runz]="needs a trust state"
 )
@@ -94,6 +92,16 @@ declare -A TOOL_ARGS=(
   [allz]="--help"
   [installz]="--status"
 )
+
+# Personal / business-specific tools are skipped by PATTERN. Naming them
+# explicitly would leak their names into a published copy that does not
+# contain them.
+is_personal() {
+    case "$1" in
+        xyzo*|spiritz) return 0 ;;
+    esac
+    return 1
+}
 
 is_slow() {
     local t="$1" s
@@ -146,7 +154,7 @@ while IFS= read -r t; do
     if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
         note_skip; continue
     fi
-    if [[ -n "${SKIP_REASON[$t]:-}" ]]; then
+    if [[ -n "${SKIP_REASON[$t]:-}" ]] || is_personal "$t"; then
         note_skip; continue
     fi
     out=$(timeout 300 "$SCRIPT_DIR/$t" --no-color </dev/null 2>&1); rc=$?
@@ -173,7 +181,7 @@ while IFS= read -r t; do
     if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
         note_skip; continue
     fi
-    if [[ -n "${SKIP_REASON[$t]:-}" ]]; then
+    if [[ -n "${SKIP_REASON[$t]:-}" ]] || is_personal "$t"; then
         note_skip; continue
     fi
     # Tools that are filters or need an argument must be fed something.
