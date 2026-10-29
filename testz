@@ -93,13 +93,20 @@ declare -A TOOL_ARGS=(
   [installz]="--status"
 )
 
-# Personal / business-specific tools are skipped by PATTERN. Naming them
-# explicitly would leak their names into a published copy that does not
-# contain them.
+# A tool that is listed in .gitignore is a PERSONAL tool — it lives on this
+# machine only and some of them change system state, so the self-test must
+# never run them. Deriving this from .gitignore rather than a hard-coded list
+# means the published copy carries no names of tools it does not contain.
 is_personal() {
-    case "$1" in
-        xyzo*|spiritz) return 0 ;;
-    esac
+    local t="$1" pat
+    [[ -f "$SCRIPT_DIR/.gitignore" ]] || return 1
+    while IFS= read -r pat; do
+        pat="${pat%%#*}"
+        pat="${pat#"${pat%%[![:space:]]*}"}"   # trim leading space
+        [[ -z "$pat" ]] && continue
+        [[ "$pat" == */* ]] && continue          # path rules never name a tool
+        [[ "$t" == $pat ]] && return 0
+    done < <(grep -vE '^[[:space:]]*(#|$)' "$SCRIPT_DIR/.gitignore" 2>/dev/null)
     return 1
 }
 
