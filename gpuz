@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # gpuz - GPU diagnostic
 # ----------------------------------------------------------------------------
@@ -41,7 +41,9 @@ while [[ $i -lt $# ]]; do
     --id=*)       GPU_ID="${arg#--id=}" ;;
     --id)         i=$((i+1)); GPU_ID="${ARGS[$i]:-}" ;;
     --no-color)   NO_COLOR=1 ;;
-    --json)       JSON_OUT=1 ;;
+    --json)       JSON_OUT=1
+        json_stdout_only
+         ;;
     -h|--help)
       cat << 'HELPEOF'
 
@@ -93,7 +95,7 @@ HELPEOF
 done
 
 # ---------- AI hook (opt-in via --ai) ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 if [[ "${AI_VERDICT:-}" == "1" ]]; then
@@ -592,6 +594,7 @@ section "VERDICT"
 END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
 
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
   for f in "${JSON_FIELDS[@]}"; do
     key="${f%%\":*}"; key="${key#\"}"
@@ -613,6 +616,7 @@ else
   fi
   printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
   chart_findings
+    exec 1>&2
 fi
 
 # ---------- AI verdict (opt-in via --ai) ----------

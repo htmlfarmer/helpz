@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # filez — Directory Surveyor, Security Auditor & Size Diagram
 #
 # Walks a directory tree, classifies every file by type, ranks by size, and
@@ -22,7 +22,7 @@
 set +o pipefail
 set +e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 C_RESET="${C_RESET:-}"; C_BOLD="${C_BOLD:-}"; C_DIM="${C_DIM:-}"
@@ -46,7 +46,9 @@ while [[ $# -gt 0 ]]; do
         --max-files) MAX_FILES="$2"; shift 2 ;;
         --recent)    RECENT_DAYS="$2"; shift 2 ;;
         --outdir)    OUTDIR="$2"; shift 2 ;;
-        --json)      JSON_OUT=1; shift ;;
+        --json)      JSON_OUT=1; shift
+            json_stdout_only
+             ;;
         --no-color)  NO_COLOR=1; shift ;;
         --ai)        AI_VERDICT=1; shift ;;
         --no-ai)     AI_VERDICT=0; shift ;;

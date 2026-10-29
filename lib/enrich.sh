@@ -9,7 +9,7 @@
 # at most once per IP per script run. Uses ip-api.com (free, no key, 45/min).
 #
 # Usage in any script:
-#   source "$(dirname "${BASH_SOURCE[0]}")/lib/enrich.sh"
+#   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/enrich.sh"
 #   echo "$(enrich_ip 1.2.3.4)"
 #   # → "Pullman, WA, United States | Ziply Fiber | moon.lan"
 #

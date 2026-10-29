@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # diskz - Block device, filesystem & SMART drive-health diagnostic
 # ----------------------------------------------------------------------------
@@ -23,7 +23,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 if [[ -f "$SCRIPT_DIR/lib/common.sh" ]]; then
   # shellcheck source=lib/common.sh
   source "$SCRIPT_DIR/lib/common.sh"
@@ -53,7 +53,9 @@ while [[ $i -lt $# ]]; do
     --fs=*)       FILTER_FS="${arg#--fs=}" ;;
     --fs)         i=$((i+1)); FILTER_FS="${ARGS[$i]:-}" ;;
     --no-color)   NO_COLOR=1 ;;
-    --json)       JSON_OUT=1 ;;
+    --json)       JSON_OUT=1
+        json_stdout_only
+         ;;
     -h|--help)
       cat << 'HELPEOF'
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # trustz - Pre-run trust gate: scan this repo's code BEFORE you execute it
 # ----------------------------------------------------------------------------
@@ -27,7 +27,7 @@
 # ============================================================================
 
 set -o pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 have_ai=1
@@ -43,7 +43,9 @@ while [[ $# -gt 0 ]]; do
         --approve) MODE="approve" ;;
         --install-hook) MODE="hook" ;;
         --no-ai)   have_ai=0 ;;
-        --json)    JSON_OUT=1 ;;
+        --json)    JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color) NO_COLOR=1; init_colors ;;
         -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
         *) echo "trustz: unknown option $1 (try --help)" >&2; exit 64 ;;

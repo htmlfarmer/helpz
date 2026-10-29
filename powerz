@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # powerz - Battery & power subsystem diagnostic
 # ----------------------------------------------------------------------------
@@ -50,7 +50,9 @@ while [[ $i -lt $# ]]; do
     --rate=*)     RATE_CENTS_KWH="${arg#--rate=}" ;;
     --rate)       i=$((i+1)); RATE_CENTS_KWH="${ARGS[$i]:-11}" ;;
     --no-color)   NO_COLOR=1 ;;
-    --json)       JSON_OUT=1 ;;
+    --json)       JSON_OUT=1
+        json_stdout_only
+         ;;
     --accuracy)   ACCURACY=1 ;;
     --measure=*)  MEASURE_SECS="${arg#--measure=}" ;;
     --measure)    i=$((i+1)); MEASURE_SECS="${ARGS[i]:-10}" ;;
@@ -115,7 +117,7 @@ HELPEOF
 done
 
 # ---------- AI hook (opt-in via --ai) ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 if [[ "${AI_VERDICT:-}" == "1" ]]; then
@@ -945,6 +947,7 @@ section "VERDICT"
 END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
 
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   printf '{"script":"power","timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
   for f in "${JSON_FIELDS[@]}"; do printf ',%s' "$f"; done
   printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$ELAPSED"
@@ -960,6 +963,7 @@ else
     exit_code=0
   fi
   printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+    exec 1>&2
 fi
 
 # Watch loop

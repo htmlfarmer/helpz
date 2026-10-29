@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # testz - Self-test for the suite: does every tool still behave?
 # ----------------------------------------------------------------------------
@@ -28,7 +28,7 @@
 # ============================================================================
 
 set -o pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 [[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; }
@@ -39,7 +39,9 @@ while [[ $# -gt 0 ]]; do
         --full)  FULL=1 ;;
         --tool)  shift; ONLY="${1:-}" ;;
         --tool=*) ONLY="${1#--tool=}" ;;
-        --json)  JSON_OUT=1 ;;
+        --json)  JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color) NO_COLOR=1; init_colors ;;
         -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
         *) echo "testz: unknown option $1" >&2; exit 64 ;;
@@ -176,6 +178,7 @@ fi
 
 # ── report ─────────────────────────────────────────────────────────────────
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
     printf '{"tool":"testz","passed":%d,"failed":%d,"skipped":%d,"failures":[' "$PASS" "$FAIL" "$SKIP"
     first=1
     for f in "${FAILURES[@]:-}"; do
@@ -186,6 +189,7 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
     done
     printf ']}\n'
     exit $(( FAIL > 0 ? 1 : 0 ))
+    exec 1>&2
 fi
 
 section "TEST SUMMARY"

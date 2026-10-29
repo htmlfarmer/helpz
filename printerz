@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 
 # ============================================================================
 # printerz - Printer Log Scanner & Debugger
@@ -40,7 +40,7 @@ set -o pipefail
 
 # ---------- shared duration parsing ----------
 # Same "--last 1hr" shorthand as logz and the rest of the suite.
-DURATION_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/duration.sh"
+DURATION_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/lib/duration.sh"
 # shellcheck source=lib/duration.sh
 [[ -r "$DURATION_LIB" ]] && source "$DURATION_LIB"
 
@@ -129,7 +129,9 @@ while [[ $# -gt 0 ]]; do
         --tail=*)      TAIL_LINES="${1#--tail=}" ;;
         --tail)        TAIL_LINES="${2:-50}"; shift ;;
         --no-color)    NO_COLOR=1; init_colors ;;
-        --json)        JSON_OUT=1; JSON_STDOUT=1 ;;
+        --json)        JSON_OUT=1; JSON_STDOUT=1
+            json_stdout_only
+             ;;
         --debug)       DEBUG_MODE=1 ;;
         --deep)        DEEP_SCAN=1 ;;
         --manual)      MANUAL_MODE=1 ;;

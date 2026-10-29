@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # kernelz - Kernel study, source builds, safe upgrade, GRUB recovery & benchmarks
 # ----------------------------------------------------------------------------
@@ -36,7 +36,7 @@ set -o pipefail
 # shellcheck disable=SC2086
 
 SCRIPT_VERSION="1.0.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # ---------- Commands & flags ----------
 COMMAND="status"
@@ -58,7 +58,9 @@ BUILD_DIR="${BUILD_DIR:-$HOME/linux-build}"
 ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --json)      JSON_OUT=1 ;;
+        --json)      JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)  NO_COLOR=1 ;;
         --dry-run)   DRY_RUN=1 ;;
         --force)     FORCE=1 ;;

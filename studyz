@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # studyz — AI-Powered Security Study
 # ============================================================================
@@ -29,7 +29,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
@@ -124,7 +124,9 @@ while [[ $# -gt 0 ]]; do
         --no-ai)       NO_AI=1; shift ;;
         --ai)          NO_AI=0; shift ;;
         --no-color)    NO_COLOR=1; shift ;;
-        --json)        JSON_OUT=1; shift ;;
+        --json)        JSON_OUT=1; shift
+            json_stdout_only
+             ;;
         --model)       MODEL="${2:-}"; shift 2 ;;
         --model=*)     MODEL="${1#--model=}"; shift ;;
         --timeout)     TIMEOUT="${2:-60}"; shift 2 ;;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # sitemapz — Standalone deep sitemap audit
 #
@@ -44,7 +44,7 @@
 set +o pipefail
 set +e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
 # shellcheck disable=SC1091
@@ -71,7 +71,9 @@ while [[ $# -gt 0 ]]; do
         sed -n '2,40p' "$0"; exit 0
     fi
     case "$1" in
-        --json)        JSON_OUT=1; shift ;;
+        --json)        JSON_OUT=1; shift
+            json_stdout_only
+             ;;
         --csv)         CSV_OUT=1; shift ;;
         --outdir)      OUTDIR="$2"; shift 2 ;;
         --max-urls)    MAX_URLS="$2"; shift 2 ;;
@@ -586,6 +588,7 @@ fi
 
 # ---------- Optional JSON dump ----------
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     JSON_REPORT="$OUTDIR/${SAFE_HOST}-${TS}.json"
     if [[ "$TYPE" == "urlset" ]]; then
         URLS=$(echo "$PARSED" | grep '^URLS=' | cut -d= -f2)
@@ -613,6 +616,7 @@ EOF
 EOF
     fi
     printf "JSON:   %s\n" "$JSON_REPORT"
+    exec 1>&2
 fi
 
 # Finalize and generate comparison report

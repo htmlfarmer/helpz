@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # usbz - USB bus diagnostic
 # ----------------------------------------------------------------------------
@@ -45,7 +45,9 @@ while [[ $i -lt $# ]]; do
     --vendor=*)  FILTER_VENDOR="${arg#--vendor=}" ;;
     --vendor)    i=$((i+1)); FILTER_VENDOR="${ARGS[$i]:-}" ;;
     --no-color)  NO_COLOR=1 ;;
-    --json)      JSON_OUT=1 ;;
+    --json)      JSON_OUT=1
+        json_stdout_only
+         ;;
     --ai)        AI_VERDICT=1 ;;
     --no-ai)     AI_VERDICT=0 ;;
     -h|--help)
@@ -100,7 +102,7 @@ done
 if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "usbz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
 
 # ---------- AI hook (opt-in via --ai) ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
@@ -642,8 +644,10 @@ chart_findings
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   printf '{"script":"usb","host":"%s","timestamp":"%s","total_devices":%d,"fastest_speed_mbps":%d,"suspended":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
     "$HOSTNAME_SHORT" "$TIMESTAMP" "$TOTAL_DEVICES" "$FASTEST_SPEED_MBPS" "$SUSPENDED" "$WARNINGS" "$CRITICAL" "$EXIT"
+    exec 1>&2
 fi
 
 # ---------- Run Comparison Finalize ----------

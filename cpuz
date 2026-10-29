@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # cpuz - CPU diagnostic
 # ----------------------------------------------------------------------------
@@ -31,7 +31,7 @@ HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
 WARNINGS=0
 CRITICAL=0
 # Source verdict logging helper
-SCRIPT_DIR_CPU="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR_CPU="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SCRIPT_DIR="$SCRIPT_DIR_CPU"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
@@ -48,7 +48,9 @@ while [[ $i -lt $# ]]; do
     --watch=*)    WATCH_INTERVAL="${arg#--watch=}" ;;
     --watch)      i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-2}" ;;
     --no-color)   NO_COLOR=1 ;;
-    --json)       JSON_OUT=1 ;;
+    --json)       JSON_OUT=1
+        json_stdout_only
+         ;;
     -h|--help)
       cat << 'HELPEOF'
 
@@ -110,7 +112,9 @@ if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
   exec 3>&1 1>/dev/null   # cpuz has many raw printfs; send them to the void, keep real stdout on fd 3
+    exec 1>&2
 fi
 
 # Initialize run comparison (skip for JSON/watch modes)

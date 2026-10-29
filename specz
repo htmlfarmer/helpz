@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # specz - Full hardware specification report
 # ----------------------------------------------------------------------------
@@ -36,7 +36,7 @@ CRITICAL=0
 JSON_FIELDS=()
 
 # Source verdict logging helper
-SCRIPT_DIR_SPECS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR_SPECS="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SCRIPT_DIR="$SCRIPT_DIR_SPECS"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
@@ -50,7 +50,9 @@ while [[ $i -lt $# ]]; do
   arg="${ARGS[$i]}"
   case "$arg" in
     --no-color)   NO_COLOR=1 ;;
-    --json)       JSON_OUT=1 ;;
+    --json)       JSON_OUT=1
+        json_stdout_only
+         ;;
     --ai)         AI_MODE=1 ;;
     -h|--help)
       cat << 'HELPEOF'
@@ -106,8 +108,10 @@ if [[ "$JSON_OUT" != "1" && "$AI_MODE" != "1" ]] && declare -f run_comparison_in
 
 # If JSON mode is enabled, suppress all stdout during data collection
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   exec 3>&1
   exec 1>/dev/null
+    exec 1>&2
 fi
 
 # ---------- Helpers ----------

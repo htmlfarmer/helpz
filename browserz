@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # browserz — Installed Web Browser & Privacy Audit
 # ----------------------------------------------------------------------------
@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck disable=SC1091
@@ -51,7 +51,9 @@ while [[ $i -lt $# ]]; do
     arg="${ARGS[$i]}"
     case "$arg" in
         -h|--help)              SHOW_HELP=1 ;;
-        --json)                 JSON_OUT=1 ;;
+        --json)                 JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
         --bench)                BENCH=1 ;;
@@ -65,7 +67,6 @@ while [[ $i -lt $# ]]; do
 done
 
 # In JSON mode the report goes to stderr and stdout carries only the JSON.
-json_stdout_only
 
 if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "browserz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
 

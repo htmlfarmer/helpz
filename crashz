@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # crashz - Crash & freeze forensics: why did the machine die, and how do I recover?
 # ----------------------------------------------------------------------------
@@ -40,7 +40,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 if [[ -f "$SCRIPT_DIR/lib/smart.sh" ]]; then
@@ -71,7 +71,9 @@ while [[ $# -gt 0 ]]; do
         --since=*)   SINCE_H="${1#--since=}" ;;
         --from-file) shift; SMART_FROM="${1:--}" ;;
         --from-file=*) SMART_FROM="${1#--from-file=}" ;;
-        --json)      JSON_OUT=1 ;;
+        --json)      JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)  NO_COLOR=1; init_colors ;;
         --apply)     APPLY=1 ;;
         --ai)        AI_VERDICT=1 ;;
@@ -629,8 +631,10 @@ cmd_why() {
     with_spin "reading the evidence" scan_all
     rank_causes
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        exec 1>&4
         emit_json_summary
         emit_verdict
+        exec 1>&2
     fi
     if [[ ${#RANKED[@]} -eq 0 ]]; then
         echo "crashz why → no crash evidence in the scanned journals — if it froze dead, run ./crashz watch 5 to prepare for next time"

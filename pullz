@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # pullz - Git pull with a rollback point and a preview of what's coming
 # ----------------------------------------------------------------------------
@@ -23,7 +23,7 @@
 # ============================================================================
 
 set -o pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
@@ -35,7 +35,9 @@ while [[ $# -gt 0 ]]; do
         --merge)     MODE="merge" ;;
         --autostash) AUTOSTASH=1 ;;
         --no-backup) BACKUP=0 ;;
-        --json)      JSON_OUT=1 ;;
+        --json)      JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)  NO_COLOR=1; init_colors ;;
         -h|--help)   sed -n '6,22p' "$0"; exit 0 ;;
         -*) echo "pullz: unknown option $1" >&2; exit 64 ;;
@@ -86,12 +88,14 @@ else
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
     printf '{"tool":"pullz","repo":"%s","branch":"%s","behind":%s,"ahead":%s,"mode":"%s"}\n' \
         "$REPO_DIR" "$BRANCH" "${BEHIND:-0}" "${AHEAD:-0}" "$MODE"
     [[ "${BEHIND:-0}" -eq 0 ]] && exit 0
     [[ "$DRY" -eq 1 ]] && exit 0
     [[ "$MODE" == "ff" && "${AHEAD:-0}" -gt 0 ]] && exit 2
     git pull -q --ff-only "$REMOTE" "$BRANCH" >/dev/null 2>&1 && exit 0 || exit 2
+    exec 1>&2
 fi
 
 # ── preview ────────────────────────────────────────────────────────────────

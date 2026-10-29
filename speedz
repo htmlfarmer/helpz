@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # speedz — System Speed Consultant
 # ----------------------------------------------------------------------------
@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
@@ -45,7 +45,9 @@ while [[ $i -lt $# ]]; do
     arg="${ARGS[$i]}"
     case "$arg" in
         -h|--help)              SHOW_HELP=1 ;;
-        --json)                 JSON_OUT=1 ;;
+        --json)                 JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-5}" ;;
         --quiet)                QUIET=1 ;;
@@ -99,9 +101,11 @@ fi
 # ─── Banner ────────────────────────────────────────────────────────────────
 JSON_CAPTURE=""
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     JSON_CAPTURE="$(mktemp)"
     exec 3>&1
     exec 1>"$JSON_CAPTURE"
+    exec 1>&2
 fi
 
 if [[ $JSON_OUT -eq 0 ]]; then
@@ -610,6 +614,7 @@ fi
 
 # ─── JSON verdict ──────────────────────────────────────────────────────────
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     exec 1>&3
     exec 3>&-
     [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
@@ -648,6 +653,7 @@ if [[ $JSON_OUT -eq 1 ]]; then
     done
     printf ',"duration_s":%d}\n' "$elapsed"
     exit 0
+    exec 1>&2
 fi
 
 # ---------- Run Comparison Finalize ----------

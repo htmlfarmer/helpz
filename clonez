@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # clonez - Clone a repo safely: clean target, sane URL, then scan what landed
 # ----------------------------------------------------------------------------
@@ -23,7 +23,7 @@
 # ============================================================================
 
 set -o pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
@@ -36,7 +36,9 @@ while [[ $# -gt 0 ]]; do
         --depth=*) DEPTH="${1#--depth=}" ;;
         --no-scan) SCAN=0 ;;
         --list)    LIST=1 ;;
-        --json)    JSON_OUT=1 ;;
+        --json)    JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color) NO_COLOR=1; init_colors ;;
         -h|--help) sed -n '6,22p' "$0"; exit 0 ;;
         -*) echo "clonez: unknown option $1" >&2; exit 64 ;;
@@ -137,8 +139,10 @@ if [[ "$SCAN" -eq 1 ]]; then
 fi
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
     printf '{"tool":"clonez","url":"%s","dest":"%s","scanned":%s}\n' "$URL" "$DEST" "$SCAN"
     exit 0
+    exec 1>&2
 fi
 
 printf "\n  ${C_DIM}next: cd %s && read the README before running anything${C_RESET}\n" "$DEST"

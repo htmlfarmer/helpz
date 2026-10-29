@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # sshauditz — SSH Configuration & Authorized Keys Security Auditor
 # ----------------------------------------------------------------------------
@@ -13,7 +13,7 @@
 set -o pipefail
 
 SCRIPT_VERSION="1.0.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 [[ -f "$SCRIPT_DIR/lib/common.sh" ]] && source "$SCRIPT_DIR/lib/common.sh"
 
@@ -62,7 +62,9 @@ i=0
 while [[ $i -lt $# ]]; do
     arg="${ARGS[$i]}"
     case "$arg" in
-        --json)      JSON_OUT=1 ;;
+        --json)      JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)  NO_COLOR=1 ;;
         --ai)        AI_VERDICT=1 ;;
         --no-ai)     AI_VERDICT=0 ;;
@@ -119,8 +121,10 @@ _ssh_donut_track() {
 trap '_ssh_donut_track' DEBUG
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
     exec 3>&1
     exec 1>/dev/null
+    exec 1>&2
 fi
 
 SUDO=""
@@ -459,8 +463,10 @@ fi
 
 # JSON fields
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
     exec 1>&3
     exec 3>&-
+    exec 1>&2
 fi
 
 add_json_field "sshd_active" "$SSHD_RUNNING" 1

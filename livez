@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # livez - Adaptive live system monitor (btop/htop-style, pure bash)
 # ----------------------------------------------------------------------------
@@ -43,7 +43,9 @@ while [[ $# -gt 0 ]]; do
     --battery-only)  ONLY="battery" ;;
     --once)          ONCE=1 ;;
     --plain)         PLAIN=1 ;;
-    --json)          JSON_OUT=1 ;;
+    --json)          JSON_OUT=1
+        json_stdout_only
+         ;;
     --no-color)      NO_COLOR=1 ;;
     --ai|--no-ai)    : ;; # accepted for suite parity; livez is continuous
     -h|--help)

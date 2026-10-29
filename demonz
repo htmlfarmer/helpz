@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # demonz — Systemd Service Summoner & Banisher
 # ----------------------------------------------------------------------------
@@ -33,7 +33,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 [[ -f "$SCRIPT_DIR/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR/lib/verdict_log.sh"
@@ -139,7 +139,9 @@ while [[ $i -lt $# ]]; do
     arg="${ARGS[$i]}"
     case "$arg" in
         -h|--help)              show_help ;;
-        --json)                 JSON_OUT=1 ;;
+        --json)                 JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --stop|--banish)        i=$((i+1)); ACTION="stop";    ACTION_TARGET="${ARGS[$i]:-}" ;;
         --disable|--bind)       i=$((i+1)); ACTION="disable"; ACTION_TARGET="${ARGS[$i]:-}" ;;
@@ -236,9 +238,11 @@ backup_sigil() {
 # output is produced.
 JSON_CAPTURE=""
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     JSON_CAPTURE="$(mktemp)"
     exec 3>&1
     exec 1>"$JSON_CAPTURE"
+    exec 1>&2
 fi
 
 print_sigil
@@ -588,6 +592,7 @@ fi
 # In JSON mode, restore stdout and emit a single verdict line — discard
 # the captured audit text.
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     exec 1>&3
     exec 3>&-
     [[ -n "$JSON_CAPTURE" && -f "$JSON_CAPTURE" ]] && rm -f "$JSON_CAPTURE"
@@ -601,6 +606,7 @@ if [[ $JSON_OUT -eq 1 ]]; then
     printf '{"fallen":%d,"possessed":%d,"dormant":%d,"status":"%s","exit_code":%d}\n' \
         "$FAILED" "$SUSPECT_FOUND" "$ENABLED_NOT_RUNNING" "$status" "$exit_code"
     exit "$exit_code"
+    exec 1>&2
 fi
 
 section "VERDICT"

@@ -56,13 +56,13 @@ init_colors
 
 # ---------- duration parsing ----------
 # Shared "1hr" / "5min" / "2h" → "N unit ago" translation (lib/duration.sh).
-[[ -z "${SCRIPT_DIR:-}" ]] && SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -z "${SCRIPT_DIR:-}" ]] && SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=lib/duration.sh
 [[ -r "$SCRIPT_DIR/lib/duration.sh" ]] && source "$SCRIPT_DIR/lib/duration.sh"
 
 # ---------- chart toolkit ----------
 # Every tool that sources common.sh also gets the text-chart helpers.
-[[ -z "${SCRIPT_DIR:-}" ]] && SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -z "${SCRIPT_DIR:-}" ]] && SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck source=lib/chart.sh
 [[ -r "$SCRIPT_DIR/lib/chart.sh" ]] && source "$SCRIPT_DIR/lib/chart.sh"
 

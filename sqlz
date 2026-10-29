@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # sqlz - PostgreSQL cluster diagnostic
 # ----------------------------------------------------------------------------
@@ -52,7 +52,9 @@ while [[ $i -lt $# ]]; do
     --host|-h)     i=$((i+1)); HOST_OPT="${ARGS[$i]:-}" ;;
     --port|-p)     i=$((i+1)); PORT_OPT="${ARGS[$i]:-5432}" ;;
     --no-color)    NO_COLOR=1 ;;
-    --json)        JSON_OUT=1 ;;
+    --json)        JSON_OUT=1
+        json_stdout_only
+         ;;
     --quick)       QUICK=1; TOP_N=5 ;;
     --top=*)       TOP_N="${arg#--top=}" ;;
     --top)         i=$((i+1)); TOP_N="${ARGS[$i]:-10}" ;;
@@ -122,7 +124,7 @@ done
 if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "sqlz" "JSON_OUT=$JSON_OUT QUICK=$QUICK" 2>/dev/null; fi
 
 # ---------- AI hook (opt-in via --ai) ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
@@ -173,20 +175,24 @@ PSQL_PRETTY=(psql "${PSQL_CONN[@]}" --no-psqlrc -P pager=off)
 TEST_CONN=$("${PSQL[@]}" -c "SELECT 1;" 2>&1)
 if [[ "$TEST_CONN" != "1" ]]; then
   if [[ $JSON_OUT -eq 1 ]]; then
+      exec 1>&4
     err_escaped="${TEST_CONN//\"/\\\"}"
     err_escaped="${err_escaped//$'\n'/\\n}"
     printf '{"timestamp":"%s","hostname":"%s","status":"connection_failed","error":"%s","critical":1,"warnings":0}\n' \
       "$TIMESTAMP" "$HOSTNAME_SHORT" "$err_escaped"
   else
     printf "\033[31m\033[1m✗\033[0m \033[31mCannot connect:\033[0m %s\n" "$TEST_CONN" >&2
+      exec 1>&2
   fi
   exit 2
 fi
 
 # If JSON mode is enabled, suppress all stdout during data collection
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   exec 3>&1
   exec 1>/dev/null
+    exec 1>&2
 fi
 
 # ---------- Helpers ----------

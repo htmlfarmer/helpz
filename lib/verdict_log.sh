@@ -10,7 +10,7 @@
 #   - A subset of the SUGGESTION_CATALOG for common categories
 #
 # Usage in standalone script (e.g. security.sh):
-#   source "$(dirname "${BASH_SOURCE[0]}")/lib/verdict_log.sh"
+#   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/verdict_log.sh"
 #   log_verdict_crit "ssh_root_login" "PermitRootLogin yes" "Set PermitRootLogin no"
 #   ...
 #   show_verdict_one_liners

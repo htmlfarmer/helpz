@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # dnsz — Standalone deep DNS audit
 #
@@ -44,7 +44,7 @@
 set +o pipefail
 set +e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
 # shellcheck disable=SC1091
@@ -67,7 +67,9 @@ while [[ $# -gt 0 ]]; do
         sed -n '2,40p' "$0"; exit 0
     fi
     case "$1" in
-        --json)       JSON_OUT=1; shift ;;
+        --json)       JSON_OUT=1; shift
+            json_stdout_only
+             ;;
         --no-color)   NO_COLOR=1; shift ;;
         --outdir)     OUTDIR="$2"; shift 2 ;;
         --resolvers)  RESOLVERS="$2"; shift 2 ;;
@@ -677,11 +679,13 @@ fi
 
 # ---------- Optional JSON dump ----------
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     cat > "$JSON_REPORT" <<EOF
 {
   "host": "$URL_HOST",
   "timestamp": "$(date -Iseconds)",
   "record_counts": {
+    exec 1>&2
 $(for k in "${!COUNTS[@]}"; do printf '    "%s": %s,\n' "$k" "${COUNTS[$k]}"; done | sort)
     "total": $(( ${COUNTS[A]} + ${COUNTS[AAAA]} + ${COUNTS[MX]} + ${COUNTS[NS]} + ${COUNTS[TXT]} + ${COUNTS[CNAME]} + ${COUNTS[SOA]} + ${COUNTS[CAA]} + ${COUNTS[SRV]} + ${COUNTS[NAPTR]} ))
   },

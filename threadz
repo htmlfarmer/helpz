@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # threadz — System Thread Activity & Deep Kernel Thread Analysis
 # ----------------------------------------------------------------------------
@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
@@ -44,7 +44,9 @@ while [[ $i -lt $# ]]; do
     arg="${ARGS[$i]}"
     case "$arg" in
         -h|--help)              SHOW_HELP=1 ;;
-        --json)                 JSON_OUT=1 ;;
+        --json)                 JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --top)                  i=$((i+1)); TOP_N="${ARGS[$i]:-15}" ;;
         --pid)                  i=$((i+1)); FOCUS_PID="${ARGS[$i]:-}" ;;

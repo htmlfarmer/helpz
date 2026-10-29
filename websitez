@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # websitez — Universal Website Audit & Diagnostics
 # ----------------------------------------------------------------------------
@@ -57,7 +57,7 @@
 
 set +o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
 # shellcheck disable=SC1091
@@ -83,7 +83,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --quick)             QUICK=1; DEPTH="quick"; SAMPLE_N=3 ;;
         --api-only)          API_ONLY=1 ;;
-        --json)              WRITE_JSON=1 ;;
+        --json)              WRITE_JSON=1
+            json_stdout_only
+             ;;
         --outdir)            OUTDIR="$2"; shift ;;
         --depth)             DEPTH="${2:-quick}"; case "$DEPTH" in
                                  quick)    SAMPLE_N=3 ;;

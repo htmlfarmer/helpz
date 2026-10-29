@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # slowz - System slowness diagnostic tool
 # ----------------------------------------------------------------------------
@@ -22,7 +22,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 if [[ -f "$SCRIPT_DIR/lib/common.sh" ]]; then
   # shellcheck source=lib/common.sh
   source "$SCRIPT_DIR/lib/common.sh"
@@ -52,7 +52,7 @@ RUN_GPU=0
 RUN_SERVICES=0
 SELECTED_SECTIONS=0
 # Source verdict logging helper
-SCRIPT_DIR_SLOW="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR_SLOW="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 [[ -f "$SCRIPT_DIR_SLOW/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_SLOW/lib/verdict_log.sh"
 
 # Source run comparison helper
@@ -72,7 +72,9 @@ PRINTER_UNIT_RE='configure-printer@|cups\.service|cups\.socket|cups-browsed'
 for arg in "$@"; do
   case "$arg" in
     --quick)       QUICK=1 ;;
-    --json)        JSON_OUT=1 ;;
+    --json)        JSON_OUT=1
+        json_stdout_only
+         ;;
     --no-color)    NO_COLOR=1 ;;
     --save)        SAVE=1 ;;
     --watch)       WATCH=1 ;;
@@ -268,9 +270,11 @@ should_run() {
 # so the audit text doesn't contaminate the JSON output that callers parse.
 JSON_CAPTURE=""
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
     JSON_CAPTURE="$(mktemp)"
     exec 3>&1
     exec 1>"$JSON_CAPTURE"
+    exec 1>&2
 fi
 
 if [[ $JSON_OUT -eq 0 ]]; then
@@ -1146,6 +1150,7 @@ END_TIME=$(date +%s)
 DURATION=$(( END_TIME - START_TIME ))
 
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   verdict="healthy"
   (( CRITICAL > 0 )) && verdict="critical"
   (( CRITICAL == 0 && WARNINGS > 0 )) && verdict="warning"
@@ -1178,6 +1183,7 @@ if [[ $JSON_OUT -eq 1 ]]; then
 }
 EOF
   exit 0
+    exec 1>&2
 fi
 
 # ---------- PSI BOTTLENECK RANKING — what's actually slowing you down ----------

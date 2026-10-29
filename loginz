@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # loginz - Bad-login analyst: who knocked, did they get in, what next
 # ----------------------------------------------------------------------------
@@ -32,7 +32,7 @@
 # ============================================================================
 
 set -o pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || {
     C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'
@@ -53,7 +53,9 @@ while [[ $# -gt 0 ]]; do
         --dossier)  MODE="dossier"; DOSSIER_N="${2:-5}"; shift ;;
         --since)    SINCE="${2:-72h}"; shift ;;
         --since=*)  SINCE="${1#--since=}" ;;
-        --json)     JSON_OUT=1 ;;
+        --json)     JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color) NO_COLOR=1; init_colors ;;
         --ai)       AI_VERDICT=1 ;;
         --no-ai)    AI_VERDICT=0 ;;
@@ -189,11 +191,13 @@ run_summary() {   # $1=1 if called from --dossier (adds report files)
     breach_rows=$(breakins || true); [[ -n "$breach_rows" ]] && breach_n=$(wc -l <<<"$breach_rows")
 
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        exec 1>&4
         local topj="" t
         t=$(awk -F'\t' '$2!="accept"{print $3}' "$LOG_TEMP" | sort | uniq -c | sort -rn | head -8 | awk '{printf "\"%s\":%s,", $2, $1}' | sed 's/,$//')
         printf '{"tool":"loginz","since":"%s","failures":%d,"invalid_probes":%d,"accepted_logins":%d,"unique_source_ips":%d,"accepted_from_attack_ips":%d,"top_fail_ips":{%s}}\n' \
             "$SINCE" "$N_FAIL" "$N_INV" "$N_ACCEPT" "$UNIQUE_IPS" "$breach_n" "$t"
         exit $(( breach_n > 0 ? 2 : (N_FAIL > 0 ? 1 : 0) ))
+        exec 1>&2
     fi
 
     emit "\n  ${C_BOLD}${C_MAGENTA}╭─ loginz ─ bad-login analyst${C_RESET}  ${C_DIM}(window: $SINCE · $(hostname -s))${C_RESET}\n"; hr

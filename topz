@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # topz - A modern, readable "what is my computer doing right now" monitor
 # ----------------------------------------------------------------------------
@@ -24,7 +24,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
@@ -35,7 +35,9 @@ while [[ $# -gt 0 ]]; do
         --watch=*)   WATCH=1; INTERVAL="${1#--watch=}" ;;
         --top=*)     TOPN="${1#--top=}" ;;
         --top)       shift; TOPN="${1:-10}" ;;
-        --json)      JSON_OUT=1 ;;
+        --json)      JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color)  NO_COLOR=1; init_colors ;;
         -h|--help)   sed -n '6,22p' "$0"; exit 0 ;;
         *) echo "topz: unknown option $1 (try --help)" >&2; exit 64 ;;
@@ -111,6 +113,7 @@ DISKROWS=$(join -a1 -a2 <(printf '%s\n' "$DISK1"|sort) <(printf '%s\n' "$DISK2"|
 
 # ─────────────────────────── JSON mode ───────────────────────────
 if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
     printf '{"ts":"%s","host":"%s","cpu_busy_pct":%s,"cpu_iowait_pct":%s,"load1":"%s","cores":%d,"mem_used_mb":%d,"mem_total_mb":%d,"mem_pct":%d,"psi_cpu":"%s","psi_io":"%s","top":[\n' \
         "$(date '+%F %T')" "$HOSTNAME_SHORT" "$BUSY" "$CPU_IOW" "$LOAD1" "$NPROC" $((MEM_USED/1024)) $((MEM_T/1024)) "$MEM_PCT" "$(psi cpu)" "$(psi io)"
     first=1
@@ -122,6 +125,7 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
     done <<< "$TOPROWS"
     printf ']}\n'
     exit 0
+    exec 1>&2
 fi
 
 # ═════════════════════════ 2. render ═════════════════════════

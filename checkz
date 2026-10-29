@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # checkz - Live security log monitor (tail -f for the journal)
 # ----------------------------------------------------------------------------
@@ -82,7 +82,9 @@ for arg in "$@"; do
     case "$arg" in
         -h|--help) show_help ;;
         --no-color) NO_COLOR_FLAG=1 ;;
-        --json) JSON_OUT=1 ;;
+        --json) JSON_OUT=1
+            json_stdout_only
+             ;;
         --ai) AI_VERDICT=1 ;;
     esac
 done
@@ -91,7 +93,9 @@ done
 # fd 4 (not fd 3) — lib/run_comparison.sh claims fd 3 as the real stdout
 # while it tees the report into a capture file.
 if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+    exec 1>&4
     exec 4>&1 1>&2
+    exec 1>&2
 fi
 
 # ---------- Colors ----------
@@ -208,16 +212,18 @@ _LAST_LINES=""
 # ---------- AI hook (opt-in via --ai) ----------
 if [[ "$AI_VERDICT" == "1" ]]; then
     # shellcheck source=lib/ai.sh
-    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/ai.sh" 2>/dev/null || true
+    source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/lib/ai.sh" 2>/dev/null || true
 fi
 
 # Trap Ctrl+C → AI verdict + exit summary
 _checkz_exit() {
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        exec 1>&4
         # JSON mode: stdout carries only the object, the report went to stderr.
         printf '{"tool":"checkz","host":"%s","timestamp":"%s","errors":%s,"warnings":%s,"login_events":%s}\n' \
             "$HOSTNAME_SHORT" "$TIMESTAMP" "$_CNT_ERROR" "$_CNT_WARN" "$_CNT_LOGIN" >&4 2>/dev/null || true
         return 0
+        exec 1>&2
     fi
     if [[ "$AI_VERDICT" == "1" ]] && [[ -n "$_LAST_LINES" ]]; then
         ai_emit_verdict "severity_check" "$_LAST_LINES" 2>/dev/null || true

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # driverz - Driver & firmware health auditor
 # ----------------------------------------------------------------------------
@@ -31,7 +31,7 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 SCRIPT_VERSION="1.0.0"
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
 
@@ -48,7 +48,9 @@ while [[ $# -gt 0 ]]; do
         --video|--graphics) ONLY=video ;;
         --watch) ONLY=watch ;;
         --since=*) SINCE="${1#--since=}" ;;
-        --json) JSON_OUT=1 ;;
+        --json) JSON_OUT=1
+            json_stdout_only
+             ;;
         --no-color) NO_COLOR=1 ;;
         -h|-help|--help)
             cat << 'HELPEOF'

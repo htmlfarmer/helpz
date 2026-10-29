@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # aiz - AI server status monitor
 # ----------------------------------------------------------------------------
@@ -43,7 +43,7 @@
 set -o pipefail
 
 # ---------- Configuration ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
@@ -74,7 +74,7 @@ OK_COUNT=0
 LAT_ROWS=()
 
 # Source verdict logging helper
-SCRIPT_DIR_AI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR_AI="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 [[ -f "$SCRIPT_DIR_AI/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_AI/lib/verdict_log.sh"
 
 # ---------- Args ----------
@@ -91,7 +91,9 @@ while [[ $i -lt $# ]]; do
     --config)   CONFIG_PATH="${ARGS[$((i+1))]:-}"; i=$((i+2)) ;;
     --quick)        QUICK=1; i=$((i+1)) ;;
     --no-color)     NO_COLOR=1; i=$((i+1)) ;;
-    --json)         JSON_OUT=1; i=$((i+1)) ;;
+    --json)         JSON_OUT=1; i=$((i+1))
+        json_stdout_only
+         ;;
     --interpret)    INTERPRET=1; i=$((i+1)) ;;
     --no-interpret) INTERPRET=0; i=$((i+1)) ;;
     --ask-timeout)  i=$((i+1)); ASK_TIMEOUT="${ARGS[$i]:-8}"; i=$((i+1)) ;;
@@ -647,6 +649,7 @@ ai_interpret
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   printf '{"timestamp":"%s","servers":[' "$TIMESTAMP"
   first=1
   for r in "${JSON_RESULTS[@]}"; do
@@ -659,6 +662,7 @@ if [[ $JSON_OUT -eq 1 ]]; then
     fi
   done
   printf '],"warnings":%d,"critical":%d}\n' "$WARNINGS" "$CRITICAL"
+    exec 1>&2
 fi
 
 # ---------- Run Comparison Finalize ----------

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # shellcheck source=.helpz_log.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
 # networkz - Comprehensive network diagnostic
 # ----------------------------------------------------------------------------
@@ -48,7 +48,7 @@ WARNINGS=0
 CRITICAL=0
 
 # ---------- Source verdict logging helper ----------
-SCRIPT_DIR_NET="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR_NET="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 [[ -f "$SCRIPT_DIR_NET/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_NET/lib/verdict_log.sh"
 
 # Index-based parser for multi-word support
@@ -62,7 +62,9 @@ while [[ $i -lt $# ]]; do
     --sniff=*)     SNIFF_SECS="${arg#--sniff=}" ;;
     --sniff)       i=$((i+1)); SNIFF_SECS="${ARGS[$i]:-0}" ;;
     --no-color)    NO_COLOR=1 ;;
-    --json)        JSON_OUT=1 ;;
+    --json)        JSON_OUT=1
+        json_stdout_only
+         ;;
     --quick)       QUICK=1; PING_COUNT=3; SNIFF_SECS=0 ;;
     --router=*)    DARKSTAT_URL="${arg#--router=}" ;;
     --router)      i=$((i+1)); DARKSTAT_URL="${ARGS[$i]:-}" ;;
@@ -132,7 +134,7 @@ HELPEOF
 done
 
 # ---------- AI hook (opt-in via --ai) ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
 if [[ "${AI_VERDICT:-}" == "1" ]]; then
@@ -152,8 +154,10 @@ fi
 
 # If JSON mode is enabled, suppress all stdout during data collection
 if [[ $JSON_OUT -eq 1 ]]; then
+    exec 1>&4
   exec 3>&1
   exec 1>/dev/null
+    exec 1>&2
 fi
 
 # ---------- Privilege detection ----------

@@ -15,7 +15,7 @@
 set +o pipefail
 set +e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HELPZ_HIST="${SCRIPT_DIR}/.helpz_history"
 
 # ---------- ANSI for suggestions ----------
@@ -497,6 +497,137 @@ path_status() {
     echo "  To remove:   helpz --path --uninstall"
 }
 
+# ---------- symptom → tool lookup ----------
+# "I don't know which tool to run" is the most common reason someone gives up
+# on a suite like this. The index below maps plain-language problems to the
+# tools that actually answer them, so `helpz wifi` finds networkz even though
+# nobody would ever have guessed that name.
+SYMPTOM_INDEX=(
+  "Computer is slow or sluggish|topz speedz slowz|slow sluggish freezing laggy hangs speed"
+  "Disk is full / no space|diskz filez|disk full no space storage cleanup"
+  "Running out of memory|memoryz|ram memory oom out-of-memory"
+  "CPU is hot or throttling|cpuz powerz|hot overheat thermal throttl cpu-temp"
+  "Something is eating the network|networkz topz|traffic bandwidth network ping latency"
+  "Wi-Fi keeps dropping|networkz dnsz|wi-fi wireless wifi wlan"
+  "Which ports are open|portz|port listening exposed open-port firewall"
+  "Is my machine secure|securityz sshauditz|security audit vulnerab safe hack"
+  "Suspicious login activity|loginz abusez|login brute-force suspicious intrusion breach"
+  "Leaked credentials or passwords|secretz|password credential secret leaked token api-key"
+  "What hardware do I have|specz|hardware specs motherboard bios"
+  "A device or driver is missing|driverz usbz pciz|driver device-not-working usb pci firmware"
+  "Kernel problems / boot fails|kernelz bootz crashz|kernel boot grub panic wont-start"
+  "Something crashed|crashz debugz logz|crash core-dump segfault killed"
+  "A service will not start|bootz logz demonz|service failed-unit systemd"
+  "Scheduled tasks and timers|cronz|cron schedule timer crontab"
+  "DNS not resolving|dnsz|dns domain resolve nameserver"
+  "Is my website healthy|websitez sitemapz|website site http url ssl certificate"
+  "Is my site down|downz websitez|down offline not-responding 502 503"
+  "GPU and graphics|gpuz driverz|gpu nvidia vram graphics cuda"
+  "Processes and threads|threadz topz|process thread zombie hung"
+  "Laptop battery and power|powerz|battery power drain watt plugged"
+  "Package manager is broken|kernelz depz|apt dpkg package dependency repo"
+  "Review code before running it|trustz runz|trust review safe-to-run supply-chain"
+  "Run many tools at once|allz|all-tools everything orchestrat summon"
+  "What should I run next|nextz helpz|next recommend suggest where-to-start"
+  "Which optional tools are missing|depz|dependenc missing-tool install-a-helper prerequisite"
+  "Push my changes safely|pushz|push commit publish github git"
+  "Pull the latest changes|pullz|pull update fetch git"
+  "Clone a repository safely|clonez|clone download-repo git"
+  "Install the suite on my PATH|installz|install path completion symlink"
+  "Test the suite itself|testz|test self-test regression check-the-suite"
+  "Make a chart from my data|chartz|chart graph plot visuali bar"
+  "Compare two tool runs|timingz|compare timing benchmark diff"
+  "Study my notes or the register|spiritz|register notes theme"
+)
+
+# Print the tools that answer a symptom, with their one-line descriptions.
+symptom_search() {
+    local query="${1:-}" q
+    q="$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')"
+    [[ -z "$q" ]] && return 1
+
+    local entry desc rest tools kw tool hit=0
+    local -a matched=()
+
+    # Each entry is  description|tool1 tool2|keyword keyword ...
+    for entry in "${SYMPTOM_INDEX[@]}"; do
+        desc="${entry%%|*}"
+        rest="${entry#*|}"
+        tools="${rest%%|*}"
+        local keywords="${rest#*|}"
+
+        # 1) the query names a tool from this entry
+        for tool in $tools; do
+            if [[ "$q" == *"$tool"* ]]; then
+                hit=1
+                matched+=("$tools")
+                break
+            fi
+        done
+        (( hit )) && continue
+
+        # 2) the query contains one of this entry's keywords
+        for kw in $keywords; do
+            if [[ "$q" == *"$kw"* ]]; then
+                hit=1
+                matched+=("$tools")
+                break
+            fi
+        done
+    done
+
+    # 3) fallback: match the query against every tool's name and description
+    if (( hit == 0 )); then
+        for tool in $(find "$SCRIPT_DIR" -maxdepth 1 -type f -executable -name '*z' -printf '%f\n' 2>/dev/null | sort); do
+            local d
+            d=$(describe_line "$tool")
+            if printf '%s %s' "$tool" "$d" | grep -qi -- "$q"; then
+                hit=1
+                matched+=("$tool")
+            fi
+        done
+    fi
+    (( hit == 0 )) && return 1
+
+    printf "  ${C_BOLD}${C_CYAN}Possible tools for ${C_RESET}${C_BOLD}%s${C_RESET}${C_CYAN}:${C_RESET}\n" "$query"
+    local t d
+    for t in "${matched[@]}"; do
+        for tool in $t; do
+            [[ -x "$SCRIPT_DIR/$tool" ]] || continue
+            d=$(describe_line "$tool")
+            printf "    ${C_GREEN}→${C_RESET} %s\n" "$d"
+        done
+    done
+    echo
+    printf "  ${C_DIM}run one with --help for details${C_RESET}\n\n"
+    return 0
+}
+
+# The one-line description of a tool, without printing it.
+describe_line() {
+    local f="$1" name desc
+    name="$(basename "$f")"
+    desc=$(grep -m1 -E "^#[[:space:]]*${name}[[:space:]]*([-–—:])[[:space:]]+" "$f" 2>/dev/null \
+           | sed -E "s/^#[[:space:]]*${name}[[:space:]]*([-–—:])[[:space:]]+//; s/[[:space:]]+\$//")
+    [[ -z "$desc" ]] && desc="$(echo "$name" | sed 's/z$//')"
+    printf '%s — %s' "$name" "$desc"
+}
+
+# Print the whole index.
+symptom_list() {
+    printf "  ${C_BOLD}${C_CYAN}SYMPTOM → TOOL${C_RESET}\n\n"
+    local entry desc rest tools kw
+    for entry in "${SYMPTOM_INDEX[@]}"; do
+        desc="${entry%%|*}"
+        rest="${entry#*|}"
+        tools="${rest%%|*}"
+        kw="${rest#*|}"
+        printf "    ${C_BOLD}%-38s${C_RESET} ${C_GREEN}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$desc" "$tools" "$kw"
+    done
+    echo
+    printf "  ${C_DIM}search it:  helpz --symptom \"your words\"${C_RESET}\n\n"
+}
+
 # ---------- main ----------
 if [[ "${1:-}" == "guard" ]]; then
     case "${2:-install}" in
@@ -527,7 +658,34 @@ if [[ "${1:-}" == "--json" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "--symptoms" ]]; then
+    symptom_list
+    exit 0
+fi
+if [[ "${1:-}" == "--symptom" ]]; then
+    shift
+    if [[ $# -eq 0 ]]; then
+        echo "helpz --symptom <words>" >&2
+        exit 64
+    fi
+    if ! symptom_search "$*"; then
+        printf "  ${C_YELLOW}no match for '%s'${C_RESET}\n" "$*"
+        printf "  ${C_DIM}try: helpz --symptoms  (lists every symptom → tool mapping)${C_RESET}\n\n"
+        exit 1
+    fi
+    exit 0
+fi
 if [[ -n "${1:-}" ]]; then
+    # Not a tool name? Try the symptom index before giving up.
+    if [[ ! -x "$SCRIPT_DIR/$1" ]]; then
+        if symptom_search "$1"; then
+            exit 0
+        fi
+        printf "helpz: no tool named '%s' and no symptom matched.\n" "$1" >&2
+        printf "       try: helpz --symptoms   (symptom → tool map)\n" >&2
+        printf "       or:  helpz --json | jq    (list every tool)\n" >&2
+        exit 64
+    fi
     detail "$1"
     exit $?
 fi

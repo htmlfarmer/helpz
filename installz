@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# installz - Put the whole suite on your PATH, properly
+# ----------------------------------------------------------------------------
+# The suite is a folder of single-file tools. This installs it so the tools
+# work from anywhere: one symlink per tool into a directory that is already
+# on your PATH, plus bash completion so `helpz <TAB>` and `cpuz --<TAB>`
+# work. It is safe to re-run — it refreshes the links and never overwrites a
+# file that is not one of its own symlinks.
+#
+# Usage:
+#   ./installz                 Install into ~/.local/bin (default)
+#   ./installz --dir DIR       Install into a different directory
+#   ./installz --uninstall     Remove the symlinks and completion
+#   ./installz --status        Show what is installed
+#   ./installz --no-completion Skip the shell completion
+#
+# Notes:
+#   * ~/.local/bin is on PATH by default on most systems; if it is not,
+#     installz says so and tells you how to fix it.
+#   * Only symlinks that point INTO this suite are ever removed.
+#   * Nothing outside the target directory is touched.
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; }
+
+TARGET_DIR="${HOME}/.local/bin"
+ACTION="install"; COMPLETION=1
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dir)   shift; TARGET_DIR="${1:-}" ;;
+        --dir=*) TARGET_DIR="${1#--dir=}" ;;
+        --uninstall) ACTION="uninstall" ;;
+        --status)    ACTION="status" ;;
+        --no-completion) COMPLETION=0 ;;
+        --json)   JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
+        *) echo "installz: unknown option $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+TARGET_DIR="${TARGET_DIR%/}"
+
+# The completion script the installer drops in.
+COMPLETION_FILE="$TARGET_DIR/helpz-completion.bash"
+COMPLETION_SNIPPET='
+# helpz / *z suite completion — installed by installz
+_helpsuite_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" dir="${HELPZ_SUITE_DIR:-}"
+    [[ -z "$dir" ]] && for dir in "$HOME/helpz" "$HOME/security"; do
+        [[ -x "$dir/helpz" ]] && break
+    done
+    [[ -d "$dir" ]] || return 0
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "--help --json --no-color --ai --no-ai" -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -W "$(cd "$dir" && ls *z 2>/dev/null | sed "s/\.z$//")" -- "$cur") )
+    fi
+}
+complete -F _helpsuite_complete helpz
+'
+
+# The tools to link: every executable *z in the suite, except installz itself.
+suite_tools() {
+    local f n
+    for f in "$SCRIPT_DIR"/*z; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        n="${f##*/}"
+        [[ "$n" == "installz" ]] && continue
+        printf '%s\n' "$n"
+    done
+}
+
+is_our_link() {   # is_our_link <path> — true if it is a symlink into this suite
+    [[ -L "$1" ]] || return 1
+    local tgt; tgt=$(readlink -f "$1" 2>/dev/null) || return 1
+    [[ "$tgt" == "$SCRIPT_DIR"/* ]]
+}
+
+do_status() {
+    section "INSTALL STATUS"
+    printf "  ${C_DIM}suite dir :${C_RESET} %s\n" "$SCRIPT_DIR"
+    printf "  ${C_DIM}target    :${C_RESET} %s\n" "$TARGET_DIR"
+    local n=0 linked=0
+    while IFS= read -r t; do
+        n=$((n+1))
+        is_our_link "$TARGET_DIR/$t" && linked=$((linked+1))
+    done < <(suite_tools)
+    printf "  ${C_DIM}tools     :${C_RESET} %d (%d linked)\n" "$n" "$linked"
+    if [[ -e "$COMPLETION_FILE" ]]; then
+        ok "completion installed at $COMPLETION_FILE"
+    else
+        info "completion not installed"
+    fi
+    case ":$PATH:" in
+        *":$TARGET_DIR:"*) ok "$TARGET_DIR is on PATH" ;;
+        *) warn "$TARGET_DIR is NOT on PATH — add it to ~/.bashrc" ;;
+    esac
+}
+
+do_install() {
+    section "INSTALL"
+    mkdir -p "$TARGET_DIR" 2>/dev/null || {
+        critf "Install" "cannot create $TARGET_DIR" "check the permissions"; exit 1; }
+
+    local n=0 skipped=0 t
+    while IFS= read -r t; do
+        local link="$TARGET_DIR/$t"
+        # Never clobber a real file that is not one of our symlinks.
+        if [[ -e "$link" && ! -L "$link" ]]; then
+            skipped=$((skipped+1))
+            printf "  ${C_YELLOW}!${C_RESET} %s already exists (not a symlink) — left alone\n" "$t"
+            continue
+        fi
+        ln -sf "$SCRIPT_DIR/$t" "$link" 2>/dev/null || {
+            printf "  ${C_RED}✗${C_RESET} could not link %s\n" "$t"; continue; }
+        n=$((n+1))
+    done < <(suite_tools)
+    ok "$n tool(s) linked into $TARGET_DIR"
+    (( skipped > 0 )) && warn "$skipped existing file(s) were left untouched"
+
+    if (( COMPLETION )); then
+        section "COMPLETION"
+        {
+            printf '%s\n' "$COMPLETION_SNIPPET"
+            printf 'export HELPZ_SUITE_DIR="%s"\n' "$SCRIPT_DIR"
+        } > "$COMPLETION_FILE" 2>/dev/null && ok "wrote $COMPLETION_FILE" || warn "could not write the completion file"
+        # Wire it into bashrc if it is not already sourced.
+        local rc="$HOME/.bashrc"
+        if [[ -f "$rc" ]] && ! grep -q 'helpz-completion.bash' "$rc" 2>/dev/null; then
+            {
+                printf '\n# helpz suite completion (installed by installz)\n'
+                printf '[ -f "%s" ] && . "%s"\n' "$COMPLETION_FILE" "$COMPLETION_FILE"
+            } >> "$rc" 2>/dev/null && ok "sourced from $rc (restart your shell or: source $rc)"
+        elif [[ -f "$rc" ]]; then
+            info "already sourced from $rc"
+        fi
+    fi
+
+    section "VERIFY"
+    local probe="" p
+    for p in "$SCRIPT_DIR"/*z; do [[ -x "$p" ]] && { probe="${p##*/}"; break; }; done
+    if [[ -n "$probe" ]]; then
+        if command -v "$probe" >/dev/null 2>&1; then
+            ok "'$probe' resolves on PATH"
+        else
+            printf "  ${C_YELLOW}!${C_RESET} '%s' is not on PATH yet — open a new shell\n" "$probe"
+            case ":$PATH:" in
+                *":$TARGET_DIR:"*) : ;;
+                *) printf "     ${C_DIM}add this to ~/.bashrc:%s\n" "$TARGET_DIR" ;;
+            esac
+        fi
+    fi
+    printf "\n  ${C_DIM}next: run 'helpz' to meet the suite${C_RESET}\n\n"
+}
+
+do_uninstall() {
+    section "UNINSTALL"
+    local n=0 t
+    while IFS= read -r t; do
+        local link="$TARGET_DIR/$t"
+        if is_our_link "$link"; then
+            rm -f "$link" && n=$((n+1))
+        fi
+    done < <(suite_tools)
+    ok "$n symlink(s) removed from $TARGET_DIR"
+
+    if [[ -e "$COMPLETION_FILE" ]]; then
+        rm -f "$COMPLETION_FILE" && ok "completion removed"
+    fi
+    local rc="$HOME/.bashrc"
+    if [[ -f "$rc" ]] && grep -q 'helpz-completion.bash' "$rc" 2>/dev/null; then
+        cp -p "$rc" "$rc.installz.bak" 2>/dev/null
+        python3 - "$rc" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, encoding='utf-8', errors='ignore') as f:
+    lines = f.readlines()
+out, skip = [], False
+for l in lines:
+    if 'helpz suite completion (installed by installz)' in l:
+        skip = True; continue
+    if skip:
+        if 'helpz-completion.bash' in l and l.lstrip().startswith('['):
+            skip = False
+        continue
+    out.append(l)
+with open(path, 'w', encoding='utf-8') as f:
+    f.writelines(out)
+PYEOF
+        ok "removed the completion hook from $rc (backup: $rc.installz.bak)"
+    fi
+    printf "\n"
+}
+
+case "$ACTION" in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+    status)    do_status ;;
+esac
+exit 0
