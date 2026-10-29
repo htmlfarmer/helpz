@@ -22,7 +22,7 @@ GUARD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z
 # NOTE: the backup dir token below is deliberately narrow — it blocks the
 # local backup directory a business-specific tool writes, without blocking
 # the tool names themselves.
-GUARD_BLOCK_TOKENS='-reports/ _reports/ .trustz/ ai.json .env id_rsa id_ed25519 .kdbx .pcap .pftrace .pem .key .p12 .pfx .netrc secrets. secure.csv O3.txt .helpz_history xyzoservicesz-backups .aws/ .gnupg/ .kube/config docker/config.json .git-credentials'
+GUARD_BLOCK_TOKENS='-reports/ _reports/ .trustz/ ai.json .env id_rsa id_ed25519 .kdbx .pcap .pftrace .pem .key .p12 .pfx .netrc secrets. secure.csv O3.txt .helpz_history servicesz-backups .aws/ .gnupg/ .kube/config docker/config.json .git-credentials'
 
 # Template/config files are non-secret by convention: ai.json.example,
 # config.yaml.sample, .env.template … never carry live credentials.
