@@ -612,6 +612,7 @@ else
     exit_code=0
   fi
   printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+  chart_findings
 fi
 
 # ---------- AI verdict (opt-in via --ai) ----------

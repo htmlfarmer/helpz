@@ -123,8 +123,8 @@ warn() {
     local category="${1:-General}" message="${2:-}" suggestion="${3:-}"
     if [[ $# -eq 1 ]]; then
         message="$1"
-        category="General"
-        suggestion=""
+        category="$(infer_category "$message")"
+        [[ -z "$category" ]] && category="General"
     fi
     _log_warn "$category" "$message" "$suggestion"
 }
@@ -135,14 +135,103 @@ crit() {
     local category="${1:-General}" message="${2:-}" fix="${3:-}"
     if [[ $# -eq 1 ]]; then
         message="$1"
-        category="General"
-        fix=""
+        category="$(infer_category "$message")"
+        [[ -z "$category" ]] && category="General"
     elif [[ $# -eq 2 ]]; then
         message="$1"
         fix="$2"
-        category="General"
+        category="$(infer_category "$message")"
+        [[ -z "$category" ]] && category="General"
     fi
     _log_crit "$category" "$message" "$fix"
+}
+
+# ---------- JSON output discipline ----------
+# Tools that support --json must put ONLY the JSON object on stdout, or
+# `tool --json | jq` breaks. The human-readable report goes to stderr and
+# the JSON object is written to fd 3 (the original stdout).
+#
+#   json_stdout_only        — call once, right after argument parsing
+#   json_emit "..."         — write the JSON object to stdout
+#
+# fd 4 is used rather than fd 3 because lib/run_comparison.sh already claims
+# fd 3 as "the real stdout" while it tees the report into a capture file.
+# Two fd-3 conventions cannot coexist; fd 4 keeps them out of each other's
+# way.
+json_stdout_only() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] || return 0
+    [[ -z "${_JSON_FD4:-}" ]] || return 0
+    _JSON_FD4=1
+    exec 4>&1 1>&2
+    return 0
+}
+
+json_emit() { printf '%s\n' "$@" >&4; }
+
+# json_out_line <text> — write one JSON line to stdout, or to fd 3 when the
+# stdout split is active (so the human report can live on stderr).
+#
+# The fd is probed rather than assumed: run_comparison_finalize does
+# `exec 1>&3 3>&-` to hand stdout back, which CLOSES fd 3. After that the
+# only valid destination is stdout itself.
+json_out_line() {
+    if [[ -n "${_JSON_FD4:-}" ]] && { true >&4; } 2>/dev/null; then
+        printf '%s\n' "$1" >&4
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# ---------- finding category inference ----------
+# Many tools call the one-argument form `crit "message"`, which leaves the
+# category as "General" — and a breakdown chart full of "General" is useless.
+# Instead of hand-editing hundreds of call sites, infer the category from the
+# message text. An explicit category always wins; inference is only a
+# fallback.
+#
+# This is an ORDERED list, not an associative array: bash hash order is not
+# stable between processes, and the category for a given message must be
+# deterministic or the findings chart would shuffle on every run. First match
+# wins, so specific patterns come before generic ones.
+FINDING_CATEGORY_HINTS=(
+  'missing_tool:not found|not installed|no such file|apt install|isn.t available|unavailable|command not found|\bmissing\b'
+  'insufficient_privileges:sudo|privilege|permission denied|not permitted|must be run as root|root-only|\bunreadable\b|need root'
+  'memory_pressure:\bmemory\b|\bram\b|\bswap\b|\boom\b|out of memory|page cache'
+  'cpu_thermal:temperature|thermal|throttl|overheat'
+  'disk_health:\bdisk\b|filesystem|\bsmart\b|i/o error|io error|out of space|mount|read-only'
+  'network_issue:\bdns\b|network|latency|packet|interface|wi-?fi|ethernet|bandwidth|traceroute'
+  'exposure:listening|exposed|wildcard|0\.0\.0\.0|firewall|\bport\b|\bbind\b|open relay'
+  'device_issue:\busb\b|\bpci\b|firmware'
+  'gpu_issue:\bgpu\b|\bvram\b|nvidia|nvtop'
+  'kernel_issue:\bkernel\b|\bgrub\b|\binitramfs\b|\bpanic\b|\boops\b'
+  'failed_service:\bservice\b|\bunit\b|systemd|\bfailed\b'
+  'scheduled_task:\bcron\b|schedule|\btimer\b|anacron'
+  'process_issue:process|zombie|\bthread\b|\bhang\b|locked|stuck'
+  'tls_expiry:certificate|\btls\b|\bssl\b|expire'
+  'package_issue:\bapt\b|dpkg|\bpackage\b|dependency|\bhold\b'
+  'clock_drift:\bclock\b|\bntp\b|\bdrift\b|time skew'
+  'printer_issue:cups|printer|\bqueue\b|lpstat|spool'
+  'auth_issue:password|\bauth\b|\blogin\b|\bssh\b|credential'
+  'file_permissions:permission|ownership|\bmode\b|world-readable|world-writable'
+  'container_issue:docker|container|podman|kubernetes|\bk8s\b'
+  'log_health:journal|log rotation|/var/log'
+)
+
+# infer_category <message> → a canonical category name (or empty).
+infer_category() {
+    local msg="${1:-}" entry cat re
+    [[ -z "$msg" ]] && return 0
+    msg="${msg,,}"
+    for entry in "${FINDING_CATEGORY_HINTS[@]}"; do
+        cat="${entry%%:*}"
+        re="${entry#*:}"
+        if [[ "$msg" =~ $re ]]; then
+            printf '%s' "$cat"
+            return 0
+        fi
+    done
+    printf ''
+    return 0
 }
 
 # Preferred variants — explicit category + message + fix
@@ -436,6 +525,29 @@ declare -A SUGGESTION_CATALOG=(
 
     # --- Generic ---
     ["general"]="Review the issue and apply appropriate remediation. See script documentation and man pages for the affected subsystem. Re-run the audit after applying changes."
+
+    # --- Inferred categories (from lib/common.sh category inference) ---
+    ["missing_tool"]="Install the missing helper, then re-run: 'sudo apt install <package>' — run './depz' to see every optional helper the suite wants and what it maps to."
+    ["insufficient_privileges"]="Some checks need root. Re-run with sudo: 'sudo ./<tool>'. Without it the tool degrades gracefully but cannot see everything."
+    ["memory_pressure"]="Memory is tight. Check what is resident: './memoryz'. Drop caches or stop a heavy process, and watch swap: 'swapon --show'."
+    ["cpu_thermal"]="The CPU is hot or throttling. Check frequencies and thermals: './cpuz'. Improve airflow or clean the dust."
+    ["disk_health"]="Check the drive: './diskz' for SMART and I/O errors, './filez' for what is filling it. Back up before running any repair."
+    ["network_issue"]="Diagnose the path: './networkz' for interface/DNS/latency, './portz' for listening services, './dnsz' for name resolution."
+    ["exposure"]="A service is reachable beyond localhost. Bind it to 127.0.0.1 or restrict it with the firewall: 'sudo ufw deny <port>'. Audit with './portz'."
+    ["device_issue"]="A device is unbound or lacks firmware. List what the kernel sees: './driverz' (and './usbz' for USB, './pciz' for PCI)."
+    ["gpu_issue"]="GPU health and VRAM pressure: './gpuz'. If VRAM is full, close other GPU users or lower their memory limit."
+    ["kernel_issue"]="Kernel-level problem. Read the boot story with './bootz --boot -1', and study it with './kernelz' (safe upgrade, GRUB fallback)."
+    ["failed_service"]="A unit will not start. Read why: 'sudo systemctl status <unit>' and 'sudo journalctl -u <unit> -n 50'. Then './bootz' for the rest."
+    ["scheduled_task"]="Review what is scheduled and when: './cronz'. Confirm each timer is intentional and runs as the right user."
+    ["process_issue"]="Something is stuck or leaking. Find it with './topz' and './threadz'; './slowz' ranks what is actually waiting on I/O."
+    ["tls_expiry"]="A certificate is expiring or already expired. Renew it, then verify: 'openssl x509 -enddate -noout -in <cert>'. Audit with './sshauditz'."
+    ["package_issue"]="The package database is unhappy. Check what is on hold and what is broken: 'apt list --held', 'dpkg --audit', and './kernelz fix'."
+    ["clock_drift"]="The clock is off, which breaks logs, TLS and cron. Check it: 'timedatectl status' and 'chronyc tracking'."
+    ["printer_issue"]="Printer trouble: './printerz' for CUPS state, queue and USB. Reset the queue with 'sudo cancel -a' then 'sudo lpstat -t'."
+    ["auth_issue"]="Authentication or credential problem. Audit SSH and keys with './sshauditz', and hunt leaked credentials with './secretz'."
+    ["file_permissions"]="Ownership or mode is wrong. Check with 'ls -l' and fix narrowly: 'sudo chown user:group <file>' or 'chmod 600 <file>'. Audit with './filez'."
+    ["container_issue"]="Container networking or config problem: './portz' shows published ports, and Docker can bypass ufw — check with 'sudo iptables -L DOCKER-USER'."
+    ["log_health"]="Log files are unreadable or filling the disk. Check: 'sudo journalctl --disk-usage', 'sudo logrotate -d /etc/logrotate.conf'."
 )
 
 get_suggestion() {
@@ -701,11 +813,12 @@ emit_verdict() {
     add_json_field "warning_log" "$WARNING_LOG" 0
 
     if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
-        printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+        _j='{"timestamp":"'"$TIMESTAMP"'","hostname":"'"$HOSTNAME_SHORT"'"'
         for f in "${JSON_FIELDS[@]}"; do
-            printf ',%s' "$f"
+            _j+=','"$f"
         done
-        printf ',"warnings":%d,"critical":%d,"duration_s":%d}\n' "$WARNINGS" "$CRITICAL" "$elapsed"
+        _j+=',"warnings":'"$WARNINGS"',"critical":'"$CRITICAL"',"duration_s":'"$elapsed"'}'
+        json_out_line "$_j"
     else
         section "VERDICT"
         if (( CRITICAL > 0 )); then

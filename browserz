@@ -64,6 +64,9 @@ while [[ $i -lt $# ]]; do
     i=$((i+1))
 done
 
+# In JSON mode the report goes to stderr and stdout carries only the JSON.
+json_stdout_only
+
 if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "browserz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
 
 # ---------- AI hook (opt-in via --ai) ----------

@@ -609,6 +609,7 @@ else
     exit_code=0
   fi
   printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+  chart_findings
   printf "\n"
 
   # Display one-liner explanations for any critical/warning issues logged

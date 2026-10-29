@@ -638,6 +638,7 @@ else
 fi
 
 printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+chart_findings
 
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then

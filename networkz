@@ -1252,6 +1252,7 @@ if [[ $JSON_OUT -eq 0 ]]; then
     printf "  ${C_GREEN}Network looks solid${C_RESET}\n"
   fi
   printf "\n${C_DIM}Scan completed in ${DURATION}s at $(date '+%H:%M:%S')${C_RESET}\n"
+  chart_findings
 
   # Display one-liner explanations for any critical/warning issues logged
   show_verdict_one_liners

@@ -795,6 +795,7 @@ if [[ $JSON_OUT -eq 0 ]]; then
   fi
 
   printf "\n${C_DIM}Scan completed in ${DURATION}s at $(date '+%H:%M:%S')${C_RESET}\n\n"
+  chart_findings
 
   # Display one-liner explanations for any critical/warning issues logged
   show_verdict_one_liners

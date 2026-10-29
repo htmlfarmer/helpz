@@ -154,7 +154,9 @@ done
 # In JSON mode the human-readable report goes to stderr and stdout carries
 # only the JSON object, so `printerz --json | jq` always works.
 if [[ "$JSON_STDOUT" -eq 1 ]]; then
-    exec 3>&1 1>&2
+    # fd 4 (not fd 3) — lib/run_comparison.sh claims fd 3 as the real stdout
+    # while it tees the report into a capture file.
+    exec 4>&1 1>&2
 fi
 
 # ---------- USB Device Scan ----------
@@ -1452,11 +1454,12 @@ main() {
     fi
 
     echo "  Scan completed in $(($(date +%s) - START_TS))s"
+    chart_findings
     echo ""
     echo "  Run './printerz --manual' for testing instructions"
 
     if [[ "$JSON_OUT" == "1" ]]; then
-        json_output >&3
+        json_output >&4
     fi
 
     if (( CRITICAL > 0 )); then

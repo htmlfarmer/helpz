@@ -1752,6 +1752,7 @@ else
     printf "  ${C_GREEN}${C_BOLD}COMPLETE${C_RESET}: full spec report generated\n"
   fi
   printf "  ${C_DIM}Scan completed in %ds at %s${C_RESET}\n" "$ELAPSED" "$(date '+%H:%M:%S')"
+  chart_findings
   echo ""
   printf "  ${C_DIM}Tip: run with ${C_BOLD}sudo${C_RESET} for full memory/BIOS/chassis details${C_RESET}\n"
   printf "  ${C_DIM}Tip: run with ${C_BOLD}--ai${C_RESET} for a compact key:value dump to paste into AI${C_RESET}\n"

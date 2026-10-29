@@ -102,6 +102,7 @@ FILTER_IP=""
 FILTER_DATE=""
 AI_VERDICT=0
 THREAT_CONTEXT=""
+JSON_OUT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -124,6 +125,10 @@ while [[ $# -gt 0 ]]; do
             FILTER_DATE="$2"
             shift 2
             ;;
+        --json)
+            JSON_OUT=1
+            shift
+            ;;
         --ai)
             AI_VERDICT=1
             shift
@@ -139,6 +144,24 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# In JSON mode the report goes to stderr and stdout carries only the JSON.
+# fd 4 (not fd 3) — lib/run_comparison.sh claims fd 3 as the real stdout.
+# An EXIT trap guarantees the object is emitted on EVERY exit path, including
+# the early "no matching attacks found" exits.
+if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+    exec 4>&1 1>&2
+    trap _abusez_json EXIT
+fi
+
+# Defined unconditionally: the EXIT traps below chain to it, and it is a
+# no-op unless JSON mode is on.
+_abusez_json() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] || return 0
+    printf '{"tool":"abusez","host":"%s","timestamp":"%s","filter_ip":"%s","filter_date":"%s","attempts":%s,"critical":%s,"warnings":%s}\n' \
+        "${HOSTNAME_SHORT:-unknown}" "${TIMESTAMP:-}" "${FILTER_IP:-}" "${FILTER_DATE:-}" \
+        "${TOTAL_ATTEMPTS:-0}" "${CRITICAL:-0}" "${WARNINGS:-0}" >&4 2>/dev/null || true
+}
 
 export TZ=America/Los_Angeles
 
@@ -181,7 +204,7 @@ cleanup_abuse() {
     rm -rf "$TMP_DIR"
     [[ -n "${FILTERED_LOG:-}" ]] && rm -f "$FILTERED_LOG"
 }
-trap cleanup_abuse EXIT
+trap 'cleanup_abuse; _abusez_json' EXIT
 
 # Privilege detection
 SUDO=""
@@ -405,7 +428,7 @@ fi
 # ============================================================================
 TOP_IPS_FILE=$(mktemp -p "$TMP_DIR")
 LOOKUP_FILE=$(mktemp -p "$TMP_DIR")
-trap 'rm -f "$TOP_IPS_FILE" "$LOOKUP_FILE"' EXIT
+trap 'rm -f "$TOP_IPS_FILE" "$LOOKUP_FILE"; _abusez_json' EXIT
 
 # Build the top-30 IP list once
 awk -v log="$LOG_TEMP" '

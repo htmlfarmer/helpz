@@ -107,12 +107,18 @@ HELPEOF
   i=$((i+1))
 done
 
-if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "bootz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
-
-# ---------- AI hook (opt-in via --ai) ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+
+# In JSON mode the report goes to stderr and stdout carries only the JSON.
+# This must happen BEFORE the comparison capture starts: the capture claims
+# fd 3 as the real stdout and tees fd 1.
+json_stdout_only
+
+if declare -f run_comparison_init >/dev/null 2>&1; then run_comparison_init "bootz" "JSON_OUT=$JSON_OUT" 2>/dev/null; fi
+
+# ---------- AI hook (opt-in via --ai) ----------
 if [[ "${AI_VERDICT:-}" == "1" ]]; then
     # shellcheck source=lib/ai.sh
     source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
@@ -631,8 +637,8 @@ printf "\n"
 # ---------- JSON output ----------
 if [[ $JSON_OUT -eq 1 ]]; then
   FIELDS=$(IFS=,; echo "${JSON_FIELDS[*]}")
-  printf '{"script":"boot","host":"%s","timestamp":"%s","boot":"%s","level":"%s","messages":%d,"issues":%d,"warnings":%d,"critical":%d,"exit":%d}\n' \
-    "$HOSTNAME_SHORT" "$TIMESTAMP" "$BOOT_IDX" "$LEVEL" "$TOTAL_MSG" "$TOTAL_ISSUES" "$WARNINGS" "$CRITICAL" "$EXIT"
+  json_emit "$(printf '{"script":"boot","host":"%s","timestamp":"%s","boot":"%s","level":"%s","messages":%d,"issues":%d,"warnings":%d,"critical":%d,"exit":%d}' \
+    "$HOSTNAME_SHORT" "$TIMESTAMP" "$BOOT_IDX" "$LEVEL" "$TOTAL_MSG" "$TOTAL_ISSUES" "$WARNINGS" "$CRITICAL" "$EXIT")"
 fi
 
 # ---------- Run Comparison Finalize ----------

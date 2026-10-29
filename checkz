@@ -75,15 +75,24 @@ HELPEOF
 }
 
 NO_COLOR_FLAG=0
+JSON_OUT=0
 AI_VERDICT=0
 REPORT_FILE=""
 for arg in "$@"; do
     case "$arg" in
         -h|--help) show_help ;;
         --no-color) NO_COLOR_FLAG=1 ;;
+        --json) JSON_OUT=1 ;;
         --ai) AI_VERDICT=1 ;;
     esac
 done
+
+# In JSON mode the report goes to stderr and stdout carries only the JSON.
+# fd 4 (not fd 3) — lib/run_comparison.sh claims fd 3 as the real stdout
+# while it tees the report into a capture file.
+if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+    exec 4>&1 1>&2
+fi
 
 # ---------- Colors ----------
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ $NO_COLOR_FLAG -eq 0 ]]; then
@@ -204,6 +213,12 @@ fi
 
 # Trap Ctrl+C → AI verdict + exit summary
 _checkz_exit() {
+    if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        # JSON mode: stdout carries only the object, the report went to stderr.
+        printf '{"tool":"checkz","host":"%s","timestamp":"%s","errors":%s,"warnings":%s,"login_events":%s}\n' \
+            "$HOSTNAME_SHORT" "$TIMESTAMP" "$_CNT_ERROR" "$_CNT_WARN" "$_CNT_LOGIN" >&4 2>/dev/null || true
+        return 0
+    fi
     if [[ "$AI_VERDICT" == "1" ]] && [[ -n "$_LAST_LINES" ]]; then
         ai_emit_verdict "severity_check" "$_LAST_LINES" 2>/dev/null || true
     fi

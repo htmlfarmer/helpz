@@ -1399,6 +1399,7 @@ else
   EXIT_CODE=0
 fi
 printf "\n  ${C_DIM}Scan completed in ${DURATION}s at %s${C_RESET}\n\n" "$(date '+%H:%M:%S')"
+chart_findings
 
   # Display one-liner explanations for any critical/warning issues logged
   show_verdict_one_liners

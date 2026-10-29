@@ -668,6 +668,7 @@ if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_final
 [[ $JSON_OUT -eq 0 ]] && section "VERDICT"
 END_TS=$(date +%s)
 ELAPSED=$((END_TS - START_TS))
+[[ $JSON_OUT -eq 0 ]] && chart_findings
 if [[ $CRITICAL -gt 0 ]]; then
   [[ $JSON_OUT -eq 0 ]] && printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical issue(s) — servers need attention\n" "$CRITICAL"
   [[ $JSON_OUT -eq 0 ]] && show_verdict_one_liners

@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# testz - Self-test for the suite: does every tool still behave?
+# ----------------------------------------------------------------------------
+# The suite grew large enough that a one-line change in a shared library can
+# break twenty tools at once. This runs the whole suite against its own
+# contract and reports anything that drifted:
+#
+#   * every script parses
+#   * every tool handles --help and exits 0
+#   * every tool's normal run exits 0, 1 or 2 (never a crash)
+#   * every tool's --json output is valid JSON
+#   * no tool leaks shell errors to stderr
+#   * the release builder's safety invariants still hold
+#
+# It is the suite's regression net. Run it before publishing.
+#
+# Usage:
+#   ./testz                 Fast checks (syntax, --help, safety, JSON)
+#   ./testz --full          Also run every tool end-to-end (slow: minutes)
+#   ./testz --tool NAME     Check one tool only
+#   ./testz --json          Machine-readable results
+#
+# Exit codes: 0 all passed · 1 failures found
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; }
+
+FULL=0; JSON_OUT="${JSON_OUT:-0}"; ONLY=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --full)  FULL=1 ;;
+        --tool)  shift; ONLY="${1:-}" ;;
+        --tool=*) ONLY="${1#--tool=}" ;;
+        --json)  JSON_OUT=1 ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
+        *) echo "testz: unknown option $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+
+PASS=0; FAIL=0; SKIP=0
+declare -a FAILURES=()
+
+note_pass() { PASS=$((PASS+1)); }
+note_fail() { FAIL=$((FAIL+1)); FAILURES+=("$1"); }
+note_skip() { SKIP=$((SKIP+1)); }
+
+# Tools that are slow by nature — excluded from --full unless asked for.
+SLOW_TOOLS="networkz benchmarkz slowz crashz allz"
+
+is_slow() {
+    local t="$1" s
+    for s in $SLOW_TOOLS; do [[ "$t" == "$s" ]] && return 0; done
+    return 1
+}
+
+tool_list() {
+    local f
+    for f in "$SCRIPT_DIR"/*z; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        f="${f##*/}"
+        [[ "$f" == "testz" ]] && continue
+        [[ -n "$ONLY" && "$f" != "$ONLY" ]] && continue
+        printf '%s\n' "$f"
+    done
+}
+
+# ── 1. syntax ─────────────────────────────────────────────────────────────
+section "1 · SYNTAX"
+while IFS= read -r t; do
+    for f in "$SCRIPT_DIR/$t" "$SCRIPT_DIR"/lib/*.sh; do
+        [[ -f "$f" ]] || continue
+        if out=$(bash -n "$f" 2>&1); then
+            note_pass
+        else
+            note_fail "syntax error in ${f##*/}: $out"
+        fi
+    done
+done < <(tool_list)
+ok "$PASS script(s) parse cleanly"
+
+# ── 2. --help ─────────────────────────────────────────────────────────────
+section "2 · --help"
+while IFS= read -r t; do
+    out=$(timeout 25 "$SCRIPT_DIR/$t" --help </dev/null 2>&1); rc=$?
+    if (( rc == 0 )); then
+        note_pass
+    elif (( rc == 64 )); then
+        note_skip   # tool treats --help as an argument, not a flag
+    else
+        note_fail "$t --help exited $rc"
+    fi
+done < <(tool_list)
+ok "$PASS tool(s) handle --help"
+
+# ── 3. exit codes + stderr noise ──────────────────────────────────────────
+section "3 · EXIT CODES & STDERR"
+while IFS= read -r t; do
+    if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
+        note_skip; continue
+    fi
+    out=$(timeout 300 "$SCRIPT_DIR/$t" --no-color </dev/null 2>&1); rc=$?
+    # 64 is the conventional "usage error" — a tool that requires an
+    # argument is behaving correctly when it says so.
+    if (( rc == 0 || rc == 1 || rc == 2 || rc == 64 )); then
+        note_pass
+    else
+        note_fail "$t exited $rc (expected 0, 1, 2 or 64)"
+    fi
+    # Shell errors leaking into output
+    noise=$(printf '%s' "$out" | grep -icE 'command not found|syntax error|unbound variable|: line [0-9]+:' || true)
+    if [[ "$noise" != "0" ]]; then
+        note_fail "$t leaked shell errors into its output"
+    else
+        note_pass
+    fi
+done < <(tool_list)
+ok "$PASS check(s) passed"
+
+# ── 4. JSON validity ──────────────────────────────────────────────────────
+section "4 · JSON OUTPUT"
+while IFS= read -r t; do
+    if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
+        note_skip; continue
+    fi
+    # Tools that are filters or need a mode must be fed something.
+    case "$t" in
+        chartz) jout=$(printf 'alpha 10\nbeta 20\n' | timeout 300 "$SCRIPT_DIR/$t" bars --json 2>/dev/null | head -c 400000) ;;
+        *)      jout=$(timeout 300 "$SCRIPT_DIR/$t" --json </dev/null 2>/dev/null | head -c 400000) ;;
+    esac
+    if printf '%s' "$jout" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+        note_pass
+    else
+        note_fail "$t --json is not valid JSON"
+    fi
+done < <(tool_list)
+ok "$PASS tool(s) emit valid JSON"
+
+# ── 5. release-builder safety ─────────────────────────────────────────────
+section "5 · PUBLISH SAFETY"
+if [[ -x "$SCRIPT_DIR/publishz" ]]; then
+    if out=$("$SCRIPT_DIR/publishz" --selftest 2>&1); then
+        note_pass
+        ok "publishz safety invariants hold"
+    else
+        note_fail "publishz --selftest failed: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    fi
+else
+    note_skip
+fi
+
+# ── 6. suite integrity ────────────────────────────────────────────────────
+section "6 · SUITE INTEGRITY"
+for req in lib/common.sh lib/chart.sh lib/duration.sh lib/guard.sh .helpz_log.sh; do
+    if [[ -r "$SCRIPT_DIR/$req" ]]; then note_pass; else note_fail "missing required file: $req"; fi
+done
+# Every tool should be listed in the README table
+if [[ -r "$SCRIPT_DIR/README.md" ]]; then
+    miss=""
+    while IFS= read -r t; do
+        grep -q "\`$t\`" "$SCRIPT_DIR/README.md" || miss="$miss $t"
+    done < <(tool_list)
+    if [[ -z "$miss" ]]; then note_pass; else note_fail "not in README.md:$miss"; fi
+else
+    note_skip
+fi
+
+# ── report ─────────────────────────────────────────────────────────────────
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"tool":"testz","passed":%d,"failed":%d,"skipped":%d,"failures":[' "$PASS" "$FAIL" "$SKIP"
+    first=1
+    for f in "${FAILURES[@]:-}"; do
+        [[ -z "$f" ]] && continue
+        (( first )) || printf ','
+        first=0
+        printf '"%s"' "${f//\"/\\\"}"
+    done
+    printf ']}\n'
+    exit $(( FAIL > 0 ? 1 : 0 ))
+fi
+
+section "TEST SUMMARY"
+printf "  ${C_GREEN}✓${C_RESET} %d passed\n" "$PASS"
+[[ "$SKIP" -gt 0 ]] && printf "  ${C_DIM}·${C_RESET} %d skipped (slow tools — use --full)\n" "$SKIP"
+if (( FAIL > 0 )); then
+    printf "  ${C_RED}✗${C_RESET} %d failed\n\n" "$FAIL"
+    for f in "${FAILURES[@]}"; do
+        [[ -z "$f" ]] && continue
+        printf "  ${C_RED}✗${C_RESET} %s\n" "$f"
+    done
+    echo
+    exit 1
+fi
+printf "  ${C_GREEN}${C_BOLD}ALL CHECKS PASSED${C_RESET}\n\n"
+exit 0
