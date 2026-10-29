@@ -50,6 +50,7 @@ while [[ $i -lt $# ]]; do
             # shell, so a tool that does not source lib/common.sh still writes
             # its JSON to the right place.
             exec 4>&1 1>&2
+            _JSON_FD4=1
             ;;
     -h|--help)
       cat << 'HELPEOF'
@@ -603,10 +604,10 @@ END_TS=$(date +%s); ELAPSED=$((END_TS - START_TS))
 if [[ $JSON_OUT -eq 1 ]]; then
     exec 1>&4
   printf '{"timestamp":"%s","hostname":"%s"' "$TIMESTAMP" "$HOSTNAME_SHORT"
+  # JSON_FIELDS entries are already complete "key":value fragments —
+  # re-wrapping them produced {"driver":"driver":"615.71.09"}.
   for f in "${JSON_FIELDS[@]}"; do
-    key="${f%%\":*}"; key="${key#\"}"
-    val="${f#*\"}"; val="${val%\"}"
-    printf ',"%s":"%s"' "$key" "$val"
+    printf ',%s' "$f"
   done
   printf ',"gpus_total":%d,"nvidia_count":%d,"warnings":%d,"critical":%d,"duration_s":%d}\n' \
     "$GPU_COUNT" "$NVIDIA_COUNT" "$WARNINGS" "$CRITICAL" "$ELAPSED"

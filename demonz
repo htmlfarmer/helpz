@@ -148,6 +148,7 @@ while [[ $i -lt $# ]]; do
                 # shell, so a tool that does not source lib/common.sh still writes
                 # its JSON to the right place.
                 exec 4>&1 1>&2
+                _JSON_FD4=1
                 ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --stop|--banish)        i=$((i+1)); ACTION="stop";    ACTION_TARGET="${ARGS[$i]:-}" ;;

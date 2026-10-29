@@ -54,6 +54,7 @@ while [[ $i -lt $# ]]; do
             # shell, so a tool that does not source lib/common.sh still writes
             # its JSON to the right place.
             exec 4>&1 1>&2
+            _JSON_FD4=1
             ;;
     --ai)        AI_VERDICT=1 ;;
     --no-ai)     AI_VERDICT=0 ;;

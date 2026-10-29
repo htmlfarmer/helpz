@@ -55,6 +55,7 @@ while [[ $# -gt 0 ]]; do
                 # shell, so a tool that does not source lib/common.sh still writes
                 # its JSON to the right place.
                 exec 4>&1 1>&2
+                _JSON_FD4=1
                 ;;
         --no-color)  NO_COLOR=1; shift ;;
         --ai)        AI_VERDICT=1; shift ;;
@@ -501,6 +502,14 @@ printf "━━━ FILEZ COMPLETE ━━━\n"
 printf "${C_RESET}"
 printf "${C_DIM}Report: %s${C_RESET}\n" "$REPORT"
 printf "\n"
+
+# ---------- JSON output ----------
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
+    printf '{"tool":"filez","host":"%s","timestamp":"%s","path":"%s","depth":%s,"top":%s,"max_files":%s}\n' \
+        "$HOSTNAME_SHORT" "$TIMESTAMP" "$SCAN_PATH" "$DEPTH" "$TOP_N" "$MAX_FILES" >&4
+    exec 1>&2
+fi
 
 # Finalize and generate comparison report
 if [[ "$JSON_OUT" != "1" ]]; then

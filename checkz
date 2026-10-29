@@ -91,6 +91,7 @@ for arg in "$@"; do
                 # shell, so a tool that does not source lib/common.sh still writes
                 # its JSON to the right place.
                 exec 4>&1 1>&2
+                _JSON_FD4=1
                 ;;
         --ai) AI_VERDICT=1 ;;
     esac
@@ -102,6 +103,7 @@ done
 if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
     exec 1>&4
     exec 4>&1 1>&2
+    _JSON_FD4=1
     exec 1>&2
 fi
 

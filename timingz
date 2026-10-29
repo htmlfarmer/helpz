@@ -811,5 +811,13 @@ case "$mode" in
 esac
 
 echo -e "  ${C_BOLD}Completed at: $(date '+%Y-%m-%d %H:%M:%S %Z')${C_RESET}"
+# ---------- JSON output ----------
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    exec 1>&4
+    printf '{"tool":"timingz","host":"%s","timestamp":"%s","mode":"%s"}\n' \
+        "$HOSTNAME_SHORT" "$TIMESTAMP" "${MODE_ARG:-2}" >&4
+    exec 1>&2
+fi
+
 if [[ "${JSON_OUT:-0}" != "1" ]] && declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null || true; fi
 echo ""

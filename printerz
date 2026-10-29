@@ -138,6 +138,7 @@ while [[ $# -gt 0 ]]; do
                 # shell, so a tool that does not source lib/common.sh still writes
                 # its JSON to the right place.
                 exec 4>&1 1>&2
+                _JSON_FD4=1
                 ;;
         --debug)       DEBUG_MODE=1 ;;
         --deep)        DEEP_SCAN=1 ;;
@@ -166,6 +167,7 @@ if [[ "$JSON_STDOUT" -eq 1 ]]; then
     # fd 4 (not fd 3) — lib/run_comparison.sh claims fd 3 as the real stdout
     # while it tees the report into a capture file.
     exec 4>&1 1>&2
+    _JSON_FD4=1
 fi
 
 # ---------- USB Device Scan ----------

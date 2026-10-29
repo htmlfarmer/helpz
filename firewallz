@@ -62,6 +62,7 @@ while [[ $i -lt $# ]]; do
                 # shell, so a tool that does not source lib/common.sh still writes
                 # its JSON to the right place.
                 exec 4>&1 1>&2
+                _JSON_FD4=1
                 ;;
         --no-color)             NO_COLOR=1; NO_COLOR_FLAG=1 ;;
         --emergency)            EMERGENCY=1 ;;
@@ -230,7 +231,10 @@ section "ACTIVE FIREWALL STATE"
 # ufw
 if has_cmd ufw; then
     # 'ufw status' needs root — an rc!=0 here means "unreadable", NOT "inactive".
-    ufw_status_raw=$(ufw status 2>/dev/null); ufw_rc=$?
+    # 'set -e' would abort the whole tool on the non-zero rc that a
+    # root-required 'ufw status' returns — and the point of this branch is to
+    # treat that rc as "unreadable", not fatal.
+    ufw_status_raw=$(ufw status 2>/dev/null) && ufw_rc=0 || ufw_rc=$?
     if [[ $ufw_rc -ne 0 || "$ufw_status_raw" != Status:* ]] && command -v sudo >/dev/null 2>&1; then
         _u=$(sudo -n ufw status 2>/dev/null) && [[ -n "$_u" ]] && ufw_status_raw="$_u"
     fi
@@ -264,7 +268,9 @@ if has_cmd nft; then
     if [[ -f /etc/nftables.conf ]] || systemctl is-active --quiet nftables 2>/dev/null; then
         # unreadable ≠ empty: 'nft list ruleset' needs root, so only call the
         # "ruleset is empty" wolf when we ACTUALLY read it (or via sudo -n).
-        nft_out=$(nft list ruleset 2>/dev/null); nft_rc=$?
+        # 'nft list ruleset' needs root — a non-zero rc means "unreadable",
+        # not "no rules". Under `set -e` that rc would abort the whole tool.
+        nft_out=$(nft list ruleset 2>/dev/null) && nft_rc=0 || nft_rc=$?
         if [[ $nft_rc -ne 0 && -z "$nft_out" ]] && command -v sudo >/dev/null 2>&1; then
             nft_out=$(sudo -n nft list ruleset 2>/dev/null) && nft_rc=0
         fi

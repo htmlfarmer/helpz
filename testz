@@ -48,6 +48,7 @@ while [[ $# -gt 0 ]]; do
                 # shell, so a tool that does not source lib/common.sh still writes
                 # its JSON to the right place.
                 exec 4>&1 1>&2
+                _JSON_FD4=1
                 ;;
         --no-color) NO_COLOR=1; init_colors ;;
         -h|--help) sed -n '6,26p' "$0"; exit 0 ;;
@@ -64,7 +65,34 @@ note_fail() { FAIL=$((FAIL+1)); FAILURES+=("$1"); }
 note_skip() { SKIP=$((SKIP+1)); }
 
 # Tools that are slow by nature — excluded from --full unless asked for.
-SLOW_TOOLS="networkz benchmarkz slowz crashz allz"
+SLOW_TOOLS="networkz benchmarkz slowz crashz allz securityz secretz browserz"
+
+# Tools whose JSON cannot be checked in isolation: they need a network peer,
+# root, a git remote, or they never exit. Recorded with a reason so the
+# summary stays honest rather than silently dropping them.
+declare -A SKIP_REASON=(
+  [clonez]="needs a git remote"
+  [pushz]="needs a git remote"
+  [pullz]="needs a git remote"
+  [websitez]="needs a URL"
+  [sitemapz]="needs a URL"
+  [javascriptz]="needs a URL"
+  [downz]="needs a URL"
+  [whoisz]="needs a domain"
+  [livez]="never exits (live monitor)"
+  [xyzoservicesz]="personal tool, needs root"
+  [xyzothinthreadsz]="personal tool, needs root"
+  [studyz]="needs the AI backend"
+  [runz]="needs a trust state"
+)
+
+# Tools that need an argument before they do anything.
+declare -A TOOL_ARGS=(
+  [chartz]="bars"
+  [publishz]="--dry-run --name testz"
+  [dnsz]="--local"
+  [allz]="--help"
+)
 
 is_slow() {
     local t="$1" s
@@ -117,6 +145,9 @@ while IFS= read -r t; do
     if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
         note_skip; continue
     fi
+    if [[ -n "${SKIP_REASON[$t]:-}" ]]; then
+        note_skip; continue
+    fi
     out=$(timeout 300 "$SCRIPT_DIR/$t" --no-color </dev/null 2>&1); rc=$?
     # 64 is the conventional "usage error" — a tool that requires an
     # argument is behaving correctly when it says so.
@@ -141,11 +172,16 @@ while IFS= read -r t; do
     if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
         note_skip; continue
     fi
-    # Tools that are filters or need a mode must be fed something.
-    case "$t" in
-        chartz) jout=$(printf 'alpha 10\nbeta 20\n' | timeout 300 "$SCRIPT_DIR/$t" bars --json 2>/dev/null | head -c 400000) ;;
-        *)      jout=$(timeout 300 "$SCRIPT_DIR/$t" --json </dev/null 2>/dev/null | head -c 400000) ;;
-    esac
+    if [[ -n "${SKIP_REASON[$t]:-}" ]]; then
+        note_skip; continue
+    fi
+    # Tools that are filters or need an argument must be fed something.
+    local extra="${TOOL_ARGS[$t]:-}"
+    if [[ "$t" == "chartz" ]]; then
+        jout=$(printf 'alpha 10\nbeta 20\n' | timeout 300 "$SCRIPT_DIR/$t" $extra --json 2>/dev/null | head -c 400000)
+    else
+        jout=$(timeout 300 "$SCRIPT_DIR/$t" $extra --json </dev/null 2>/dev/null | head -c 400000)
+    fi
     if printf '%s' "$jout" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
         note_pass
     else
@@ -201,7 +237,7 @@ fi
 
 section "TEST SUMMARY"
 printf "  ${C_GREEN}✓${C_RESET} %d passed\n" "$PASS"
-[[ "$SKIP" -gt 0 ]] && printf "  ${C_DIM}·${C_RESET} %d skipped (slow tools — use --full)\n" "$SKIP"
+[[ "$SKIP" -gt 0 ]] && printf "  ${C_DIM}·${C_RESET} %d skipped (slow tools — use --full; some need a URL or root)\n" "$SKIP"
 if (( FAIL > 0 )); then
     printf "  ${C_RED}✗${C_RESET} %d failed\n\n" "$FAIL"
     for f in "${FAILURES[@]}"; do
