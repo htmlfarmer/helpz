@@ -41,7 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # ---------- Commands & flags ----------
 COMMAND="status"
 case "${1:-}" in
-    status|check|study|upgrade|update|build|verify|recover|protect|bench|cleanup|history|fix)
+    status|check|study|upgrade|update|build|verify|recover|protect|bench|cleanup|history|fix|best|recommend)
         COMMAND="$1"; shift ;;
     -h|--help) COMMAND="help" ;;
     ""|-*) ;;
@@ -51,8 +51,14 @@ esac
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"   # resets JSON_OUT/NO_COLOR — parse AFTER sourcing
 
+# The "latest best kernel" intelligence: upstream release table, repo
+# candidates, tiering (stable-but-settled > stable-fresh > LTS > EOL).
+# shellcheck source=lib/kernelbest.sh
+[[ -r "$SCRIPT_DIR/lib/kernelbest.sh" ]] && source "$SCRIPT_DIR/lib/kernelbest.sh"
+
 DRY_RUN=0; FORCE=0; ASSUME_YES=0; WANT_IO=0; BENCH_FULL=0; APPLY_FIX=0; APPLY_FIX=0
 TO_PKG=""
+SETTLE_DAYS=""; WANT_NEWEST=0
 BUILD_VER=""; BUILD_LTS=0; BUILD_JOBS=""; BUILD_MINIMAL=0; BUILD_GIT=0
 BUILD_DIR="${BUILD_DIR:-$HOME/linux-build}"
 ARGS=("$@")
@@ -87,6 +93,9 @@ while [[ $# -gt 0 ]]; do
         --minimal)   BUILD_MINIMAL=1 ;;
         --git)       BUILD_GIT=1 ;;
         --lts)       BUILD_LTS=1 ;;
+        --settle)    shift; SETTLE_DAYS="${1:-}" ;;
+        --settle=*)  SETTLE_DAYS="${1#--settle=}" ;;
+        --newest)    WANT_NEWEST=1 ;;
         -h|--help)   COMMAND="help" ;;
         show|compare) [[ "$COMMAND" == "bench" ]] && { shift; continue; }
                       printf 'kernelz: unknown option "%s" (try --help)\n' "$1" >&2; exit 64 ;;
@@ -96,6 +105,16 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 init_colors
+
+# --settle N overrides how long a kernel must have existed before kernelz
+# trusts it ("latest that is also heavily tested").
+if [[ -n "$SETTLE_DAYS" ]]; then
+    if [[ ! "$SETTLE_DAYS" =~ ^[0-9]+$ ]]; then
+        printf 'kernelz: --settle needs a number of days (got "%s")\n' "$SETTLE_DAYS" >&2
+        exit 64
+    fi
+    KB_SETTLE_DAYS="$SETTLE_DAYS"
+fi
 
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
     if [[ "$JSON_OUT" -eq 0 ]] && declare -f run_comparison_init >/dev/null 2>&1; then
@@ -122,6 +141,23 @@ fi
 ver_gt()  { dpkg --compare-versions "$1" gt "$2" 2>/dev/null; }
 ver_ge()  { dpkg --compare-versions "$1" ge "$2" 2>/dev/null; }
 
+# compare kernel series ("7.2" vs "6.1"); 0 means $1 is the newer series
+series_gt() {
+    local a="$1" b="$2"
+    [[ -z "$a" || -z "$b" ]] && return 1
+    [[ "$a" == "$b" ]] && return 1
+    local amaj amin bmaj bmin
+    amaj="${a%%.*}"; amin="${a#*.}"
+    bmaj="${b%%.*}"; bmin="${b#*.}"
+    [[ "$amaj" =~ ^[0-9]+$ ]] || return 1
+    [[ "$amin" =~ ^[0-9]+$ ]] || amin=0
+    [[ "$bmaj" =~ ^[0-9]+$ ]] || return 1
+    [[ "$bmin" =~ ^[0-9]+$ ]] || bmin=0
+    (( amaj > bmaj )) && return 0
+    (( amaj < bmaj )) && return 1
+    (( amin > bmin ))
+}
+
 pkg_for_release() {
     local rel="$1" p
     p=$(dpkg -S "/boot/vmlinuz-$rel" 2>/dev/null | cut -d: -f1 | tr -d ' ')
@@ -138,6 +174,22 @@ installed_image_pkgs() {
 }
 
 apt_candidate() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}' | grep -v '^$'; }
+
+# A candidate version can exist only on this machine ("***" in the version
+# table means "installed, no repository provides it"). Such a kernel gets no
+# security updates from apt, so it must not count as "from the repos".
+pkg_in_repo() {
+    local p="$1" out ver
+    out=$(apt-cache policy "$p" 2>/dev/null)
+    [[ -z "$out" ]] && return 1
+    ver=$(awk '/Candidate:/{print $2; exit}' <<< "$out")
+    [[ -z "$ver" || "$ver" == "(none)" ]] && return 1
+    awk -v v="$ver" '
+        /Version table:/{intab=1; next}
+        intab && $1 == v && $2 ~ /^[0-9]+$/ {found=1}
+        END{exit !found}
+    ' <<< "$out"
+}
 
 META_PKG=""; META_CAND=""; HDR_PKG=""; HDR_CAND=""
 detect_meta() {
@@ -285,8 +337,20 @@ gather_kernel_facts() {
     [[ -n "$CUR_PKG" ]] && CUR_HELD=$(pkg_state "$CUR_PKG") && [[ "$CUR_HELD" == h* ]] && CUR_HELD=1 || CUR_HELD=0
     [[ -n "$CUR_PKG" ]] && [[ "$(apt_candidate "$CUR_PKG" 2>/dev/null)" != "" ]] \
         && [[ "$(apt_candidate "$CUR_PKG")" != "(none)" ]] && IN_REPO=1
+    [[ -n "$CUR_PKG" ]] && pkg_in_repo "$CUR_PKG" || IN_REPO=0
     UPDATE=0
     [[ -n "$META_CAND" ]] && ver_gt "$META_CAND" "$CUR_VER" && UPDATE=1
+}
+
+# The upstream/repo analysis is network-backed, so it is computed at most once
+# per run and only when a section actually needs it.
+KB_READY=0
+ensure_best() {
+    [[ "$KB_READY" -eq 1 ]] && return 0
+    declare -f kb_recommend >/dev/null 2>&1 || return 0
+    kb_recommend
+    KB_READY=1
+    return 0
 }
 
 # ============================================================================
@@ -317,12 +381,24 @@ DESCRIPTION
   GRUB one-shot fallback net — a bad home-built kernel reboots itself
   back to the last known good one.
 
+  THE "LATEST BEST KERNEL" RULE
+  Every run compares the kernel you are on against the newest kernel that is
+  worth trusting — NOT the very latest (a release that landed days ago is
+  untested) and NOT the long-term branch (that is the safe fallback, not the
+  goal). The verdict is built from the upstream release table (kernel.org),
+  the age of each release, whether its series is long-term or end-of-life,
+  and the number of people who actually tested it. The report then explains
+  WHY an upgrade is worth it and WHAT the newer kernel fixes (CVE ids and
+  notable fixes pulled from the upstream changelog).
+
 USAGE
-  ./kernelz                     Kernel snapshot + update check + risk study
+  ./kernelz                     Kernel snapshot + BEST-KERNEL verdict + risk study
+  ./kernelz best                Just the best-kernel verdict and what it fixes
   ./kernelz study               Deep study: config hardening, CVE changelog,
                                 CPU mitigations, taint, boot ledger
-  ./kernelz upgrade             Install latest kernel + GRUB safety net + protect
+  ./kernelz upgrade             Install the best (tested) kernel + GRUB safety net
   ./kernelz update              Alias for upgrade
+  ./kernelz upgrade --newest    Take the very newest kernel instead of the tested one
   ./kernelz build               Compile the LATEST MAINLINE from source: toolchain
                                 audit → sha256-verified download → bindeb-pkg →
                                 install → same GRUB one-shot safety net
@@ -348,6 +424,9 @@ USAGE
 
 OPTIONS
   --to=VERSION|PKG   Upgrade to a specific kernel instead of repo candidate
+  --settle=N         Days a release must have existed to count as "tested"
+                     (default 14; lower = trust newer kernels sooner)
+  --newest           (upgrade) take the very newest kernel, not the tested one
   --ver=X.Y.Z        (build) exact mainline version to compile
   --lts              (build) latest longterm series instead of current stable
   --minimal          (build) make localmodconfig after olddefconfig
@@ -431,6 +510,7 @@ section_snapshot() {
             [[ $IN_REPO -eq 0 ]] && printf "  ${C_DIM}Note: %s is a custom kernel not tracked by %s; repo max is %s${C_RESET}\n" "$CUR_PKG" "$META_PKG" "$META_CAND"
         fi
         printf "  ${C_DIM}Headers:  ${HDR_PKG:-n/a} → ${HDR_CAND:-n/a}${C_RESET}\n"
+        printf "  ${C_DIM}(this is apt's view — the BEST KERNEL section below is the tested one)${C_RESET}\n"
     else
         info "No kernel meta-package found in repositories"
     fi
@@ -472,6 +552,291 @@ section_grub() {
             critf "GrubEntry" "No GRUB menu entry for installed kernel $rel" "sudo update-grub"
         fi
     done < <(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||')
+}
+
+# ============================================================================
+# BEST KERNEL — what you run vs what you should be running
+# ----------------------------------------------------------------------------
+# The rule: NOT the very latest (it just landed, it is untested), but the
+# newest kernel that has had time to bake — and not the long-term branch
+# unless nothing else is on offer.
+# ============================================================================
+section_best() {
+    ensure_best
+    section "BEST KERNEL — what you run vs what you should run"
+    if ! declare -f kb_recommend >/dev/null 2>&1; then
+        info "kernelbest module unavailable — skipping the comparison"
+        return 0
+    fi
+    if [[ -z "$KB_BEST_PKG" ]]; then
+        info "no kernel images found in the repositories — nothing to compare against"
+        add_json_field kernel_best_version ""
+        return 0
+    fi
+
+    local kzl
+    kzl() { printf "  ${C_DIM}%-15s${C_RESET} %s\n" "$1" "$2"; }
+
+    # ---- what you are running ----
+    local rser rup rdate rnote reol
+    rser=$(kb_running_series)
+    rup=$(kb_running_upstream)
+    reol=$(kb_series_is_eol "$rser")
+    kzl "Running" "${C_BOLD}$REL${C_RESET}${rser:+  (series $rser)}"
+    if [[ -n "$rup" ]]; then
+        rdate=$(kb_upstream_date "$rup") || rdate=""
+        if [[ -n "$rdate" ]]; then
+            kzl "Upstream build" "$rup · released $(kb_fmt_date "$rdate") · $(kb_fmt_age "$rdate") old"
+        else
+            kzl "Upstream build" "$rup · release date unknown"
+        fi
+    else
+        kzl "Upstream build" "not an upstream release number — custom/local kernel"
+    fi
+    if [[ "$reol" == "1" ]]; then
+        kzl "Series state" "${C_RED}${C_BOLD}END-OF-LIFE${C_RESET} — upstream no longer fixes series $rser"
+        warnf "KernelEOL" "running series $rser is end-of-life upstream — no more security fixes will be published for it" \
+            "move to a supported kernel: kernelz best (shows the newest tested one)"
+    elif [[ -n "$rser" ]] && [[ "$(kb_series_is_lts "$rser")" == "1" ]]; then
+        kzl "Series state" "long-term branch — supported for years, but not the newest"
+    else
+        kzl "Series state" "${C_GREEN}supported upstream${C_RESET}${rser:+ (series $rser)}"
+    fi
+    if [[ -n "$CUR_PKG" && $IN_REPO -eq 0 ]]; then
+        kzl "Source" "${C_YELLOW}custom build${C_RESET} — your distro's security updates never reach it"
+    elif [[ -n "$CUR_PKG" ]]; then
+        kzl "Source" "distro package $CUR_PKG"
+    fi
+    printf "\n"
+
+    # ---- upstream landscape ----
+    if [[ "$KB_UPSTREAM_OK" -eq 1 ]]; then
+        kzl "Upstream stable" "${C_BOLD}${KB_STABLE_VER:-?}${C_RESET} · released ${KB_STABLE_ISO:-?} · $(kb_fmt_age "$KB_STABLE_DATE") old"
+        if [[ -n "$KB_LTS_LIST" ]]; then
+            kzl "Long-term" "${C_DIM}${KB_LTS_LIST}${C_RESET}"
+        fi
+        printf "\n"
+    else
+        info "upstream release table unavailable (offline?) — using repository data only"
+        printf "\n"
+    fi
+
+    # ---- what the repositories offer ----
+    local rows=() i
+    for ((i = 0; i < ${#KB_C_PKG[@]}; i++)); do
+        rows+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s' "${KB_C_TIER[i]}" "${KB_C_DATE[i]:-0}" "${KB_C_PKG[i]}" "${KB_C_VER[i]}" "${KB_C_SERIES[i]}" "${KB_C_NOTE[i]}")")
+    done
+    if [[ ${#rows[@]} -gt 0 ]]; then
+        subsec "Kernels available in your repositories"
+        printf "  ${C_DIM}%-5s %-30s %-14s %-6s %-6s %-11s %-9s %s${C_RESET}\n" \
+            "tier" "package" "version" "series" "branch" "released" "age" "note"
+        while IFS=$'\t' read -r t d pkg ver ser note; do
+            local mark="" col="$C_DIM"
+            [[ "$pkg" == "$KB_BEST_PKG" && "$ver" == "$KB_BEST_VER" ]] && { mark=" ${C_GREEN}${C_BOLD}★ recommended${C_RESET}"; col="$C_GREEN"; }
+            [[ "$pkg" == "$KB_NEW_PKG" && "$ver" == "$KB_NEW_VER" ]] && [[ -z "$mark" ]] && mark=" ${C_YELLOW}(newest in repos)${C_RESET}"
+            local age="unknown" released="unknown"
+            if [[ "$d" =~ ^[0-9]+$ ]] && (( d > 0 )); then
+                age=$(kb_fmt_age "$d"); released=$(kb_fmt_date "$d")
+            fi
+            printf "  %-5s ${col}%-30s %-14s %-6s %-6s %-11s %-9s${C_RESET} %-30s%b\n" \
+                "$t" "$pkg" "$ver" "$ser" \
+                "$( [[ "$(kb_series_is_lts "$ser")" == "1" ]] && echo "LTS" || echo "stable" )" \
+                "$released" "$age" "$note" "$mark"
+        done < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1,1n -k2,2nr | head -8)
+        [[ ${#rows[@]} -gt 8 ]] && info "$(( ${#rows[@]} - 8 )) older candidate(s) not shown"
+        printf "\n"
+    fi
+
+    # ---- the verdict ----
+    local tierlbl
+    tierlbl=$(kb_tier_label "$KB_BEST_TIER")
+    printf "  ${C_BOLD}${C_BLUE}RECOMMENDED${C_RESET}  ${C_BOLD}${KB_BEST_VER}${C_RESET}  ${C_DIM}(${KB_BEST_PKG})${C_RESET}\n"
+    kzl "Why this one" "${C_BOLD}${tierlbl}${C_RESET} — series $KB_BEST_SERIES · $(kb_fmt_age_old "$KB_BEST_DATE")"
+    case "$KB_BEST_TIER" in
+        1)
+            printf "      ${C_DIM}newest non-LTS kernel in the repos that has been out ${KB_SETTLE_DAYS}+ days${C_RESET}\n"
+            ;;
+        2)
+            printf "      ${C_DIM}this is the newest non-LTS kernel your distro ships, but it is still fresh —${C_RESET}\n"
+            if [[ "$KB_BEST_DATE" =~ ^[0-9]+$ ]] && (( KB_BEST_DATE > 0 )); then
+                local wait=$(( KB_SETTLE_DAYS - $(kb_age_days "$KB_BEST_DATE") ))
+                (( wait < 0 )) && wait=0
+                printf "      ${C_DIM}it becomes fully trusted in about %d more day(s)${C_RESET}\n" "$wait"
+            else
+                printf "      ${C_DIM}its release date is unknown, so it cannot be trusted yet — retry with network${C_RESET}\n"
+            fi
+            ;;
+        3|4)
+            printf "      ${C_DIM}your distro ships no non-LTS kernel that has settled, so this long-term${C_RESET}\n"
+            printf "      ${C_DIM}branch is the newest thing here with a real track record${C_RESET}\n"
+            ;;
+    esac
+    if [[ -n "$KB_STABLE_VER" && "$KB_BEST_UP" != "$KB_STABLE_VER" ]]; then
+        local sdate="${KB_STABLE_DATE:-0}" sage
+        sage=$(kb_age_days "$sdate")
+        if (( sage < KB_SETTLE_DAYS )) && [[ "$KB_BEST_TIER" != "2" ]]; then
+            printf "      ${C_DIM}upstream's newer stable ${KB_STABLE_VER} is only ${sage} day(s) old — too fresh to trust yet${C_RESET}\n"
+        fi
+    fi
+    printf "\n"
+
+    # ---- are we actually behind? ----
+    if [[ -z "$KB_BEST_VER" ]]; then
+        :
+    elif [[ "$KB_BEST_VER" == "$CUR_VER" && "$KB_BEST_PKG" == "$CUR_PKG" ]]; then
+        printf "  ${C_GREEN}${C_BOLD}You are running the recommended kernel${C_RESET} ${C_DIM}($CUR_VER)${C_RESET}\n\n"
+    elif series_gt "$KB_BEST_SERIES" "$rser"; then
+        printf "  ${C_MAGENTA}${C_BOLD}UPGRADE SUGGESTED${C_RESET}  %s → %s   ${C_DIM}(series %s, %s old, %s)${C_RESET}\n" \
+            "$CUR_VER" "$KB_BEST_VER" "$KB_BEST_SERIES" "$(kb_fmt_age "$KB_BEST_DATE")" "$(kb_tier_label "$KB_BEST_TIER")"
+        printf "  ${C_DIM}Next: %s upgrade   (safe — the new kernel boots once, GRUB falls back)${C_RESET}\n\n" "${0##*/}"
+    elif [[ "$KB_BEST_SERIES" == "$rser" ]]; then
+        if ver_gt "$KB_BEST_VER" "$CUR_VER"; then
+            printf "  ${C_MAGENTA}${C_BOLD}UPGRADE SUGGESTED${C_RESET}  %s → %s   ${C_DIM}(same series, %s old)${C_RESET}\n" \
+                "$CUR_VER" "$KB_BEST_VER" "$(kb_fmt_age "$KB_BEST_DATE")"
+            printf "  ${C_DIM}Next: %s upgrade   (safe — the new kernel boots once, GRUB falls back)${C_RESET}\n\n" "${0##*/}"
+        else
+            printf "  ${C_GREEN}You are ahead of the recommended kernel${C_RESET} ${C_DIM}(running $CUR_VER, recommended $KB_BEST_VER)${C_RESET}\n\n"
+        fi
+    else
+        # The repos' best tested kernel belongs to an OLDER branch than the
+        # one in use — that is the long-term fallback, not a step forward.
+        printf "  ${C_YELLOW}${C_BOLD}OLDER BRANCH AVAILABLE${C_RESET}  your distro's tested kernel is %s (series %s) —\n" \
+            "$KB_BEST_VER" "$KB_BEST_SERIES"
+        printf "  ${C_DIM}an older branch than the %s you run. That is the long-term fallback, not a step forward.${C_RESET}\n\n" "$rser"
+    fi
+
+    # ---- JSON ----
+    add_json_field kernel_best_package "$KB_BEST_PKG"
+    add_json_field kernel_best_version "$KB_BEST_VER"
+    add_json_field kernel_best_series "$KB_BEST_SERIES"
+    add_json_field kernel_best_upstream "$KB_BEST_UP"
+    add_json_field kernel_best_tier "$KB_BEST_TIER"
+    add_json_field kernel_best_note "$KB_BEST_NOTE"
+    add_json_field kernel_best_age_days "$(kb_age_days "$KB_BEST_DATE")" 1
+    add_json_field kernel_newest_version "$KB_NEW_VER"
+    add_json_field kernel_running_series "$rser"
+    add_json_field kernel_running_upstream "$rup"
+    add_json_field kernel_running_eol "$( [[ "$reol" == "1" ]] && echo true || echo false )" 1
+    add_json_field kernel_upstream_stable "$KB_STABLE_VER"
+    add_json_field kernel_upstream_lts "$KB_LTS_LIST"
+    add_json_field kernel_settle_days "$KB_SETTLE_DAYS" 1
+}
+
+# ============================================================================
+# WHY UPGRADE · WHAT IS FIXED
+# ============================================================================
+section_fixes() {
+    ensure_best
+    section "WHY UPGRADE · WHAT IS FIXED"
+    if [[ -z "$KB_BEST_PKG" ]]; then
+        info "no recommended kernel to compare against"
+        return 0
+    fi
+
+    local rser rup reol reasons=()
+    rser=$(kb_running_series)
+    rup=$(kb_running_upstream)
+    reol=$(kb_series_is_eol "$rser")
+
+    subsec "Why you might want to upgrade"
+    if [[ "$reol" == "1" ]]; then
+        reasons+=("${C_RED}your series $rser is END-OF-LIFE upstream${C_RESET} — no more fixes will ever be published for it")
+    fi
+    if [[ -n "$CUR_PKG" && $IN_REPO -eq 0 ]]; then
+        reasons+=("you run a custom kernel — your distro's security patches never reach it")
+    fi
+    if [[ -n "$KB_BEST_VER" && "$KB_BEST_VER" != "$CUR_VER" ]]; then
+        if series_gt "$KB_BEST_SERIES" "$rser"; then
+            reasons+=("a newer, already-tested kernel is available: ${C_BOLD}${KB_BEST_VER}${C_RESET} (series $KB_BEST_SERIES, out $(kb_fmt_age "$KB_BEST_DATE"))")
+        elif [[ "$KB_BEST_SERIES" == "$rser" ]] && ver_gt "$KB_BEST_VER" "$CUR_VER"; then
+            reasons+=("a newer patch of the same series is available: ${C_BOLD}${KB_BEST_VER}${C_RESET} (out $(kb_fmt_age "$KB_BEST_DATE"))")
+        fi
+    fi
+    # behind inside your own series?
+    local latest_in_series="${KB_SER_LATEST[$rser]:-}"
+    if [[ -n "$rup" && -n "$latest_in_series" ]] && ver_gt "$latest_in_series" "$rup"; then
+        reasons+=("you are behind inside series $rser: running $rup, upstream's last release of that series was $latest_in_series")
+    fi
+    # unmitigated CPU vulnerabilities
+    local cvuln=0
+    for f in /sys/devices/system/cpu/vulnerabilities/*; do
+        [[ -r "$f" ]] || continue
+        grep -q '^Vulnerable' "$f" 2>/dev/null && cvuln=$(( cvuln + 1 ))
+    done
+    (( cvuln > 0 )) && reasons+=("${cvuln} CPU vulnerability class(es) are unmitigated on this kernel — newer kernels add mitigations")
+
+    if [[ ${#reasons[@]} -eq 0 ]]; then
+        ok "no strong reason to move — you are on the recommended kernel"
+    else
+        local r
+        for r in "${reasons[@]}"; do printf "    ${C_YELLOW}▸${C_RESET} %b\n" "$r"; done
+    fi
+    # the "neither branch is right" case: say what to do instead
+    if [[ "$reol" == "1" && -n "$KB_STABLE_VER" ]]; then
+        local sage; sage=$(kb_age_days "$KB_STABLE_DATE")
+        printf "\n"
+        if (( sage < KB_SETTLE_DAYS )); then
+            printf "    ${C_CYAN}▸${C_RESET} upstream's current stable %s is only %d day(s) old — it will have settled in about %d day(s).\n" \
+                "$KB_STABLE_VER" "$sage" "$(( KB_SETTLE_DAYS - sage ))"
+            printf "    ${C_CYAN}▸${C_RESET} until then: %s build (compile it yourself, same GRUB safety net) or stay on a supported LTS.\n" "${0##*/}"
+        else
+            printf "    ${C_CYAN}▸${C_RESET} upstream's current stable %s has settled (%d days old) but your distro does not package it.\n" \
+                "$KB_STABLE_VER" "$sage"
+            printf "    ${C_CYAN}▸${C_RESET} %s build compiles it for you, behind the same GRUB safety net.\n" "${0##*/}"
+        fi
+    fi
+    printf "\n"
+
+    subsec "What the recommended kernel carries"
+    if [[ -z "$KB_BEST_UP" ]]; then
+        info "could not map ${KB_BEST_VER} to an upstream release — no changelog comparison possible"
+        return 0
+    fi
+    local facts commits testers cves cl
+    facts=$(kb_release_facts "$KB_BEST_UP") || facts="0|0|"
+    commits="${facts%%|*}"; testers="${facts#*|}"; testers="${testers%%|*}"
+    cves="${facts##*|}"
+    kvline() { printf "    ${C_DIM}%-14s${C_RESET} %s\n" "$1" "$2"; }
+    kvline "upstream" "$KB_BEST_UP"
+    kvline "commits" "$commits"
+    kvline "tested by" "${testers} upstream tester(s) ${C_DIM}(the stable tree's own Tested-by roster)${C_RESET}"
+    if [[ -n "$cves" ]]; then
+        kvline "CVE fixes" ""
+        printf '%s\n' "$cves" | tr ',' '\n' | while read -r c; do
+            [[ -z "$c" ]] && continue
+            printf "      ${C_RED}%s${C_RESET}\n" "$c"
+        done
+    else
+        kvline "CVE fixes" "none referenced in this release's changelog"
+    fi
+
+    cl=$(kb_release_changelog "$KB_BEST_UP") || cl=""
+    if [[ -n "$cl" ]]; then
+        local highlights
+        highlights=$(kb_highlights "$cl")
+        if [[ -n "$highlights" ]]; then
+            printf "\n    ${C_DIM}notable fixes in this release:${C_RESET}\n"
+            printf '%s\n' "$highlights" | head -8 | while IFS= read -r s; do
+                printf "      ${C_GREEN}•${C_RESET} %s\n" "$s"
+            done
+        fi
+    fi
+    printf "\n"
+
+    # If the repo also has a newer (but less settled) kernel, say what it adds.
+    if [[ -n "$KB_NEW_VER" && "$KB_NEW_VER" != "$KB_BEST_VER" && -n "$KB_NEW_UP" ]]; then
+        local nfacts ncves
+        nfacts=$(kb_release_facts "$KB_NEW_UP") || nfacts="0|0|"
+        ncves="${nfacts##*|}"
+        printf "  ${C_YELLOW}${C_BOLD}NOTE${C_RESET}  the repos also carry ${C_BOLD}${KB_NEW_VER}${C_RESET}, which is newer but only"
+        printf " %s day(s) old — not yet trusted.\n" "$(kb_age_days "$KB_NEW_DATE")"
+        if [[ -n "$ncves" ]]; then
+            printf "        ${C_DIM}it does carry: %s${C_RESET}\n" "$(printf '%s' "$ncves" | tr ',' ' ')"
+            printf "        ${C_DIM}take it with --newest if you want those fixes now${C_RESET}\n"
+        fi
+        printf "\n"
+    fi
+    return 0
 }
 
 run_risk_checks() {
@@ -584,8 +949,10 @@ cmd_status() {
 
     json_muffle
     section_snapshot
+    section_best
     section_grub
     run_risk_checks
+    section_fixes
     json_unmuffle
 
     if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
@@ -676,8 +1043,10 @@ cmd_study() {
     record_boot
     json_muffle
     section_snapshot
+    section_best
     section_grub
     run_risk_checks
+    section_fixes
     section "KERNEL IDENTITY"
     printf "  %s\n" "$(uname -a)"
     [[ -r /proc/version ]] && printf "  ${C_DIM}%s${C_RESET}\n" "$(cat /proc/version)"
@@ -697,6 +1066,22 @@ cmd_study() {
     if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
         run_comparison_finalize 2>/dev/null || true
     fi
+    emit_verdict
+}
+
+# ============================================================================
+# BEST  (kernelz best) — just the recommendation, nothing else
+# ============================================================================
+cmd_best() {
+    gather_kernel_facts
+    ensure_best
+    emit "\n  ${C_BOLD}${C_BLUE}╔═══════════════════════════════════════════════════════════════╗
+  ║  KERNELZ — which kernel should I be running?                  ║
+  ╚═══════════════════════════════════════════════════════════════╝${C_RESET}\n"
+    json_muffle
+    section_best
+    section_fixes
+    json_unmuffle
     emit_verdict
 }
 
@@ -748,9 +1133,10 @@ cmd_upgrade() {
     fi
 
     section_snapshot
+    ensure_best
 
     heading "── PLAN ──"
-    local target_pkg="" target_rel="" downgrade=0
+    local target_pkg="" target_rel="" downgrade=0 target_pin=""
     if [[ -n "$TO_PKG" ]]; then
         [[ "$TO_PKG" == linux-* ]] && target_pkg="$TO_PKG" || target_pkg="linux-image-$TO_PKG"
         local cand; cand=$(apt_candidate "$target_pkg")
@@ -762,12 +1148,31 @@ cmd_upgrade() {
         downgrade=1
     elif [[ $UPDATE -eq 1 ]]; then
         target_pkg="$META_PKG"
+        # The "latest best" kernel is not always the newest package in the
+        # repos: a release that landed days ago is still untested. When the
+        # recommended kernel carries an OLDER upstream release than the meta
+        # candidate, install that exact package instead of the meta (which
+        # would pull the fresh one).
+        local meta_up="" best_up=""
+        meta_up=$(kb_pkg_upstream "$META_CAND" 2>/dev/null) || meta_up=""
+        best_up="$KB_BEST_UP"
+        if [[ "$WANT_NEWEST" -eq 0 && -n "$KB_BEST_PKG" && -n "$best_up" && -n "$meta_up" \
+              && "$best_up" != "$meta_up" && "$KB_BEST_TIER" != "5" ]] \
+           && ver_gt "$meta_up" "$best_up"; then
+            target_pkg="$KB_BEST_PKG"
+            target_pin="=$KB_BEST_VER"
+            info "targeting the tested kernel $KB_BEST_VER (series $KB_BEST_SERIES, $(kb_fmt_age "$KB_BEST_DATE") old)"
+            info "the repo also has $META_CAND (upstream $meta_up), but it is only $(kb_age_days "$KB_NEW_DATE") day(s) old — use --newest to take it"
+        fi
     else
         ok "Running kernel $CUR_VER is already the newest (repo candidate: ${META_CAND:-n/a})"
+        if [[ -n "$KB_BEST_VER" && "$KB_BEST_VER" != "$CUR_VER" ]]; then
+            info "the tested kernel your distro ships is $KB_BEST_VER — run 'kernelz best' for the full picture"
+        fi
     fi
 
     local pkgs_to_install=()
-    [[ -n "$target_pkg" ]] && pkgs_to_install+=("$target_pkg")
+    [[ -n "$target_pkg" ]] && pkgs_to_install+=("${target_pkg}${target_pin}")
     if [[ -n "$target_pkg" && -n "$HDR_PKG" ]]; then pkgs_to_install+=("$HDR_PKG"); fi
 
     heading "── 1. Refresh & install ──"
@@ -785,6 +1190,10 @@ cmd_upgrade() {
         # if --to was given as an ABI/version, the exact release is knowable
         local to_rel="${TO_PKG#linux-image-}"
         [[ "$TO_PKG" == linux-* ]] || to_rel="$TO_PKG"
+        [[ -f "/boot/vmlinuz-$to_rel" ]] && target_rel="$to_rel"
+    elif [[ -n "$target_pin" ]]; then
+        # a pinned (deliberately older) target: its release name is known
+        local to_rel="${target_pkg#linux-image-}"
         [[ -f "/boot/vmlinuz-$to_rel" ]] && target_rel="$to_rel"
     fi
     [[ -n "$target_rel" ]] || target_rel="$REL"
@@ -895,26 +1304,56 @@ build_derive_urls() {   # $1 = version -> UP_* set
     UP_SHAURL="https://cdn.kernel.org/pub/linux/kernel/${UP_SERIES}/sha256sums.asc"
 }
 
+# kernel.org publishes a release under vX.x for the current series and under
+# vX.Y for every other (long-term) branch. Its feed already carries the real
+# tarball URL, so use that instead of guessing the directory.
+build_adopt_source() {   # $1 = version, $2 = source url from the feed
+    local v="$1" src="$2" dir tar
+    [[ -z "$v" || -z "$src" ]] && return 0
+    dir="${src%/*}"; tar="${src##*/}"
+    [[ "$dir" == *"/pub/linux/kernel/"* ]] || return 0
+    UP_SERIES="${dir##*/}"
+    [[ -n "$UP_SERIES" ]] || return 0
+    UP_TARBALL="$tar"
+    UP_URL="$src"
+    UP_SHAURL="https://cdn.kernel.org/pub/linux/kernel/${UP_SERIES}/sha256sums.asc"
+    return 0
+}
+
 build_latest_query() {   # sets UP_* on success
     local json=""
     json=$(curl -fsS --max-time 15 "$KERNEL_ORG_JSON" 2>/dev/null) || json=""
     if [[ -z "$json" ]] && command -v wget >/dev/null 2>&1; then
         json=$(wget -qO- --timeout=15 "$KERNEL_ORG_JSON" 2>/dev/null) || json=""
     fi
-    local v=""
+    local v="" src=""
     if [[ -n "$json" ]] && command -v jq >/dev/null 2>&1; then
         if (( BUILD_LTS )); then
-            # LTS rows are marked by a non-false/non-null .longterm value
+            # Long-term rows are marked either by the "longterm" moniker or
+            # by a non-false .longterm field — accept both.
             v=$(printf '%s' "$json" | jq -r '
-                [.releases[] | select(.longterm != false and .longterm != null)
+                [.releases[]
+                 | select((.moniker == "longterm")
+                          or (.longterm != false and .longterm != null))
                  | .version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // empty' 2>/dev/null)
             [[ -z "$v" ]] && warnf "SourceNet" "kernel.org feed carries no longterm markers — showing latest stable instead" \
                 "pin an LTS explicitly: kernelz build --ver 6.12.x"
         fi
         if [[ -z "$v" ]]; then
+            # the current stable branch — never an end-of-life one
+            v=$(printf '%s' "$json" | jq -r '
+                [.releases[]
+                 | select(.moniker == "stable" and (.iseol != true))
+                 | .version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // empty' 2>/dev/null)
+        fi
+        if [[ -z "$v" ]]; then
             v=$(printf '%s' "$json" | jq -r '
                 [.releases[] | .version
                  | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0] // empty' 2>/dev/null)
+        fi
+        if [[ -n "$v" ]]; then
+            src=$(printf '%s' "$json" | jq -r --arg v "$v" '
+                [.releases[] | select(.version == $v) | .source] | .[0] // empty' 2>/dev/null)
         fi
     fi
     if [[ -z "$v" ]] && command -v git >/dev/null 2>&1; then   # offline-json fallback: git tags
@@ -924,6 +1363,8 @@ build_latest_query() {   # sets UP_* on success
     fi
     [[ -n "$v" ]] || return 1
     build_derive_urls "$v"
+    [[ -n "$src" ]] && build_adopt_source "$v" "$src"
+    return 0
 }
 
 toolchain_audit() {
@@ -1918,6 +2359,7 @@ case "$COMMAND" in
     help)    show_help ;;
     status|check) cmd_status ;;
     study)   cmd_study ;;
+    best|recommend) cmd_best ;;
     upgrade|update) cmd_upgrade ;;
     build)   cmd_build ;;
     verify)  cmd_verify ;;
