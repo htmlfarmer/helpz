@@ -296,13 +296,26 @@ kb_parse_date() {    # "Fri Jun 19 13:37:33 2026 +0200" -> epoch
     printf '%s' "$(( naive - loc - g ))"
 }
 
-kb_upstream_date() {  # upstream release -> epoch of its release date
+kb_upstream_date() {  # upstream release (or series) -> epoch of its release date
     local up="${1:-}" maj ser base f d e
     [[ -z "$up" ]] && return 1
     maj="${up%%.*}"
     ser=$(kb_series_of "$up") || return 1
+    # The exact release first.
     for base in "v${maj}.x" "v${ser}"; do
         f=$(kb_cache_head "$KB_CDN_BASE/$base/ChangeLog-$up") || continue
+        [[ -s "$f" ]] || continue
+        d=$(grep -m1 -E '^Date:' "$f" 2>/dev/null | sed 's/^Date:[[:space:]]*//')
+        [[ -z "$d" ]] && continue
+        e=$(kb_parse_date "$d") || continue
+        [[ -n "$e" ]] && { printf '%s' "$e"; return 0; }
+    done
+    # Fall back to the SERIES changelog. This matters on Ubuntu-style
+    # packaging: the ABI is X.Y.0 (7.0.0-42-generic), and X.Y.0 is not an
+    # upstream release — the branch changelog is what exists. Its date is
+    # when the branch was born, which is exactly the maturity signal we want.
+    for base in "v${maj}.x" "v${ser}"; do
+        f=$(kb_cache_head "$KB_CDN_BASE/$base/ChangeLog-$ser") || continue
         [[ -s "$f" ]] || continue
         d=$(grep -m1 -E '^Date:' "$f" 2>/dev/null | sed 's/^Date:[[:space:]]*//')
         [[ -z "$d" ]] && continue
@@ -552,16 +565,37 @@ kb_better() {   # dateA verA dateB verB -> 0 when A is newer
 # ---------------------------------------------------------------------------
 # release facts for "what is fixed in that kernel"
 # ---------------------------------------------------------------------------
-kb_release_changelog() {   # upstream release -> path to its ChangeLog (cached)
+kb_release_changelog() {   # upstream release (or series) -> path to its ChangeLog
     local up="${1:-}" maj ser base f
     [[ -z "$up" ]] && return 1
     maj="${up%%.*}"
     ser=$(kb_series_of "$up") || return 1
+    # exact release
     for base in "v${maj}.x" "v${ser}"; do
         f=$(kb_cache_file "$KB_CDN_BASE/$base/ChangeLog-$up" 604800) || continue
         [[ -s "$f" ]] && { printf '%s' "$f"; return 0; }
     done
+    # series-wide changelog (Ubuntu-style X.Y.0 ABIs land here)
+    for base in "v${maj}.x" "v${ser}"; do
+        f=$(kb_cache_file "$KB_CDN_BASE/$base/ChangeLog-$ser" 604800) || continue
+        [[ -s "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
     return 1
+}
+
+# Is the changelog we found the whole branch rather than one release?
+kb_changelog_is_series() {   # upstream release -> 0/1
+    local up="${1:-}" ser
+    ser=$(kb_series_of "$up") || return 1
+    [[ "$up" == "$ser" ]] && { printf '1'; return 0; }
+    # the exact release exists only if its own changelog was published
+    local maj="${up%%.*}" base
+    for base in "v${maj}.x" "v${ser}"; do
+        local f; f=$(kb_cache_file "$KB_CDN_BASE/$base/ChangeLog-$up" 604800) || continue
+        [[ -s "$f" ]] && { printf '0'; return 0; }
+    done
+    printf '1'
+    return 0
 }
 
 kb_commit_subjects() {   # changelog -> "sha<TAB>subject" per commit

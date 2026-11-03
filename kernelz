@@ -801,6 +801,10 @@ section_best() {
     local tierlbl
     tierlbl=$(kb_tier_label "$KB_BEST_TIER")
     printf "  ${C_BOLD}${C_BLUE}RECOMMENDED${C_RESET}  ${C_BOLD}${KB_BEST_VER}${C_RESET}  ${C_DIM}(${KB_BEST_PKG})${C_RESET}\n"
+    if [[ -n "$KB_BEST_PKG" ]]; then
+        printf "  ${C_BOLD}Will install${C_RESET}   ${C_BOLD}%s${C_RESET}  %s  ${C_DIM}(series %s)${C_RESET}\n" \
+            "$KB_BEST_PKG" "$KB_BEST_VER" "$KB_BEST_SERIES"
+    fi
     kzl "Why this one" "${C_BOLD}${tierlbl}${C_RESET} — series $KB_BEST_SERIES · $(kb_fmt_age_old "$KB_BEST_DATE")"
     case "$KB_BEST_TIER" in
         1)
@@ -891,11 +895,16 @@ section_howto_upgrade() {
 
     # 1 — the upgrade itself
     printf "  ${C_BOLD}1.${C_RESET} install the tested kernel and arm the GRUB fallback:\n"
-    printf "       ${C_CYAN}%s upgrade${C_RESET}" "$call"
-    if [[ -n "$KB_BEST_VER" && "$KB_BEST_VER" != "$META_CAND" && "$KB_BEST_TIER" != "5" ]]; then
-        printf "   ${C_DIM}(targets %s, not the fresher %s)${C_RESET}\n" "$KB_BEST_VER" "$META_CAND"
+    printf "       ${C_CYAN}%s upgrade${C_RESET}\n" "$call"
+    if [[ -n "$KB_BEST_PKG" ]]; then
+        printf "       ${C_BOLD}→ will install:${C_RESET} %s %s   ${C_DIM}(series %s, %s old)${C_RESET}\n" \
+            "$KB_BEST_PKG" "$KB_BEST_VER" "$KB_BEST_SERIES" "$(kb_fmt_age "$KB_BEST_DATE")"
+        if [[ -n "$META_CAND" && "$KB_BEST_VER" != "$META_CAND" ]]; then
+            printf "       ${C_DIM}→ NOT the repo's newest (%s) — that one is only %d day(s) old, still untested${C_RESET}\n" \
+                "$META_CAND" "$(kb_age_days "$KB_NEW_DATE")"
+        fi
     else
-        printf "\n"
+        printf "       ${C_DIM}(no recommended kernel found — the repos have nothing to install)${C_RESET}\n"
     fi
     printf "       ${C_DIM}the new kernel boots ONCE; if it fails, the next reboot lands back on %s${C_RESET}\n" "$REL"
 
@@ -1004,12 +1013,17 @@ section_fixes() {
         info "could not map ${KB_BEST_VER} to an upstream release — no changelog comparison possible"
         return 0
     fi
-    local facts commits testers cves cl
+    local facts commits testers cves cl scope
     facts=$(kb_release_facts "$KB_BEST_UP") || facts="0|0|"
     commits="${facts%%|*}"; testers="${facts#*|}"; testers="${testers%%|*}"
     cves="${facts##*|}"
+    scope=$(kb_changelog_is_series "$KB_BEST_UP")
     kvline() { printf "    ${C_DIM}%-14s${C_RESET} %s\n" "$1" "$2"; }
-    kvline "upstream" "$KB_BEST_UP"
+    if [[ "$scope" == "1" ]]; then
+        kvline "upstream" "${KB_BEST_SERIES} branch ${C_DIM}(this build's ABI is $KB_BEST_UP — the exact upstream patch is not published)${C_RESET}"
+    else
+        kvline "upstream" "$KB_BEST_UP"
+    fi
     kvline "commits" "$commits"
     kvline "tested by" "${testers} upstream tester(s) ${C_DIM}(the stable tree's own Tested-by roster)${C_RESET}"
     if [[ -n "$cves" ]]; then
@@ -1019,7 +1033,7 @@ section_fixes() {
             printf "      ${C_RED}%s${C_RESET}\n" "$c"
         done
     else
-        kvline "CVE fixes" "none referenced in this release's changelog"
+        kvline "CVE fixes" "none referenced in its changelog"
     fi
 
     cl=$(kb_release_changelog "$KB_BEST_UP") || cl=""
@@ -1027,7 +1041,11 @@ section_fixes() {
         local highlights
         highlights=$(kb_highlights "$cl")
         if [[ -n "$highlights" ]]; then
-            printf "\n    ${C_DIM}notable fixes in this release:${C_RESET}\n"
+            if [[ "$scope" == "1" ]]; then
+                printf "\n    ${C_DIM}notable fixes in the %s branch:${C_RESET}\n" "$KB_BEST_SERIES"
+            else
+                printf "\n    ${C_DIM}notable fixes in this release:${C_RESET}\n"
+            fi
             printf '%s\n' "$highlights" | head -8 | while IFS= read -r s; do
                 printf "      ${C_GREEN}•${C_RESET} %s\n" "$s"
             done
@@ -1470,6 +1488,19 @@ cmd_upgrade() {
     local pkgs_to_install=()
     [[ -n "$target_pkg" ]] && pkgs_to_install+=("${target_pkg}${target_pin}")
     if [[ -n "$target_pkg" && -n "$HDR_PKG" ]]; then pkgs_to_install+=("$HDR_PKG"); fi
+
+    # Say exactly what is about to be installed — before anything happens.
+    if [[ -n "$target_pkg" ]]; then
+        local tver="${target_pin#=}"
+        [[ -z "$tver" ]] && tver=$(apt_candidate "$target_pkg")
+        printf "\n"
+        printf "  ${C_BOLD}${C_BLUE}TARGET${C_RESET}   ${C_BOLD}%s${C_RESET}  %s\n" "$target_pkg" "$tver"
+        printf "  ${C_DIM}currently running:${C_RESET} %s  %s\n" "$REL" "$CUR_VER"
+        printf "  ${C_DIM}the old kernel stays installed and bootable — if the new one fails,${C_RESET}\n"
+        printf "  ${C_DIM}the next reboot lands back on %s automatically.${C_RESET}\n" "$REL"
+        printf "  ${C_DIM}will run:${C_RESET} sudo apt-get install -y %s\n" "${pkgs_to_install[*]}"
+        printf "\n"
+    fi
 
     heading "── 1. Refresh & install ──"
     run_cmd apt-get update || warnf "AptUpdate" "apt-get update failed (offline?)" "retry with network"
