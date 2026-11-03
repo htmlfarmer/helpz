@@ -893,6 +893,10 @@ fi
 # ============================================================================
 section "RECOMMENDATIONS"
 
+# The absolute path of this tool, so "sudo <that>" always works. A bare
+# name fails under sudo, which resets PATH to its secure_path.
+LOGZ_ABS="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
+
 REC_FILE=$(mktemp)
 {
   # --- highest priority first, each one naming the real thing ---
@@ -913,7 +917,9 @@ REC_FILE=$(mktemp)
     echo "  ${C_DIM}correctable PCIe bus errors are usually noise; uncorrectable ones mean back up now${C_RESET}"
   fi
   if (( ${#INACCESSIBLE_LOGS[@]} > 0 )) && [[ -z "$SUDO" ]] && [[ $EUID -ne 0 ]]; then
-    echo "• Re-run with sudo for full coverage: ${C_BOLD}sudo $0${C_RESET}"
+    echo "• Re-run with sudo for full coverage: ${C_BOLD}sudo ${LOGZ_ABS}${C_RESET}"
+    echo "  ${C_DIM}(a bare 'sudo logz' only works once installz --system has linked${C_RESET}"
+    echo "   ${C_DIM}the tools into a directory sudo's PATH includes)${C_RESET}"
   fi
   if (( WARNINGS > 5 )); then
     echo "• ${WARNINGS} warnings in this window — the TOP RECURRING MESSAGES section above"
@@ -924,7 +930,7 @@ REC_FILE=$(mktemp)
   fi
   echo "• Follow live errors as they happen: ${C_BOLD}journalctl -p err -f${C_RESET}"
   echo "• Full history in a pager: ${C_BOLD}journalctl --since '7 days ago' | less${C_RESET}"
-  echo "• Save this report: ${C_BOLD}$0 --no-color > ~/security/logs-$(date +%Y%m%d).txt${C_RESET}"
+  echo "• Save this report: ${C_BOLD}${LOGZ_ABS} --no-color > ~/security/logs-$(date +%Y%m%d).txt${C_RESET}"
   if [[ -r /var/log/syslog ]] || [[ -r /var/log/kern.log ]]; then
     echo "• Older logs are rotated: ${C_BOLD}ls -lt /var/log/*.gz | head${C_RESET}"
   fi

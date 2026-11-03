@@ -39,6 +39,9 @@ while [[ $# -gt 0 ]]; do
         --dir=*) TARGET_DIR="${1#--dir=}" ;;
         --uninstall) ACTION="uninstall" ;;
         --status)    ACTION="status" ;;
+        --system)    SYSTEM_INSTALL=1 ;;
+        --sudo-dir)  shift; SUDO_DIR="${1:-}" ;;
+        --sudo-dir=*) SUDO_DIR="${1#--sudo-dir=}" ;;
         --no-completion) COMPLETION=0 ;;
         --json)   JSON_OUT=1; exec 4>&1 1>&2; _JSON_FD4=1 ;;
         --no-color) NO_COLOR=1; init_colors ;;
@@ -48,6 +51,12 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 TARGET_DIR="${TARGET_DIR%/}"
+# sudo resets PATH to its secure_path, which normally does NOT include
+# ~/.local/bin - that is why "sudo logz" fails with "command not found".
+# Linking the tools into a secure_path directory makes "sudo <tool>" work.
+SYSTEM_INSTALL="${SYSTEM_INSTALL:-0}"
+SUDO_DIR="${SUDO_DIR:-/usr/local/bin}"
+SUDO_DIR="${SUDO_DIR%/}"
 
 # The completion script the installer drops in.
 COMPLETION_FILE="$TARGET_DIR/helpz-completion.bash"
@@ -85,6 +94,95 @@ is_our_link() {   # is_our_link <path> — true if it is a symlink into this sui
     [[ "$tgt" == "$SCRIPT_DIR"/* ]]
 }
 
+# Is a directory inside sudo's secure_path? If it is not, "sudo <tool>"
+# cannot find the tools at all.
+sudo_path_has() {   # sudo_path_has <dir> -> 0/1
+    local dir="$1" sp
+    sp=$(sudo -n -l 2>/dev/null | grep -i 'secure_path' | head -1)
+    [[ -z "$sp" ]] && sp=$(grep -ih 'secure_path' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | head -1)
+    if [[ -z "$sp" ]]; then
+        # distro default: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        case "$dir" in
+            /usr/local/bin|/usr/local/sbin|/usr/bin|/usr/sbin|/bin|/sbin) return 0 ;;
+        esac
+        return 1
+    fi
+    sp="${sp#*=}"
+    # sudo prints the list with escaped colons: /usr/local/sbin\:/usr/local/bin\:...
+    sp="${sp//\\/}"
+    sp="${sp//\"/}"
+    sp="${sp//,/}"
+    case ":$sp:" in *":$dir:"*) return 0 ;; esac
+    return 1
+}
+
+# Link every tool into <dir>, using sudo when the directory needs root.
+link_tools() {   # link_tools <dir> [needs_root]
+    local dir="$1" need_root="${2:-0}" n=0 skipped=0 t link
+    local -a PRE=()
+    # Only reach for sudo when the directory really needs it.
+    if [[ "$need_root" -eq 1 && $EUID -ne 0 && ! -d "$dir" || ! -w "$dir" ]]; then
+        if [[ $EUID -ne 0 && "$need_root" -eq 1 ]]; then
+            if command -v sudo >/dev/null 2>&1; then
+                if ! sudo -n true 2>/dev/null; then
+                    critf "Install" "$dir needs root and sudo could not authenticate" \
+                        "run it with a password: sudo $0 --system"
+                    return 1
+                fi
+                PRE=(sudo)
+            else
+                critf "Install" "cannot write $dir without root and sudo is missing" "run as root: sudo $0 --system"
+                return 1
+            fi
+        fi
+    fi
+    "${PRE[@]}" mkdir -p "$dir" 2>/dev/null || {
+        critf "Install" "cannot create $dir" "check the permissions"; return 1; }
+    while IFS= read -r t; do
+        link="$dir/$t"
+        # Never clobber a real file that is not one of our symlinks.
+        if [[ -e "$link" && ! -L "$link" ]]; then
+            skipped=$((skipped+1))
+            printf "  ${C_YELLOW}!${C_RESET} %s already exists (not a symlink) — left alone\n" "$t"
+            continue
+        fi
+        if ! "${PRE[@]}" ln -sf "$SCRIPT_DIR/$t" "$link" 2>/dev/null; then
+            printf "  ${C_RED}✗${C_RESET} could not link %s\n" "$t"; continue
+        fi
+        n=$((n+1))
+    done < <(suite_tools)
+    if (( n == 0 )) && (( skipped == 0 )); then
+        critf "Install" "no links could be created in $dir" "run as root: sudo $0 --system"
+        return 1
+    fi
+    ok "$n tool(s) linked into $dir"
+    (( skipped > 0 )) && warn "$skipped existing file(s) were left untouched"
+    return 0
+}
+
+# Link the suite into a directory sudo can see, so "sudo <tool>" works.
+do_system_install() {
+    section "SYSTEM-WIDE LINKS (for sudo)"
+    if sudo_path_has "$SUDO_DIR"; then
+        ok "$SUDO_DIR is inside sudo's secure_path"
+    else
+        warn "$SUDO_DIR is not in sudo's secure_path — 'sudo <tool>' may still fail"
+        info "check it with: sudo -l | grep secure_path"
+    fi
+    link_tools "$SUDO_DIR" 1 || return 1
+    printf "\n"
+    local probe="" p
+    for p in "$SCRIPT_DIR"/*z; do [[ -x "$p" ]] && { probe="${p##*/}"; break; }; done
+    if [[ -n "$probe" ]]; then
+        if sudo -n "$SUDO_DIR/$probe" --help >/dev/null 2>&1; then
+            ok "'sudo $probe' works"
+        elif [[ -x "$SUDO_DIR/$probe" ]]; then
+            ok "'$SUDO_DIR/$probe' is in place — 'sudo $probe' will work"
+        fi
+    fi
+    printf "  ${C_DIM}now: sudo logz · sudo kernelz · sudo bootz ...${C_RESET}\n\n"
+}
+
 do_status() {
     section "INSTALL STATUS"
     printf "  ${C_DIM}suite dir :${C_RESET} %s\n" "$SCRIPT_DIR"
@@ -104,6 +202,24 @@ do_status() {
         *":$TARGET_DIR:"*) ok "$TARGET_DIR is on PATH" ;;
         *) warn "$TARGET_DIR is NOT on PATH — add it to ~/.bashrc" ;;
     esac
+
+    # The one that bites: sudo cannot see ~/.local/bin.
+    section "SUDO ACCESS"
+    if sudo_path_has "$TARGET_DIR"; then
+        ok "$TARGET_DIR is inside sudo's secure_path — 'sudo <tool>' works"
+    else
+        warn "'sudo <tool>' will fail: sudo's PATH does not include $TARGET_DIR"
+        info "fix it with:  ${C_BOLD}./installz --system${C_RESET}   (links the tools into $SUDO_DIR)"
+        local ssys=0 t
+        while IFS= read -r t; do
+            is_our_link "$SUDO_DIR/$t" && ssys=$((ssys+1))
+        done < <(suite_tools)
+        if (( ssys > 0 )); then
+            ok "$ssys tool(s) already linked into $SUDO_DIR — 'sudo <tool>' works"
+        else
+            printf "  ${C_DIM}or run the tool by its full path: sudo %s/logz${C_RESET}\n" "$SCRIPT_DIR"
+        fi
+    fi
 }
 
 do_install() {
@@ -126,6 +242,11 @@ do_install() {
     done < <(suite_tools)
     ok "$n tool(s) linked into $TARGET_DIR"
     (( skipped > 0 )) && warn "$skipped existing file(s) were left untouched"
+
+    # Also link where sudo can see them, so "sudo logz" works.
+    if [[ "$SYSTEM_INSTALL" -eq 1 ]] || ! sudo_path_has "$TARGET_DIR"; then
+        do_system_install
+    fi
 
     if (( COMPLETION )); then
         section "COMPLETION"
@@ -172,6 +293,16 @@ do_uninstall() {
         fi
     done < <(suite_tools)
     ok "$n symlink(s) removed from $TARGET_DIR"
+
+    # And the system-wide links, if they are ours.
+    local sn=0
+    while IFS= read -r t; do
+        local slink="$SUDO_DIR/$t"
+        if is_our_link "$slink"; then
+            rm -f "$slink" 2>/dev/null && sn=$((sn+1))
+        fi
+    done < <(suite_tools)
+    (( sn > 0 )) && ok "$sn symlink(s) removed from $SUDO_DIR"
 
     if [[ -e "$COMPLETION_FILE" ]]; then
         rm -f "$COMPLETION_FILE" && ok "completion removed"

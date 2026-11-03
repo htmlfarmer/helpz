@@ -717,6 +717,24 @@ if [[ ":$PATH:" != *":$SCRIPT_DIR:"* ]]; then
     echo
 fi
 
+# ── sudo visibility self-heal ──────────────────────────────────────────────
+# sudo resets PATH to its secure_path, which normally excludes ~/.local/bin.
+# The result is "sudo logz" -> "command not found", which looks like the tool
+# is missing rather than a PATH problem. Say so, and give the one-line fix.
+_sudo_sp=$(sudo -n -l 2>/dev/null | grep -i 'secure_path' | head -1)
+[[ -z "$_sudo_sp" ]] && _sudo_sp=$(grep -ih 'secure_path' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | head -1)
+if [[ -z "$_sudo_sp" ]]; then
+    _sudo_sp="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+fi
+_sudo_sp="${_sudo_sp#*=}"; _sudo_sp="${_sudo_sp//\\/}"; _sudo_sp="${_sudo_sp//\"/}"
+if [[ ":${_sudo_sp}:" != *":${SCRIPT_DIR}:"* ]] && [[ ":${_sudo_sp}:" != *":${HOME}/.local/bin:"* ]]; then
+    if [[ ! -e "/usr/local/bin/helpz" ]]; then
+        printf "  ${_Y}⚠${_R}  'sudo <tool>' won't work — sudo's PATH excludes the suite\n"
+        printf "     ${_C}fix:${_R} ${_B}sudo %s/installz --system${_R}  ${_D}(links the tools where sudo can see them)${_R}\n" "$SCRIPT_DIR"
+        echo
+    fi
+fi
+
 # Recent usage — only shows if there's history
 echo "── SUGGESTED NEXT (quick system scan) ──"
 _suggest_out=$(suggest_next 2>/dev/null) || _suggest_out=""
