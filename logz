@@ -317,48 +317,59 @@ fi
 # ---------- Privilege check ----------
 section "PRIVILEGE"
 NEEDS_SUDO=true
+
+# How much can we see without root? Say that BEFORE asking for a password.
+_detect_log_access() {
+  ACCESSIBLE_LOGS=()
+  INACCESSIBLE_LOGS=()
+  for _lf in /var/log/syslog /var/log/kern.log /var/log/daemon.log \
+              /var/log/user.log /var/log/messages /var/log/mail.log \
+              /var/log/debug /var/log/auth.log /var/log/dpkg.log \
+              /var/log/boot.log /var/log/Xorg.0.log; do
+    if [[ -r "$_lf" ]]; then
+      ACCESSIBLE_LOGS+=("$_lf")
+    elif [[ -f "$_lf" ]]; then
+      INACCESSIBLE_LOGS+=("$_lf")
+    fi
+  done
+}
+_detect_log_access
+
 if [[ $EUID -eq 0 ]]; then
   ok "Running as root - full access to all logs"
   SUDO=""
   NEEDS_SUDO=false
-elif sudo -n true 2>/dev/null; then
-  ok "sudo available (cached, no password needed)"
-  SUDO="sudo"
-  NEEDS_SUDO=false
-elif [[ $JSON_OUT -eq 0 ]] && { [[ -t 0 ]] || [[ -n "${SUDO_ASKPASS:-}" ]]; }; then
-  # Interactive session - try to prompt for password
-  if sudo -v 2>/dev/null; then
-    ok "sudo credentials accepted"
-    SUDO="sudo"
-    NEEDS_SUDO=false
-  else
-    warn "sudo password not provided - falling back to non-privileged mode"
-    SUDO=""
-  fi
 else
-  warn "sudo not available non-interactively - falling back to non-privileged mode"
-  warn "(some logs in /var/log may be unreadable)"
-  SUDO=""
+  info "${#ACCESSIBLE_LOGS[@]} logs readable without root, ${#INACCESSIBLE_LOGS[@]} need root"
+  info "the system journal, unit status and failed services need root for full coverage"
 fi
 
-# Detect which log files we can read regardless of sudo
-ACCESSIBLE_LOGS=()
-INACCESSIBLE_LOGS=()
-for LOGFILE in /var/log/syslog /var/log/kern.log /var/log/daemon.log \
-               /var/log/user.log /var/log/messages /var/log/mail.log \
-               /var/log/debug /var/log/auth.log /var/log/dpkg.log \
-               /var/log/boot.log /var/log/Xorg.0.log; do
-  if [[ -r "$LOGFILE" ]]; then
-    ACCESSIBLE_LOGS+=("$LOGFILE")
-  elif [[ -f "$LOGFILE" ]]; then
-    INACCESSIBLE_LOGS+=("$LOGFILE")
+if [[ $EUID -ne 0 ]]; then
+  if sudo -n true 2>/dev/null; then
+    ok "sudo available (cached, no password needed)"
+    SUDO="sudo"
+    NEEDS_SUDO=false
+  elif [[ $JSON_OUT -eq 0 ]] && { [[ -t 0 ]] || [[ -n "${SUDO_ASKPASS:-}" ]]; }; then
+    # Interactive session - ask once, clearly, and explain why
+    printf "  ${C_CYAN}→${C_RESET} authenticating with sudo ${C_DIM}(one prompt, then cached ~15 min)${C_RESET}\n"
+    if sudo -v 2>/dev/null; then
+      ok "sudo credentials accepted"
+      SUDO="sudo"
+      NEEDS_SUDO=false
+    else
+      warn "sudo password not provided - continuing without root"
+      warn "(the journal, unit status and some /var/log files stay unreadable)"
+      SUDO=""
+    fi
+  else
+    warn "sudo not available non-interactively - continuing without root"
+    warn "(the journal, unit status and some /var/log files stay unreadable)"
+    SUDO=""
   fi
-done
+fi
 
-if [[ ${#INACCESSIBLE_LOGS[@]} -gt 0 ]]; then
-  info "${#ACCESSIBLE_LOGS[@]} logs readable, ${#INACCESSIBLE_LOGS[@]} need root/sudo"
-else
-  ok "All standard logs readable"
+if [[ ${#INACCESSIBLE_LOGS[@]} -gt 0 && -z "$SUDO" && $EUID -ne 0 ]]; then
+  info "unreadable without root: ${INACCESSIBLE_LOGS[*]}"
 fi
 
 if [[ -n "$SINCE" ]]; then
@@ -383,6 +394,12 @@ else
       emerg|alert|crit|err)
         if (( COUNT > 0 )); then
           crit "$COUNT ${PRIO} messages"
+          # Show what they actually are - the count alone is not actionable.
+          if [[ "$PRIO" == "err" ]]; then
+            ERR_LINES=$($SUDO journalctl ${SINCE:+--since "$SINCE"} -p err --no-pager -q 2>/dev/null | tail -6)
+            [[ -n "$ERR_LINES" ]] && printf '%s\n' "$ERR_LINES" \
+              | awk -v d="$C_DIM" -v r="$C_RESET" '{$1=""; $2=""; $3=""; print "    " d "|" r " " substr($0,4)}'
+          fi
         else
           ok "0 ${PRIO} messages"
         fi
@@ -390,6 +407,7 @@ else
       warning)
         if (( COUNT > 50 )); then
           warn "$COUNT warnings (high)"
+          info "the TOP RECURRING MESSAGES section below shows which ones"
         elif (( COUNT > 0 )); then
           info "$COUNT warnings"
         else
@@ -410,20 +428,26 @@ fi
 section "CRITICAL EVENTS"
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # OOM kills
-  OOM=$(count_journal "oom|out of memory|killed process")
+  # The patterns must be specific: a bare "oom" also matches filenames
+  # like population_lOWZOOM_check.py, which is not a memory problem.
+  OOM=$(count_journal "oom-kill|out of memory|killed process|oom_reaper|systemd-oomd|memory cgroup out of memory")
   if (( OOM > 0 )); then
     crit "$OOM OOM-kill events - something is leaking memory"
-    run_journal | grep -iE "oom|killed process" \
+    run_journal | grep -iE "oom-kill|out of memory|killed process|oom_reaper|systemd-oomd" \
       | tail -5 \
       | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+    printf "      ${C_GREEN}fix:${C_RESET} sudo journalctl -k --since '$SINCE' | grep -iE 'oom|killed process'\n"
   else
     ok "No OOM kills"
   fi
 
   # Kernel panics
-  PANIC=$(count_journal "kernel panic|hardware error|machine check")
+  PANIC=$(count_journal "kernel panic|hardware error|machine check|watchdog.*lockup")
   if (( PANIC > 0 )); then
     crit "$PANIC kernel panic / hardware error events"
+    run_journal | grep -iE "kernel panic|hardware error|machine check" \
+      | tail -3 \
+      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
   else
     ok "No kernel panics"
   fi
@@ -440,9 +464,13 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   fi
 
   # Hardware errors (mce, edac, etc.)
-  MCE=$(count_journal "machine check|mce:|edac|memory c")
+  MCE=$(count_journal "machine check exception|mce:|edac.*error|memory cgroup out of memory")
   if (( MCE > 0 )); then
     crit "$MCE hardware/memory errors - check DIMMs and CPU"
+    run_journal | grep -iE "machine check exception|mce:|edac.*error" \
+      | tail -3 \
+      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+    printf "      ${C_GREEN}fix:${C_RESET} sudo dmesg | grep -iE 'mce|edac|machine check'\n"
   else
     ok "No MCE / hardware errors"
   fi
@@ -478,11 +506,17 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
 fi
 
 # Traditional auth.log
-if [[ -r /var/log/auth.log ]]; then
+if [[ -r /var/log/auth.log || -n "$SUDO" ]]; then
   subsec "/var/log/auth.log (recent activity)"
   AUTH_LOG_FAILS=$(count_sudo_grep "authentication failure|failed password|invalid user" /var/log/auth.log)
   if (( AUTH_LOG_FAILS > 0 )); then
-    warn "$AUTH_LOG_FAILS auth.log failures (lifetime, not just window)"
+    warn "$AUTH_LOG_FAILS failed-login attempts in auth.log ${C_DIM}(whole file, not just this window)${C_RESET}"
+    # Show them - a count of "failures" is scarier and less useful than the
+    # actual lines, which say whether it was you or someone else.
+    AUTH_LINES=$(${SUDO:+$SUDO }grep -hiE "authentication failure|failed password|invalid user" /var/log/auth.log 2>/dev/null | tail -4)
+    [[ -n "$AUTH_LINES" ]] && printf '%s\n' "$AUTH_LINES" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "    " d "|" r " " $0}'
+    printf "      ${C_GREEN}fix:${C_RESET} sudo grep -i 'failed password' /var/log/auth.log | tail -20\n"
+    printf "      ${C_DIM}if the source IPs are not yours, harden SSH: see ./sshauditz${C_RESET}\n"
   else
     ok "No auth.log failures"
   fi
@@ -492,6 +526,7 @@ fi
 # SECTION 4: Service failures
 # ============================================================================
 section "SERVICE STATUS"
+FAILED_DETAIL=""
 if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
   subsec "Currently failed systemd units"
   # systemctl --failed output - strip ANSI, take only lines that look like unit names
@@ -501,15 +536,43 @@ if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
                 | sort -u)
   FAILED=$(echo -n "$FAILED_LIST" | grep -c '.' || true)
   if [[ -n "$FAILED_LIST" ]] && [[ "$FAILED" -gt 0 ]]; then
-    crit "$FAILED failed systemd units:"
-    echo "$FAILED_LIST" | head -10 | sed 's/^/    /'
+    crit "$FAILED failed systemd unit(s):"
+    # For each failed unit: WHY it failed, what it printed, and how to fix it.
+    while read -r unit; do
+      [[ -z "$unit" ]] && continue
+      local_result=""
+      local_status=""
+      if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
+        local_result=$(systemctl show "$unit" -p Result --value 2>/dev/null)
+        local_status=$(systemctl show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null)
+        local_status=$(systemctl show "$unit" -p InactiveEnterTimestamp --value 2>/dev/null)
+      fi
+      printf "    ${C_BOLD}%s${C_RESET}" "$unit"
+      [[ -n "$local_result" ]] && printf " ${C_DIM}— %s${C_RESET}" "$local_result"
+      [[ -n "$local_status" && "$local_status" != "n/a" ]] && printf " ${C_DIM}(since %s)${C_RESET}" "$local_status"
+      printf "\n"
+      # The actual error output of the unit
+      if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
+        _uline=$(${SUDO:+$SUDO }journalctl -u "$unit" -n 6 --no-pager -q 2>/dev/null \
+                 | grep -viE "^-- (Boot|Journal|Logs)|^$" | tail -4)
+        if [[ -n "$uline" ]]; then
+          printf '%s\n' "$uline" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "      " d "|" r " " $0}'
+        fi
+      else
+        printf "      ${C_DIM}│ (needs root for the unit's own log)${C_RESET}\n"
+      fi
+      printf "      ${C_GREEN}fix:${C_RESET} sudo systemctl status %s\n" "$unit"
+      printf "      ${C_GREEN}fix:${C_RESET} sudo journalctl -u %s -n 30 --no-pager\n" "$unit"
+      printf "      ${C_GREEN}fix:${C_RESET} sudo systemctl restart %s\n" "$unit"
+      FAILED_DETAIL="${FAILED_DETAIL}${unit}"$'\n'
+    done <<< "$FAILED_LIST"
   else
     ok "All systemd units healthy"
   fi
 
   subsec "Recently restarted/crashed services"
   if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
-    $SUDO journalctl ${SINCE:+--since "$SINCE"} _SYSTEMD_UNIT="*.service" --no-pager -q 2>/dev/null \
+    ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} _SYSTEMD_UNIT="*.service" --no-pager -q 2>/dev/null \
       | grep -E "Started|Stopped|Failed" \
       | grep -E "Failed|stopped.*result=signal" \
       | tail -10 \
@@ -524,11 +587,44 @@ fi
 # SECTION 5: Disk-related issues
 # ============================================================================
 section "DISK & FILESYSTEM EVENTS"
+DISK_DETAIL=""
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # Disk errors
-  DISK_ERR=$(count_journal "i/o error|ata[0-9]+.*failed|medium error|sd.*error")
+  # "sd.*error" on its own also matches "sshd: ... error", so the device
+  # names are matched explicitly instead.
+  DISK_ERR=$(count_journal "i/o error|buffer i/o|medium error|ata[0-9]+.*(failed|error)|critical medium|blk_update_request|nvme[0-9]+n[0-9]+.*(error|timeout|reset|abort)|pcie bus error")
   if (( DISK_ERR > 0 )); then
-    crit "$DISK_ERR disk I/O errors - check SMART health"
+    # Pull the real error lines and the devices involved - "3 disk I/O
+    # errors" on its own tells the reader nothing about what to do.
+    DISK_LINES=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
+                 | grep -iE "i/o error|buffer i/o|medium error|ata[0-9]+.*(failed|error)|critical medium|blk_update_request|nvme[0-9]+n[0-9]+.*(error|timeout|reset|abort)|pcie bus error" \
+                 | head -8)
+    DISK_DEVS=$(printf '%s\n' "$DISK_LINES" \
+                | grep -oE '\b(nvme[0-9]+n[0-9]+|sd[a-z]|hd[a-z]|vd[a-z]|mmcblk[0-9]+)\b' \
+                | sort -u | tr '\n' ' ')
+    # Correctable PCIe bus errors are usually link noise, not a dying disk.
+    DISK_CORR=$(printf '%s\n' "$DISK_LINES" | grep -ci "correctable")
+    DISK_HARD=$(( DISK_ERR - DISK_CORR ))
+    if [[ -n "$DISK_DEVS" ]]; then
+      crit "$DISK_ERR disk I/O errors on ${DISK_DEVS% }:"
+    else
+      crit "$DISK_ERR disk I/O errors:"
+    fi
+    [[ -n "$DISK_LINES" ]] && printf '%s\n' "$DISK_LINES" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "    " d "|" r " " $0}'
+    for _dev in ${DISK_DEVS}; do
+      printf "      ${C_GREEN}fix:${C_RESET} sudo smartctl -a /dev/%s      ${C_DIM}(health, wear, error log)${C_RESET}\n" "$_dev"
+      if [[ "$_dev" == nvme* ]]; then
+        printf "      ${C_GREEN}fix:${C_RESET} sudo nvme smart-log /dev/%s     ${C_DIM}(nvme-specific)${C_RESET}\n" "${_dev%n*}"
+      fi
+    done
+    printf "      ${C_GREEN}fix:${C_RESET} sudo dmesg | grep -iE '%s'\n" "$( [[ -n "$DISK_DEVS" ]] && echo "${DISK_DEVS% }" || echo 'nvme|sd[a-z]' )"
+    if (( DISK_CORR > 0 )) && (( DISK_HARD <= 0 )); then
+      printf "      ${C_YELLOW}note:${C_RESET} %d of them are PCIe 'Correctable' bus errors — usually link noise,\n" "$DISK_CORR"
+      printf "            ${C_YELLOW}not${C_RESET} a dying disk. Check SMART anyway; if it keeps growing, reseat the drive/PCIe slot.\n"
+    else
+      printf "      ${C_YELLOW}note:${C_RESET} %d non-correctable error(s) — treat the drive as suspect: back up now.\n" "$DISK_HARD"
+    fi
+    DISK_DETAIL="$DISK_DEVS"
   else
     ok "No disk I/O errors"
   fi
@@ -562,25 +658,32 @@ fi
 # SECTION 6: Network events
 # ============================================================================
 section "NETWORK EVENTS"
+NET_FINDINGS=0
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # Link state changes
   LINK=$(count_journal "link (is )?(up|down)|link becomes|carrier (lost|gained)")
   if (( LINK > 0 )); then
     info "$LINK link state changes (informational)"
     [[ $LINK -gt 50 ]] && warn "Excessive link flapping ($LINK events)"
+    NET_FINDINGS=1
   fi
 
   # DHCP / IP issues
   DHCP=$(count_journal "dhcp.*no offer|dhcpoffer|dhcpnak|address already in use")
   if (( DHCP > 0 )); then
     warn "$DHCP DHCP conflicts / issues"
+    NET_FINDINGS=1
   fi
 
   # DNS issues
   DNS=$(count_journal "named.*error|systemd-resolved.*failed|connection timed out.*53")
   if (( DNS > 0 )); then
     warn "$DNS DNS-related errors"
+    NET_FINDINGS=1
   fi
+  (( NET_FINDINGS == 0 )) && ok "No network events in this window"
+else
+  info "(needs root/sudo to read the system journal)"
 fi
 
 # ============================================================================
@@ -605,12 +708,15 @@ for LOGFILE in /var/log/syslog /var/log/kern.log /var/log/daemon.log \
 
   if [[ -f "$LOGFILE" ]] && [[ -n "$READER" || -r "$LOGFILE" ]]; then
     subsec "$LOGFILE"
-    SIZE=$(du -h "$LOGFILE" 2>/dev/null | awk '{print $1}')
-    LINES=$(wc -l < "$LOGFILE" 2>/dev/null)
+    # The shell reports a failed redirection itself, so 2>/dev/null on the
+    # command is NOT enough - the whole block has to be silenced.
+    SIZE=$( { du -h "$LOGFILE"; } 2>/dev/null | awk '{print $1}')
+    LINES=$( { wc -l < "$LOGFILE"; } 2>/dev/null | tr -d ' ')
+    [[ -z "$LINES" ]] && LINES=0
     if [[ -n "$READER" ]]; then ACCESS="sudo"; else ACCESS="user"; fi
     # Count error/warning lines in tail (last 10k lines for speed)
-    ERR=$(count_grep "error|fail|emerg" <(tail -n 10000 "$LOGFILE" 2>/dev/null))
-    WRN=$(count_grep "warn" <(tail -n 10000 "$LOGFILE" 2>/dev/null))
+    ERR=$( { tail -n 10000 "$LOGFILE" 2>/dev/null; } | count_grep "error|fail|emerg")
+    WRN=$( { tail -n 10000 "$LOGFILE" 2>/dev/null; } | count_grep "warn")
     printf "  ${C_CYAN}%-40s${C_RESET} ${C_DIM}%-7s${C_RESET} %8s %7s %7s\n" \
       "$LOGFILE" "$ACCESS" "$SIZE" "$ERR" "$WRN"
     info "Size: $SIZE, Lines: $LINES"
@@ -628,6 +734,7 @@ done
 section "APPLICATION LOGS"
 
 # Helper for app log scanning
+APP_LOGS_SEEN=0
 scan_app_log() {
   local f="$1"
   local READER=""
@@ -636,8 +743,11 @@ scan_app_log() {
   elif [[ -n "$SUDO" ]] && sudo -n test -r "$f" 2>/dev/null; then
     READER="$SUDO"
   else
-    return  # Can't read this file
+    # Say so instead of printing nothing - silence reads as "the tool broke"
+    info "$(basename "$f"): unreadable without root"
+    return
   fi
+  APP_LOGS_SEEN=1
   local ERR
   ERR=$($READER grep -ciE "error|fail|emerg" "$f" 2>/dev/null | head -1)
   [[ -z "$ERR" ]] && ERR=0
@@ -680,6 +790,11 @@ if [[ -d /var/log/postgresql ]]; then
   done
 fi
 
+# An empty section reads as "the tool broke" — say so explicitly.
+if [[ $APP_LOGS_SEEN -eq 0 ]]; then
+  info "no application log directories found under /var/log"
+fi
+
 # ============================================================================
 # SECTION 9: Top recurring messages (dedup + frequency)
 # ============================================================================
@@ -692,9 +807,13 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
       # Strip timestamp (first 3 fields: "Aug 27 10:30:15") and hostname
       msg = ""
       for (i=5; i<=NF; i++) msg = msg " " $i
-      # Strip process IDs and numbers that vary
-      gsub(/[0-9]+/, "N", msg)
-      gsub(/\[N+\]/, "[N]", msg)
+      # Only the genuinely volatile parts are masked. Replacing EVERY digit
+      # destroyed the meaning ("10-kill-slumber" became "N-kill-slumber"),
+      # so only the PID and IP addresses are touched.
+      gsub(/\[[0-9]+\]/, "[N]", msg)
+      gsub(/([0-9]{1,3}\.){3}[0-9]{1,3}/, "<ip>", msg)
+      gsub(/[ \t]+/, " ", msg)
+      sub(/^ /, "", msg)
       print msg
     }' \
     | sort | uniq -c | sort -rn | head -"$TOP_N" \
@@ -702,7 +821,7 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
       count = $1
       $1 = ""
       msg = substr($0, 2)
-      if (length(msg) > 100) msg = substr(msg, 1, 100) "..."
+      if (length(msg) > 110) msg = substr(msg, 1, 110) "..."
       printf "  %5d  %s\n", count, msg
     }')
   printf '%s\n' "$RECURRING_ROWS"
@@ -714,7 +833,9 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     while IFS= read -r row; do
       [[ -z "$row" ]] && continue
       cnt=$(awk '{print $1}' <<< "$row")
-      lbl=$(awk '{print $2}' <<< "$row")
+      # Label with the PROGRAM name, not the second word - "kernel:" three
+      # times in a row told the reader nothing.
+      lbl=$(awk '{$1=""; sub(/^[ \t]+/,""); print}' <<< "$row" | cut -d: -f1 | sed 's/\[N\]//' | tr -d ' ')
       [[ -z "$lbl" ]] && lbl="?"
       local_chart_data+=("$cnt $lbl")
     done <<< "$RECURRING_ROWS"
@@ -761,26 +882,45 @@ section "RECOMMENDATIONS"
 
 REC_FILE=$(mktemp)
 {
-  if [[ ${#INACCESSIBLE_LOGS[@]} -gt 0 ]]; then
-    echo "• Re-run with sudo for full coverage: sudo $0"
+  # --- highest priority first, each one naming the real thing ---
+  if [[ -n "$FAILED_LIST" ]]; then
+    while read -r unit; do
+      [[ -z "$unit" ]] && continue
+      echo "• ${unit} is failed — see the SERVICE STATUS section above for why."
+      echo "    ${C_BOLD}sudo systemctl status ${unit}${C_RESET}"
+      echo "    ${C_BOLD}sudo journalctl -u ${unit} -n 30 --no-pager${C_RESET}"
+      echo "    ${C_BOLD}sudo systemctl restart ${unit}${C_RESET}   ${C_DIM}(if the cause is fixed)${C_RESET}"
+    done <<< "$FAILED_LIST"
   fi
-  if (( CRITICAL > 0 )) && [[ -n "$FAILED_LIST" ]]; then
-    echo "• Address failed systemd units first: systemctl status <unit-name>"
-    echo "• Restart a failed unit: sudo systemctl restart <unit-name>"
-    echo "• View its logs: sudo journalctl -u <unit-name> --since '1 hour ago'"
+  if [[ -n "$DISK_DETAIL" ]]; then
+    for _dev in $DISK_DETAIL; do
+      echo "• ${_dev} reported I/O errors — check its health:"
+      echo "    ${C_BOLD}sudo smartctl -a /dev/${_dev}${C_RESET}"
+    done
+    echo "  ${C_DIM}correctable PCIe bus errors are usually noise; uncorrectable ones mean back up now${C_RESET}"
+  fi
+  if (( ${#INACCESSIBLE_LOGS[@]} > 0 )) && [[ -z "$SUDO" ]] && [[ $EUID -ne 0 ]]; then
+    echo "• Re-run with sudo for full coverage: ${C_BOLD}sudo $0${C_RESET}"
   fi
   if (( WARNINGS > 5 )); then
-    echo "• High warning count - investigate recurring patterns in 'TOP RECURRING MESSAGES'"
+    echo "• ${WARNINGS} warnings in this window — the TOP RECURRING MESSAGES section above"
+    echo "  ${C_DIM}lists which message produced them and how often. Fix the top one first.${C_RESET}"
   fi
-  echo "• For full history: journalctl --since '7 days ago' | less"
-  echo "• Follow live errors: journalctl -p err -f"
-  echo "• To save this report: ./logz --no-color > ~/security/logs-$(date +%Y%m%d).txt"
+  if (( CRITICAL > 0 )); then
+    echo "• The CRITICAL lines are the ones to act on: ${C_BOLD}journalctl -p err --since '$SINCE'${C_RESET}"
+  fi
+  echo "• Follow live errors as they happen: ${C_BOLD}journalctl -p err -f${C_RESET}"
+  echo "• Full history in a pager: ${C_BOLD}journalctl --since '7 days ago' | less${C_RESET}"
+  echo "• Save this report: ${C_BOLD}$0 --no-color > ~/security/logs-$(date +%Y%m%d).txt${C_RESET}"
   if [[ -r /var/log/syslog ]] || [[ -r /var/log/kern.log ]]; then
-    echo "• Old logs may be in /var/log/*.gz (rotated). Check with: ls -lt /var/log/*.gz | head"
+    echo "• Older logs are rotated: ${C_BOLD}ls -lt /var/log/*.gz | head${C_RESET}"
   fi
 } > "$REC_FILE"
 
-sort -u "$REC_FILE" | sed 's/^/  /'
+# Deliberately NOT sorted: the order IS the priority (failed units first,
+# then disk, then the rest) and sorting used to scatter each bullet away
+# from the commands that belong to it.
+sed 's/^/  /' "$REC_FILE"
 rm -f "$REC_FILE"
 
 # ============================================================================
