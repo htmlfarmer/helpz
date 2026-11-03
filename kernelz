@@ -915,6 +915,8 @@ section_howto_upgrade() {
     # 3 — promote it
     printf "  ${C_BOLD}3.${C_RESET} after the reboot, promote it to the permanent default:\n"
     printf "       ${C_CYAN}%s verify${C_RESET}   ${C_DIM}(only after the new kernel proved healthy)${C_RESET}\n" "$call"
+    printf "       ${C_DIM}until this runs the new kernel boots ONLY ONCE — the next reboot goes${C_RESET}\n"
+    printf "       ${C_DIM}back to %s. 'kernelz' will offer to promote it for you.${C_RESET}\n" "$REL"
 
     # 4 — the same steps without the wrapper
     printf "\n  ${C_BOLD}Doing it by hand instead?${C_RESET}\n"
@@ -1191,8 +1193,81 @@ cmd_status() {
 
     # The whole point of the tool: check, then OFFER to do it. The old
     # kernel stays installed and bootable either way.
+    offer_pending
     offer_upgrade
     emit_verdict
+}
+
+# ============================================================================
+# OFFER PENDING — finish or roll back an upgrade that is half-done
+# ----------------------------------------------------------------------------
+# After `kernelz upgrade` the new kernel boots exactly ONCE and GRUB's
+# permanent default still points at the old one. So the story is only
+# finished once the new kernel is promoted. If the new kernel died, the
+# machine came back on the old one by itself — the job is to say so and
+# clean up.
+# ============================================================================
+offer_pending() {
+    [[ "$JSON_OUT" -eq 1 ]] && return 0
+    [[ "$COMMAND" != "status" && "$COMMAND" != "check" ]] && return 0
+    local pr pts prev
+    pr=$(pending_get TARGET_REL)
+    [[ -z "$pr" ]] && return 0
+    pts=$(pending_get TS); prev=$(pending_get PREV_REL)
+
+    # ---- case 1: the new kernel booted and is running right now ----
+    if [[ "$pr" == "$REL" ]]; then
+        section "PENDING — the new kernel is running"
+        printf "  ${C_GREEN}${C_BOLD}%s booted successfully${C_RESET} ${C_DIM}(installed %s)${C_RESET}\n" \
+            "$REL" "$(date -d "@${pts:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+        printf "  ${C_DIM}GRUB's permanent default still points at %s — until the new kernel is${C_RESET}\n" "$prev"
+        printf "  ${C_DIM}promoted, the next reboot goes back to it.${C_RESET}\n\n"
+
+        local cmd="${0##*/}"
+        local path; path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+        local call="sudo $path"
+        command -v "$cmd" >/dev/null 2>&1 && call="sudo $cmd"
+
+        if [[ ! -t 0 ]]; then
+            printf "  ${C_DIM}→ promote it now:  ${C_BOLD}%s verify${C_RESET}\n\n" "$call"
+            return 0
+        fi
+        if (( ASSUME_YES == 1 )); then
+            printf "  ${C_GREEN}→${C_RESET} --yes given: promoting it.\n\n"
+            cmd_verify
+            return 0
+        fi
+        printf "  ${C_GREEN}→${C_RESET} make %s the permanent default?  ${C_DIM}[y/N]${C_RESET} " "$REL"
+        local a; read -r a || a=""
+        printf "\n"
+        if [[ "${a,,}" == y* ]]; then
+            cmd_verify
+        else
+            info "not promoting — '$call verify' when you are satisfied with this kernel"
+            printf "  ${C_DIM}the old kernel stays the default until then${C_RESET}\n\n"
+        fi
+        return 0
+    fi
+
+    # ---- case 2: the new kernel is gone and we are back on the old one ----
+    if [[ "$BOOT_EPOCH" -gt "${pts:-0}" ]]; then
+        section "PENDING — the upgrade did not stick"
+        printf "  ${C_RED}${C_BOLD}%s was installed but the system came back on %s${C_RESET}\n" "$pr" "$REL"
+        printf "  ${C_DIM}the GRUB fallback worked exactly as designed — you are safe on the old kernel.${C_RESET}\n"
+        printf "  ${C_DIM}previous boot errors (the likely cause):${C_RESET}\n"
+        journalctl -q -b -1 -p err --no-pager 2>/dev/null | tail -8 | sed 's/^/      /' \
+            || info "journalctl not readable without sudo"
+        printf "\n"
+        local cmd="${0##*/}"
+        local path; path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+        local call="sudo $path"
+        command -v "$cmd" >/dev/null 2>&1 && call="sudo $cmd"
+        printf "  ${C_DIM}→${C_RESET} what to do:\n"
+        printf "       ${C_BOLD}%s verify${C_RESET}    ${C_DIM}diagnose the failed boot (full analysis)${C_RESET}\n" "$call"
+        printf "       ${C_BOLD}%s recover${C_RESET}   ${C_DIM}pin GRUB to %s and clear the pending record${C_RESET}\n" "$call" "$REL"
+        printf "       ${C_DIM}%s stays installed, so you can retry any time${C_RESET}\n\n" "$REL"
+    fi
+    return 0
 }
 
 # ============================================================================
