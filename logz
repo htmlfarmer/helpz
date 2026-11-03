@@ -379,6 +379,68 @@ else
 fi
 
 # ============================================================================
+# SECTION 0: AT A GLANCE — the whole scan on one screen
+# ============================================================================
+# The scan below is long. This panel answers "is anything wrong, and is it
+# getting worse?" before the reader has to wade through the detail.
+if [[ $JSON_OUT -eq 0 ]]; then
+  section "AT A GLANCE"
+  printf "  ${C_DIM}window:${C_RESET} %s → now   ${C_DIM}host:${C_RESET} %s\n" "${SINCE:-since boot}" "$HOSTNAME_SHORT"
+  printf "\n"
+
+  if [[ $HAVE_JOURNALCTL -eq 1 && ( -n "$SUDO" || $EUID -eq 0 ) ]]; then
+    # --count transfers no lines, so these calls stay cheap.
+    _jc=$( ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p emerg..err --no-pager -q --count 2>/dev/null | tail -1)
+    _jw=$( ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p warning   --no-pager -q --count 2>/dev/null | tail -1)
+    _jn=$( ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p notice..info --no-pager -q --count 2>/dev/null | tail -1)
+    [[ "$_jc" =~ ^[0-9]+$ ]] || _jc=0
+    [[ "$_jw" =~ ^[0-9]+$ ]] || _jw=0
+    [[ "$_jn" =~ ^[0-9]+$ ]] || _jn=0
+    _jt=$(( _jc + _jw + _jn ))
+
+    # --- one bar: problems | warnings | chatter -------------------------
+    # The suite's own glyph set (█ ▓ ░) so it stays readable without colour.
+    read -r _g_full _g_mid _g_light <<< "$(chart_glyphs)"
+    if (( _jt > 0 )); then
+      _bw=44
+      _n1=$(( _jc * _bw / _jt )); (( _n1 < 1 && _jc > 0 )) && _n1=1
+      _n2=$(( _jw * _bw / _jt ))
+      _n3=$(( _bw - _n1 - _n2 )); (( _n3 < 0 )) && _n3=0
+      _bar=""
+      (( _n1 > 0 )) && _bar+="${C_RED}$(chart_repeat "$_g_full" "$_n1")${C_RESET}"
+      (( _n2 > 0 )) && _bar+="${C_YELLOW}$(chart_repeat "$_g_mid" "$_n2")${C_RESET}"
+      (( _n3 > 0 )) && _bar+="${C_DIM}$(chart_repeat "$_g_light" "$_n3")${C_RESET}"
+      printf "  ${C_BOLD}mix${C_RESET}       %b\n" "$_bar"
+      printf "  ${C_DIM}%s %d problem%s   %s %d warning%s   %s %d info${C_RESET}\n" \
+        "$_g_full" "$_jc" "$( [[ $_jc -eq 1 ]] && echo "" || echo "s" )" \
+        "$_g_mid"  "$_jw" "$( [[ $_jw -eq 1 ]] && echo "" || echo "s" )" \
+        "$_g_light" "$_jn"
+    else
+      printf "  ${C_GREEN}mix${C_RESET}       %s  ${C_DIM}the journal is completely quiet in this window${C_RESET}\n" \
+        "$(chart_repeat "$_g_light" 44)"
+    fi
+
+    # --- trend: is it getting worse? -----------------------------------
+    # Bucket the window into 12 slices and count problems in each.
+    _t0=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -o short-unix --no-pager -q 2>/dev/null | head -1 | awk '{print $1}')
+    _tnow=$(date +%s)
+    if [[ "$_t0" =~ ^[0-9]+$ ]] && (( _tnow - _t0 > 120 )); then
+      _span=$(( _tnow - _t0 ))
+      _spark=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p warning..alert -o short-unix --no-pager -q 2>/dev/null \
+        | awk -v s="$_t0" -v sp="$_span" '
+            { b=int(($1-s)/(sp/12+1)); if(b<0)b=0; if(b>11)b=11; c[b]++ }
+            END{ for(i=0;i<12;i++) printf "%d%s", c[i]+0, (i<11?" ":"") }')
+      if [[ -n "$_spark" ]]; then
+        printf "  ${C_BOLD}trend${C_RESET}     %s  ${C_DIM}problems per 1/12 of the window${C_RESET}\n" "$(chart_spark "$_spark")"
+      fi
+    fi
+  else
+    info "(the journal needs root — run 'sudo $0' for the full picture)"
+  fi
+  printf "\n"
+fi
+
+# ============================================================================
 # SECTION 1: Systemd journal summary
 # ============================================================================
 section "SYSTEMD JOURNAL SUMMARY"
@@ -481,24 +543,32 @@ fi
 # ============================================================================
 section "AUTHENTICATION & SECURITY"
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
-  # Failed sudo
-  SUDO_FAIL=$(count_journal "sudo.*authentication failure|sudo.*incorrect password")
+  # "COMMAND=" lines are sudo recording what was run - the scanner's own
+  # grep commands land there and would otherwise be counted as attacks.
+  SUDO_FAIL=$(count_journal "sudo.*authentication failure;|sudo.*incorrect password")
   if (( SUDO_FAIL > 0 )); then
     warn "$SUDO_FAIL failed sudo attempts"
+    _sf=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
+          | grep -iE "sudo.*(authentication failure;|incorrect password)" | tail -3)
+    [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{$1="";$2="";$3="";print "    " d "|" r " " substr($0,4)}'
   else
     ok "No failed sudo attempts"
   fi
 
   # SSH auth failures
-  SSH_FAIL=$(count_journal "sshd.*authentication failure|sshd.*failed password")
+  SSH_FAIL=$(count_journal "sshd.*authentication failure;|sshd.*failed password")
   if (( SSH_FAIL > 0 )); then
     crit "$SSH_FAIL SSH authentication failures - possible brute force"
+    _sf=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
+          | grep -iE "sshd.*(authentication failure;|failed password)" | tail -3)
+    [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{$1="";$2="";$3="";print "    " d "|" r " " substr($0,4)}'
+    printf "      ${C_GREEN}fix:${C_RESET} sudo sshauditz        ${C_DIM}(full SSH audit)${C_RESET}\n"
   else
     ok "No SSH auth failures"
   fi
 
   # Other auth events
-  AUTH_FAIL=$(count_journal "authentication failure")
+  AUTH_FAIL=$(count_journal "authentication failure;")
   if (( AUTH_FAIL > SUDO_FAIL + SSH_FAIL )); then
     EXTRA=$(( AUTH_FAIL - SUDO_FAIL - SSH_FAIL ))
     warn "$EXTRA other authentication failures"
@@ -508,17 +578,22 @@ fi
 # Traditional auth.log
 if [[ -r /var/log/auth.log || -n "$SUDO" ]]; then
   subsec "/var/log/auth.log (recent activity)"
-  AUTH_LOG_FAILS=$(count_sudo_grep "authentication failure|failed password|invalid user" /var/log/auth.log)
+  # Only real login failures. The broad pattern also matched logz's OWN
+  # sudo command line ("grep -ciE 'authentication failure|failed
+  # password|...'"), which sudo writes into auth.log — the scanner was
+  # reporting itself.
+  AUTH_LOG_PAT="Failed password for|authentication failure;|Invalid user|FAILED LOGIN|authentication failure$"
+  AUTH_LOG_FAILS=$(count_sudo_grep "$AUTH_LOG_PAT" /var/log/auth.log)
   if (( AUTH_LOG_FAILS > 0 )); then
     warn "$AUTH_LOG_FAILS failed-login attempts in auth.log ${C_DIM}(whole file, not just this window)${C_RESET}"
     # Show them - a count of "failures" is scarier and less useful than the
     # actual lines, which say whether it was you or someone else.
-    AUTH_LINES=$(${SUDO:+$SUDO }grep -hiE "authentication failure|failed password|invalid user" /var/log/auth.log 2>/dev/null | tail -4)
+    AUTH_LINES=$(${SUDO:+$SUDO }grep -hiE "$AUTH_LOG_PAT" /var/log/auth.log 2>/dev/null | tail -4)
     [[ -n "$AUTH_LINES" ]] && printf '%s\n' "$AUTH_LINES" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "    " d "|" r " " $0}'
-    printf "      ${C_GREEN}fix:${C_RESET} sudo grep -i 'failed password' /var/log/auth.log | tail -20\n"
+    printf "      ${C_GREEN}fix:${C_RESET} sudo grep -iE 'Failed password for|Invalid user' /var/log/auth.log | tail -20\n"
     printf "      ${C_DIM}if the source IPs are not yours, harden SSH: see ./sshauditz${C_RESET}\n"
   else
-    ok "No auth.log failures"
+    ok "No failed logins in auth.log"
   fi
 fi
 
@@ -555,8 +630,18 @@ if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
       if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
         _uline=$(${SUDO:+$SUDO }journalctl -u "$unit" -n 6 --no-pager -q 2>/dev/null \
                  | grep -viE "^-- (Boot|Journal|Logs)|^$" | tail -4)
-        if [[ -n "$uline" ]]; then
-          printf '%s\n' "$uline" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "      " d "|" r " " $0}'
+        # The journal may have rotated away; systemctl status still knows.
+        if [[ -z "$_uline" ]]; then
+          _sl=$(systemctl status "$unit" --no-pager -l 2>/dev/null \
+                | grep -viE "^[[:space:]]*$|^Loaded |^Active:|^Docs:|^Process:|^Tasks:|^Memory:|^CPU:|^CGroup:" \
+                | tail -3)
+          [[ -n "$_sl" ]] && _uline="systemctl status still shows:
+$_sl"
+        fi
+        if [[ -n "$_uline" ]]; then
+          printf '%s\n' "$_uline" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "      " d "│" r " " $0}'
+        else
+          printf "      ${C_DIM}│ no log lines left for this unit (the journal has rotated)${C_RESET}\n"
         fi
       else
         printf "      ${C_DIM}│ (needs root for the unit's own log)${C_RESET}\n"
@@ -585,12 +670,16 @@ if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
 
   subsec "Recently restarted/crashed services"
   if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
-    ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} _SYSTEMD_UNIT="*.service" --no-pager -q 2>/dev/null \
+    _recent=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} _SYSTEMD_UNIT="*.service" --no-pager -q 2>/dev/null \
       | grep -E "Started|Stopped|Failed" \
       | grep -E "Failed|stopped.*result=signal" \
       | tail -10 \
-      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}' \
-      | head -10
+      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}')
+    if [[ -n "$_recent" ]]; then
+      printf '%s\n' "$_recent" | head -10
+    else
+      ok "No service crashes or restarts in this window"
+    fi
   else
     info "(needs root/sudo for service crash history)"
   fi

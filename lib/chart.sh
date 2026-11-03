@@ -210,7 +210,8 @@ chart_spark() {
     [[ -z "$data" ]] && return 0
     local out
     out=$(printf '%s\n' $data | awk '
-        BEGIN{ split("▁▂▃▄▅▆▇█", g, " "); n=0; mn=""; mx=""; sum=0 }
+        BEGIN{ g[1]="▁"; g[2]="▂"; g[3]="▃"; g[4]="▄"; g[5]="▅"; g[6]="▆"; g[7]="▇"; g[8]="█"
+               n=0; mn=""; mx=""; sum=0 }
         $1 !~ /^-?[0-9.]+$/ { next }
         { n++; v[n]=$1+0; sum+=$1+0; if (mn=="" || v[n]<mn) mn=v[n]; if (mx=="" || v[n]>mx) mx=v[n] }
         END{
