@@ -757,12 +757,12 @@ section_best() {
                 [[ "${KB_C_SERIES[i]}" == "$KB_STABLE_SER" ]] && { have=1; break; }
             done
             if (( have == 0 )); then
-                local sage; sage=$(kb_age_days "$KB_STABLE_DATE")
+                local sage; sage=$(kb_series_age_days "$KB_STABLE_SER" 2>/dev/null || echo 0)
                 if (( sage >= KB_SETTLE_DAYS )); then
-                    warnf "KernelGap" "your distro does not package upstream's current stable branch ($KB_STABLE_SER, settled ${sage} days ago)" \
+                    warnf "KernelGap" "your distro does not package upstream's current stable branch ($KB_STABLE_SER, open ${sage} days)" \
                         "compile it yourself: ${0##*/} build (same GRUB safety net)"
                 else
-                    info "your distro does not package upstream's current stable branch ($KB_STABLE_SER) yet — it settled ${sage} day(s) ago"
+                    info "your distro does not package upstream's current stable branch ($KB_STABLE_SER) yet — it opened ${sage} day(s) ago"
                 fi
             fi
         fi
@@ -805,31 +805,33 @@ section_best() {
         printf "  ${C_BOLD}Will install${C_RESET}   ${C_BOLD}%s${C_RESET}  %s  ${C_DIM}(series %s)${C_RESET}\n" \
             "$KB_BEST_PKG" "$KB_BEST_VER" "$KB_BEST_SERIES"
     fi
-    kzl "Why this one" "${C_BOLD}${tierlbl}${C_RESET} — series $KB_BEST_SERIES · $(kb_fmt_age_old "$KB_BEST_DATE")"
+    kzl "Why this one" "${C_BOLD}${tierlbl}${C_RESET} — series $KB_BEST_SERIES · branch open $(kb_series_age_days "$KB_BEST_SERIES" 2>/dev/null || echo '?')d"
+    local bage; bage=$(kb_series_age_days "$KB_BEST_SERIES" 2>/dev/null || echo "")
     case "$KB_BEST_TIER" in
         1)
-            printf "      ${C_DIM}newest non-LTS kernel in the repos that has been out ${KB_SETTLE_DAYS}+ days${C_RESET}\n"
+            printf "      ${C_DIM}the newest regular stable kernel your distro ships — the %s branch${C_RESET}\n" "$KB_BEST_SERIES"
+            printf "      ${C_DIM}has been out %s days, so it has had time to be tested${C_RESET}\n" "$bage"
             ;;
         2)
-            printf "      ${C_DIM}this is the newest non-LTS kernel your distro ships, but it is still fresh —${C_RESET}\n"
-            if [[ "$KB_BEST_DATE" =~ ^[0-9]+$ ]] && (( KB_BEST_DATE > 0 )); then
-                local wait=$(( KB_SETTLE_DAYS - $(kb_age_days "$KB_BEST_DATE") ))
-                (( wait < 0 )) && wait=0
-                printf "      ${C_DIM}it becomes fully trusted in about %d more day(s)${C_RESET}\n" "$wait"
-            else
-                printf "      ${C_DIM}its release date is unknown, so it cannot be trusted yet — retry with network${C_RESET}\n"
-            fi
+            printf "      ${C_DIM}the newest regular stable kernel your distro ships, but the %s branch${C_RESET}\n" "$KB_BEST_SERIES"
+            printf "      ${C_DIM}only opened %s days ago — it settles in about %d more day(s)${C_RESET}\n" \
+                "$bage" "$(( KB_SETTLE_DAYS - ${bage:-0} ))"
             ;;
-        3|4)
-            printf "      ${C_DIM}your distro ships no non-LTS kernel that has settled, so this long-term${C_RESET}\n"
-            printf "      ${C_DIM}branch is the newest thing here with a real track record${C_RESET}\n"
+        3)
+            printf "      ${C_DIM}your distro ships no regular stable kernel, so this long-term branch is${C_RESET}\n"
+            printf "      ${C_DIM}the newest thing here with a real track record${C_RESET}\n"
             ;;
     esac
-    if [[ -n "$KB_STABLE_VER" && "$KB_BEST_UP" != "$KB_STABLE_VER" ]]; then
-        local sdate="${KB_STABLE_DATE:-0}" sage
-        sage=$(kb_age_days "$sdate")
-        if (( sage < KB_SETTLE_DAYS )) && [[ "$KB_BEST_TIER" != "2" ]]; then
-            printf "      ${C_DIM}upstream's newer stable ${KB_STABLE_VER} is only ${sage} day(s) old — too fresh to trust yet${C_RESET}\n"
+    if [[ -n "$KB_STABLE_VER" && -n "$KB_STABLE_SER" && "$KB_BEST_SERIES" != "$KB_STABLE_SER" ]]; then
+        local sage; sage=$(kb_series_age_days "$KB_STABLE_SER" 2>/dev/null || echo 0)
+        if (( sage < KB_SETTLE_DAYS )); then
+            printf "      ${C_DIM}upstream's newer stable branch %s (%s) opened only %d day(s) ago —${C_RESET}\n" \
+                "$KB_STABLE_SER" "$KB_STABLE_VER" "$sage"
+            printf "      ${C_DIM}it settles in about %d more day(s)${C_RESET}\n" "$(( KB_SETTLE_DAYS - sage ))"
+        else
+            printf "      ${C_DIM}upstream's newer stable branch %s (%s) opened %d day(s) ago —${C_RESET}\n" \
+                "$KB_STABLE_SER" "$KB_STABLE_VER" "$sage"
+            printf "      ${C_DIM}it is settled, but your distro does not package it yet${C_RESET}\n"
         fi
     fi
     printf "\n"
@@ -1546,7 +1548,7 @@ cmd_upgrade() {
         meta_up=$(kb_pkg_upstream "$META_CAND" 2>/dev/null) || meta_up=""
         best_up="$KB_BEST_UP"
         if [[ "$WANT_NEWEST" -eq 0 && -n "$KB_BEST_PKG" && -n "$best_up" && -n "$meta_up" \
-              && "$best_up" != "$meta_up" && "$KB_BEST_TIER" != "5" ]] \
+              && "$best_up" != "$meta_up" && "$KB_BEST_TIER" != "4" ]] \
            && ver_gt "$meta_up" "$best_up"; then
             target_pkg="$KB_BEST_PKG"
             target_pin="=$KB_BEST_VER"

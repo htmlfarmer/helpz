@@ -227,8 +227,44 @@ kb_series_is_lts() {   # series -> 0/1
     printf '0'
 }
 
-kb_series_is_eol() {   # series -> 0/1
-    [[ "${KB_SER_EOL[$1]:-0}" == "1" ]] && { printf '1'; return 0; }
+# When was this branch OPENED? The first entry of the branch's changelog is
+# the X.Y.0 release commit, so its Date is the branch's birth date — the
+# honest measure of "how long has this branch been out and tested".
+kb_series_birth() {   # series -> epoch
+    local ser="${1:-}" maj base f d e
+    [[ -z "$ser" ]] && return 1
+    maj="${ser%%.*}"
+    for base in "v${maj}.x" "v${ser}"; do
+        f=$(kb_cache_head "$KB_CDN_BASE/$base/ChangeLog-$ser") || continue
+        [[ -s "$f" ]] || continue
+        d=$(grep -m1 -E '^Date:' "$f" 2>/dev/null | sed 's/^Date:[[:space:]]*//')
+        [[ -z "$d" ]] && continue
+        e=$(kb_parse_date "$d") || continue
+        [[ -n "$e" ]] && { printf '%s' "$e"; return 0; }
+    done
+    return 1
+}
+
+# Is this branch finished upstream?
+#
+# kernel.org's feed lists every branch that is still maintained (the current
+# stable plus all long-term branches) and flags the ones that just went
+# end-of-life. A branch that has dropped out of the feed altogether is
+# finished — that is how the 7.0 branch looks today, and it MUST be
+# excluded or it would outrank the current stable simply by being older.
+kb_series_is_eol() {   # series [release epoch] -> 0/1
+    local ser="$1" date="${2:-}" age
+    [[ "${KB_SER_EOL[$ser]:-0}" == "1" ]] && { printf '1'; return 0; }
+    if [[ "$KB_UPSTREAM_OK" -eq 1 ]]; then
+        # not in the feed = upstream no longer maintains it
+        [[ -z "${KB_SER_LATEST[$ser]:-}" ]] && { printf '1'; return 0; }
+        printf '0'; return 0
+    fi
+    # offline: fall back to the age of the release we have
+    if [[ "$date" =~ ^[0-9]+$ ]] && (( date > 0 )); then
+        age=$(( ( $(date +%s) - date ) / 86400 ))
+        (( age >= KB_EOL_DAYS )) && { printf '1'; return 0; }
+    fi
     printf '0'
 }
 
@@ -449,54 +485,56 @@ kb_add_candidate() {   # pkg ver abi upstream-hint flavour suite index
     return 0
 }
 
-# tier 1 = best: stable branch, settled
-# tier 2 = stable branch but too fresh (or unknown) to trust yet
-# tier 3 = LTS branch — the safe fallback. The settle window does NOT apply
-#          here: the long-term branch is already the conservative choice, and
-#          skipping one of its security patches to gain "a few more days of
-#          testing" would be a bad trade. The newest LTS build wins.
-# tier 4 = (reserved) LTS branch that is still fresh
-# tier 5 = end-of-life series
-kb_tier() {   # series date -> tier
+# tier 1 = the goal: a live, non-LTS (regular stable) branch that has been
+#          out long enough to be trusted
+# tier 2 = a live, non-LTS branch that is still fresh
+# tier 3 = a long-term branch — the safe fallback, explicitly not the goal
+# tier 4 = finished upstream (end-of-life) — never recommended
+#
+# The settle window is measured against the BRANCH's birth date (the X.Y.0
+# release), not against the newest patch: a branch that opened 3 months ago
+# and got a patch 2 days ago is a mature branch, and the newest regular
+# stable branch is exactly what we want to move to.
+KB_EOL_DAYS=90          # a release this old means the branch is finished
+kb_tier() {   # series release_date -> tier
     local series="$1" date="$2" age lts eol
     lts=$(kb_series_is_lts "$series")
-    eol=$(kb_series_is_eol "$series")
-    (( eol == 1 )) && { printf '5'; return 0; }
+    eol=$(kb_series_is_eol "$series" "$date")
+    (( eol == 1 )) && { printf '4'; return 0; }
     (( lts == 1 )) && { printf '3'; return 0; }
-    if [[ ! "$date" =~ ^[0-9]+$ ]] || (( date <= 0 )); then
-        printf '2'; return 0
-    fi
-    age=$(( ( $(date +%s) - date ) / 86400 ))
-    if (( age >= KB_SETTLE_DAYS )); then
-        printf '1'; return 0
-    fi
+    age=$(kb_series_age_days "$series") || age=0
+    if (( age >= KB_SETTLE_DAYS )); then printf '1'; return 0; fi
     printf '2'; return 0
+}
+
+kb_series_age_days() {   # series -> days since the branch opened
+    local b
+    b=$(kb_series_birth "${1:-}") || return 1
+    printf '%s' "$(( ( $(date +%s) - b ) / 86400 ))"
 }
 
 kb_tier_note() {   # series date tier -> short label
     local series="$1" date="$2" tier="$3" age
-    if [[ ! "$date" =~ ^[0-9]+$ ]] || (( date <= 0 )); then
-        printf 'release date unknown'
-        return 0
-    fi
-    age=$(( ( $(date +%s) - date ) / 86400 ))
     case "$tier" in
-        1) printf 'stable, %dd old' "$age" ;;
-        2) printf 'stable but only %dd old — untested' "$age" ;;
-        3) printf 'LTS branch, %dd old' "$age" ;;
-        4) printf 'LTS branch, %dd old' "$age" ;;
-        5) printf 'end-of-life upstream' ;;
+        4) printf 'finished upstream (end-of-life)'; return 0 ;;
+        3)
+            age=$(kb_series_age_days "$series") || age=0
+            printf 'LTS branch, out %dd' "$age"; return 0 ;;
+    esac
+    age=$(kb_series_age_days "$series") || age=0
+    case "$tier" in
+        1) printf 'regular stable, branch out %dd' "$age" ;;
+        2) printf 'regular stable but branch only %dd old — fresh' "$age" ;;
         *) printf 'unknown' ;;
     esac
 }
 
 kb_tier_label() {  # tier -> headline word
     case "$1" in
-        1) printf 'LATEST TESTED STABLE' ;;
-        2) printf 'TOO FRESH (not yet tested)' ;;
+        1) printf 'LATEST STABLE (tested)' ;;
+        2) printf 'LATEST STABLE (still fresh)' ;;
         3) printf 'LONG-TERM (safe, not the goal)' ;;
-        4) printf 'LONG-TERM (fresh)' ;;
-        5) printf 'END-OF-LIFE' ;;
+        4) printf 'END-OF-LIFE' ;;
         *) printf 'UNKNOWN' ;;
     esac
 }
