@@ -14,6 +14,9 @@
 # Usage:
 #   ./installz                 Install into ~/.local/bin (default)
 #   ./installz --dir DIR       Install into a different directory
+#   ./installz --system        Also link into a directory sudo can see, so
+#                              "sudo logz" works (default /usr/local/bin)
+#   ./installz --sudo-dir DIR  Which directory to use for the sudo-visible links
 #   ./installz --uninstall     Remove the symlinks and completion
 #   ./installz --status        Show what is installed
 #   ./installz --no-completion Skip the shell completion
@@ -21,6 +24,11 @@
 # Notes:
 #   * ~/.local/bin is on PATH by default on most systems; if it is not,
 #     installz says so and tells you how to fix it.
+#   * sudo RESETS PATH to its secure_path, which normally does NOT include
+#     ~/.local/bin — so "sudo logz" fails with "command not found" even
+#     though logz is right there. installz detects this and offers
+#     --system, which links the tools into /usr/local/bin (inside the
+#     default secure_path) so sudo finds them.
 #   * Only symlinks that point INTO this suite are ever removed.
 #   * Nothing outside the target directory is touched.
 # ============================================================================
