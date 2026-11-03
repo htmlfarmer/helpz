@@ -564,6 +564,19 @@ if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
       printf "      ${C_GREEN}fix:${C_RESET} sudo systemctl status %s\n" "$unit"
       printf "      ${C_GREEN}fix:${C_RESET} sudo journalctl -u %s -n 30 --no-pager\n" "$unit"
       printf "      ${C_GREEN}fix:${C_RESET} sudo systemctl restart %s\n" "$unit"
+      # Point at the tool in this suite that actually owns that problem.
+      _tool=""
+      case "$unit" in
+        *kernel*)              _tool="kernelz" ;;
+        *sshd*|*ssh*)          _tool="sshauditz" ;;
+        *postgres*|*mysql*|*mongo*|*redis*) _tool="sqlz" ;;
+        *docker*|*container*)  _tool="securityz" ;;
+        *network*|*netplan*|*wpa*) _tool="networkz" ;;
+        *disk*|*smart*|*mdadm*|*raid*) _tool="diskz" ;;
+        *cron*|*timer*)        _tool="cronz" ;;
+        *print*|*cups*)        _tool="printerz" ;;
+      esac
+      [[ -n "$_tool" ]] && printf "      ${C_CYAN}see also:${C_RESET} ./%s ${C_DIM}(deeper check for this)${C_RESET}\n" "$_tool"
       FAILED_DETAIL="${FAILED_DETAIL}${unit}"$'\n'
     done <<< "$FAILED_LIST"
   else
