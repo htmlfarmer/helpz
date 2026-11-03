@@ -31,6 +31,17 @@ KB_SETTLE_DAYS="${KERNELZ_SETTLE_DAYS:-14}"
 KB_JSON_URL="https://www.kernel.org/releases.json"
 KB_CDN_BASE="https://cdn.kernel.org/pub/linux/kernel"
 
+# Which package manager is this system using? The verdict has to work on
+# every Linux, not just Debian/Ubuntu.
+kb_pkg_mgr() {
+    if   command -v apt-get >/dev/null 2>&1; then printf 'deb'
+    elif command -v dnf     >/dev/null 2>&1; then printf 'rpm'
+    elif command -v yum     >/dev/null 2>&1; then printf 'rpm'
+    elif command -v rpm     >/dev/null 2>&1; then printf 'rpm'
+    elif command -v pacman  >/dev/null 2>&1; then printf 'pacman'
+    else printf 'none'; fi
+}
+
 KB_ONLINE=0            # 1 once kernel.org answered at least once
 KB_UPSTREAM_OK=0       # releases.json parsed into the series tables
 
@@ -42,6 +53,7 @@ declare -A KB_SER_EOL=()       # 6.1 -> 0/1          series reached end-of-life
 KB_STABLE_VER=""               # current upstream stable, e.g. 7.3.1
 KB_STABLE_ISO=""
 KB_STABLE_DATE=0
+KB_STABLE_SER=""               # its series, e.g. 7.3
 KB_LTS_LIST=""                 # "6.18.60 6.12.115 ..." newest of each LTS branch
 
 # candidate kernel images the repositories offer
@@ -181,6 +193,7 @@ PY
             best="$bver"
             KB_STABLE_ISO="${KB_SER_ISO[$ser]}"
             KB_STABLE_DATE="${KB_SER_DATE[$ser]}"
+            KB_STABLE_SER="$ser"
         fi
     done
     KB_STABLE_VER="$best"
@@ -227,8 +240,12 @@ kb_pkg_upstream() {   # package version -> upstream release (best effort)
     [[ -z "$v" ]] && return 1
     v="${v#*:}"                  # drop epoch
     v="${v%%-*}"                 # drop packaging revision
-    [[ "$v" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
-    printf '%s' "$v"
+    if [[ "$v" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then printf '%s' "$v"; return 0; fi
+    # distribution tag glued onto the version: 6.10.1.arch1 / 6.11.4.fc41
+    if [[ "$v" =~ ^([0-9]+(\.[0-9]+)+)\.[a-z]+[0-9]+$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"; return 0
+    fi
+    return 1
 }
 
 kb_series_of() {     # "6.1.176" -> "6.1"
@@ -301,13 +318,29 @@ kb_upstream_date() {  # upstream release -> epoch of its release date
 kb_repo_candidates() {
     KB_C_PKG=(); KB_C_VER=(); KB_C_ABI=(); KB_C_SERIES=(); KB_C_UP=()
     KB_C_DATE=(); KB_C_TIER=(); KB_C_SUITE=(); KB_C_FLAV=(); KB_C_NOTE=()
-    command -v apt >/dev/null 2>&1 || return 0
+    local mgr; mgr=$(kb_pkg_mgr)
+    case "$mgr" in
+        deb)    kb_candidates_deb ;;
+        rpm)    kb_candidates_rpm ;;
+        pacman) kb_candidates_pacman ;;
+        *) return 0 ;;
+    esac
 
+    # rank every candidate into a tier
+    local i
+    for ((i = 0; i < ${#KB_C_PKG[@]}; i++)); do
+        KB_C_TIER[i]=$(kb_tier "${KB_C_SERIES[i]}" "${KB_C_DATE[i]}")
+        KB_C_NOTE[i]=$(kb_tier_note "${KB_C_SERIES[i]}" "${KB_C_DATE[i]}" "${KB_C_TIER[i]}")
+    done
+}
+
+# ---------- Debian / Ubuntu ----------
+kb_candidates_deb() {
     local listing
     listing=$(apt list -a 'linux-image-*' 2>/dev/null | awk 'NR>1 && NF>=2 {print $1" "$2}')
     [[ -z "$listing" ]] && return 0
 
-    local name ver suite rest abi flavour key up ser date tier
+    local name ver suite rest abi flavour key
     local -A chosen=() flavour_of=()
     while read -r name ver; do
         [[ -z "$name" || -z "$ver" ]] && continue
@@ -343,35 +376,64 @@ kb_repo_candidates() {
         fi
     done <<< "$listing"
 
-    local n=0
+    local n=0 ver
     for key in "${!chosen[@]}"; do
         abi="${key%%|*}"
         ver="${key#*|}"
-        up=$(kb_pkg_upstream "$ver") || up=""
-        if [[ -n "$up" ]]; then
-            ser=$(kb_series_of "$up") || ser=""
-        else
-            ser=$(printf '%s' "${abi%%-*}" | cut -d. -f1,2)
-        fi
-        [[ -n "$ser" ]] || continue
-        date=$(kb_upstream_date "$up") || date=""
-        KB_C_PKG[n]="${chosen[$key]}"
-        KB_C_VER[n]="$ver"
-        KB_C_ABI[n]="$abi"
-        KB_C_SERIES[n]="$ser"
-        KB_C_UP[n]="$up"
-        KB_C_DATE[n]="$date"
-        KB_C_SUITE[n]="$suite"
-        KB_C_FLAV[n]="${flavour_of[$key]}"
+        kb_add_candidate "${chosen[$key]}" "$ver" "$abi" "" "${flavour_of[$key]}" "stable" "$n"
         n=$((n + 1))
     done
+}
 
-    # rank every candidate into a tier
-    local i
-    for ((i = 0; i < ${#KB_C_PKG[@]}; i++)); do
-        KB_C_TIER[i]=$(kb_tier "${KB_C_SERIES[i]}" "${KB_C_DATE[i]}")
-        KB_C_NOTE[i]=$(kb_tier_note "${KB_C_SERIES[i]}" "${KB_C_DATE[i]}" "${KB_C_TIER[i]}")
-    done
+# ---------- Fedora / RHEL / openSUSE (rpm) ----------
+kb_candidates_rpm() {
+    local q; q=$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum)
+    local out
+    out=$(timeout 90 "$q" -q repoquery --available --qf '%{name} %{epoch}:%{version}-%{release}' \
+           'kernel*' 2>/dev/null | grep -vE '^kernel-(devel|modules|headers|tools|docs|debuginfo|perf|src|mlk5|pa|scsi|selinux|signing|debug|extra|firmware|abi|config|dtb|cmake|libpfm|ntfs|tools-devel|unstable)' )
+    [[ -z "$out" ]] && out=$(timeout 90 "$q" -q list available 'kernel*' 2>/dev/null | awk 'NF>2{print $1" "$2}')
+    [[ -z "$out" ]] && return 0
+
+    local name ver abi n=0
+    while read -r name ver; do
+        [[ -z "$name" || -z "$ver" ]] && continue
+        case "$name" in
+            kernel|kernel-core|kernel-default|kernel-desktop|kernel-latest|linux) ;;
+            *) continue ;;
+        esac
+        ver="${ver#*:}"                     # drop the epoch
+        abi="$ver"
+        kb_add_candidate "$name" "$ver" "$abi" "" "" "rpm" "$n"
+        n=$((n + 1))
+    done <<< "$out"
+}
+
+# ---------- Arch / Manjaro ----------
+kb_candidates_pacman() {
+    local out
+    out=$(timeout 60 pacman -Si linux 2>/dev/null | awk -F': *' '/^Version/{print $2}')
+    [[ -z "$out" ]] && return 0
+    kb_add_candidate "linux" "$out" "$out" "" "" "arch" 0
+}
+
+# Register one candidate and resolve its upstream release + date.
+kb_add_candidate() {   # pkg ver abi upstream-hint flavour suite index
+    local pkg="$1" ver="$2" abi="$3" up="$4" flavour="$5" suite="$6" n="$7"
+    local ser date
+    if [[ -z "$up" ]]; then
+        up=$(kb_pkg_upstream "$ver") || up=""
+    fi
+    if [[ -n "$up" ]]; then
+        ser=$(kb_series_of "$up") || ser=""
+    else
+        ser=$(printf '%s' "${abi%%-*}" | cut -d. -f1,2)
+    fi
+    [[ -n "$ser" ]] || return 0
+    date=$(kb_upstream_date "$up") || date=""
+    KB_C_PKG[n]="$pkg"; KB_C_VER[n]="$ver"; KB_C_ABI[n]="$abi"
+    KB_C_SERIES[n]="$ser"; KB_C_UP[n]="$up"; KB_C_DATE[n]="$date"
+    KB_C_SUITE[n]="$suite"; KB_C_FLAV[n]="$flavour"
+    return 0
 }
 
 # tier 1 = best: stable branch, settled
