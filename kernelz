@@ -149,9 +149,44 @@ elif command -v rpm     >/dev/null 2>&1; then PKG_MGR="rpm"
 elif command -v pacman  >/dev/null 2>&1; then PKG_MGR="pacman"
 fi
 
+# The command a user would type for a routine distro upgrade (shown in tips).
+case "$PKG_MGR" in
+    deb)    PKG_UPGRADE_CMD="sudo apt upgrade" ;;
+    rpm)    PKG_UPGRADE_CMD="sudo dnf upgrade" ;;
+    pacman) PKG_UPGRADE_CMD="sudo pacman -Syu" ;;
+esac
+
+# Arch names kernels by file stem (vmlinuz-linux), not by uname -r, and GRUB
+# titles use that stem too. Map REL to the identity GRUB and the package
+# manager agree on, so entry lookup, verify and pending records line up.
+if [[ "$PKG_MGR" == "pacman" ]]; then
+    _kpkg=$(pacman -Qo "/lib/modules/$(uname -r)" 2>/dev/null | awk '{print $(NF-1)}')
+    if [[ -n "$_kpkg" ]]; then
+        _kfile=$(pacman -Ql "$_kpkg" 2>/dev/null | awk '/\/boot\/vmlinuz-/{print $2; exit}')
+        [[ -n "$_kfile" ]] && REL="${_kfile##*/vmlinuz-}"
+    fi
+    unset _kpkg _kfile
+fi
+
 # ---------- Small utilities ----------
-ver_gt()  { dpkg --compare-versions "$1" gt "$2" 2>/dev/null; }
-ver_ge()  { dpkg --compare-versions "$1" ge "$2" 2>/dev/null; }
+# Version compare that also works without dpkg (Arch/Fedora ship no dpkg).
+# The dpkg path stays authoritative on Debian/Ubuntu; elsewhere we fall back
+# to a numeric segment compare, which is all kernel versions ever need.
+_vcmp() {   # prints -1 / 0 / 1 for $1 vs $2
+    awk -v a="$1" -v b="$2" 'BEGIN{
+        n=split(a,A,/[^0-9]+/); m=split(b,B,/[^0-9]+/)
+        for(i=1;i<=n||i<=m;i++){ x=(i<=n?A[i]+0:0); y=(i<=m?B[i]+0:0)
+            if(x!=y){ print (x>y?1:-1); exit } }
+        print 0 }'
+}
+ver_gt() {
+    if command -v dpkg >/dev/null 2>&1; then dpkg --compare-versions "$1" gt "$2"
+    else [[ "$(_vcmp "$1" "$2")" == 1 ]]; fi
+}
+ver_ge() {
+    if command -v dpkg >/dev/null 2>&1; then dpkg --compare-versions "$1" ge "$2"
+    else [[ "$(_vcmp "$1" "$2")" != -1 ]]; fi
+}
 
 # compare kernel series ("7.2" vs "6.1"); 0 means $1 is the newer series
 series_gt() {
@@ -205,6 +240,96 @@ pkg_state() {
 }
 pkg_is_held() { [[ "$(pkg_state "$1")" == h* ]]; }
 
+# ---------- Write-path helpers (one implementation per package manager) ----------
+pkg_refresh() {
+    case "$PKG_MGR" in
+        deb)    run_cmd apt-get update ;;
+        rpm)    local q; q=$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum)
+                run_cmd "$q" -y makecache ;;
+        pacman) info "pacman refreshes its sync db during install (-Syu)" ;;
+    esac
+}
+pkg_install() {   # install package names with the distro's manager
+    case "$PKG_MGR" in
+        deb)    run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        rpm)    local q; q=$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum)
+                run_cmd "$q" install -y "$@" ;;
+        # Arch does not support partial upgrades — -Syu is the correct install.
+        pacman) run_cmd pacman -Syu --needed --noconfirm "$@" ;;
+    esac
+}
+grub_cfg_path() {
+    if [[ -r /boot/grub/grub.cfg || ! -e /boot/grub2/grub.cfg ]]; then
+        printf '/boot/grub/grub.cfg'
+    else
+        printf '/boot/grub2/grub.cfg'    # Fedora layout
+    fi
+}
+grub_regen() {   # update-grub (Debian) · grub-mkconfig (Arch) · grub2-mkconfig (Fedora)
+    local out; out=$(grub_cfg_path)
+    if   command -v update-grub     >/dev/null 2>&1; then run_cmd update-grub
+    elif command -v grub-mkconfig  >/dev/null 2>&1; then run_cmd grub-mkconfig -o "$out"
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then run_cmd grub2-mkconfig -o "$out"
+    else warnf "GrubRegen" "no GRUB config generator found" "install grub (or grub2)"; return 1; fi
+}
+grub_set_default() {
+    if   command -v grub-set-default  >/dev/null 2>&1; then run_cmd grub-set-default "$@"
+    elif command -v grub2-set-default >/dev/null 2>&1; then run_cmd grub2-set-default "$@"
+    else warnf "GrubDefault" "grub-set-default not found" "install grub"; return 1; fi
+}
+grub_reboot_cmd() {   # one-shot trial boot
+    if   command -v grub-reboot  >/dev/null 2>&1; then run_cmd grub-reboot "$@"
+    elif command -v grub2-reboot >/dev/null 2>&1; then run_cmd grub2-reboot "$@"
+    else warnf "GrubReboot" "grub-reboot not found" "install grub"; return 1; fi
+}
+grub_editenv_unset() {   # clear the one-shot trial marker
+    local env=/boot/grub/grubenv
+    [[ -e /boot/grub2/grubenv && ! -e /boot/grub/grubenv ]] && env=/boot/grub2/grubenv
+    if   command -v grub-editenv  >/dev/null 2>&1; then run_cmd grub-editenv  "$env" unset next_entry
+    elif command -v grub2-editenv >/dev/null 2>&1; then run_cmd grub2-editenv "$env" unset next_entry
+    else warnf "GrubEnv" "grub-editenv not found" "install grub"; return 1; fi
+}
+hold_pkg() {   # $1 = package — the manager's "never touch this kernel"
+    case "$PKG_MGR" in
+        deb)
+            if apt-mark showhold 2>/dev/null | grep -qxF "$1"; then
+                ok "custom kernel $1 is held — apt cannot remove it"
+            elif run_cmd apt-mark hold "$1" >/dev/null; then
+                ok "held $1 (out-of-repo kernel — protected from apt upgrade/full-upgrade/autoremove)"
+            else
+                warnf "HoldMissing" "could not hold $1" "sudo apt-mark hold $1"
+            fi ;;
+        pacman)
+            local f=/etc/pacman.conf
+            if awk -F= '/^IgnorePkg/{print $2}' "$f" 2>/dev/null | grep -qw "$1"; then
+                ok "custom kernel $1 is in IgnorePkg — pacman cannot touch it"
+            elif grep -q '^IgnorePkg' "$f" 2>/dev/null; then
+                if run_cmd sed -i -E "s|^IgnorePkg[[:space:]]*=[[:space:]]*|IgnorePkg = $1 |" "$f"; then
+                    ok "held $1 (prepended to IgnorePkg in /etc/pacman.conf)"
+                else
+                    warnf "HoldMissing" "could not extend IgnorePkg" "edit IgnorePkg in /etc/pacman.conf, add: $1"
+                fi
+            else
+                if run_cmd tee -a "$f" <<<"IgnorePkg = $1" >/dev/null; then
+                    ok "held $1 (IgnorePkg added to /etc/pacman.conf)"
+                else
+                    warnf "HoldMissing" "could not add IgnorePkg" "echo 'IgnorePkg = $1' | sudo tee -a /etc/pacman.conf"
+                fi
+            fi ;;
+        rpm)
+            if dnf versionlock list >/dev/null 2>&1; then
+                if run_cmd dnf -y versionlock add "$1" >/dev/null; then
+                    ok "held $1 (dnf versionlock)"
+                else
+                    warnf "HoldMissing" "versionlock failed for $1" "sudo dnf versionlock add $1"
+                fi
+            else
+                warnf "HoldMissing" "dnf versionlock plugin missing — $1 not held" \
+                    "sudo dnf install python3-dnf-plugin-versionlock && sudo dnf versionlock add $1"
+            fi ;;
+    esac
+}
+
 installed_image_pkgs() {
     case "$PKG_MGR" in
         deb)
@@ -216,7 +341,14 @@ installed_image_pkgs() {
                 | grep -E '^kernel(-core|-default|-desktop|-latest)?\b'
             ;;
         pacman)
-            pacman -Q linux 2>/dev/null | awk '{print "linux\t"$2"\tii"}'
+            # Arch kernels are /boot/vmlinuz-<name> files with no version in
+            # the name — ask pacman who owns each one.
+            local f p
+            for f in /boot/vmlinuz-*; do
+                [[ -e "$f" ]] || continue
+                p=$(pacman -Qo "$f" 2>/dev/null | awk '{print $(NF-1)}')
+                [[ -n "$p" ]] && printf '%s\t%s\tii\n' "$p" "$(pacman -Q "$p" 2>/dev/null | awk '{print $2}')"
+            done | sort -u
             ;;
     esac
 }
@@ -289,6 +421,8 @@ detect_meta() {
         pacman)
             v=$(apt_candidate linux 2>/dev/null)
             [[ -n "$v" ]] && { META_PKG="linux"; META_CAND="$v"; }
+            v=$(apt_candidate linux-headers 2>/dev/null)
+            [[ -n "$v" ]] && HDR_PKG="linux-headers"
             ;;
     esac
 }
@@ -340,6 +474,10 @@ _APT_REMOVAL_SET=0
 _APT_REMOVAL=""
 kernels_apt_would_remove() {   # -> pkg names (one per line)
     [[ "$_APT_REMOVAL_SET" -eq 1 ]] && { printf '%s' "$_APT_REMOVAL"; return 0; }
+    # the simulation is `apt-get -s` — Debian/Ubuntu only
+    if [[ "$PKG_MGR" != deb ]]; then
+        _APT_REMOVAL_SET=1; _APT_REMOVAL=""; printf ''; return 0
+    fi
     local kind p out=""
     for kind in upgrade full-upgrade autoremove; do
         while read -r p; do
@@ -415,10 +553,15 @@ record_boot() {
 
 # ---------- GRUB entry parsing (submenu-aware) ----------
 read_grubcfg() {
-    local f=/boot/grub/grub.cfg
-    if [[ -r "$f" ]]; then cat "$f"
-    elif [[ -f "$f" ]] && command -v sudo >/dev/null 2>&1; then
-        sudo -n cat "$f" 2>/dev/null || true   # never prompt during read-only passes
+    local f
+    for f in "$(grub_cfg_path)" /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+        [[ -r "$f" ]] || continue
+        cat "$f" && return 0
+        break
+    done
+    # never prompt during read-only passes; callers treat empty as "need root"
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -n cat "$(grub_cfg_path)" 2>/dev/null || true
     fi
 }
 grub_entries() {   # $1=cfg -> "id<TAB>title" (submenu-aware, indent-tolerant)
@@ -451,6 +594,11 @@ grub_entry_id_for() {   # $1=cfg, rest=tokens to match in titles
     local tok id
     for tok in "$@"; do
         [[ -z "$tok" ]] && continue
+        # 1) title ENDS with the token — "linux" must not grab "linux-lts"
+        id=$(grub_entries "$cfg" | awk -F'\t' -v t="$tok" \
+             'substr($2, length($2)-length(t)+1) == t { print $1; exit }')
+        [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+        # 2) substring anywhere (version embedded mid-title)
         id=$(grub_entries "$cfg" | awk -F'\t' -v t="$tok" 'index($2,t){print $1; exit}')
         [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
     done
@@ -531,6 +679,7 @@ USAGE
   ./kernelz study               Deep study: config hardening, CVE changelog,
                                 CPU mitigations, taint, boot ledger
   ./kernelz upgrade             Install the best (tested) kernel + GRUB safety net
+                                Debian/Ubuntu (apt) · Fedora/RHEL (dnf) · Arch (pacman)
   ./kernelz update              Alias for upgrade
   ./kernelz upgrade --newest    Take the very newest kernel instead of the tested one
   ./kernelz build               Compile the LATEST MAINLINE from source: toolchain
@@ -934,15 +1083,23 @@ section_howto_upgrade() {
 
     # what protect actually guarantees
     local removed
-    removed=$(kernels_apt_would_remove)
     printf "\n  ${C_DIM}What that buys you:${C_RESET}\n"
-    printf "       ${C_DIM}· the kernel meta-package stays installed, so apt keeps tracking kernels${C_RESET}\n"
-    printf "       ${C_DIM}· every installed kernel is marked 'manual' — autoremove cannot reap it${C_RESET}\n"
-    printf "       ${C_DIM}· out-of-repo kernels are 'hold' — upgrade/full-upgrade/autoremove skip them${C_RESET}\n"
-    if [[ -n "$removed" ]]; then
-        printf "       ${C_YELLOW}· apt currently plans to remove: %s — 'protect' holds these${C_RESET}\n" "$(tr '\n' ' ' <<< "$removed")"
+    if [[ "$PKG_MGR" == deb ]]; then
+        removed=$(kernels_apt_would_remove)
+        printf "       ${C_DIM}· the kernel meta-package stays installed, so apt keeps tracking kernels${C_RESET}\n"
+        printf "       ${C_DIM}· every installed kernel is marked 'manual' — autoremove cannot reap it${C_RESET}\n"
+        printf "       ${C_DIM}· out-of-repo kernels are 'hold' — upgrade/full-upgrade/autoremove skip them${C_RESET}\n"
+        if [[ -n "$removed" ]]; then
+            printf "       ${C_YELLOW}· apt currently plans to remove: %s — 'protect' holds these${C_RESET}\n" "$(tr '\n' ' ' <<< "$removed")"
+        else
+            printf "       ${C_GREEN}· simulation: apt's upgrade, full-upgrade and autoremove would remove NO kernel${C_RESET}\n"
+        fi
     else
-        printf "       ${C_GREEN}· simulation: apt's upgrade, full-upgrade and autoremove would remove NO kernel${C_RESET}\n"
+        removed=""
+        printf "       ${C_DIM}· the kernel meta-package stays installed, so %s keeps tracking kernels${C_RESET}\n" "${PKG_UPGRADE_CMD##* }"
+        printf "       ${C_DIM}· out-of-repo kernels are held (${PKG_MGR}: %s) — upgrades skip them${C_RESET}\n" \
+            "$( [[ "$PKG_MGR" == pacman ]] && printf 'IgnorePkg' || printf 'versionlock' )"
+        printf "       ${C_DIM}· 'protect' also proves the GRUB menu still boots every installed kernel${C_RESET}\n"
     fi
     printf "\n"
 }
@@ -1507,7 +1664,7 @@ ensure_grub_savedefault() {
         run_cmd sed -i -E "s|^GRUB_TIMEOUT=.*|GRUB_TIMEOUT=5|" "$f" || true; changed=1; }
     if [[ $changed -eq 1 ]]; then
         info "GRUB_DEFAULT → saved (default = last known good kernel)"
-        run_cmd update-grub || warnf "UpdateGrub" "update-grub failed" "sudo update-grub manually"
+        grub_regen || warnf "UpdateGrub" "GRUB config regeneration failed" "run update-grub / grub-mkconfig manually"
     fi
     return 0
 }
@@ -1519,8 +1676,10 @@ cmd_upgrade() {
         emit_verdict
     fi
     # preflight: don't build on a broken package database
-    if dpkg --audit 2>/dev/null | grep -qiE 'half-installed|half-configured|not fully installed'; then
+    if [[ "$PKG_MGR" == deb ]] && dpkg --audit 2>/dev/null | grep -qiE 'half-installed|half-configured|not fully installed'; then
         warnf "Preflight" "dpkg database has unfinished installs — kernel postinst hooks may fail mid-upgrade" "run 'kernelz fix --apply' first (or continue; install will show the same error)"
+    elif [[ "$PKG_MGR" == pacman ]] && [[ -n "$(pacman -Dk 2>&1)" ]]; then
+        warnf "Preflight" "pacman reports database problems — the kernel install may fail" "run 'pacman -Dk' and fix, then re-run"
     fi
 
     section_snapshot
@@ -1529,9 +1688,15 @@ cmd_upgrade() {
     heading "── PLAN ──"
     local target_pkg="" target_rel="" downgrade=0 target_pin=""
     if [[ -n "$TO_PKG" ]]; then
-        [[ "$TO_PKG" == linux-* ]] && target_pkg="$TO_PKG" || target_pkg="linux-image-$TO_PKG"
-        local cand; cand=$(apt_candidate "$target_pkg")
-        [[ -z "$cand" || "$cand" == "(none)" ]] && { critf "Target" "$target_pkg not available in repositories" "apt-cache search linux-image"; exit 2; }
+        if [[ "$PKG_MGR" == deb ]]; then
+            [[ "$TO_PKG" == linux-* ]] && target_pkg="$TO_PKG" || target_pkg="linux-image-$TO_PKG"
+        else
+            target_pkg="$TO_PKG"    # pacman/dnf: pass the package name as-is
+        fi
+        local cand search_hint="apt-cache search linux-image"
+        case "$PKG_MGR" in pacman) search_hint="pacman -Ss '^linux'" ;; rpm) search_hint="dnf search kernel" ;; esac
+        cand=$(apt_candidate "$target_pkg")
+        [[ -z "$cand" || "$cand" == "(none)" ]] && { critf "Target" "$target_pkg not available in repositories" "$search_hint"; exit 2; }
         if ver_gt "$CUR_VER" "${cand}" && [[ $FORCE -eq 0 ]]; then
             critf "Downgrade" "requested $target_pkg ($cand) is older than running $CUR_VER — use --force to allow" "kernelz status shows what you run"
             exit 2
@@ -1555,6 +1720,8 @@ cmd_upgrade() {
             info "targeting the tested kernel $KB_BEST_VER (series $KB_BEST_SERIES, $(kb_fmt_age "$KB_BEST_DATE") old)"
             info "the repo also has $META_CAND (upstream $meta_up), but it is only $(kb_age_days "$KB_NEW_DATE") day(s) old — use --newest to take it"
         fi
+        # dnf's install syntax is name-version, not pkg=version — no pin there
+        [[ "$PKG_MGR" == rpm ]] && target_pin=""
     else
         ok "Running kernel $CUR_VER is already the newest (repo candidate: ${META_CAND:-n/a})"
         if [[ -n "$KB_BEST_VER" && "$KB_BEST_VER" != "$CUR_VER" ]]; then
@@ -1566,7 +1733,29 @@ cmd_upgrade() {
     [[ -n "$target_pkg" ]] && pkgs_to_install+=("${target_pkg}${target_pin}")
     if [[ -n "$target_pkg" && -n "$HDR_PKG" ]]; then pkgs_to_install+=("$HDR_PKG"); fi
 
+    # Arch replaces the kernel package in place — after -Syu the old kernel is
+    # GONE from /boot. A second kernel package is the only boot fallback, so
+    # offer one (the Arch equivalent of "the old kernel stays installed").
+    if [[ "$PKG_MGR" == pacman && "$META_PKG" == "linux" && ! -e /boot/vmlinuz-linux-lts ]]; then
+        local lts_ans="y"
+        if [[ $ASSUME_YES -eq 0 ]]; then
+            printf "  ${C_YELLOW}?${C_RESET} Arch swaps the kernel in place — install ${C_BOLD}linux-lts${C_RESET} as your boot fallback? [Y/n] "
+            read -r lts_ans || lts_ans=y
+        fi
+        if [[ ! "${lts_ans:-y}" =~ ^[Nn] ]]; then
+            pkgs_to_install+=(linux-lts linux-lts-headers)
+            info "linux-lts will be the GRUB fallback if the new main kernel fails"
+        else
+            warnf "Fallback" "no fallback kernel — a bad kernel leaves the GRUB menu nothing older to pick" "sudo pacman -S linux-lts linux-lts-headers"
+        fi
+    fi
+
     # Say exactly what is about to be installed — before anything happens.
+    local install_cmd="apt-get install -y"
+    case "$PKG_MGR" in
+        rpm)    install_cmd="$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum) install -y" ;;
+        pacman) install_cmd="pacman -Syu --needed --noconfirm" ;;
+    esac
     if [[ -n "$target_pkg" ]]; then
         local tver="${target_pin#=}"
         [[ -z "$tver" ]] && tver=$(apt_candidate "$target_pkg")
@@ -1575,21 +1764,26 @@ cmd_upgrade() {
         printf "  ${C_DIM}currently running:${C_RESET} %s  %s\n" "$REL" "$CUR_VER"
         printf "  ${C_DIM}the old kernel stays installed and bootable — if the new one fails,${C_RESET}\n"
         printf "  ${C_DIM}the next reboot lands back on %s automatically.${C_RESET}\n" "$REL"
-        printf "  ${C_DIM}will run:${C_RESET} sudo apt-get install -y %s\n" "${pkgs_to_install[*]}"
+        printf "  ${C_DIM}will run:${C_RESET} sudo %s %s\n" "$install_cmd" "${pkgs_to_install[*]}"
         printf "\n"
     fi
 
     heading "── 1. Refresh & install ──"
-    run_cmd apt-get update || warnf "AptUpdate" "apt-get update failed (offline?)" "retry with network"
+    pkg_refresh || warnf "Refresh" "package index refresh failed (offline?)" "retry with network"
     if [[ ${#pkgs_to_install[@]} -gt 0 ]]; then
         # noninteractive prompts keep apt from asking about GRUB device lists
-        run_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs_to_install[@]}" \
-            || { critf "Install" "apt-get install failed — nothing changed, you are still on $REL" "re-run with network / check apt logs"; exit 2; }
+        pkg_install "${pkgs_to_install[@]}" \
+            || { critf "Install" "package install failed — nothing changed, you are still on $REL" "re-run with network / check package manager logs"; exit 2; }
     else
         info "nothing to install — ensuring protection for current kernel instead"
     fi
 
     target_rel=$(newest_installed_release)
+    # Arch: filename sort would rank linux-lts above linux — the primary
+    # kernel is the one the meta package owns, and that is the target.
+    if [[ "$PKG_MGR" == pacman && -n "$META_PKG" && -e "/boot/vmlinuz-$META_PKG" ]]; then
+        target_rel="$META_PKG"
+    fi
     if [[ -n "$TO_PKG" ]]; then
         # if --to was given as an ABI/version, the exact release is knowable
         local to_rel="${TO_PKG#linux-image-}"
@@ -1631,8 +1825,10 @@ cmd_upgrade() {
             # nothing new: pin current as the permanent good default
             read -r -a toks <<< "$(entry_tokens "$REL")"
             if good_id=$(grub_entry_id_for "$cfg" "${toks[@]}"); then
-                run_cmd grub-set-default "$good_id" && ok "permanent default = known-good entry $good_id ($REL)"
+                grub_set_default "$good_id" && ok "permanent default = known-good entry $good_id ($REL)"
             fi
+            # Arch upgrades the kernel in place: same entry, new content.
+            [[ "$PKG_MGR" == pacman ]] && info "Arch swaps this entry's kernel on reboot — linux-lts is the GRUB menu fallback"
         else
             read -r -a g_toks <<< "$(entry_tokens "$REL")"
             read -r -a n_toks <<< "$(entry_tokens "$target_rel")"
@@ -1640,14 +1836,14 @@ cmd_upgrade() {
             new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
             if [[ -z "$good_id" || -z "$new_id" ]]; then
                 info "entry lookup failed — running update-grub and retrying"
-                run_cmd update-grub || true
+                grub_regen || true
                 cfg=$(read_grubcfg)
                 good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
                 new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
             fi
             if [[ -n "$good_id" && -n "$new_id" ]]; then
-                run_cmd grub-set-default "$good_id" || warnf "GrubDefault" "grub-set-default failed" "sudo grub-set-default $good_id"
-                run_cmd grub-reboot "$new_id"       || warnf "GrubReboot"  "grub-reboot failed"       "sudo grub-reboot $new_id"
+                grub_set_default "$good_id" || warnf "GrubDefault" "grub-set-default failed" "sudo grub-set-default $good_id"
+                grub_reboot_cmd "$new_id"       || warnf "GrubReboot"  "grub-reboot failed"       "sudo grub-reboot $new_id"
                 ok "default = $REL (entry $good_id) — next boot = $target_rel (entry $new_id), once only"
                 printf "  ${C_DIM}If %s fails to boot, the following reboot lands back on %s automatically${C_RESET}\n" "$target_rel" "$REL"
             else
@@ -1656,7 +1852,7 @@ cmd_upgrade() {
         fi
     fi
 
-    heading "── 4. Make 'sudo apt upgrade' unable to void the new kernel ──"
+    heading "── 4. Make the package manager unable to void the new kernel ──"
     protect_apply 1
 
     heading "── 5. Record pending update ──"
@@ -1677,7 +1873,7 @@ TS=$TS_EPOCH"
     else
         printf "  ${C_GREEN}Already on the newest kernel — protections applied, no reboot needed.${C_RESET}\n"
     fi
-    printf "  ${C_DIM}You can still run 'sudo apt upgrade' any time — kernelz protect holds the line.${C_RESET}\n"
+    printf "  ${C_DIM}You can still run '$PKG_UPGRADE_CMD' any time — kernelz protect holds the line.${C_RESET}\n"
     exit 0
 }
 
@@ -2054,14 +2250,14 @@ cmd_build() {
         good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
         new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
         if [[ -z "$good_id" || -z "$new_id" ]]; then
-            run_cmd update-grub || true
+            grub_regen || true
             cfg=$(read_grubcfg)
             good_id=$(grub_entry_id_for "$cfg" "${g_toks[@]}")
             new_id=$(grub_entry_id_for "$cfg" "${n_toks[@]}")
         fi
         if [[ -n "$good_id" && -n "$new_id" ]]; then
-            run_cmd grub-set-default "$good_id" || warnf "GrubDefault" "grub-set-default failed" "sudo grub-set-default $good_id"
-            run_cmd grub-reboot "$new_id" || warnf "GrubReboot" "grub-reboot failed" "sudo grub-reboot $new_id"
+            grub_set_default "$good_id" || warnf "GrubDefault" "grub-set-default failed" "sudo grub-set-default $good_id"
+            grub_reboot_cmd "$new_id" || warnf "GrubReboot" "grub-reboot failed" "sudo grub-reboot $new_id"
             ok "default = $REL (entry $good_id) — next boot = $new_rel (entry $new_id), once only"
         else
             critf "GrubEntry" "GRUB entries unresolved for $REL / $new_rel" "sudo update-grub, then: kernelz recover"
@@ -2098,15 +2294,18 @@ TS=$(date +%s)"
 PROTECT_APPLY=0
 protect_apply() {   # 1 = apply fixes now
     PROTECT_APPLY="$1"
-    section "APT-UPGRADE HARDENING (kernel protection)"
+    local mgr_lbl="APT"
+    [[ "$PKG_MGR" == rpm ]] && mgr_lbl="DNF"
+    [[ "$PKG_MGR" == pacman ]] && mgr_lbl="PACMAN"
+    section "$mgr_lbl-UPGRADE HARDENING (kernel protection)"
     local protected_now=0
 
-    # 1) meta-package keeps apt pulling kernels
+    # 1) meta-package keeps the distro pulling kernels
     if [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]]; then
         if [[ "$PROTECT_APPLY" -eq 1 ]]; then
-            if run_cmd apt-get install -y "$META_PKG"; then
-                if [[ "$DRY_RUN" -eq 1 ]]; then info "would install $META_PKG — future kernels arrive via plain apt upgrade"
-                else ok "installed $META_PKG — future kernels arrive via plain apt upgrade"; fi
+            if pkg_install "$META_PKG"; then
+                if [[ "$DRY_RUN" -eq 1 ]]; then info "would install $META_PKG — future kernels arrive via $PKG_UPGRADE_CMD"
+                else ok "installed $META_PKG — future kernels arrive via $PKG_UPGRADE_CMD"; fi
             fi
         else
             warnf "KernelMeta" "$META_PKG missing" "kernelz protect installs it"
@@ -2115,33 +2314,44 @@ protect_apply() {   # 1 = apply fixes now
         ok "$META_PKG present"
     fi
 
-    # 2) every installed kernel: manual (never autoremove)
+    # 2) every installed kernel: manual (never autoremove) — Debian/Ubuntu
+    #    only; pacman has no autoremove and dnf's is not kernel-aware.
     local pkg ver stat
-    installed_image_pkgs | while IFS=$'\t' read -r pkg ver stat; do
-        if apt-mark showmanual 2>/dev/null | grep -qxF "$pkg"; then
-            :
-        elif [[ "$PROTECT_APPLY" -eq 1 ]]; then
-            run_cmd apt-mark manual "$pkg" >/dev/null
-            printf "  ${C_GREEN}✓${C_RESET} marked manual: %s (protected from autoremove)\n" "$pkg"
-        else
-            printf "  ${C_YELLOW}!${C_RESET} %s is auto-marked — autoremove could target it (run: kernelz protect --yes)\n" "$pkg"
-        fi
-    done
+    if [[ "$PKG_MGR" == deb ]]; then
+        installed_image_pkgs | while IFS=$'\t' read -r pkg ver stat; do
+            if apt-mark showmanual 2>/dev/null | grep -qxF "$pkg"; then
+                :
+            elif [[ "$PROTECT_APPLY" -eq 1 ]]; then
+                run_cmd apt-mark manual "$pkg" >/dev/null
+                printf "  ${C_GREEN}✓${C_RESET} marked manual: %s (protected from autoremove)\n" "$pkg"
+            else
+                printf "  ${C_YELLOW}!${C_RESET} %s is auto-marked — autoremove could target it (run: kernelz protect --yes)\n" "$pkg"
+            fi
+        done
+    else
+        info "autoremove marking is Debian-specific — skipped on this distro"
+    fi
 
     # 3) EVERY out-of-repo kernel gets held — not just the running one.
-    #    A held package is skipped by upgrade, full-upgrade and autoremove,
-    #    so a custom kernel can never be swapped out behind your back.
+    #    Held means: apt skips it, pacman's IgnorePkg skips it, dnf's
+    #    versionlock skips it — a custom kernel is never swapped out silently.
     local custom
     while read -r pkg; do
         [[ -z "$pkg" ]] && continue
-        if apt-mark showhold 2>/dev/null | grep -qxF "$pkg"; then
-            ok "custom kernel $pkg is held — apt cannot remove it"
-        elif [[ "$PROTECT_APPLY" -eq 1 ]]; then
-            run_cmd apt-mark hold "$pkg" >/dev/null \
-                && ok "held $pkg (out-of-repo kernel — protected from apt upgrade/full-upgrade/autoremove)" \
-                || warnf "HoldMissing" "could not hold $pkg" "sudo apt-mark hold $pkg"
+        if [[ "$PROTECT_APPLY" -eq 1 ]]; then
+            hold_pkg "$pkg"
         else
-            warnf "HoldMissing" "out-of-repo kernel $pkg is not held" "sudo apt-mark hold $pkg"
+            local held=0
+            case "$PKG_MGR" in
+                deb)    apt-mark showhold 2>/dev/null | grep -qxF "$pkg" && held=1 ;;
+                pacman) awk -F= '/^IgnorePkg/{print $2}' /etc/pacman.conf 2>/dev/null | grep -qw "$pkg" && held=1 ;;
+                rpm)    dnf versionlock list 2>/dev/null | grep -qw "$pkg" && held=1 ;;
+            esac
+            if [[ $held -eq 1 ]]; then
+                ok "custom kernel $pkg is held — the package manager cannot remove it"
+            else
+                warnf "HoldMissing" "out-of-repo kernel $pkg is not held" "kernelz protect --yes"
+            fi
         fi
     done < <(installed_image_pkgs | cut -f1 | while read -r p; do
                 pkg_in_repo "$p" || printf '%s\n' "$p"
@@ -2151,7 +2361,9 @@ protect_apply() {   # 1 = apply fixes now
     #    Anything it plans to remove is held so the plan can never run.
     local removed
     removed=$(kernels_apt_would_remove)
-    if [[ -z "$removed" ]]; then
+    if [[ "$PKG_MGR" != deb ]]; then
+        info "kernel-removal simulation is Debian-specific — skipped (the holds above are the protection here)"
+    elif [[ -z "$removed" ]]; then
         ok "apt simulation (upgrade + full-upgrade + autoremove): no installed kernel would be removed"
     else
         warnf "AptRemoval" "apt would remove: $(tr '\n' ' ' <<< "$removed")"
@@ -2246,7 +2458,7 @@ cmd_verify() {
         read -r -a toks <<< "$(entry_tokens "$REL")"
         id=$(grub_entry_id_for "$cfg" "${toks[@]}")
         if [[ -n "$id" ]]; then
-            run_cmd grub-set-default "$id" >/dev/null && ok "GRUB default promoted to $REL (entry $id)"
+            grub_set_default "$id" >/dev/null && ok "GRUB default promoted to $REL (entry $id)"
         else
             warnf "GrubDefault" "entry for $REL not found to promote" "sudo update-grub && sudo kernelz verify"
         fi
@@ -2296,17 +2508,17 @@ cmd_recover() {
     fi
     state_write last_good "$lg"
     ensure_grub_savedefault || true
-    run_cmd update-grub || true
+    grub_regen || true
     local cfg id
     cfg=$(read_grubcfg)
     read -r -a toks <<< "$(entry_tokens "$lg")"
     id=$(grub_entry_id_for "$cfg" "${toks[@]}")
     if [[ -n "$id" ]]; then
-        run_cmd grub-set-default "$id" && ok "GRUB permanent default forced to $lg (entry $id)"
+        grub_set_default "$id" && ok "GRUB permanent default forced to $lg (entry $id)"
     else
         critf "Recover" "no menu entry for $lg after update-grub" "inspect: sudo grep menuentry /boot/grub/grub.cfg"
     fi
-    run_cmd grub-editenv /boot/grub/grubenv unset next_entry
+    grub_editenv_unset
     state_rm pending.conf
     kz_hist "recover to=$lg"
     section "MANUAL RECIPE (if you cannot boot at all)"
@@ -2353,7 +2565,7 @@ cmd_cleanup() {
         local real=()
         for p in $list; do [[ "$p" == "$META_PKG" ]] || real+=("$p"); done
         run_cmd apt-get purge -y "${real[@]}" || critf "Cleanup" "purge failed" "apt-get -f install"
-        run_cmd update-grub || true
+        grub_regen || true
         kz_hist "cleanup purged$(echo "$list")"
         ok "purged old kernels; GRUB regenerated"
     else
