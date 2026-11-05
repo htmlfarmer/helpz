@@ -580,8 +580,26 @@ grub_entries() {   # $1=cfg -> "id<TAB>title" (submenu-aware, indent-tolerant)
             subpos = top; top++; in_sub = 1; subcnt = 0
         } else if (line ~ /^[ \t]*menuentry[ \t]/) {
             t = qtitle(line)
-            if (in_sub && depth >= 1) { print subpos ">" subcnt "\t" t; subcnt++ }
-            else                      { print top "\t" t; top++ }
+            # Prefer the real --id: menu positions shift whenever
+            # grub-mkconfig regenerates (new kernel, os-prober entry), while
+            # ids never do. grub.cfg carries either the literal
+            # `$menuentry_id_option 'X'` or the expanded `--id 'X'`.
+            id = ""
+            p = index(line, "menuentry_id_option")
+            if (!p) p = index(line, "--id")
+            if (p) {
+                rest = substr(line, p)
+                q = sprintf("%c", 39)
+                i = index(rest, q)
+                if (i) { rest = substr(rest, i+1); j = index(rest, q); if (j) id = substr(rest, 1, j-1) }
+            }
+            if (id == "") {
+                if (in_sub && depth >= 1) id = subpos ">" subcnt
+                else                      id = sprintf("%d", top)
+            }
+            if (in_sub && depth >= 1) subcnt++
+            else                      top++
+            print id "\t" t
         }
         tmp = line
         o = gsub(/{/, "&", tmp); c = gsub(/}/, "&", tmp)
@@ -1802,12 +1820,18 @@ cmd_upgrade() {
 
     heading "── 2. Snapshot current state ──"
     local snap ts; ts=$(date +%Y%m%d-%H%M%S)
-    [[ "$DRY_RUN" -eq 1 ]] || { $SUDO mkdir -p "$STATE_SYS/snapshots" 2>/dev/null || mkdir -p "$STATE_USR/snapshots"; }
-    local snapdir="$STATE_SYS/snapshots"; [[ -w "$snapdir" ]] || snapdir="$STATE_USR/snapshots"
+    # Pick a snapshot dir we can actually write, and make sure it exists —
+    # the system dir may exist root-owned while the user fallback was never
+    # created (that combination used to make these redirects fail loudly).
+    local snapdir="$STATE_SYS/snapshots"
+    [[ -d "$snapdir" && -w "$snapdir" ]] || snapdir="$STATE_USR/snapshots"
+    [[ "$DRY_RUN" -eq 1 ]] || mkdir -p "$snapdir" 2>/dev/null || true
     [[ "$DRY_RUN" -eq 1 ]] || {
-        $SUDO cp /etc/default/grub "$snapdir/$ts-etc-grub" 2>/dev/null || cp /etc/default/grub "$snapdir/$ts-etc-grub" 2>/dev/null
-        read_grubcfg > "$snapdir/$ts-grub.cfg" 2>/dev/null
-        installed_image_pkgs > "$snapdir/$ts-kernels.tsv" 2>/dev/null
+        cp /etc/default/grub "$snapdir/$ts-etc-grub" 2>/dev/null \
+            || $SUDO cp /etc/default/grub "$snapdir/$ts-etc-grub" 2>/dev/null \
+            || true
+        read_grubcfg > "$snapdir/$ts-grub.cfg" 2>/dev/null || true
+        installed_image_pkgs > "$snapdir/$ts-kernels.tsv" 2>/dev/null || true
     }
     ok "snapshots + last_good ($REL) recorded"
     state_write last_good "$REL"
