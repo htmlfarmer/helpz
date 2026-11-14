@@ -1288,6 +1288,10 @@ section_network_safety() {   # section_network_safety [target_release]
         done
     fi
 
+    if [[ -n "$target" && ! -d "/lib/modules/$target" ]]; then
+        printf "    ${C_DIM}%s is not installed yet — the driver check runs once it is on disk${C_RESET}\n\n" "$target"
+        return 0
+    fi
     if [[ -n "$target" ]] && (( lif_ok == 0 )); then
         warnf "NetworkSafety" "the NIC carrying your default route ($lifeline) has no driver for $target" \
             "you will LOSE NETWORK ACCESS after the reboot — build it first: sudo dkms autoinstall -k $target && sudo depmod -a $target"
@@ -1623,6 +1627,9 @@ cmd_status() {
     section_grub
     run_risk_checks
     section_fixes
+    # The lifeline check: does the kernel on disk right now still have the
+    # driver that carries your default route?
+    section_network_safety ""
     json_unmuffle
 
     if declare -f run_comparison_finalize >/dev/null 2>&1 && [[ "$JSON_OUT" -eq 0 ]]; then
@@ -2762,15 +2769,31 @@ cmd_build() {
         dk_new=$(printf '%s\n' "$dk_all" | grep -F "$new_rel" || true)
         # Per module: every DKMS module that exists for some other kernel
         # should exist for the new one too. nvidia is the one that matters.
+        # "dkms status" prints "name/version, kernel, arch: state" - the
+        # commas are part of the fields, so strip them before comparing.
         dk_missing=$(printf '%s\n' "$dk_all" | awk -v k="$new_rel" '
-            { mods[$1]=1; if ($2==k) built[$1]=1 }
+            { gsub(/,/, "", $1); gsub(/,/, "", $2)
+              mods[$1]=1; if ($2==k) built[$1]=1 }
             END { for (m in mods) if (!(m in built)) printf "%s ", m }')
+        # Only modules that are actually IN USE matter. A DKMS module that
+        # was skipped for this kernel (BUILD_EXCLUSIVE) is not a problem
+        # unless something is using it right now.
+        dk_missing_inuse=""
+        for _m in $dk_missing; do
+            _base="${_m%%/*}"
+            if grep -qE "^${_base} " /proc/modules 2>/dev/null; then
+                dk_missing_inuse="${dk_missing_inuse} ${_m}"
+            fi
+        done
         if [[ -z "$dk_all" ]]; then
             info "dkms reports no modules at all"
-        elif [[ -n "$dk_missing" ]]; then
-            warnf "Dkms" "DKMS module(s) not built for $new_rel:${dk_missing} — the driver will be missing" \
+        elif [[ -n "$dk_missing_inuse" ]]; then
+            warnf "Dkms" "DKMS module(s) in use are not built for $new_rel:${dk_missing_inuse}" \
                 "build them now: sudo dkms autoinstall -k $new_rel && sudo depmod -a $new_rel"
-            printf "      ${C_DIM}without them the box boots without a GPU driver (black screen / no 3D)${C_RESET}\n"
+            printf "      ${C_DIM}without them the box boots without that driver (black screen / no 3D)${C_RESET}\n"
+        elif [[ -n "$dk_missing" ]]; then
+            info "DKMS module(s) not built for $new_rel:${dk_missing} — they are not in use, and DKMS skipped them"
+            info "  (BUILD_EXCLUSIVE: the module does not apply to this kernel/config)"
         else
             ok "every DKMS module is built for $new_rel:"
             printf '%s\n' "$dk_new" | sed 's/^/      ${C_DIM}│${C_RESET} /'
@@ -2853,7 +2876,7 @@ TS=$(date +%s)"
     # is for, so the pile is never a mystery.
     local v mark stray=""
     printf "\n  ${C_DIM}kernels on this machine now:${C_RESET}\n"
-    while read -v v; do
+    for v in $(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||'); do
         [[ -z "$v" ]] && continue
         mark=""
         [[ "$v" == "$REL" ]] && mark="${C_GREEN}  <- running now${C_RESET}"
@@ -2862,7 +2885,7 @@ TS=$(date +%s)"
         if [[ "$v" != "$REL" && "$v" != "$new_rel" ]]; then
             stray="$stray $v"
         fi
-    done < <(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||')
+    done
     if [[ -n "$stray" ]]; then
         printf "  ${C_DIM}also present (not running, harmless):%s${C_RESET}\n" "$stray"
         printf "  ${C_DIM}drop them when you are happy with the new kernel: sudo %s cleanup${C_RESET}\n" "${0##*/}"

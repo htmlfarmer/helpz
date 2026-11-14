@@ -560,12 +560,19 @@ else
 fi
 
 if [[ "$JSON_OUT" == "1" ]]; then
+    # Do NOT call emit_verdict() in JSON mode: it writes a SECOND JSON
+    # object to the same stream (so consumers get "Extra data" and fail to
+    # parse), and it only assigns exit_code inside its non-JSON branch —
+    # meaning it exits 0 even when this run just reported CRITICAL.
+    # Emit exactly one object and exit with the real code.
     j=""
     [[ ${#JSON_FIELDS[@]} -gt 0 ]] && j=$(printf '%s,' "${JSON_FIELDS[@]}" | sed 's/,$//')
     printf '{"tool":"sensorz","version":"%s","ts":"%s","host":"%s","warnings":%d,"critical":%d,%s}\n' \
         "$SCRIPT_VERSION" "$TIMESTAMP" "$HOSTNAME_SHORT" "$WARNINGS" "$CRITICAL" "$j" >&4
+    exit "$exit_code"
 fi
 
+# Human mode: emit_verdict prints the VERDICT block and exits itself.
 if declare -F emit_verdict >/dev/null 2>&1; then
     emit_verdict
 fi
