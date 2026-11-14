@@ -41,8 +41,10 @@ HIST_DIR="${HIST_DIR:-$HOME/.security-runs/history}"
 PRI_COMMON="load1 load5 mem_pct swap_pct disk_pct psi_cpu psi_io psi_mem failed_units"
 # A single tool's view adds its verdict and runtime on top.
 PRI_TOOL="crit warn dur ${PRI_COMMON}"
-# "dur" wanders with machine load and would always win the drift contest.
-NO_DRIFT="dur"
+# "dur" wanders with machine load, and the psi_* numbers are single-second
+# samples — both jump every run and would always win the drift contest.
+# They are still recorded and still shown in the detail view.
+NO_DRIFT="dur psi_cpu psi_io psi_memory"
 
 MODE="overview"          # overview | detail | boots
 ARG_TOOL=""
@@ -324,16 +326,16 @@ END {
     for (i = 1; i <= nb; i++) {
         b = ORD[i]
         printf "@boot\t%s\t%d\t%d\t%d\t%d\t%s\t%s", b, BF[b], BL[b], BR[b], BN[b], BS[b], BK[b]
+        for (j = 1; j <= PKn; j++) delete PK[j]     # portable: no `delete PK`
+        PKn = 0
         n = split(BKL[b], raw, " ")
-        delete PK
-        np = 0
-        for (j = 1; j <= n; j++) if (raw[j] != "") PK[++np] = raw[j]
-        for (j = 2; j <= np; j++) {
+        for (j = 1; j <= n; j++) if (raw[j] != "") PK[++PKn] = raw[j]
+        for (j = 2; j <= PKn; j++) {
             t = PK[j]; m = j - 1
             while (m >= 1 && kless(t, PK[m])) { PK[m + 1] = PK[m]; m-- }
             PK[m + 1] = t
         }
-        for (j = 1; j <= np; j++) printf "\t%s=%g", PK[j], medb(b, PK[j])
+        for (j = 1; j <= PKn; j++) printf "\t%s=%g", PK[j], medb(b, PK[j])
         printf "\n"
     }
     exit 0
@@ -478,7 +480,7 @@ if [[ "$MODE" == "overview" ]]; then
     (( toolcount == 1 )) && tw="tool" || tw="tools"
     (( total == 1 ))     && rw="run"  || rw="runs"
     info "${C_BOLD}$toolcount${C_RESET} $tw · ${C_BOLD}$total${C_RESET} $rw since ${C_DIM}$(date -d "@$oldest" '+%Y-%m-%d' 2>/dev/null || echo "?")${C_RESET} · ${C_DIM}$HIST_DIR${C_RESET}"
-    info "${C_DIM}Δ = this run vs the median of the previous $WINDOW runs (\"common\")${C_RESET}"
+    info "${C_DIM}Δ = this run vs the median of the previous $WINDOW runs (\"common\") · drift skips dur/psi_* — they are live samples${C_RESET}"
 
     printf -v h1 '%-16s' "TOOL"
     printf -v h2 '%6s'   "RUNS"

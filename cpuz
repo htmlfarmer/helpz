@@ -644,6 +644,13 @@ if [[ "${AI_VERDICT:-}" == "1" ]]; then
     ai_emit_verdict "summarize" "CPU diagnostic complete on $(hostname -s)" 2>/dev/null || true
 fi
 
+# ---------- Metric history (./trendz) ----------
+# The shared snapshot (load, mem, swap, disk, PSI, verdict counts, duration)
+# is recorded automatically; peak temperature is cpuz's own number.
+if declare -f hist_metric >/dev/null 2>&1; then
+    hist_metric peak_temp_c "${HOTTEST_T:-}"
+fi
+
 # Finalize and generate comparison report
 if [[ "$JSON_OUT" != "1" ]] && [[ "$WATCH_INTERVAL" == "0" ]]; then
     run_comparison_finalize
