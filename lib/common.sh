@@ -97,13 +97,20 @@ suite_bootstrap() {
     local dir; dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
     [[ -d "$dir" ]] || return 0
 
-    # 1) the user's PATH
+    # 1) the user's PATH. An existing, working link is left alone — otherwise
+    #    running the source tree and the published tree would keep flipping
+    #    ~/.local/bin back and forth.
     local userbin="$HOME/.local/bin"
     if ! suite_links_to "$userbin/$tool" "$dir"; then
-        mkdir -p "$userbin" 2>/dev/null
-        suite_link_all "$dir" "$userbin" "" || true
-        [[ -L "$userbin/$tool" ]] && \
-            printf "  ${C_DIM}linked the suite into %s so the tools work from anywhere${C_RESET}\n" "$userbin" >&2
+        if [[ -L "$userbin/$tool" ]] && ! suite_links_to "$userbin/$tool" "$dir" \
+           && [[ -e "$(readlink -f "$userbin/$tool" 2>/dev/null)" ]]; then
+            :   # points at another live copy of the suite — leave it alone
+        else
+            mkdir -p "$userbin" 2>/dev/null
+            suite_link_all "$dir" "$userbin" "" || true
+            [[ -L "$userbin/$tool" ]] && \
+                printf "  ${C_DIM}linked the suite into %s so the tools work from anywhere${C_RESET}\n" "$userbin" >&2
+        fi
         case ":$PATH:" in
             *":$userbin:"*) : ;;
             *) printf "  ${C_DIM}%s is not on your PATH yet — add it to ~/.bashrc: export PATH=\"%s:$PATH\"${C_RESET}\n" \

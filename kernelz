@@ -1972,7 +1972,7 @@ cmd_latest() {
     gather_kernel_facts
     # A copy of the suite whose lib/ files are out of step with the tool
     # would die with a bare "command not found". Say what is actually wrong.
-    kb_check_module "kb_latest_trusted kb_recommend" || { emit_verdict; return 0; }
+    kb_check_module kb_latest_trusted kb_recommend || { emit_verdict; return 0; }
     if [[ $EUID -ne 0 && -z "$SUDO" ]]; then
         critf "Privileges" "no root and no sudo available" "run as root"
         emit_verdict
