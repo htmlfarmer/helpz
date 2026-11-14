@@ -17,6 +17,8 @@
 #   ./powerz --no-color      # plain output
 #   ./powerz --json          # machine-readable summary
 #   ./powerz --watch 5       # refresh every 5 seconds (Ctrl+C to stop)
+#   ./powerz bill --kwh=N    # reproduce a printed electricity bill and read
+#                            # off its true all-in cents/kWh for --rate
 #
 # Requires: none (sysfs only)
 # Optional: nvidia-smi (NVIDIA GPUs), bc
@@ -33,7 +35,27 @@ MEASURE_SECS=10
 
 # Default electricity rate (cents per kilowatt-hour).
 # Override with --rate=11  or --rate=20  (cents/kWh)
+#
+# NOTE: this is a FLAT rate. Real utility bills are usually TIERED and
+# often change mid-period, so a flat default will not match a printed
+# bill — use `powerz bill` to reproduce one and read off the true all-in
+# cents/kWh (total $ ÷ total kWh), then pass that to --rate.
 RATE_CENTS_KWH=11
+
+# ── `powerz bill` mode parameters (see calc_bill) ─────────────────────────
+BILL_MODE=0
+B_KWH=""            # total kWh on the bill (required)
+B_DAYS=30           # billing period length in days
+B_CHG=0             # days billed at the OLD rate before a rate change
+B_BASIC=0           # fixed monthly service charge ($)
+B_TIER1=""          # size in kWh of the first (cheaper) tier
+B_R1A=""            # cents/kWh, tier 1, first period
+B_R1B=""            # cents/kWh, tier 1, after the rate change
+B_R2A=""            # cents/kWh, tier 2 (above tier1), first period
+B_R2B=""            # cents/kWh, tier 2, after the rate change
+B_TAX=0             # per-kWh tax in DOLLARS (e.g. 0.000923)
+B_FRAN=0            # franchise/fee percent of (basic + energy)
+B_EXPECT=""         # printed total from the bill, to verify against
 START_TS=$(date +%s)
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
 HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
@@ -42,13 +64,45 @@ JSON_FIELDS=()
 # ---------- Args ----------
 ARGS=("$@")
 i=0
-while [[ $i -lt $# ]]; do
+# Bound on ${#ARGS[@]}, NOT on $#.
+# --json below calls `shift`, which decrements $# — so a loop bounded by
+# $# terminates one entry early and silently DROPS THE LAST FLAG whenever
+# --json appears. That is how `powerz bill --json ... --franchise=3` lost
+# its franchise fee (total came out $118.15 instead of $121.67), and it
+# also silently dropped trailing flags in the original probe.
+while [[ $i -lt ${#ARGS[@]} ]]; do
   arg="${ARGS[$i]}"
   case "$arg" in
     --watch=*)    WATCH_INTERVAL="${arg#--watch=}" ;;
     --watch)      i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-5}" ;;
     --rate=*)     RATE_CENTS_KWH="${arg#--rate=}" ;;
     --rate)       i=$((i+1)); RATE_CENTS_KWH="${ARGS[$i]:-11}" ;;
+    # ── tiered-bill mode: `powerz bill --kwh=N ...` ──────────────────────
+    bill)         BILL_MODE=1 ;;
+    --kwh=*)      B_KWH="${arg#--kwh=}" ;;
+    --kwh)        i=$((i+1)); B_KWH="${ARGS[$i]:-}" ;;
+    --days=*)     B_DAYS="${arg#--days=}" ;;
+    --days)       i=$((i+1)); B_DAYS="${ARGS[$i]:-30}" ;;
+    --change-after=*) B_CHG="${arg#--change-after=}" ;;
+    --change-after)   i=$((i+1)); B_CHG="${ARGS[$i]:-0}" ;;
+    --basic=*)    B_BASIC="${arg#--basic=}" ;;
+    --basic)      i=$((i+1)); B_BASIC="${ARGS[$i]:-0}" ;;
+    --tier1=*)    B_TIER1="${arg#--tier1=}" ;;
+    --tier1)      i=$((i+1)); B_TIER1="${ARGS[$i]:-}" ;;
+    --rate1=*)    B_R1A="${arg#--rate1=}" ;;
+    --rate1)      i=$((i+1)); B_R1A="${ARGS[$i]:-}" ;;
+    --rate1b=*)   B_R1B="${arg#--rate1b=}" ;;
+    --rate1b)     i=$((i+1)); B_R1B="${ARGS[$i]:-}" ;;
+    --rate2=*)    B_R2A="${arg#--rate2=}" ;;
+    --rate2)      i=$((i+1)); B_R2A="${ARGS[$i]:-}" ;;
+    --rate2b=*)   B_R2B="${arg#--rate2b=}" ;;
+    --rate2b)     i=$((i+1)); B_R2B="${ARGS[$i]:-}" ;;
+    --tax=*)      B_TAX="${arg#--tax=}" ;;
+    --tax)        i=$((i+1)); B_TAX="${ARGS[$i]:-0}" ;;
+    --franchise=*) B_FRAN="${arg#--franchise=}" ;;
+    --franchise)   i=$((i+1)); B_FRAN="${ARGS[$i]:-0}" ;;
+    --expect=*)   B_EXPECT="${arg#--expect=}" ;;
+    --expect)     i=$((i+1)); B_EXPECT="${ARGS[$i]:-}" ;;
     --no-color)   NO_COLOR=1 ;;
         --json)
             JSON_OUT=1
@@ -83,16 +137,49 @@ USAGE
   ./powerz --no-color      Plain output
   ./powerz --json          Machine-readable summary
   ./powerz --watch 5       Refresh every 5 seconds (Ctrl+C to stop)
+  ./powerz bill --kwh=N    Reproduce a printed electricity bill and read off
+                           its true all-in cents/kWh for --rate
 
 OPTIONS
   --watch[=N]     Re-run every N seconds (default 5)
   --accuracy      Compare power/cost estimates against RAPL/battery counters,
                   log history to ~/.powerz/accuracy.tsv, grade the guesses
   --measure[=N]   Sampling window for --accuracy in seconds (default 10)
-  --rate[=N]      Electricity rate in cents/kWh (default 11)
+  --rate[=N]      Electricity rate in cents/kWh (default 11 — see BILL below)
   --no-color      Disable colors
   --json          Output JSON summary
   -h, --help      Show this help
+
+BILL MODE   ./powerz bill --kwh=N [flags]
+  Real bills are TIERED, often change rate MID-PERIOD, and usually add a
+  fixed service charge, a per-kWh tax and a percentage fee. A flat --rate
+  cannot represent that, which is why the default can be far off.
+
+  --kwh=N            Total kWh billed              (required)
+  --days=N           Billing period in days        (default 30)
+  --change-after=N   Days billed at the old rate before a rate change
+                     (prorates every tier across the two spans)
+  --basic=N          Fixed service charge in $     (default 0)
+  --tier1=N          Size in kWh of the cheaper first tier
+                     (omit for a flat, untiered bill)
+  --rate1=N          cents/kWh, tier 1, first period
+  --rate1b=N         cents/kWh, tier 1, after the change   (default = rate1)
+  --rate2=N          cents/kWh, tier 2 (above tier1)       (default = rate1)
+  --rate2b=N         cents/kWh, tier 2, after the change   (default = rate2)
+  --tax=N            Per-kWh tax in DOLLARS e.g. 0.000923  (default 0)
+  --franchise=P      Percentage fee on (basic + energy)    (default 0)
+  --expect=N         Total printed on the bill — verifies the arithmetic.
+                     Mismatches are a CRITICAL finding, not a warning.
+
+  Example — an 851.55 kWh, 29-day bill with a rate change on day 13:
+
+    ./powerz bill --kwh=851.55 --days=29 --change-after=13 \
+      --basic=20 --tier1=600 \
+      --rate1=10.598 --rate1b=11.424 --rate2=11.886 --rate2b=12.712 \
+      --tax=0.000923 --franchise=3 --expect=121.67
+
+  The all-in rate it prints (total $ / total kWh) is the number to feed
+  back into --rate, so the probe's cost estimate matches the bill.
 
 ALTERNATIVE COMMANDS
   upower -i $(upower -e | grep BAT)   Detailed battery info (needs upower)
@@ -136,6 +223,138 @@ fi
 # Source run comparison helper
 if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then
   source "$SCRIPT_DIR/lib/run_comparison.sh"
+fi
+
+# ---------- `powerz bill` — reproduce a printed (tiered) bill ----------
+#
+# Utility bills are rarely a flat rate: there is usually a fixed service
+# charge, a cheaper first tier of kWh, a steeper tier above it, a per-kWh
+# tax, and a percentage fee. Many also change rate MID-PERIOD, in which
+# case the utility prorates each tier across the two rate spans by day.
+#
+# Everything here is reverse-engineered arithmetic that reproduces a real
+# bill line-for-line; --expect lets you assert the printed total so a
+# wrong formula cannot pass silently.
+calc_bill() {
+    if [[ -z "${B_KWH:-}" ]]; then
+        critf "Bill" "powerz bill needs --kwh=N (the kWh total on your bill)" \
+            "example: powerz bill --kwh=851.55 --days=29 --change-after=13 --basic=20 --tier1=600 --rate1=10.598 --rate1b=11.424 --rate2=11.886 --rate2b=12.712 --tax=0.000923 --franchise=3"
+        emit_verdict
+    fi
+
+    # defaults so a single-rate bill needs only --kwh and --rate1
+    [[ -z "$B_R1A" ]] && B_R1A="$RATE_CENTS_KWH"
+    [[ -z "$B_R1B" ]] && B_R1B="$B_R1A"
+    [[ -z "$B_R2A" ]] && B_R2A="$B_R1A"
+    [[ -z "$B_R2B" ]] && B_R2B="$B_R1B"
+    # a change before day 0 or after the period means no change
+    [[ -z "$B_CHG" || "$B_CHG" -le 0 || "$B_CHG" -ge "$B_DAYS" ]] && B_CHG=0
+
+    section "BILL CALCULATION"
+    kpi "kWh"        "$B_KWH"
+    kpi "period"     "${B_DAYS} days"
+    (( B_CHG > 0 )) && kpi "rate change" "after ${B_CHG} days (${B_R1A}¢ → ${B_R1B}¢ in tier 1)"
+    kpi "basic"      "\$${B_BASIC}"
+    [[ -n "$B_TIER1" ]] && kpi "tier 1 size" "${B_TIER1} kWh" || kpi "tier 1 size" "unbounded (flat)"
+
+    local out
+    out=$(awk \
+        -v kwh="$B_KWH" -v days="$B_DAYS" -v chg="$B_CHG" -v t1="${B_TIER1:-0}" \
+        -v basic="$B_BASIC" -v tax="$B_TAX" -v fran="$B_FRAN" \
+        -v r1a="$B_R1A" -v r1b="$B_R1B" -v r2a="$B_R2A" -v r2b="$B_R2B" '
+        BEGIN {
+            t1 = t1 + 0
+            band1 = (t1 > 0) ? ((kwh < t1) ? kwh : t1) : 0
+            band2 = kwh - band1
+            if (chg > 0) { f_old = chg / days; f_new = (days - chg) / days }
+            else         { f_old = 1; f_new = 0 }
+
+            k1a = band1 * f_old; c1a = k1a * r1a / 100
+            k1b = band1 * f_new; c1b = k1b * r1b / 100
+            k2a = band2 * f_old; c2a = k2a * r2a / 100
+            k2b = band2 * f_new; c2b = k2b * r2b / 100
+
+            energy = c1a + c1b + c2a + c2b
+            taxamt = kwh * tax
+            fr     = (basic + energy) * fran / 100
+            total  = basic + energy + taxamt + fr
+            allin  = (kwh > 0) ? total / kwh * 100 : 0
+
+            # when there is no tier boundary (t1==0) everything sits in
+            # band2 — label it "flat rate" rather than a meaningless "tier2"
+            l1 = (t1 > 0) ? "tier1" : "flat rate"
+            l2 = (t1 > 0) ? "tier2" : "flat rate"
+
+            # tab-separated so bash can render it in the house style
+            printf "item\tkWh\t\tamount\n"
+            if (basic  > 0) printf "Basic charge\t-\t$ %.2f\n", basic
+            if (band1 > 0) {
+                if (f_new > 0)
+                    printf "  %s old (%.4f¢)\t%.5f\t$ %.4f\n", l1, r1a, k1a, c1a
+                if (f_old > 0 && f_new > 0)
+                    printf "  %s new (%.4f¢)\t%.5f\t$ %.4f\n", l1, r1b, k1b, c1b
+                else if (f_new == 0)
+                    printf "  %s (%.4f¢)\t%.5f\t$ %.4f\n", l1, r1a, k1a, c1a
+            }
+            if (band2 > 0) {
+                if (f_new > 0)
+                    printf "  %s old (%.4f¢)\t%.5f\t$ %.4f\n", l2, r2a, k2a, c2a
+                if (f_old > 0 && f_new > 0)
+                    printf "  %s new (%.4f¢)\t%.5f\t$ %.4f\n", l2, r2b, k2b, c2b
+                else if (f_new == 0)
+                    printf "  %s (%.4f¢)\t%.5f\t$ %.4f\n", l2, r2a, k2a, c2a
+            }
+            if (taxamt > 0) printf "Per-kWh tax\t%.5f\t$ %.4f\n", kwh, taxamt
+            if (fr > 0)     printf "Franchise %.0f%%\t-\t$ %.4f\n", fran, fr
+            printf "TOTAL\t%.5f\t$ %.4f\n", kwh, total
+            printf "ALLIN\t\t$ %.6f\t%.6f\n", total, allin
+        }')
+
+    local line item kwhpart amount
+    table_begin "item" "kWh" "amount"
+    while IFS=$'\t' read -r item kwhpart amount; do
+        [[ -z "$item" || "$item" == "item" ]] && continue
+        [[ "$item" == "ALLIN" ]] && continue
+        [[ "$item" == "TOTAL" ]] && { total_line="$amount"; continue; }
+        table_row "$item" "$kwhpart" "$amount"
+    done <<<"$out"
+    table_end
+
+    local allin
+    allin=$(awk -F'\t' '$1=="ALLIN"{print $4}' <<<"$out")
+    emit "\n  ${C_BOLD}total${C_RESET}        ${C_GREEN}${total_line}${C_RESET}\n"
+    emit "  ${C_BOLD}all-in rate${C_RESET} ${C_GREEN}${allin}¢/kWh${C_RESET}  ${C_DIM}(total \$ ÷ total kWh)${C_RESET}\n"
+    emit "  ${C_DIM}use this, not the flat default:${C_RESET} ./powerz --rate=$(awk -v a="$allin" 'BEGIN{printf "%.2f", a}')\n\n"
+
+    if [[ -n "${B_EXPECT:-}" ]]; then
+        # BUG FIX: total_line is a FORMATTED string ("$ 12.0000"). Passing it
+        # straight to awk as -v t= makes `(t<0)` a STRING comparison, because
+        # "$ 12.0000" does not look numeric — and '$' (0x24) sorts before
+        # '0' (0x48), so the test was TRUE for EVERY positive total. The
+        # ternary then took the -t branch, yielded 0, and --expect reported
+        # "matches exactly" no matter what number you gave it.
+        # Strip to bare digits first, then compare as numbers.
+        local tv diff
+        tv=$(printf '%s' "$total_line" | tr -cd '0-9.')
+        [[ -z "$tv" ]] && tv=0
+        diff=$(awk -v t="$tv" -v e="$B_EXPECT" 'BEGIN{d=t-e; if(d<0)d=-d; printf "%.2f", d}')
+        if awk "BEGIN{exit !($diff < 0.011)}"; then
+            ok "matches the printed bill exactly (\$$B_EXPECT)"
+        else
+            critf "Bill" "recomputed total differs from the printed bill by \$${diff}" \
+                "check tier sizes, day counts and whether the fee base includes the tax"
+        fi
+    fi
+
+    JSON_FIELDS+=("\"bill_kwh\":${B_KWH}" "\"bill_total\":${total_line#\$}" "\"bill_rate_cents\":${allin}")
+    emit_verdict
+}
+
+# The bill branch runs before any hardware probing: it needs no sensors,
+# and running the probe first would waste time and pollute the output.
+if [[ "$BILL_MODE" == "1" ]]; then
+    calc_bill
+    exit $?
 fi
 
 # Initialize run comparison (skip for JSON/watch modes)
