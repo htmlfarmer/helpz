@@ -448,8 +448,12 @@ if [[ $JSON_OUT -eq 0 ]]; then
     read -r _g_full _g_mid _g_light <<< "$(chart_glyphs)"
     if (( _jt > 0 )); then
       _bw=44
+      # Every non-zero bucket gets at least ONE cell. Integer division put
+      # 251 warnings (0.9% of 28k info lines) at 0 cells, so the bar read
+      # "█ then all ░" while the legend below it advertised a ▓ segment that
+      # was never drawn.
       _n1=$(( _jc * _bw / _jt )); (( _n1 < 1 && _jc > 0 )) && _n1=1
-      _n2=$(( _jw * _bw / _jt ))
+      _n2=$(( _jw * _bw / _jt )); (( _n2 < 1 && _jw > 0 )) && _n2=1
       _n3=$(( _bw - _n1 - _n2 )); (( _n3 < 0 )) && _n3=0
       _bar=""
       (( _n1 > 0 )) && _bar+="${C_RED}$(chart_repeat "$_g_full" "$_n1")${C_RESET}"
@@ -520,11 +524,11 @@ else
             ERR_LINES=$(journal_window -p err..err | tail -6)
             [[ -n "$ERR_LINES" ]] && printf '%s\n' "$ERR_LINES" \
               | awk -v d="$C_DIM" -v r="$C_RESET" '
-                  # Only a timestamped line has fields to strip; a journal
-                  # continuation line is message text - show it, indented,
-                  # instead of eating its first three words.
+                  # Keep the timestamp: two failures of the same unit at
+                  # different times are two events, not one line pasted
+                  # twice. Only a continuation line gets indented instead.
                   /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/ {
-                    $1=""; $2=""; $3=""; print "    " d "|" r " " substr($0,4); next
+                    print "    " d "|" r " " $0; next
                   }
                   { sub(/^[ \t]+/, ""); print "    " d "|" r "   " $0 }'
           fi
@@ -601,7 +605,13 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     crit "$PANIC kernel panic / hardware error events"
     run_journal | grep -iE "kernel panic|hardware error|machine check" \
       | tail -3 \
-      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+      | awk '{
+          # Keep the timestamp. Stripping it made four lines from ONE kill
+          # (and separate failures of the same unit) look like the same line
+          # pasted twice — the reader sees a duplicate, not two events.
+          if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " $0; next }
+          sub(/^[ \t]+/, ""); print "        " $0
+        }'
   else
     ok "No kernel panics"
   fi
@@ -612,7 +622,13 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     warn "$SEGFAULT segfault events"
     run_journal | grep -iE "segfault|signal 11" \
       | tail -3 \
-      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+      | awk '{
+          # Keep the timestamp. Stripping it made four lines from ONE kill
+          # (and separate failures of the same unit) look like the same line
+          # pasted twice — the reader sees a duplicate, not two events.
+          if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " $0; next }
+          sub(/^[ \t]+/, ""); print "        " $0
+        }'
   else
     ok "No segfaults"
   fi
@@ -628,7 +644,13 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     crit "$MCE hardware/memory errors - check DIMMs and CPU"
     run_journal | grep -iE "machine check exception|mce:|edac.*error" \
       | tail -3 \
-      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+      | awk '{
+          # Keep the timestamp. Stripping it made four lines from ONE kill
+          # (and separate failures of the same unit) look like the same line
+          # pasted twice — the reader sees a duplicate, not two events.
+          if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " $0; next }
+          sub(/^[ \t]+/, ""); print "        " $0
+        }'
     printf "      ${C_GREEN}fix:${C_RESET} sudo dmesg | grep -iE 'mce|edac|machine check'\n"
   else
     ok "No MCE / hardware errors"
@@ -647,7 +669,7 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     warn "$SUDO_FAIL failed sudo attempts"
     _sf=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
           | grep -iE "sudo.*(authentication failure;|incorrect password)" | tail -3)
-    [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{$1="";$2="";$3="";print "    " d "|" r " " substr($0,4)}'
+    [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{ if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " d "|" r " " $0; next } sub(/^[ \t]+/,""); print "    " d "|" r "   " $0 }'
   else
     ok "No failed sudo attempts"
   fi
@@ -658,7 +680,7 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     crit "$SSH_FAIL SSH authentication failures - possible brute force"
     _sf=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
           | grep -iE "sshd.*(authentication failure;|failed password)" | tail -3)
-    [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{$1="";$2="";$3="";print "    " d "|" r " " substr($0,4)}'
+    [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{ if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " d "|" r " " $0; next } sub(/^[ \t]+/,""); print "    " d "|" r "   " $0 }'
     printf "      ${C_GREEN}fix:${C_RESET} sudo sshauditz        ${C_DIM}(full SSH audit)${C_RESET}\n"
   else
     ok "No SSH auth failures"
@@ -779,10 +801,12 @@ $_sl"
       | grep -aE "Failed|Stopped" \
       | tail -10 \
       | awk '
-          # Same as elsewhere: only strip a timestamp when there is one,
-          # otherwise this eats the first three words of continuation lines.
+          # Keep the timestamp. Stripping it turned five separate failures
+          # (each writing "Failed with result" + "Failed to start") into ten
+          # lines that looked copy-pasted. Continuation lines are indented
+          # instead of losing their first three words.
           /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/ {
-            $1=""; $2=""; $3=""; print "    " substr($0,4); next
+            print "    " $0; next
           }
           { sub(/^[ \t]+/, ""); print "        " $0 }')
     if [[ -n "$_recent" ]]; then
@@ -1035,8 +1059,12 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
         if (msg == "") return
         # Only the genuinely volatile parts are masked. Replacing EVERY digit
         # destroyed the meaning ("10-kill-slumber" became "N-kill-slumber"),
-        # so only the PID and IP addresses are touched.
+        # so only the PID and IP addresses are touched. Both PID spellings
+        # count: "[3453060]" (the program tag) and "(pid 3464358)" (inline).
+        # Masking only the first one left eight copies of ONE NVRM warning in
+        # the top-10, each differing solely by the client's pid.
         gsub(/\[[0-9]+\]/, "[N]", msg)
+        gsub(/\(pid[ =][0-9]+\)/, "(pid [N])", msg)
         gsub(/([0-9]{1,3}\.){3}[0-9]{1,3}/, "<ip>", msg)
         gsub(/[ \t]+/, " ", msg)
         sub(/^ /, "", msg)

@@ -3,6 +3,29 @@
 # lib/common.sh - Shared utilities for Security & Diagnostic Suite
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# sudo resets HOME to /root. That is wrong for this suite: the state
+# directory, the build directory, the logs and the saved reports all belong
+# to the human, not to root. It also makes tools forget what they did —
+# "sudo kernelz build" would look in /root/linux-build and happily compile a
+# kernel that is already sitting in /home/asher/linux-build. Put HOME back
+# before anything below reads it.
+# ---------------------------------------------------------------------------
+_kz_uid="${EUID:-$(id -u)}"
+if [[ "$_kz_uid" -eq 0 ]]; then
+    _kz_home=""
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        _kz_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    elif [[ -n "${SUDO_UID:-}" && "$SUDO_UID" != "0" ]]; then
+        _kz_home=$(getent passwd "$SUDO_UID" 2>/dev/null | cut -d: -f6)
+    fi
+    if [[ -n "$_kz_home" && -d "$_kz_home" ]]; then
+        export HOME="$_kz_home"
+    fi
+    unset _kz_home
+fi
+unset _kz_uid
+
 # ---------- Global Counters & State ----------
 WARNINGS=0
 CRITICAL=0
