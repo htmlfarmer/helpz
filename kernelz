@@ -60,7 +60,11 @@ source "$SCRIPT_DIR/lib/common.sh"   # resets JSON_OUT/NO_COLOR — parse AFTER 
 
 DRY_RUN=0; FORCE=0; ASSUME_YES=0; WANT_IO=0; BENCH_FULL=0; APPLY_FIX=0; APPLY_FIX=0
 TO_PKG=""
-SETTLE_DAYS=""; WANT_NEWEST=0
+SETTLE_DAYS=""; WANT_NEWEST=0; APT_ONLY=0
+# The distro kernel meta package makes apt pull the distro's kernel in. On a
+# box moving to a source-built kernel that is usually NOT wanted, so it is
+# opt-in there.
+WANT_META=1
 BUILD_VER=""; BUILD_LTS=0; BUILD_JOBS=""; BUILD_MINIMAL=0; BUILD_GIT=0
 BUILD_DIR="${BUILD_DIR:-$HOME/linux-build}"
 ARGS=("$@")
@@ -98,6 +102,9 @@ while [[ $# -gt 0 ]]; do
         --settle)    shift; SETTLE_DAYS="${1:-}" ;;
         --settle=*)  SETTLE_DAYS="${1#--settle=}" ;;
         --newest)    WANT_NEWEST=1 ;;
+        --apt-only)  APT_ONLY=1 ;;
+        --meta)      WANT_META=1 ;;
+        --no-meta)   WANT_META=0 ;;
         -h|--help)   COMMAND="help" ;;
         show|compare) [[ "$COMMAND" == "bench" ]] && { shift; continue; }
                       printf 'kernelz: unknown option "%s" (try --help)\n' "$1" >&2; exit 64 ;;
@@ -670,6 +677,32 @@ kb_check_module() {   # kb_check_module <fn> ... -> 0 when all exist
     return 1
 }
 
+# What will 'kernelz upgrade' ACTUALLY do? Resolved once, so the report and
+# the action can never disagree.
+KB_PLAN_ROUTE=""; KB_PLAN_PKG=""; KB_PLAN_VER=""; KB_PLAN_SERIES=""; KB_PLAN_UP=""
+kb_plan_target() {
+    [[ -n "$KB_PLAN_ROUTE" ]] && return 0
+    KB_PLAN_ROUTE=""; KB_PLAN_PKG=""; KB_PLAN_VER=""; KB_PLAN_SERIES=""; KB_PLAN_UP=""
+    local mode="stable"; (( BUILD_LTS )) && mode="lts"
+    kb_latest_trusted "$mode" || return 1
+    local tser="$KB_LATEST_SER" tgt="$KB_LATEST_VER"
+    if (( KB_LATEST_FRESH == 1 )); then
+        # The newest branch is brand new — not trusted yet. Take the distro's
+        # own kernel instead.
+        KB_PLAN_ROUTE="apt"; KB_PLAN_PKG="$KB_BEST_PKG"; KB_PLAN_VER="$KB_BEST_VER"
+        KB_PLAN_SERIES="$KB_BEST_SERIES"
+        return 0
+    fi
+    if kb_repo_pick_for "$tser"; then
+        KB_PLAN_ROUTE="apt"; KB_PLAN_PKG="$KB_PICK_PKG"; KB_PLAN_VER="$KB_PICK_VER"
+        KB_PLAN_SERIES="$tser"; KB_PLAN_UP="$KB_PICK_UP"
+        return 0
+    fi
+    KB_PLAN_ROUTE="build"; KB_PLAN_VER="$tgt"; KB_PLAN_SERIES="$tser"
+    KB_PLAN_PKG="linux-image-${tgt}-kz"
+    return 0
+}
+
 # ============================================================================
 # HELP
 # ============================================================================
@@ -1000,15 +1033,21 @@ section_best() {
     fi
 
     # ---- the verdict ----
+    # The headline is the TARGET (what an upgrade will install). The distro's
+    # own pick is shown underneath as the fallback it would use instead.
     local tierlbl
     tierlbl=$(kb_tier_label "$KB_BEST_TIER")
-    printf "  ${C_BOLD}${C_BLUE}RECOMMENDED${C_RESET}  ${C_BOLD}${KB_BEST_VER}${C_RESET}  ${C_DIM}(${KB_BEST_PKG})${C_RESET}\n"
-    if [[ -n "$KB_BEST_PKG" ]]; then
-        printf "  ${C_BOLD}Will install${C_RESET}   ${C_BOLD}%s${C_RESET}  %s  ${C_DIM}(series %s)${C_RESET}\n" \
-            "$KB_BEST_PKG" "$KB_BEST_VER" "$KB_BEST_SERIES"
-    fi
-    kzl "Why this one" "${C_BOLD}${tierlbl}${C_RESET} — series $KB_BEST_SERIES · branch open $(kb_series_age_days "$KB_BEST_SERIES" 2>/dev/null || echo '?')d"
     local bage; bage=$(kb_series_age_days "$KB_BEST_SERIES" 2>/dev/null || echo "")
+    if kb_plan_target; then
+        if [[ "$KB_PLAN_ROUTE" == "build" ]]; then
+            printf "  ${C_BOLD}${C_BLUE}TARGET${C_RESET}        ${C_BOLD}${KB_PLAN_VER}${C_RESET}  ${C_DIM}(series ${KB_PLAN_SERIES})${C_RESET}\n"
+            printf "  ${C_DIM}route:${C_RESET}       ${C_BOLD}built from source${C_RESET} ${C_DIM}— your distro does not package series ${KB_PLAN_SERIES}${C_RESET}\n"
+        else
+            printf "  ${C_BOLD}${C_BLUE}TARGET${C_RESET}        ${C_BOLD}${KB_PLAN_VER}${C_RESET}  ${C_DIM}(series ${KB_PLAN_SERIES}, via apt${KB_PLAN_UP:+, upstream $KB_PLAN_UP})${C_RESET}\n"
+            printf "  ${C_DIM}route:${C_RESET}       ${C_BOLD}${KB_PLAN_PKG}${C_RESET} ${C_DIM}— installed by your distro, security-updated${C_RESET}\n"
+        fi
+    fi
+    printf "  ${C_DIM}distro ships${C_RESET} ${KB_BEST_VER} ${C_DIM}(series ${KB_BEST_SERIES}) — ${tierlbl}${C_RESET}\n"
     case "$KB_BEST_TIER" in
         1)
             printf "      ${C_DIM}the newest regular stable kernel your distro ships — the %s branch${C_RESET}\n" "$KB_BEST_SERIES"
@@ -1033,7 +1072,7 @@ section_best() {
         else
             printf "      ${C_DIM}upstream's newer stable branch %s (%s) opened %d day(s) ago —${C_RESET}\n" \
                 "$KB_STABLE_SER" "$KB_STABLE_VER" "$sage"
-            printf "      ${C_DIM}it is settled, but your distro does not package it yet${C_RESET}\n"
+            printf "      ${C_DIM}it is settled, so it is the target above${C_RESET}\n"
         fi
     fi
     printf "\n"
@@ -1327,7 +1366,11 @@ run_risk_checks() {
 
     # Kernel meta package: without it `apt upgrade` stops tracking kernels
     if [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]]; then
-        warnf "KernelMeta" "$META_PKG not installed — 'sudo apt upgrade' will NOT track kernel updates" "kernelz protect installs it"
+        if (( WANT_META == 0 )); then
+            info "$META_PKG not installed — on purpose for a source-built kernel (apt would pull the distro kernel in too)"
+        else
+            warnf "KernelMeta" "$META_PKG not installed — 'sudo apt upgrade' will NOT track kernel updates" "kernelz protect installs it"
+        fi
     elif [[ -n "$META_PKG" ]]; then
         ok "$META_PKG installed — apt upgrade keeps pulling kernel updates"
     fi
@@ -1756,6 +1799,55 @@ cmd_upgrade() {
     section_snapshot
     ensure_best
 
+    # =====================================================================
+    # WHICH KERNEL?
+    # The goal is upstream's CURRENT STABLE branch — the newest code that
+    # has had time to bake. Not the long-term branch (the safe fallback),
+    # and not a branch that opened five minutes ago.
+    #
+    #   distro packages that branch  -> install it through apt (tested + patched)
+    #   distro does not package it    -> compile it, same GRUB one-shot net
+    #   --apt-only                    -> never compile; take the distro's own
+    # =====================================================================
+    if [[ -z "$TO_PKG" ]] && (( APT_ONLY == 0 )); then
+        local mode="stable"; (( BUILD_LTS )) && mode="lts"
+        if with_spin "checking kernel.org" kb_latest_trusted "$mode"; then
+            local tser="$KB_LATEST_SER" tgt="$KB_LATEST_VER"
+            if (( KB_LATEST_FRESH == 1 )); then
+                printf "  ${C_YELLOW}·${C_RESET} upstream's current stable branch %s opened only %d day(s) ago — not trusted yet\n" \
+                    "$tser" "$(( KB_SETTLE_DAYS - KB_LATEST_WAIT ))"
+                printf "  ${C_DIM}  falling back to your distro's tested kernel. Use --settle=0 to take it anyway.${C_RESET}\n"
+            elif kb_repo_pick_for "$tser"; then
+                printf "  ${C_GREEN}✓${C_RESET} your distro packages series %s — installing it through apt\n" "$tser"
+                printf "    ${C_DIM}target: %s %s%s\n" "$KB_PICK_PKG" "$KB_PICK_VER" \
+                    "$( [[ -n "$KB_PICK_UP" ]] && printf ' (upstream %s)' "$KB_PICK_UP" )"
+                TO_PKG="$KB_PICK_PKG"
+                add_json_field upgrade_target_series "$tser"
+                add_json_field upgrade_target_version "$KB_PICK_VER"
+                add_json_field upgrade_route "apt"
+            else
+                printf "  ${C_YELLOW}·${C_RESET} your distro does not package series %s (newest it ships: %s)\n" \
+                    "$tser" "${KB_BEST_VER:-nothing}"
+                printf "  ${C_DIM}  compiling %s from source instead — same GRUB one-shot net:%s\n" "$tgt" "${C_RESET}"
+                printf "  ${C_DIM}  %s boots once; if it fails, the next reboot lands back on %s by itself.${C_RESET}\n\n" "$tgt" "$REL"
+                BUILD_VER="$tgt"
+                WANT_META=0
+                # An upgrade request means DO it — compile, install, arm the
+                # GRUB net. Without this the build route stopped after printing
+                # a plan and handed the user a second command to run.
+                (( DRY_RUN )) || APPLY_FIX=1
+                add_json_field upgrade_target_series "$tser"
+                add_json_field upgrade_target_version "$tgt"
+                add_json_field upgrade_route "build"
+                kz_hist "upgrade target=$tgt route=build series=$tser"
+                cmd_build
+                return 0
+            fi
+        else
+            info "could not read kernel.org — using your distro's own kernel"
+        fi
+    fi
+
     heading "── PLAN ──"
     local target_pkg="" target_rel="" downgrade=0 target_pin=""
     if [[ -n "$TO_PKG" ]]; then
@@ -2075,6 +2167,7 @@ cmd_latest() {
 
     # ---- route 2: build it (same safety net) ----
     BUILD_VER="$tgt"
+    WANT_META=0
     add_json_field latest_target "$tgt"
     add_json_field latest_series "$tser"
     add_json_field latest_route "build"
@@ -2384,6 +2477,7 @@ cmd_build() {
         "${CFG_LABEL} → make olddefconfig$( ((BUILD_MINIMAL)) && echo ' → localmodconfig (only loaded modules — much smaller/faster)')" \
         "append -kz localversion (uname → $UP_VER-kz: apt has no idea it exists — it can never be wiped or collided with) + make -j$JOBS_N bindeb-pkg" \
         "sudo dpkg -i the debs (initramfs + GRUB entries are created by the package hooks)" \
+        "DKMS modules (nvidia et al) are recompiled against the new kernel by the package hooks — verified before the reboot" \
         "GRUB default stays on $REL; new kernel boots ONCE via grub-reboot (same net as kernelz upgrade)" \
         "reboot → ./kernelz verify promotes it once the boot is healthy"; do
         printf "  ${C_BOLD}%d.${C_RESET} %s\n" "$i" "$step"; i=$((i+1))
@@ -2396,8 +2490,14 @@ cmd_build() {
         # when the reader got here through `kernelz latest`, the copy-pasteable
         # way back is `latest` (it picks the same target again) — not `build`.
         local sub="build"; [[ "$COMMAND" == "latest" ]] && sub="latest"
+        # Keep the version pinned: without --ver the next run would pick
+        # whatever upstream published since, not the version just built.
+        local vpin=""; [[ -n "$BUILD_VER" ]] && vpin="--ver $BUILD_VER "
         printf "  ${C_GREEN}→${C_RESET} run everything now (build + install + safety net):\n"
-        printf "      ${C_BOLD}sudo %s %s %s-y${C_RESET}\n" "${0##*/}" "$sub" "$( ((BUILD_LTS)) && echo '--lts ' )"
+        printf "      ${C_BOLD}sudo %s %s %s-y${C_RESET}\n" "${0##*/}" "$sub" "$vpin"
+        if ls "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb >/dev/null 2>&1; then
+            printf "      ${C_DIM}(the %s artifacts are already built — this installs them, it does not recompile)${C_RESET}\n" "$UP_VER"
+        fi
         printf "  ${C_GREEN}→${C_RESET} or compile yourself, then let kernelz wire the safety net:\n"
         printf "      ${C_BOLD}bash %s${C_RESET}  ${C_DIM}(long part — logs in $BUILD_DIR)${C_RESET}\n" "$BUILD_SCRIPT"
         printf "      ${C_BOLD}sudo %s build --apply --ver %s${C_RESET}  ${C_DIM}(installs artifacts + grub one-shot)${C_RESET}\n" "${0##*/}" "$UP_VER"
@@ -2423,10 +2523,20 @@ cmd_build() {
         }
     fi
 
-    if [[ "$BUILD_FLAVOR" == "deb" ]]; then
+    # A re-run must not redo work that is already done: if the kernel is
+    # already on disk, skip straight to the GRUB safety net.
+    local already_installed=""
+    for _v in /boot/vmlinuz-"$UP_VER"*; do
+        [[ -e "$_v" ]] && { already_installed="${_v##*/vmlinuz-}"; break; }
+    done
+    if [[ -n "$already_installed" ]]; then
+        heading "── B. install packages ──"
+        ok "kernel $already_installed is already installed — nothing to install"
+        info "going straight to the GRUB safety net"
+    elif [[ "$BUILD_FLAVOR" == "deb" ]]; then
         heading "── B. install packages ──"
         shopt -s nullglob
-        local -a debs=( "$BUILD_DIR"/linux-image_*"$UP_VER"*.deb "$BUILD_DIR"/linux-headers_*"$UP_VER"*.deb \
+        local -a debs=( "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb "$BUILD_DIR"/linux-headers-*"$UP_VER"*.deb \
                         "$BUILD_DIR"/linux-libc-dev_*.deb )
         shopt -u nullglob
         (( ${#debs[@]} )) || { critf "BuildFail" "no debs found in $BUILD_DIR after build" "check script output"; emit_verdict; }
@@ -2445,6 +2555,54 @@ cmd_build() {
     new_rel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -vx "$REL" | sort -V | tail -1)
     [[ -z "$new_rel" ]] && { critf "VerifyFail" "dpkg ran but no new /boot/vmlinuz-* appeared" "check dpkg output above; nothing to boot" ; emit_verdict; }
     ok "new kernel on disk: $new_rel"
+
+    # ── DKMS / GPU modules ──────────────────────────────────────────────
+    # The proprietary drivers (nvidia) are DKMS modules: they are compiled
+    # AGAINST each kernel. A new kernel without them boots to a black
+    # screen, so this is checked before the reboot, not after.
+    heading "── B2. third-party modules (DKMS) for $new_rel ──"
+    if ! command -v dkms >/dev/null 2>&1; then
+        info "dkms not installed — no third-party modules to rebuild"
+    else
+        local dk_all dk_new dk_missing
+        dk_all=$(timeout 30 dkms status 2>/dev/null)
+        dk_new=$(printf '%s\n' "$dk_all" | grep -F "$new_rel" || true)
+        # Per module: every DKMS module that exists for some other kernel
+        # should exist for the new one too. nvidia is the one that matters.
+        dk_missing=$(printf '%s\n' "$dk_all" | awk -v k="$new_rel" '
+            { mods[$1]=1; if ($2==k) built[$1]=1 }
+            END { for (m in mods) if (!(m in built)) printf "%s ", m }')
+        if [[ -z "$dk_all" ]]; then
+            info "dkms reports no modules at all"
+        elif [[ -n "$dk_missing" ]]; then
+            warnf "Dkms" "DKMS module(s) not built for $new_rel:${dk_missing} — the driver will be missing" \
+                "build them now: sudo dkms autoinstall -k $new_rel && sudo depmod -a $new_rel"
+            printf "      ${C_DIM}without them the box boots without a GPU driver (black screen / no 3D)${C_RESET}\n"
+        else
+            ok "every DKMS module is built for $new_rel:"
+            printf '%s\n' "$dk_new" | sed 's/^/      ${C_DIM}│${C_RESET} /'
+        fi
+        # An "installed" DKMS module for the new kernel still has to have
+        # produced its .ko — that is what the module loader actually needs.
+        local ko_missing=""
+        local mod ver inst
+        while read -r mod ver inst; do
+            [[ -z "$mod" ]] && continue
+            [[ "$inst" != "installed" ]] && continue
+            [[ "$ver" != "$new_rel" ]] && continue
+            if ! ls /lib/modules/"$new_rel"/updates/dkms/"$mod"*.ko >/dev/null 2>&1; then
+                ko_missing="$ko_missing $mod"
+            fi
+        done < <(dkms status 2>/dev/null | awk '{print $1, $2, $3}')
+        if [[ -n "$ko_missing" ]]; then
+            warnf "Dkms" "DKMS module(s) installed but no .ko in /lib/modules/$new_rel/updates/dkms/:${ko_missing}" \
+                "rebuild them: sudo dkms autoinstall -k $new_rel && sudo depmod -a $new_rel"
+        fi
+        # A running nvidia GPU makes this a hard requirement, not a nicety.
+        if command -v nvidia-smi >/dev/null 2>&1 && pgrep -x nvidia-smi >/dev/null 2>&1; then
+            printf "      ${C_DIM}an nvidia GPU is in use on this box — its driver MUST build for ${new_rel}${C_RESET}\n"
+        fi
+    fi
 
     heading "── C. GRUB safety net (new kernel boots ONCE, default stays known-good) ──"
     state_write last_good "$REL"
@@ -2481,6 +2639,7 @@ TS=$(date +%s)"
     ok "pending: $new_rel (source:$UP_VER) — verify after reboot"
 
     heading "── E. shield the fallback line from sudo apt upgrade ──"
+    WANT_META=0
     if [[ "$BUILD_FLAVOR" == "deb" ]]; then
         info "your $REL fallback IS an apt package — protect keeps 'sudo apt upgrade' from ever removing it"
         protect_apply 1
@@ -2489,6 +2648,37 @@ TS=$(date +%s)"
     fi
 
     kz_hist "build apply ver=$UP_VER new_rel=$new_rel flavor=$BUILD_FLAVOR"
+
+    # ---- what the machine looks like now ----
+    # An earlier run may have installed a distro kernel (the meta package)
+    # that was never wanted. Show every kernel that is present and what it
+    # is for, so the pile is never a mystery.
+    local v mark stray=""
+    printf "\n  ${C_DIM}kernels on this machine now:${C_RESET}\n"
+    while read -v v; do
+        [[ -z "$v" ]] && continue
+        mark=""
+        [[ "$v" == "$REL" ]] && mark="${C_GREEN}  <- running now${C_RESET}"
+        [[ "$v" == "$new_rel" ]] && mark="${C_CYAN}  <- new, boots once, then you verify it${C_RESET}"
+        printf "    %-30s%s\n" "$v" "$mark"
+        if [[ "$v" != "$REL" && "$v" != "$new_rel" ]]; then
+            stray="$stray $v"
+        fi
+    done < <(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||')
+    if [[ -n "$stray" ]]; then
+        printf "  ${C_DIM}also present (not running, harmless):%s${C_RESET}\n" "$stray"
+        printf "  ${C_DIM}drop them when you are happy with the new kernel: sudo %s cleanup${C_RESET}\n" "${0##*/}"
+    fi
+    # The distro meta package is the thing that makes apt pull the distro's
+    # own kernel (the LTS) in and keep tracking it. On a box that has moved
+    # to a source-built kernel it is usually a leftover worth removing.
+    if [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" == ii* ]]; then
+        printf "  ${C_YELLOW}note:${C_RESET} %s is installed — every 'sudo apt upgrade' will keep pulling the\n" "$META_PKG"
+        printf "        ${C_YELLOW}distro kernel (%s) alongside your %s${C_RESET}\n" "${META_CAND:-the LTS}" "$new_rel"
+        printf "        ${C_DIM}drop the meta package (the kernel itself stays as your fallback):${C_RESET}\n"
+        printf "        ${C_BOLD}sudo apt-get remove %s${C_RESET}\n" "$META_PKG"
+    fi
+
     section "NEXT STEPS"
     printf "  ${C_BOLD}1.${C_RESET} reboot now:            ${C_CYAN}sudo reboot${C_RESET}\n"
     printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verify${C_RESET}  ${C_DIM}(promotes %s to permanent default)${C_RESET}\n" "${0##*/}" "$new_rel"
@@ -2510,7 +2700,17 @@ protect_apply() {   # 1 = apply fixes now
     local protected_now=0
 
     # 1) meta-package keeps the distro pulling kernels
-    if [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]]; then
+    #
+    #    Careful: the meta package is what PULLS the distro's own kernel in.
+    #    On a box that is moving to a source-built kernel (-kz) that is not
+    #    wanted — it is exactly how a long-term-branch kernel (6.1.x) ends
+    #    up installed on a machine that never asked for it, and then every
+    #    apt upgrade tracks it. So it is opt-in there.
+    if [[ "$WANT_META" -eq 0 ]]; then
+        info "skipping the $META_PKG meta package — your kernel is a source build, and the meta package"
+        info "would only make apt keep pulling the distro kernel (${META_CAND:-the LTS}) alongside it"
+        info "add --meta if you want the distro kernel tracked as well"
+    elif [[ -n "$META_PKG" ]] && [[ "$(pkg_state "$META_PKG")" != ii* ]]; then
         if [[ "$PROTECT_APPLY" -eq 1 ]]; then
             if pkg_install "$META_PKG"; then
                 if [[ "$DRY_RUN" -eq 1 ]]; then info "would install $META_PKG — future kernels arrive via $PKG_UPGRADE_CMD"
