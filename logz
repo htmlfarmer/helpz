@@ -576,13 +576,16 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # The patterns must be specific: a bare "oom" also matches filenames
   # like population_lOWZOOM_check.py, which is not a memory problem.
   #
-  # Count KILL RECORDS, not matching lines. One kill writes 4-5 lines
+  # Count DISTINCT VICTIMS, not matching lines. One kill writes 4-5 lines
   # ("invoked oom-killer", "oom-kill:constraint=...", "Memory cgroup out of
   # memory: Killed process N ...", "Failed with result 'oom-kill'"), so
   # counting every match reported "8 OOM-kill events" for a single dead
-  # process. "Killed process <pid>" is the one line that names the victim:
-  # it appears exactly once per kill.
-  OOM=$(run_journal | grep -aciE "killed process [0-9]+")
+  # process. "kill process <n>" catches both kernel phrasings ("Killed
+  # process 3453060" and "Out of memory: Kill process 3453060"); sorting
+  # the pids keeps one kill counted once even when both lines are present.
+  OOM=$(run_journal | grep -aoiE "kill(ed)? process [0-9]+" \
+        | grep -oE "[0-9]+" | sort -u | wc -l)
+  [[ "$OOM" =~ ^[0-9]+$ ]] || OOM=0
   if (( OOM > 0 )); then
     _s=""; (( OOM > 1 )) && _s="s"
     crit "$OOM OOM kill$_s - something is leaking memory"
@@ -1062,7 +1065,7 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
         # so only the PID and IP addresses are touched. Both PID spellings
         # count: "[3453060]" (the program tag) and "(pid 3464358)" (inline).
         # Masking only the first one left eight copies of ONE NVRM warning in
-        # the top-10, each differing solely by the client's pid.
+        # the top-10, each differing solely by the client pid.
         gsub(/\[[0-9]+\]/, "[N]", msg)
         gsub(/\(pid[ =][0-9]+\)/, "(pid [N])", msg)
         gsub(/([0-9]{1,3}\.){3}[0-9]{1,3}/, "<ip>", msg)
@@ -1114,9 +1117,6 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   if [[ $JSON_OUT -eq 0 ]] && [[ -n "$RECURRING_ROWS" ]]; then
     subsec "Distribution chart (most -> least frequent)"
     local_chart_data=()
-    # First pass: program + full message text, TAB-separated so the message
-    # can keep its spaces.
-    declare -A _prog_n=()
     while IFS= read -r row; do
       [[ -z "$row" ]] && continue
       cnt=$(awk '{print $1}' <<< "$row")
@@ -1135,22 +1135,21 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
       prog=${prog// /}                            # program names have no spaces
       [[ -z "$prog" ]] && prog="?"
       local_chart_data+=("$cnt"$'\t'"$prog"$'\t'"$msg")
-      _prog_n["$prog"]=$(( ${_prog_n["$prog"]:-0} + 1 ))
     done <<< "$RECURRING_ROWS"
-    # Second pass: a bare program name is unreadable when the same program
-    # logs several different messages - three identical "systemd" bars
-    # appeared here. Duplicates get a short snippet of their own message.
+    # Second pass: build the label. ALWAYS show a snippet of the message,
+    # not just the program name — a bare "systemd[N]" bar told the reader
+    # nothing about which message it was, and keying the snippet on
+    # "is this program duplicated?" gave singletons no text at all.
+    # Trim msg first: it starts with the space that followed "kernel:",
+    # which was printing as "kernel:  [UFW BLOCK]".
     _chart_out=()
     for r in "${local_chart_data[@]}"; do
       IFS=$'\t' read -r cnt prog msg <<< "$r"
-      if (( ${_prog_n["$prog"]:-0} > 1 )); then
-        snip=$(printf '%s' "$msg" | tr -s ' ' | cut -c1-24)
-        (( ${#msg} > 24 )) && snip="${snip}…"
-        lbl="$prog: $snip"
-      else
-        lbl="$prog"
-      fi
-      _chart_out+=("$cnt"$'\t'"$lbl")
+      msg=$(printf '%s' "$msg" | tr -s ' ' | sed 's/^ *//;s/ *$//')
+      snip=$(printf '%s' "$msg" | cut -c1-30)
+      (( ${#msg} > 30 )) && snip="${snip}…"
+      [[ -z "$snip" ]] && snip="(empty)"
+      _chart_out+=("$cnt"$'\t'"$prog: $snip")
     done
     local_max=0 local_total=0
     for r in "${_chart_out[@]}"; do
