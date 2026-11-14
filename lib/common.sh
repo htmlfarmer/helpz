@@ -8,7 +8,7 @@
 # directory, the build directory, the logs and the saved reports all belong
 # to the human, not to root. It also makes tools forget what they did —
 # "sudo kernelz build" would look in /root/linux-build and happily compile a
-# kernel that is already sitting in /home/asher/linux-build. Put HOME back
+# kernel that is already sitting in $HOME/linux-build. Put HOME back
 # before anything below reads it.
 # ---------------------------------------------------------------------------
 _kz_uid="${EUID:-$(id -u)}"
