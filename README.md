@@ -58,7 +58,7 @@ export PATH="$PWD:$PATH"       # or: ln -s "$PWD" ~/.local/bin/ztools
 | `nextz` | "What should I run next?" — prescriptive router over recent findings |
 | `pciz` | PCI/PCIe bus diagnostic |
 | `portz` | Listening Services & Exposure Auditor |
-| `powerz` | Battery & power subsystem diagnostic |
+| `powerz` | Power, battery & electricity-bill diagnostic |
 | `printerz` | Printer Log Scanner & Debugger |
 | `pullz` | Git pull with a rollback point and a preview of what's coming |
 | `pushz` | Push to GitHub with a secret/leak gate in front of it |

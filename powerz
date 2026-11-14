@@ -3,7 +3,7 @@
 # shellcheck source=.helpz_log.sh
 . "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
-# powerz - Battery & power subsystem diagnostic
+# powerz - Power, battery & electricity-bill diagnostic
 # ----------------------------------------------------------------------------
 # Inspects AC adapter, battery health (wear, cycle count, voltage), charge/
 # discharge power rates, runtime estimates, suspend modes (s2idle vs deep),
