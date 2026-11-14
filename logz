@@ -554,7 +554,16 @@ else
   # and warning above as if they were notice/info (their report: 1874
   # "notice/info" that contained all 1623 warnings), and dropped real
   # info-level lines. notice..info is the pair the label promises.
-  NCOUNT=$(journal_count "notice..info")
+  #
+  # Reuse AT A GLANCE's number when it took one: a second query seconds
+  # later on a journal doing ~8 msg/s reads higher (their report showed
+  # 28234 in the mix bar and 28258 here), and two different answers to
+  # the same question in one report reads as a bug.
+  if [[ "${_jn:-}" =~ ^[0-9]+$ ]]; then
+    NCOUNT=$_jn
+  else
+    NCOUNT=$(journal_count "notice..info")
+  fi
   [[ "$NCOUNT" =~ ^[0-9]+$ ]] || NCOUNT=0
   info "$NCOUNT notice/info messages"
 
