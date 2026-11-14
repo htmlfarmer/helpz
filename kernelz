@@ -43,7 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # ---------- Commands & flags ----------
 COMMAND="status"
 case "${1:-}" in
-    status|check|study|upgrade|update|latest|build|verify|verified|recover|protect|bench|cleanup|history|fix|best|recommend)
+    status|check|study|about|info|upgrade|update|latest|build|verify|verified|recover|protect|bench|cleanup|history|fix|best|recommend)
         COMMAND="$1"; shift ;;
     -h|--help) COMMAND="help" ;;
     ""|-*) ;;
@@ -759,6 +759,10 @@ USAGE
   ./kernelz best                Just the best-kernel verdict and what it fixes
   ./kernelz study               Deep study: config hardening, CVE changelog,
                                 CPU mitigations, taint, boot ledger
+  ./kernelz about               What THIS running kernel is built with: identity,
+                                command line (annotated), preemption model,
+                                memory/hardening/storage setup, driver versions,
+                                and how its config differs from distro stock
   ./kernelz upgrade             Install the best (tested) kernel + GRUB safety net
                                 Debian/Ubuntu (apt) · Fedora/RHEL (dnf) · Arch (pacman)
   ./kernelz update              Alias for upgrade
@@ -1619,6 +1623,219 @@ run_risk_checks() {
     if [[ -n "$perr" ]] && (( perr > 0 )); then
         warnf "PriorBoot" "$perr error lines in the previous boot" "journalctl -b -1 -p err   (or ./bootz --boot -1)"
     fi
+}
+
+# ── about: describe the RUNNING kernel's setup ─────────────────────────────
+#
+# `study` reports on kernels that are AVAILABLE; `best` picks one. Neither
+# answers the question "what is the thing I am actually running built
+# with, how is it configured, and how does it differ from stock?" — so
+# this does.
+#
+# Everything here is read from /proc and /sys, and every read degrades to
+# "needs root" rather than failing: only /sys/kernel/debug/sched/preempt
+# requires privileges, and without it we fall back to the CONFIG_PREEMPT_*
+# flags in the config file.
+cmd_about() {
+    gather_kernel_facts
+    record_boot
+
+    local rel; rel=$(uname -r)
+    local vfile; vfile=$(cat /proc/version 2>/dev/null)
+    # /proc/version: "Linux version <rel> (<builder>) (<compiler>) #N <flavour> <date>"
+    # The compiler field contains NESTED parens (gcc (Debian ...) 12.2.0), so
+    # naive non-greedy sed stops at the wrong one — take the first paren
+    # group as the builder, then everything up to ") #" as the compiler.
+    local rest builder compiler flavour build_date
+    rest="${vfile#Linux version ${rel} }"
+    rest="${rest#(}";  builder="${rest%%)*}"
+    rest="${rest#*) }"
+    compiler="${rest%%\) #*}"; compiler="${compiler#(}"
+    # date is a fixed 6-token tail: "Sat Nov 14 04:07:17 PST 2026"
+    build_date=$(grep -oE '[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]+ [0-9:]+ [A-Z]+ [0-9]{4}' <<<"$vfile" | head -1)
+    flavour=$(sed -E "s/^.*#1 //; s/ *${build_date}.*$//" <<<"$vfile")
+
+    section "KERNEL IDENTITY"
+    kpi "release"     "$rel"
+    kpi "flavour"     "${flavour:-unknown}   (SMP + preemption model)"
+    kpi "built by"    "${builder:-unknown}"
+    kpi "compiler"    "${compiler:-unknown}"
+    kpi "built"       "${build_date:-unknown}"
+    kpi "package"     "${CUR_PKG:-not a package kernel} ${CUR_VER:+($CUR_VER)}"
+    [[ "${CUR_HELD:-0}" == "1" ]] && kpi "held" "yes — apt upgrade will not replace it"
+
+    # localversion is appended by the build (echo '-kz' > localversion-kernelz)
+    local lv=""
+    [[ -r "/boot/config-$rel" ]] && lv=$(grep -E "^CONFIG_LOCALVERSION=" "/boot/config-$rel" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    # The -kz suffix comes from `echo -kz > localversion-kernelz` in the
+    # build, NOT from CONFIG_LOCALVERSION (which is empty) — showing
+    # CONFIG_LOCALVERSION alone as "localversion" was contradictory.
+    kpi "uname suffix"  "-${rel##*-}   (appended by localversion-kernelz at build)"
+    kpi "CONFIG_LOCALVERSION" "${lv:-<empty>}"
+    ok "uname -r = $rel"
+
+    # ── command line, annotated ───────────────────────────────────────────
+    section "COMMAND LINE"
+    local cmd; cmd=$(cat /proc/cmdline 2>/dev/null)
+    emit "  ${C_DIM}%s${C_RESET}\n" "$cmd"
+    local tok
+    for tok in $cmd; do
+        case "$tok" in
+            transparent_hugepage=never)
+                ok "THP disabled — removes synchronous-compaction stalls (kcompactd/compact_stall)" ;;
+            preempt=*)
+                ok "preemption pinned to '${tok#preempt=}' (PREEMPT_DYNAMIC: switchable at boot)" ;;
+            mitigations=*)
+                warn "explicit mitigations= override: ${tok#mitigations=}" "kernel defaults are safer unless you measured a reason" ;;
+            nopti|nosmap|nosmep|nokaslr|noibrs|noibpb)
+                crit "security mitigation disabled: $tok" "re-enable unless you own the threat model" ;;
+            swapfile=*) : ;;
+        esac
+    done
+    grep -q "preempt=" <<<"$cmd" \
+        || info "no preempt= set — using the build default (see PREEMPTION below)"
+
+    # ── preemption ────────────────────────────────────────────────────────
+    section "PREEMPTION"
+    local pm=""
+    # tr/sed strip the trailing newline+padding so the value is clean in
+    # both the table and the JSON ("full (lazy)" not "full (lazy) ").
+    pm=$(sudo -n cat /sys/kernel/debug/sched/preempt 2>/dev/null | tr -d '\n' | sed 's/[[:space:]]*$//') || true
+    if [[ -n "$pm" ]]; then
+        kpi "active model" "$pm"
+    else
+        info "active model: needs root (cat /sys/kernel/debug/sched/preempt)"
+    fi
+    local cfg="/boot/config-$rel"
+    if [[ -r "$cfg" ]]; then
+        local dyn lazy
+        dyn=$(grep -c "^CONFIG_PREEMPT_DYNAMIC=y" "$cfg" 2>/dev/null || echo 0)
+        lazy=$(grep -c "^CONFIG_PREEMPT_LAZY=y" "$cfg" 2>/dev/null || echo 0)
+        if (( dyn > 0 )); then
+            ok "CONFIG_PREEMPT_DYNAMIC=y — model switchable at boot via preempt=, NO rebuild needed"
+            kpi "switchable to" "none · voluntary · lazy · full"
+        else
+            warn "no CONFIG_PREEMPT_DYNAMIC — preemption model is baked into .config" "changing it costs a full rebuild"
+        fi
+        (( lazy > 0 )) && info "CONFIG_PREEMPT_LAZY=y — lazy preemption accounting (lower overhead)"
+    fi
+
+    # ── memory (the knobs this machine actually runs) ─────────────────────
+    section "MEMORY SETUP"
+    kpi "swappiness"        "$(sysctl -n vm.swappiness 2>/dev/null)"
+    kpi "overcommit"        "$(sysctl -n vm.overcommit_memory 2>/dev/null)  ($( [[ "$(sysctl -n vm.overcommit_memory 2>/dev/null)" == 1 ]] && echo 'always' || echo 'heuristic'))"
+    kpi "min_free_kbytes"   "$(sysctl -n vm.min_free_kbytes 2>/dev/null)"
+    kpi "dirty_ratio"       "$(sysctl -n vm.dirty_ratio 2>/dev/null)"
+    kpi "page-cluster"      "$(sysctl -n vm.page-cluster 2>/dev/null)"
+    local thp; thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -oE "\[[a-z]+\]" | tr -d '[]')
+    kpi "THP"               "${thp:-unknown}"
+    if [[ "${thp:-}" == "never" ]]; then
+        ok "THP off — no compact_stall stalls"
+    else
+        warn "THP = ${thp:-unknown} — can cause compact_stall stalls under load" "echo never > /sys/kernel/mm/transparent_hugepage/enabled"
+    fi
+    local zs; zs=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)
+    local zc; zc=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null)
+    kpi "zswap"             "$([ "$zs" = Y ] && echo "on (${zc:-?})" || echo off)"
+    kpi "zram"              "$(swapon --show --noheadings 2>/dev/null | awk '/zram/{print $3" @"$5}' | head -1 || echo none)"
+
+    # ── hardening ─────────────────────────────────────────────────────────
+    section "HARDENING"
+    local kp; kp=$(sysctl -n kernel.kptr_restrict 2>/dev/null)
+    local dm; dm=$(sysctl -n kernel.dmesg_restrict 2>/dev/null)
+    local as; as=$(sysctl -n kernel.randomize_va_space 2>/dev/null)
+    local yp; yp=$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null)
+    local ub; ub=$(sysctl -n kernel.unprivileged_bpf_disabled 2>/dev/null)
+    kpi "kptr_restrict"  "${kp:-?}  ($( (( ${kp:-0} >= 1 )) && echo ok || echo 'kernel pointers visible'))"
+    kpi "dmesg_restrict" "${dm:-?}  ($( (( ${dm:-0} >= 1 )) && echo ok || echo 'world-readable dmesg'))"
+    kpi "ASLR"           "${as:-?}  ($( (( ${as:-0} == 2 )) && echo 'full' || echo 'partial'))"
+    kpi "yama ptrace"    "${yp:-?}  ($( (( ${yp:-0} >= 1 )) && echo ok || echo 'any process may ptrace'))"
+    kpi "unpriv BPF"     "${ub:-?}  ($( [[ "$ub" == 2 || "$ub" == 1 ]] && echo disabled || echo ALLOWED))"
+    # mitigations are ON by default unless the cmdline turns them off
+    if grep -qE "nopti|nosmap|nosmep|nokaslr|mitigations=off" <<<"$cmd"; then
+        crit "one or more CPU mitigations disabled on the command line"
+    else
+        ok "CPU mitigations at kernel defaults (no nopti/nosmap/nosmep/nokaslr/mitigations=off)"
+    fi
+
+    # ── storage ───────────────────────────────────────────────────────────
+    section "STORAGE"
+    local rootdev; rootdev=$(findmnt -no SOURCE / 2>/dev/null)
+    local rootfstype; rootfstype=$(findmnt -no FSTYPE / 2>/dev/null)
+    local rootopts; rootopts=$(findmnt -no OPTIONS / 2>/dev/null)
+    kpi "root"          "${rootdev:-?} (${rootfstype:-?})"
+    kpi "mount opts"    "${rootopts:-?}"
+    # rootdev is a PARTITION (/dev/sda2) but the scheduler lives on the
+    # whole disk (/sys/block/sda/...). `${rootdev%%[0-9]*}` left the
+    # "/dev/" prefix in place, so the path never existed and this always
+    # printed "unknown". lsblk's pkname gives the parent for any scheme
+    # (sda2 → sda, nvme0n1p2 → nvme0n1).
+    local rootblk sched
+    rootblk=$(lsblk -no pkname "$rootdev" 2>/dev/null | head -1 | tr -d '[:space:]')
+    [[ -z "$rootblk" ]] && rootblk=${rootdev#/dev/}
+    sched=$(cat "/sys/block/$rootblk/queue/scheduler" 2>/dev/null | tr -d '\n' | sed 's/[[:space:]]*$//')
+    kpi "root disk"      "$rootblk"
+    kpi "I/O scheduler"  "${sched:-unknown}"
+    if grep -q "noatime" <<<"$rootopts"; then
+        ok "root mounted noatime"
+    elif grep -q "relatime" <<<"$rootopts"; then
+        info "root mounted relatime (the modern default — fine)"
+    fi
+
+    # ── drivers ───────────────────────────────────────────────────────────
+    section "DRIVERS"
+    local nvmod nvuser
+    nvmod=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}' /proc/driver/nvidia/version 2>/dev/null)
+    nvuser=$(ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.* 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    if [[ -n "$nvmod" ]]; then
+        if [[ -n "$nvuser" && "$nvmod" != "$nvuser" ]]; then
+            crit "NVIDIA: kernel module $nvmod != userspace $nvuser" "DKMS rebuild + reboot — this is what breaks nvidia-smi"
+        else
+            ok "NVIDIA kernel module $nvmod matches userspace"
+        fi
+    else
+        info "no NVIDIA kernel module loaded"
+    fi
+    if command -v dkms >/dev/null 2>&1; then
+        local dks; dks=$(dkms status 2>/dev/null | grep -cF "$rel")
+        kpi "DKMS for this kernel" "$dks module(s) built"
+        (( dks == 0 )) && warn "no DKMS modules built for $rel" "run: sudo dkms autoinstall -k $rel"
+    fi
+
+    # ── how this differs from the distro stock kernel ─────────────────────
+    section "DELTA VS STOCK"
+    local stock
+    stock=$(ls -1 /boot/config-6.* 2>/dev/null | grep -v -- "-kz" | sort -V | tail -1)
+    if [[ -n "$stock" && -r "$stock" && -r "$cfg" ]]; then
+        kpi "stock ref"  "$(basename "$stock")"
+        local added removed
+        added=$(comm -13 <(grep -E "^(CONFIG_|# CONFIG_)" "$stock" 2>/dev/null | sort) \
+                         <(grep -E "^(CONFIG_|# CONFIG_)" "$cfg" 2>/dev/null | sort) | wc -l)
+        removed=$(comm -23 <(grep -E "^(CONFIG_|# CONFIG_)" "$stock" 2>/dev/null | sort) \
+                           <(grep -E "^(CONFIG_|# CONFIG_)" "$cfg" 2>/dev/null | sort) | wc -l)
+        kpi "options changed" "$added added / $removed removed vs stock"
+        if [[ "${added:-0}" -eq 0 && "${removed:-0}" -eq 0 ]]; then
+            info "config is identical to the stock kernel"
+        else
+            info "full diff: diff <(grep CONFIG $stock) <(grep CONFIG $cfg)"
+        fi
+    else
+        info "no stock kernel config available to compare against"
+    fi
+
+    emit "\n  ${C_DIM}Tip: kernelz study = available kernels · kernelz bench = this boot's speed${C_RESET}\n"
+
+    # Same contract as the other subcommands: a verdict block in human mode,
+    # a JSON object in --json mode, and an exit code reflecting findings.
+    # Without this, `about --json` printed NOTHING — section()/kpi()/ok()
+    # are all no-ops when JSON_OUT=1 and this function emitted no JSON of
+    # its own.
+    add_json_field kernel_release "$rel"
+    add_json_field preempt_model "${pm:-unknown}"
+    add_json_field thp_mode "${thp:-unknown}"
+    add_json_field nvidia_module "${nvmod:-none}"
+    add_json_field io_scheduler "${sched:-unknown}"
+    emit_verdict
 }
 
 cmd_status() {
@@ -3768,6 +3985,7 @@ cmd_fix() {
 # ============================================================================
 case "$COMMAND" in
     help)    show_help ;;
+    about|info) cmd_about ;;
     status|check) cmd_status ;;
     study)   cmd_study ;;
     best|recommend) cmd_best ;;
