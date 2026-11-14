@@ -571,12 +571,25 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # OOM kills
   # The patterns must be specific: a bare "oom" also matches filenames
   # like population_lOWZOOM_check.py, which is not a memory problem.
-  OOM=$(count_journal "oom-kill|out of memory|killed process|oom_reaper|systemd-oomd|memory cgroup out of memory")
+  #
+  # Count KILL RECORDS, not matching lines. One kill writes 4-5 lines
+  # ("invoked oom-killer", "oom-kill:constraint=...", "Memory cgroup out of
+  # memory: Killed process N ...", "Failed with result 'oom-kill'"), so
+  # counting every match reported "8 OOM-kill events" for a single dead
+  # process. "Killed process <pid>" is the one line that names the victim:
+  # it appears exactly once per kill.
+  OOM=$(run_journal | grep -aciE "killed process [0-9]+")
   if (( OOM > 0 )); then
-    crit "$OOM OOM-kill events - something is leaking memory"
-    run_journal | grep -iE "oom-kill|out of memory|killed process|oom_reaper|systemd-oomd" \
+    _s=""; (( OOM > 1 )) && _s="s"
+    crit "$OOM OOM kill$_s - something is leaking memory"
+    run_journal | grep -aiE "oom-kill|out of memory|killed process|oom_reaper|systemd-oomd" \
       | tail -5 \
-      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}'
+      | awk '{
+          # Keep the timestamp: without it, four lines from ONE kill and
+          # two lines from another look like the same line pasted twice.
+          if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " $0; next }
+          sub(/^[ \t]+/, ""); print "        " $0
+        }'
     printf "      ${C_GREEN}fix:${C_RESET} sudo journalctl -k --since '$SINCE' | grep -iE 'oom|killed process'\n"
   else
     ok "No OOM kills"
@@ -605,7 +618,12 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   fi
 
   # Hardware errors (mce, edac, etc.)
-  MCE=$(count_journal "machine check exception|mce:|edac.*error|memory cgroup out of memory")
+  # Deliberately NOT "memory cgroup out of memory": that is an OOM kill, already
+  # reported two checks above. Leaving it in flagged a single OOM as
+  # "1 hardware/memory errors - check DIMMs and CPU", and the sample grep below
+  # doesn't know that pattern either — so the panel printed a count with no
+  # lines under it and sent the reader to grep dmesg for MCEs that weren't there.
+  MCE=$(count_journal "machine check exception|mce:|edac.*error")
   if (( MCE > 0 )); then
     crit "$MCE hardware/memory errors - check DIMMs and CPU"
     run_journal | grep -iE "machine check exception|mce:|edac.*error" \
