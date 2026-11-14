@@ -22,6 +22,8 @@
 #   ./kernelz study                  Deep kernel study (config, CVEs, mitigations)
 #   ./kernelz upgrade                Install latest kernel + GRUB safety net + protect
 #   ./kernelz update                 Alias for upgrade
+#   ./kernelz latest                 Newest UPSTREAM kernel: apt when the distro ships
+#                                    that series, source build when it does not
 #   ./kernelz build                  Compile the latest mainline from source (toolchain audit + GRUB safety net)
 #   ./kernelz verify                 After reboot: promote new kernel or report fallback
 #   ./kernelz recover                Force GRUB back to the last known good kernel
@@ -41,7 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # ---------- Commands & flags ----------
 COMMAND="status"
 case "${1:-}" in
-    status|check|study|upgrade|update|build|verify|recover|protect|bench|cleanup|history|fix|best|recommend)
+    status|check|study|upgrade|update|latest|build|verify|recover|protect|bench|cleanup|history|fix|best|recommend)
         COMMAND="$1"; shift ;;
     -h|--help) COMMAND="help" ;;
     ""|-*) ;;
@@ -487,6 +489,21 @@ ensure_best() {
     return 0
 }
 
+# The suite is several files that have to agree. When one lib/ file is
+# updated and its sibling is not (a half-finished publish, a stale copy in
+# ~/helpz), the tool dies with a bare "command not found". Check up front
+# and say what is actually wrong.
+kb_check_module() {   # kb_check_module <fn> ... -> 0 when all exist
+    local f missing=""
+    for f in "$@"; do
+        declare -F "$f" >/dev/null 2>&1 || missing="${missing} ${f}"
+    done
+    [[ -z "$missing" ]] && return 0
+    critf "StaleModule" "this copy of the suite is out of date — lib/kernelbest.sh does not define:${missing}" \
+        "update it: git -C ${SCRIPT_DIR} pull   (or re-publish: ./publishz from the source tree)"
+    return 1
+}
+
 # ============================================================================
 # HELP
 # ============================================================================
@@ -515,6 +532,17 @@ DESCRIPTION
   GRUB one-shot fallback net — a bad home-built kernel reboots itself
   back to the last known good one.
 
+  TWO DIFFERENT QUESTIONS
+  `kernelz upgrade` installs the newest kernel your DISTRO tests and ships.
+  On a distro that only packages a long-term branch, that is the safest
+  kernel — but it can be an OLDER branch than the one you already run, so it
+  is not "the latest". `kernelz latest` takes upstream's CURRENT STABLE
+  instead (never an end-of-life branch, age of the branch always reported)
+  and picks the route itself: apt when your distro ships that series, a
+  source build when it does not — same GRUB one-shot fallback either way.
+  Use `kernelz best` to see the distro's tested pick, `kernelz latest` to
+  see and take the newest one worth running.
+
   THE "LATEST BEST KERNEL" RULE
   Every run compares the kernel you are on against the newest kernel that is
   worth trusting — NOT the very latest (a release that landed days ago is
@@ -533,6 +561,11 @@ USAGE
   ./kernelz upgrade             Install the best (tested) kernel + GRUB safety net
   ./kernelz update              Alias for upgrade
   ./kernelz upgrade --newest    Take the very newest kernel instead of the tested one
+  ./kernelz latest              The NEWEST upstream kernel — not the distro's older
+                                branch. Installs through apt when your distro ships
+                                that series, compiles it when it does not; same GRUB
+                                one-shot fallback either way. Add --lts for the
+                                newest long-term branch instead of current stable
   ./kernelz build               Compile the LATEST MAINLINE from source: toolchain
                                 audit → sha256-verified download → bindeb-pkg →
                                 install → same GRUB one-shot safety net
@@ -567,7 +600,9 @@ OPTIONS
   --git              (build) shallow-tag git tree, incremental rebuilds across point releases
   --jobs=N           (build) compile parallelism (default: nproc)
   --dir=PATH         (build) build location (default ~/linux-build, needs ~25-30G)
-  --apply            (build) run the full pipeline instead of plan-only
+  --apply            (build/latest) run the full pipeline instead of plan-only;
+                     `latest` defaults to it, so the build happens after one
+                     confirmation prompt — add --dry-run for the plan only
   --io               Include disk benchmarks in `bench`
   --full             Include full benchmarkz run in `bench`
   --dry-run          Print what upgrade/protect would do, change nothing
@@ -730,7 +765,7 @@ section_best() {
     if [[ "$reol" == "1" ]]; then
         kzl "Series state" "${C_RED}${C_BOLD}END-OF-LIFE${C_RESET} — upstream no longer fixes series $rser"
         warnf "KernelEOL" "running series $rser is end-of-life upstream — no more security fixes will be published for it" \
-            "move to a supported kernel: kernelz best (shows the newest tested one)"
+            "move to a supported kernel: kernelz latest (newest upstream) · kernelz best (newest your distro ships)"
     elif [[ -n "$rser" ]] && [[ "$(kb_series_is_lts "$rser")" == "1" ]]; then
         kzl "Series state" "long-term branch — supported for years, but not the newest"
     else
@@ -760,7 +795,7 @@ section_best() {
                 local sage; sage=$(kb_series_age_days "$KB_STABLE_SER" 2>/dev/null || echo 0)
                 if (( sage >= KB_SETTLE_DAYS )); then
                     warnf "KernelGap" "your distro does not package upstream's current stable branch ($KB_STABLE_SER, open ${sage} days)" \
-                        "compile it yourself: ${0##*/} build (same GRUB safety net)"
+                        "take the newest: ${0##*/} latest (apt if the distro ships it, source build if not — same GRUB safety net)"
                 else
                     info "your distro does not package upstream's current stable branch ($KB_STABLE_SER) yet — it opened ${sage} day(s) ago"
                 fi
@@ -858,7 +893,8 @@ section_best() {
         # one in use — that is the long-term fallback, not a step forward.
         printf "  ${C_YELLOW}${C_BOLD}OLDER BRANCH AVAILABLE${C_RESET}  your distro's tested kernel is %s (series %s) —\n" \
             "$KB_BEST_VER" "$KB_BEST_SERIES"
-        printf "  ${C_DIM}an older branch than the %s you run. That is the long-term fallback, not a step forward.${C_RESET}\n\n" "$rser"
+        printf "  ${C_DIM}an older branch than the %s you run. That is the long-term fallback, not a step forward.${C_RESET}\n" "$rser"
+        printf "  ${C_DIM}Next: %s latest   (the newest upstream kernel — apt if the distro ships it, build if not)${C_RESET}\n\n" "${0##*/}"
     fi
 
     # ---- how to actually do it ----
@@ -909,6 +945,19 @@ section_howto_upgrade() {
         printf "       ${C_DIM}(no recommended kernel found — the repos have nothing to install)${C_RESET}\n"
     fi
     printf "       ${C_DIM}the new kernel boots ONCE; if it fails, the next reboot lands back on %s${C_RESET}\n" "$REL"
+
+    # 1b — the distro's pick is not always a step FORWARD: when it belongs to
+    #      an older branch than the kernel already running, say so and point
+    #      at the other route before the reader installs a downgrade.
+    if [[ -n "$KB_BEST_SERIES" ]]; then
+        local hser; hser=$(kb_running_series)
+        if [[ -n "$hser" && "$KB_BEST_SERIES" != "$hser" ]] && ! series_gt "$KB_BEST_SERIES" "$hser"; then
+            printf "       ${C_YELLOW}that is your distro's tested pick — but an OLDER branch than the %s you run.${C_RESET}\n" "$hser"
+            printf "       ${C_DIM}want the newest upstream instead (apt when the distro ships that series,\n"
+            printf "       ${C_DIM}source build when it does not — same GRUB fallback)?${C_RESET}\n"
+            printf "       ${C_CYAN}%s latest${C_RESET}\n" "$call"
+        fi
+    fi
 
     # 2 — reboot
     printf "  ${C_BOLD}2.${C_RESET} reboot into it:\n"
@@ -996,18 +1045,22 @@ section_fixes() {
         local r
         for r in "${reasons[@]}"; do printf "    ${C_YELLOW}▸${C_RESET} %b\n" "$r"; done
     fi
-    # the "neither branch is right" case: say what to do instead
+    # the "neither branch is right" case: say what to do instead.
+    # The settle window is measured against the BRANCH's birth (the X.Y.0
+    # release) everywhere else in kernelz — the patch's own age would
+    # understate how long this branch has been tested (7.3 opened 25 days
+    # ago even though 7.3.4 itself is 3 days old).
     if [[ "$reol" == "1" && -n "$KB_STABLE_VER" ]]; then
-        local sage; sage=$(kb_age_days "$KB_STABLE_DATE")
+        local sage; sage=$(kb_series_age_days "$KB_STABLE_SER" 2>/dev/null || echo 0)
         printf "\n"
         if (( sage < KB_SETTLE_DAYS )); then
-            printf "    ${C_CYAN}▸${C_RESET} upstream's current stable %s is only %d day(s) old — it will have settled in about %d day(s).\n" \
-                "$KB_STABLE_VER" "$sage" "$(( KB_SETTLE_DAYS - sage ))"
-            printf "    ${C_CYAN}▸${C_RESET} until then: %s build (compile it yourself, same GRUB safety net) or stay on a supported LTS.\n" "${0##*/}"
+            printf "    ${C_CYAN}▸${C_RESET} upstream's current stable %s (series %s) opened only %d day(s) ago — it settles in about %d day(s).\n" \
+                "$KB_STABLE_VER" "$KB_STABLE_SER" "$sage" "$(( KB_SETTLE_DAYS - sage ))"
+            printf "    ${C_CYAN}▸${C_RESET} until then: %s latest (takes it now, with the GRUB fallback) or stay on a supported LTS.\n" "${0##*/}"
         else
-            printf "    ${C_CYAN}▸${C_RESET} upstream's current stable %s has settled (%d days old) but your distro does not package it.\n" \
+            printf "    ${C_CYAN}▸${C_RESET} upstream's current stable %s is settled — its branch has been open %d days — but your distro does not package it.\n" \
                 "$KB_STABLE_VER" "$sage"
-            printf "    ${C_CYAN}▸${C_RESET} %s build compiles it for you, behind the same GRUB safety net.\n" "${0##*/}"
+            printf "    ${C_CYAN}▸${C_RESET} %s latest gets it for you — apt when the distro ships that series, build when it does not.\n" "${0##*/}"
         fi
     fi
     printf "\n"
@@ -1682,6 +1735,135 @@ TS=$TS_EPOCH"
 }
 
 # ============================================================================
+# LATEST — move to the newest upstream kernel worth trusting
+# ----------------------------------------------------------------------------
+# `upgrade` answers "what does my distro test and ship?" — on this box that is
+# the 6.1 long-term branch: well tested, but an OLDER branch than the kernel
+# already running. `latest` answers the other question, "what is the newest
+# kernel worth running?", and picks the delivery route itself:
+#
+#     · distro packages that branch  → apt install (distro-tested, patched)
+#     · distro does not              → compile it, same GRUB one-shot net
+#
+# Either way the current kernel stays the permanent default until the new one
+# has proved itself (`kernelz verify`), so a bad jump boots itself back.
+# ============================================================================
+cmd_latest() {
+    gather_kernel_facts
+    # A copy of the suite whose lib/ files are out of step with the tool
+    # would die with a bare "command not found". Say what is actually wrong.
+    kb_check_module "kb_latest_trusted kb_recommend" || { emit_verdict; return 0; }
+    if [[ $EUID -ne 0 && -z "$SUDO" ]]; then
+        critf "Privileges" "no root and no sudo available" "run as root"
+        emit_verdict
+    fi
+    if dpkg --audit 2>/dev/null | grep -qiE 'half-installed|half-configured|not fully installed'; then
+        warnf "Preflight" "dpkg database has unfinished installs — kernel hooks may fail mid-upgrade" \
+            "run 'kernelz fix --apply' first (or continue; install will show the same error)"
+    fi
+    # `latest` means "take me there": default to the full pipeline, gated by
+    # the same confirmation prompt every source build gets. --dry-run previews
+    # the plan (and writes the build script) without compiling anything.
+    if (( DRY_RUN )); then APPLY_FIX=0; else APPLY_FIX=1; fi
+
+    # --ver pins an exact version, which is what `build --ver` is for. Refuse
+    # rather than silently ignoring the pin and building something else.
+    if [[ -n "$BUILD_VER" ]]; then
+        critf "Target" "kernelz latest picks its own target — --ver pins an exact version, which is 'build --ver'" \
+            "run: ${0##*/} build --ver $BUILD_VER   (or drop --ver from latest)"
+        emit_verdict
+    fi
+
+    ensure_best
+
+    local mode="stable"; (( BUILD_LTS )) && mode="lts"
+    if ! with_spin "querying kernel.org" kb_latest_trusted "$mode"; then
+        critf "Upstream" "cannot read kernel.org's release table (offline, and no cached copy?)" \
+            "retry online — or take a distro kernel: ${0##*/} upgrade · pin one: ${0##*/} build --ver X.Y.Z"
+        emit_verdict
+    fi
+
+    local tgt="$KB_LATEST_VER" tser="$KB_LATEST_SER"
+    local rser rup reol
+    rser=$(kb_running_series); rup=$(kb_running_upstream)
+    reol=$(kb_series_is_eol "$rser")
+
+    section "LATEST — the newest kernel worth trusting"
+    kv() { emit "  ${C_DIM}%-16s${C_RESET} %s\n" "$1" "$2"; }
+    kv "Running" "${C_BOLD}$REL${C_RESET}${rser:+  (series $rser)}$( [[ "$reol" == "1" ]] && printf '  %sEND-OF-LIFE upstream%s' "$C_RED$C_BOLD" "$C_RESET" )"
+    if [[ -n "$KB_BEST_PKG" ]]; then
+        kv "Distro ships" "${KB_BEST_VER}  (series $KB_BEST_SERIES) — $(kb_tier_label "$KB_BEST_TIER")"
+    fi
+    kv "Upstream stable" "${KB_STABLE_VER:-?}  (series ${KB_STABLE_SER:-?}) · released ${KB_STABLE_ISO:-?} · $(kb_fmt_age "$KB_STABLE_DATE") old"
+    kv "TARGET" "${C_BOLD}${tgt}${C_RESET}  (series $tser) · $KB_LATEST_WHY"
+
+    if [[ "$KB_LATEST_FRESH" -eq 1 ]]; then
+        printf "  ${C_YELLOW}!${C_RESET} the %s branch opened only %d day(s) ago — brand new, not yet baked\n" \
+            "$tser" "$(( KB_SETTLE_DAYS - KB_LATEST_WAIT ))"
+        printf "  ${C_DIM}  kernelz normally waits %d days before trusting a new branch (--settle=N changes that)\n" "$KB_SETTLE_DAYS"
+        printf "  ${C_DIM}  taking it anyway, because you asked for 'latest' — it boots once and falls back if unhealthy${C_RESET}\n"
+    fi
+    # Say plainly why this is not the 6.1 the report keeps recommending.
+    if [[ -n "$KB_BEST_PKG" && "$KB_BEST_SERIES" != "$tser" ]]; then
+        local bage bkind
+        bage=$(kb_series_age_days "$KB_BEST_SERIES" 2>/dev/null || echo '?')
+        bkind="regular stable"; [[ "$(kb_series_is_lts "$KB_BEST_SERIES")" == "1" ]] && bkind="long-term"
+        printf "  ${C_DIM}why not the distro's %s?  it is the newest your repos ship, but it belongs to the\n" "$KB_BEST_VER"
+        printf "  ${C_DIM}      %s %s branch (open %s days) — the safe fallback, not the newest code.%s\n" \
+            "$bkind" "$KB_BEST_SERIES" "$bage" "${C_RESET}"
+    fi
+    printf "\n"
+
+    # ---- already there? ----
+    if ver_ge "$CUR_VER" "$tgt"; then
+        if [[ "$reol" == "1" ]]; then
+            warnf "KernelEOL" "you run $REL (series $rser) — end-of-life upstream — and $tgt is not newer than it" \
+                "the supported move is upstream's current stable: ${0##*/} latest"
+        else
+            ok "already running the newest kernel worth trusting: $REL (≥ $tgt)"
+        fi
+        add_json_field latest_target "$tgt"
+        add_json_field latest_series "$tser"
+        add_json_field latest_route "none"
+        kz_hist "latest target=$tgt route=none (already there)"
+        emit_verdict
+    fi
+
+    # ---- route 1: the distro packages this branch → apt ----
+    if kb_repo_pick_for "$tser"; then
+        local cup="$KB_PICK_UP"
+        [[ -z "$cup" ]] && cup=$(kb_pkg_upstream "$KB_PICK_VER" 2>/dev/null) || true
+        if [[ -z "$cup" ]] || ver_gt "$cup" "$CUR_VER"; then
+            ok "your distro packages series $tser — installing through apt (distro-tested + security-updated)"
+            info "target: $KB_PICK_PKG $KB_PICK_VER${cup:+  (upstream $cup)}"
+            add_json_field latest_target "$tgt"
+            add_json_field latest_series "$tser"
+            add_json_field latest_route "apt"
+            kz_hist "latest target=$tgt route=apt pkg=$KB_PICK_PKG ver=$KB_PICK_VER"
+            TO_PKG="$KB_PICK_PKG"
+            cmd_upgrade
+            return 0
+        fi
+        info "your distro's copy of $tser ($KB_PICK_VER) is not newer than what you run ($CUR_VER) — building $tgt instead"
+    else
+        printf "  ${C_YELLOW}·${C_RESET} your distro does not package series %s (newest it ships: %s) — building it from source\n" \
+            "$tser" "${KB_BEST_VER:-nothing}"
+        printf "  ${C_DIM}  same GRUB one-shot net as 'kernelz upgrade': %s boots once, and a failed boot\n" "$tgt"
+        printf "  ${C_DIM}  lands back on %s by itself.${C_RESET}\n" "$REL"
+    fi
+    printf "\n"
+
+    # ---- route 2: build it (same safety net) ----
+    BUILD_VER="$tgt"
+    add_json_field latest_target "$tgt"
+    add_json_field latest_series "$tser"
+    add_json_field latest_route "build"
+    kz_hist "latest target=$tgt route=build fresh=$KB_LATEST_FRESH"
+    cmd_build
+    return 0
+}
+
+# ============================================================================
 # BUILD — compile the latest mainline kernel from source (same safety net)
 # ============================================================================
 KERNEL_ORG_JSON="https://www.kernel.org/releases.json"
@@ -1991,8 +2173,11 @@ cmd_build() {
 
     if (( APPLY_FIX == 0 )); then
         section "NEXT STEPS"
+        # when the reader got here through `kernelz latest`, the copy-pasteable
+        # way back is `latest` (it picks the same target again) — not `build`.
+        local sub="build"; [[ "$COMMAND" == "latest" ]] && sub="latest"
         printf "  ${C_GREEN}→${C_RESET} run everything now (build + install + safety net):\n"
-        printf "      ${C_BOLD}sudo %s build --apply %s-y${C_RESET}\n" "${0##*/}" "$( ((BUILD_LTS)) && echo '--lts ' )"
+        printf "      ${C_BOLD}sudo %s %s %s-y${C_RESET}\n" "${0##*/}" "$sub" "$( ((BUILD_LTS)) && echo '--lts ' )"
         printf "  ${C_GREEN}→${C_RESET} or compile yourself, then let kernelz wire the safety net:\n"
         printf "      ${C_BOLD}bash %s${C_RESET}  ${C_DIM}(long part — logs in $BUILD_DIR)${C_RESET}\n" "$BUILD_SCRIPT"
         printf "      ${C_BOLD}sudo %s build --apply --ver %s${C_RESET}  ${C_DIM}(installs artifacts + grub one-shot)${C_RESET}\n" "${0##*/}" "$UP_VER"
@@ -2796,6 +2981,7 @@ case "$COMMAND" in
     study)   cmd_study ;;
     best|recommend) cmd_best ;;
     upgrade|update) cmd_upgrade ;;
+    latest)  cmd_latest ;;
     build)   cmd_build ;;
     verify)  cmd_verify ;;
     recover) cmd_recover ;;

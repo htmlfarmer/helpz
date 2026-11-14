@@ -51,6 +51,158 @@ init_colors() {
     fi
 }
 
+# ============================================================================
+# SUITE BOOTSTRAP — run the tools from anywhere, including under sudo
+# ----------------------------------------------------------------------------
+# Two things stop a suite tool from "just working":
+#
+#   1. it is not on PATH              -> link it into ~/.local/bin
+#   2. sudo RESETS PATH to its secure_path, which normally does NOT include
+#      ~/.local/bin -> "sudo kernelz" says "command not found" even though
+#      the tool is sitting right there
+#
+# So the suite links itself into both places. The sudo-visible link needs
+# root, so it is asked for once, the first time, and never again.
+# ============================================================================
+suite_links_to() {   # <link> <srcdir> — true when the link points into srcdir
+    [[ -L "$1" ]] || return 1
+    local t; t="$(readlink -f "$1" 2>/dev/null)" || return 1
+    [[ "$t" == "$2"/* ]]
+}
+
+suite_link_all() {   # suite_link_all <srcdir> <bindir> [sudo-prefix]
+    local src="$1" bin="$2" pre="${3:-}"
+    local -a P=()
+    [[ -n "$pre" ]] && P=("$pre")
+    "${P[@]}" mkdir -p "$bin" 2>/dev/null || return 1
+    local f n
+    for f in "$src"/*z; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        n="${f##*/}"
+        [[ "$n" == "publishz" ]] && continue
+        "${P[@]}" ln -sf "$f" "$bin/$n" 2>/dev/null
+    done
+    return 0
+}
+
+BOOTSTRAP_DONE=0
+suite_bootstrap() {
+    [[ "$BOOTSTRAP_DONE" -eq 1 ]] && return 0
+    BOOTSTRAP_DONE=1
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    [[ "${SUITE_NO_BOOTSTRAP:-0}" -eq 1 ]] && return 0
+    [[ "$EUID" -eq 0 ]] && return 0            # already root: nothing to gain
+    local tool="${0##*/}"
+    [[ -z "$tool" || "$tool" == */* ]] && return 0
+    local dir; dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+    [[ -d "$dir" ]] || return 0
+
+    # 1) the user's PATH
+    local userbin="$HOME/.local/bin"
+    if ! suite_links_to "$userbin/$tool" "$dir"; then
+        mkdir -p "$userbin" 2>/dev/null
+        suite_link_all "$dir" "$userbin" "" || true
+        [[ -L "$userbin/$tool" ]] && \
+            printf "  ${C_DIM}linked the suite into %s so the tools work from anywhere${C_RESET}\n" "$userbin" >&2
+        case ":$PATH:" in
+            *":$userbin:"*) : ;;
+            *) printf "  ${C_DIM}%s is not on your PATH yet — add it to ~/.bashrc: export PATH=\"%s:$PATH\"${C_RESET}\n" \
+                   "$userbin" "$userbin" >&2 ;;
+        esac
+    fi
+
+    # 2) what sudo can see
+    local sysbin="/usr/local/bin"
+    suite_links_to "$sysbin/$tool" "$dir" && return 0
+    [[ -d "$sysbin" ]] || return 0
+    if [[ -w "$sysbin" ]]; then
+        suite_link_all "$dir" "$sysbin" "" && \
+            printf "  ${C_DIM}linked the suite into %s — 'sudo %s' works now${C_RESET}\n" "$sysbin" "$tool" >&2
+        return 0
+    fi
+    if sudo -n true 2>/dev/null; then
+        suite_link_all "$dir" "$sysbin" "sudo" && \
+            printf "  ${C_DIM}linked the suite into %s — 'sudo %s' works now${C_RESET}\n" "$sysbin" "$tool" >&2
+        return 0
+    fi
+    # No cached sudo and root is needed — ask once, out loud, and explain why.
+    if [[ -t 0 ]] && [[ -t 2 ]]; then
+        printf "\n  ${C_YELLOW}sudo cannot see these tools${C_RESET} ${C_DIM}('sudo %s' would say 'command not found')${C_RESET}\n" "$tool" >&2
+        printf "  ${C_BOLD}Install them into %s so sudo finds them? [Y/n]${C_RESET} " "$sysbin" >&2
+        local ans; read -r ans || ans=""
+        if [[ -z "$ans" || "${ans,,}" == y* ]]; then
+            if suite_link_all "$dir" "$sysbin" "sudo"; then
+                printf "  ${C_GREEN}✓${C_RESET} done — ${C_BOLD}sudo %s${C_RESET} works now\n" "$tool" >&2
+            else
+                printf "  ${C_YELLOW}!${C_RESET} could not write %s — try: sudo %s/installz --system\n" \
+                    "$sysbin" "$dir" >&2
+            fi
+        else
+            printf "  ${C_DIM}skipping. Later: sudo %s/installz --system${C_RESET}\n" "$dir" >&2
+        fi
+    fi
+    return 0
+}
+
+# ============================================================================
+# CROSS-MODULE SYMBOL CHECK
+# ----------------------------------------------------------------------------
+# A tool and its lib/ files must agree. When one lib file is updated and
+# its sibling is not, the tool dies at runtime with "command not found" —
+# long after the change that caused it. This walks the tools, collects the
+# helpers they CALL, and checks that the libs they load actually define
+# them. Run before publishing.
+# ============================================================================
+suite_check_symbols() {   # suite_check_symbols <dir> — prints problems, returns count
+    local dir="${1:-.}" bad=0 f t sym called
+    local -A defined=()
+    for f in "$dir"/lib/*.sh; do
+        [[ -f "$f" ]] || continue
+        while read -r sym; do
+            [[ -n "$sym" ]] && defined["$sym"]=1
+        done < <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{' "$f" 2>/dev/null | sed 's/().*//')
+    done
+    for t in "$dir"/*z; do
+        [[ -f "$t" && -x "$t" ]] || continue
+        local -A own=()
+        # functions the tool defines itself
+        while read -r sym; do
+            [[ -n "$sym" ]] && own["$sym"]=1
+        done < <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{' "$t" 2>/dev/null | sed 's/().*//')
+        # ...and its own local/array variables, which are not calls either
+        while read -r sym; do
+            [[ -n "$sym" ]] && own["$sym"]=1
+        done < <(grep -oE '(^|[[:space:]])(local|declare|typeset)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*[A-Za-z_][A-Za-z0-9_]*' "$t" 2>/dev/null \
+                  | grep -oE '[A-Za-z_][A-Za-z0-9_]*$' | sort -u)
+        while read -r sym; do
+            [[ -n "$sym" ]] && own["$sym"]=1
+        done < <(grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$t" 2>/dev/null | grep -oE '[A-Za-z_][A-Za-z0-9_]*=' | tr -d '=' | sort -u)
+        # Only identifiers in COMMAND position count. String literals and
+        # variable references are stripped first, so a local array named
+        # chart_rows or a JSON key "suite_dir" is not mistaken for a call.
+        called=$(awk '
+            { line = " " $0                       # a leading space guarantees
+                                                 # a preceding character to
+                                                 # anchor on, even at line start
+              gsub(/"[^"]*"/, " ", line)           # string literals
+              gsub(/\047[^\047]*\047/, " ", line)  # single-quoted literals
+              gsub(/\$\{[^}]*\}/, " ", line)      # ${var}
+              gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, " ", line)
+              while (match(line, /[^A-Za-z0-9_](kb|chart|suite)_[A-Za-z0-9_]+/)) {
+                  print substr(line, RSTART + 1, RLENGTH - 1)
+                  line = substr(line, RSTART + RLENGTH)
+              } }' "$t" 2>/dev/null | sort -u)
+        for sym in $called; do
+            [[ -n "${own[$sym]:-}" ]] && continue
+            [[ -n "${defined[$sym]:-}" ]] && continue
+            printf '  %s calls %s() but no lib/ file defines it\n' "${t##*/}" "$sym"
+            bad=$((bad + 1))
+        done
+    done
+    printf '%s' "$bad"
+    return 0
+}
+
 # Run color initialization initially
 init_colors
 
@@ -862,3 +1014,16 @@ emit_verdict() {
 
     exit "$exit_code"
 }
+
+# ============================================================================
+# SELF-BOOTSTRAP — run at source time so EVERY tool is runnable from
+# anywhere and visible to sudo, without the user having to remember
+# installz. Skipped for --json (the notes would interleave with the report)
+# and for anything non-interactive that cannot answer a prompt.
+# ============================================================================
+case " $* " in
+    *" --json "*|*" --json="*) _SUITE_BOOTSTRAP_SKIP=1 ;;
+esac
+if [[ "${_SUITE_BOOTSTRAP_SKIP:-0}" -eq 0 && "${JSON_OUT:-0}" -eq 0 ]]; then
+    suite_bootstrap
+fi
