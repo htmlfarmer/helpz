@@ -181,6 +181,11 @@ BILL MODE   ./powerz bill --kwh=N [flags]
   The all-in rate it prints (total $ / total kWh) is the number to feed
   back into --rate, so the probe's cost estimate matches the bill.
 
+  It also breaks the bill down over time — per hour, per day, per month
+  and per year — scaled from the bill's OWN period (29 days is not 30),
+  using the same 365/12 month convention as the main probe so the two
+  tables are directly comparable.
+
 ALTERNATIVE COMMANDS
   upower -i $(upower -e | grep BAT)   Detailed battery info (needs upower)
   acpi -V                             All ACPI/power info
@@ -324,7 +329,32 @@ calc_bill() {
     allin=$(awk -F'\t' '$1=="ALLIN"{print $4}' <<<"$out")
     emit "\n  ${C_BOLD}total${C_RESET}        ${C_GREEN}${total_line}${C_RESET}\n"
     emit "  ${C_BOLD}all-in rate${C_RESET} ${C_GREEN}${allin}¢/kWh${C_RESET}  ${C_DIM}(total \$ ÷ total kWh)${C_RESET}\n"
-    emit "  ${C_DIM}use this, not the flat default:${C_RESET} ./powerz --rate=$(awk -v a="$allin" 'BEGIN{printf "%.2f", a}')\n\n"
+    emit "  ${C_DIM}use this, not the flat default:${C_RESET} ./powerz --rate=$(awk -v a="$allin" 'BEGIN{printf "%.2f", a}')\n"
+
+    # ── over time ────────────────────────────────────────────────────────
+    # Divide by the bill's OWN period length (B_DAYS), not a naive 30:
+    # utilities commonly bill 28/29/31 days, and ÷30 quietly misstates the
+    # daily rate. "per month" then scales that daily rate to 365/12 days so
+    # it is comparable with the main probe's ENERGY COST table (which uses
+    # the same 365/12 convention).
+    local tv daily hourly monthly yearly
+    tv=$(printf '%s' "$total_line" | tr -cd '0-9.')
+    [[ -z "$tv" ]] && tv=0
+    daily=$(awk  -v t="$tv" -v d="$B_DAYS" 'BEGIN{ if (d>0) printf "%.4f", t/d; else printf "%.4f", 0 }')
+    hourly=$(awk -v d="$daily" 'BEGIN{ printf "%.5f", d/24 }')
+    monthly=$(awk -v d="$daily" 'BEGIN{ printf "%.2f", d*365/12 }')
+    yearly=$(awk  -v d="$daily" 'BEGIN{ printf "%.2f", d*365 }')
+
+    if [[ $JSON_OUT -eq 0 ]]; then
+        emit "\n  ${C_BOLD}over time${C_RESET}  ${C_DIM}(scaled from this bill's ${B_DAYS}-day period)${C_RESET}\n"
+        printf "  %-12s $ %s\n" "per hour"  "$hourly"
+        printf "  %-12s $ %s\n" "per day"   "$daily"
+        printf "  %-12s $ %s\n" "per month" "$monthly"
+        printf "  %-12s $ %s\n" "per year"  "$yearly"
+        printf "\n"
+    fi
+    JSON_FIELDS+=("\"bill_per_hour\":${hourly}" "\"bill_per_day\":${daily}" \
+                  "\"bill_per_month\":${monthly}" "\"bill_per_year\":${yearly}")
 
     if [[ -n "${B_EXPECT:-}" ]]; then
         # BUG FIX: total_line is a FORMATTED string ("$ 12.0000"). Passing it
