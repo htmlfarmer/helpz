@@ -109,7 +109,11 @@ HELPEOF
         -*) printf 'trendz: unknown option %s (try --help)\n' "$1" >&2; exit 64 ;;
         *)
                 [[ -n "$ARG_TOOL" ]] && { printf 'trendz: unexpected argument %s\n' "$1" >&2; exit 64; }
-                ARG_TOOL="$1"; MODE="detail" ;;
+                ARG_TOOL="$1"
+                # a bare name selects the detail view — but a name given
+                # AFTER --boot belongs to the boot view
+                [[ "$MODE" == "overview" ]] && MODE="detail"
+                ;;
     esac
     shift
 done
@@ -137,7 +141,11 @@ json_stdout_only
 #                                 median of every metric seen in that boot
 # ============================================================================
 HIST_AWK='
-BEGIN { W = (window + 0 >= 1) ? window + 0 : 50; PRI = pri }
+BEGIN { W = (window + 0 >= 1) ? window + 0 : 50
+        # padded with spaces so index() can look for " key " and still
+        # match the FIRST and LAST entry of the list
+        PRI = " " pri " "
+        NODRIFT = " " nodrift " " }
 
 function unq(s) { gsub(/^"|"$/, "", s); return s }
 
@@ -207,7 +215,7 @@ function kless(a, b,   ra, rb) {
     if (ra != rb) return ra < rb
     return a < b
 }
-function excluded(k) { return index(" " nodrift " ", " " k " ") > 0 }
+function excluded(k) { return index(NODRIFT, " " k " ") > 0 }
 
 {
     parse($0)
@@ -368,6 +376,36 @@ jstr() {                          # quoted + escaped, for --json
     printf '"%s"' "$s"
 }
 
+# delta_of <now> <common> — sets _d_arrow / _d_label / _d_col for one cell.
+# "Common" is the median of the previous runs; no previous runs means the
+# metric is new, and a common value of 0 means "was never seen" (→ new).
+delta_of() {
+    local now="${1:-}" com="${2:-}" pct p abs
+    if [[ -z "$com" || "$com" == "-" ]]; then
+        _d_arrow=" "; _d_label="first run"; _d_col="$C_DIM"; return 0
+    fi
+    pct=$(awk -v a="$now" -v b="$com" 'BEGIN {
+        if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
+        printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
+    p="${pct#[+-]}"                # "+0" is still zero — strip the sign first
+    if [[ "$p" == "0" ]]; then
+        _d_arrow=""; _d_label="="; _d_col="$C_GREEN"
+    elif [[ "$pct" == "9999" ]]; then
+        _d_arrow="▲"; _d_label="new"; _d_col="$C_RED"
+    elif [[ "$pct" == "-9999" ]]; then
+        _d_arrow="▼"; _d_label="gone"; _d_col="$C_GREEN"
+    else
+        [[ "$pct" == -* ]] && _d_arrow="▼" || _d_arrow="▲"
+        _d_label="${pct}%"
+        abs="$p"
+        if   (( abs >= 50 )); then _d_col="$C_RED"
+        elif (( abs >= 10 )); then _d_col="$C_YELLOW"
+        else _d_col="$C_GREEN"
+        fi
+    fi
+    return 0
+}
+
 no_history() {
     if [[ "$JSON_OUT" -eq 1 ]]; then
         json_emit "$(printf '{"mode":"overview","history_dir":%s,"tools":[],"runs":0}' "$(jstr "$HIST_DIR")")"
@@ -390,8 +428,15 @@ if [[ "$MODE" == "overview" ]]; then
     shopt -u nullglob
     (( ${#files[@]} == 0 )) && no_history
 
-    rows=$(awk -v mode=overview -v window="$WINDOW" -v pri="$PRI_TOOL" -v nodrift="$NO_DRIFT" \
-           "$HIST_AWK" "${files[@]}" 2>/dev/null | sort -t$'\t' -k5,5nr)
+    # one awk pass per file: mode=overview describes a single tool, and a
+    # shared counter would silently fold every file into one row
+    rows=""
+    for f in "${files[@]}"; do
+        r=$(awk -v mode=overview -v window="$WINDOW" -v pri="$PRI_TOOL" -v nodrift="$NO_DRIFT" \
+            "$HIST_AWK" "$f" 2>/dev/null)
+        [[ -n "$r" ]] && rows+="$r"$'\n'
+    done
+    rows=$(printf '%s' "$rows" | sort -t$'\t' -k5,5nr)
 
     if [[ -z "$rows" ]]; then
         no_history
@@ -409,6 +454,7 @@ if [[ "$MODE" == "overview" ]]; then
                 pct=$(awk -v a="$dnow" -v b="$dmed" 'BEGIN {
                     if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
                     printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
+                pct="${pct#+}"      # JSON numbers carry no sign prefix
             fi
             json_parts+=("$(printf '{"tool":%s,"runs":%d,"boots":%d,"first_ts":%d,"last_ts":%d,"crit":%s,"warn":%s,"drift_key":%s,"drift_pct":%s}' \
                 "$(jstr "$t")" "$n" "$b" "$first" "$last" \
@@ -429,7 +475,9 @@ if [[ "$MODE" == "overview" ]]; then
         total=$(( total + n )); toolcount=$(( toolcount + 1 ))
         [[ -z "$oldest" || "$first" -lt "$oldest" ]] && oldest=$first
     done <<< "$rows"
-    info "${C_BOLD}$toolcount${C_RESET} tools · ${C_BOLD}$total${C_RESET} runs since ${C_DIM}$(date -d "@$oldest" '+%Y-%m-%d' 2>/dev/null || echo "?")${C_RESET} · ${C_DIM}$HIST_DIR${C_RESET}"
+    (( toolcount == 1 )) && tw="tool" || tw="tools"
+    (( total == 1 ))     && rw="run"  || rw="runs"
+    info "${C_BOLD}$toolcount${C_RESET} $tw · ${C_BOLD}$total${C_RESET} $rw since ${C_DIM}$(date -d "@$oldest" '+%Y-%m-%d' 2>/dev/null || echo "?")${C_RESET} · ${C_DIM}$HIST_DIR${C_RESET}"
     info "${C_DIM}Δ = this run vs the median of the previous $WINDOW runs (\"common\")${C_RESET}"
 
     printf -v h1 '%-16s' "TOOL"
@@ -464,23 +512,9 @@ if [[ "$MODE" == "overview" ]]; then
 
         p_drift=""
         if [[ -n "$dkey" ]]; then
-            pct=$(awk -v a="$dnow" -v b="$dmed" 'BEGIN {
-                if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
-                printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
-            arrow="▲"; label="${pct}%"; col="$C_GREEN"
-            if   [[ "$pct" == "0" ]];     then arrow="";  label="=";    col="$C_GREEN"
-            elif [[ "$pct" == "9999" ]];  then arrow="▲"; label="new";  col="$C_RED"
-            elif [[ "$pct" == "-9999" ]]; then arrow="▼"; label="gone"; col="$C_GREEN"
-            else
-                [[ "$pct" == -* ]] && arrow="▼" || arrow="▲"
-                abs="${pct#[+-]}"; abs="${abs%%.*}"
-                if   (( abs >= 50 )); then col="$C_RED"
-                elif (( abs >= 10 )); then col="$C_YELLOW"
-                else col="$C_GREEN"
-                fi
-            fi
-            printf -v p_pct '%8s' "${arrow}${label}"
-            p_drift="${C_BOLD}${dkey}${C_RESET} ${col}${p_pct}${C_RESET}"
+            delta_of "$dnow" "$dmed"
+            printf -v p_pct '%8s' "${_d_arrow}${_d_label}"
+            p_drift="${C_BOLD}${dkey}${C_RESET} ${_d_col}${p_pct}${C_RESET}"
         else
             printf -v p_pct '%8s' "—"
             p_drift="${C_DIM}${p_pct}${C_RESET}"
@@ -536,6 +570,7 @@ if [[ "$MODE" == "detail" ]]; then
                 pct_json=$(awk -v a="$now" -v b="$com" 'BEGIN {
                     if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
                     printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
+                pct_json="${pct_json#+}"   # JSON numbers carry no sign prefix
             fi
             J_MET+=("$(printf '{"key":%s,"now":%s,"common":%s,"min":%s,"max":%s,"runs":%s,"delta_pct":%s}' \
                 "$(jstr "$key")" "$now" "$com_json" "$mn" "$mx" "$cnt" "$pct_json")")
@@ -548,7 +583,9 @@ if [[ "$MODE" == "detail" ]]; then
     fi
 
     section "$ARG_TOOL — RUN HISTORY"
-    info "${C_BOLD}${nruns:-0}${C_RESET} runs · ${C_BOLD}${nboots:-0}${C_RESET} boots · first ${C_DIM}$(date -d "@$first_ts" '+%Y-%m-%d' 2>/dev/null || echo '?')${C_RESET} · last ${C_BOLD}$(ago_text "$last_ts")${C_RESET}"
+    (( nruns == 1 )) && rw="run"  || rw="runs"
+    (( nboots == 1 )) && bw="boot" || bw="boots"
+    info "${C_BOLD}${nruns:-0}${C_RESET} $rw · ${C_BOLD}${nboots:-0}${C_RESET} $bw · first ${C_DIM}$(date -d "@$first_ts" '+%Y-%m-%d' 2>/dev/null || echo '?')${C_RESET} · last ${C_BOLD}$(ago_text "$last_ts")${C_RESET}"
     info "boot ${C_DIM}${rboot:0:8}…${C_RESET} started ${C_DIM}${rbs:-?}${C_RESET} · kernel ${C_DIM}${rkern:-?}${C_RESET} · uptime at last run ${C_DIM}${rup:-?}s${C_RESET}"
     info "${C_DIM}COMMON = median of the previous $WINDOW runs; Δ compares NOW with it${C_RESET}"
 
@@ -569,25 +606,8 @@ if [[ "$MODE" == "detail" ]]; then
         IFS='|' read -r key now com mn mx cnt series <<< "$row"
 
         # delta vs the common value
-        if [[ "$com" == "-" || -z "$com" ]]; then
-            arrow=" "; label="first run"; col="$C_DIM"
-        else
-            pct=$(awk -v a="$now" -v b="$com" 'BEGIN {
-                if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
-                printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
-            if   [[ "$pct" == "0" ]];     then arrow="";  label="=";    col="$C_GREEN"
-            elif [[ "$pct" == "9999" ]];  then arrow="▲"; label="new";  col="$C_RED"
-            elif [[ "$pct" == "-9999" ]]; then arrow="▼"; label="gone"; col="$C_GREEN"
-            else
-                [[ "$pct" == -* ]] && arrow="▼" || arrow="▲"
-                label="${pct}%"
-                abs="${pct#[+-]}"; abs="${abs%%.*}"
-                if   (( abs >= 50 )); then col="$C_RED"
-                elif (( abs >= 10 )); then col="$C_YELLOW"
-                else col="$C_GREEN"
-                fi
-            fi
-        fi
+        delta_of "$now" "$com"
+        arrow="$_d_arrow"; label="$_d_label"; col="$_d_col"
 
         # sparkline of the last 20 runs (the full series stays in the file)
         glyphs=""
@@ -652,7 +672,8 @@ if [[ "$MODE" == "boots" ]]; then
         B_BS[$nboot]="$bs"; B_KERN[$nboot]="$kern"
         for pair in $metrics; do
             [[ "$pair" == *=* ]] || continue
-            B_MET[$nboot, "${pair%%=*}"]="${pair#*=}"
+            # no space after the comma: the subscript must be "1,load1"
+            B_MET[$nboot,"${pair%%=*}"]="${pair#*=}"
         done
     done <<< "$out"
 
@@ -699,7 +720,7 @@ if [[ "$MODE" == "boots" ]]; then
     else
         section "BOOT COMPARISON — system snapshot across every tool"
     fi
-    info "${C_BOLD}$nboot${C_RESET} boot(s) in history · ${C_DIM}* = the boot you are on now${C_RESET}"
+    info "${C_DIM}$nboot boot$([ "$nboot" -eq 1 ] && echo '' || echo 's') in history${C_RESET} · ${C_DIM}* = the boot you are on now${C_RESET}"
 
     printf "\n  ${C_DIM}%-10s %-12s %6s %6s" "BOOT" "STARTED" "RUNS" "TOOLS"
     for k in "${COLS[@]}"; do printf " %9s" "$k"; done
@@ -731,23 +752,8 @@ if [[ "$MODE" == "boots" ]]; then
         for k in "${COLS[@]}"; do
             a="${B_MET[1,${k}]:-}"; b="${B_MET[2,${k}]:-}"
             [[ -z "$a" || -z "$b" ]] && continue
-            if [[ "$b" == "0" ]]; then
-                [[ "$a" == "0" ]] && { pct=0; } || { pct=9999; }
-            else
-                pct=$(awk -v x="$a" -v y="$b" 'BEGIN { printf "%+.0f", (x - y) / (y < 0 ? -y : y) * 100 }')
-            fi
-            if   [[ "$pct" == "0" ]];     then arrow="";  label="=";    col="$C_GREEN"
-            elif [[ "$pct" == "9999" ]];  then arrow="▲"; label="new";  col="$C_RED"
-            else
-                [[ "$pct" == -* ]] && arrow="▼" || arrow="▲"
-                label="${pct}%"
-                abs="${pct#[+-]}"; abs="${abs%%.*}"
-                if   (( abs >= 50 )); then col="$C_RED"
-                elif (( abs >= 10 )); then col="$C_YELLOW"
-                else col="$C_GREEN"
-                fi
-            fi
-            line+="${C_DIM}${k}${C_RESET} ${col}${arrow}${label}${C_RESET}  "
+            delta_of "$a" "$b"
+            line+="${C_DIM}${k}${C_RESET} ${_d_col}${_d_arrow}${_d_label}${C_RESET}  "
         done
         printf '%s\n' "$line"
     else

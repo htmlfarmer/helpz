@@ -68,24 +68,25 @@ hist_metric() {
 }
 
 # hist_secs "<duration>" → integer seconds. Accepts what systemd prints:
-#   "45.2s"  "1min 2.345s"  "2h"  "1min"  "350ms"
+#   "45.2s"  "1min 2.345s"  "4min53.242s"  "2h"  "1min"  "350ms"
+# Tokens are pulled out with a match loop rather than split on spaces, so the
+# space-less "4min53.242s" form parses too.
 hist_secs() {
     local raw="${1:-}"
     [[ -z "$raw" ]] && return 1
     awk -v s="$raw" 'BEGIN {
-        n = split(s, a, /[ \t]+/)
         tot = 0
-        for (i = 1; i <= n; i++) {
-            t = a[i]
-            if (t == "") continue
-            num = t; sub(/[^0-9.].*$/, "", num)
-            if (num == "") continue
-            unit = t; sub(/^[0-9.]+/, "", unit)
-            if      (unit == "ms")            tot += num / 1000
-            else if (unit == ""  || unit == "s"  || unit == "sec")   tot += num
-            else if (unit == "m"  || unit == "min") tot += num * 60
-            else if (unit == "h"  || unit == "hr")  tot += num * 3600
-            else if (unit == "d")             tot += num * 86400
+        while (match(s, /[0-9]+(\.[0-9]+)?(ms|s|m|h|d)?/)) {
+            tok = substr(s, RSTART, RLENGTH)
+            s   = substr(s, RSTART + RLENGTH)
+            num = tok; sub(/(ms|s|m|h|d)$/, "", num)
+            if (num == "" || num !~ /^[0-9.]+$/) continue
+            unit = substr(tok, length(num) + 1)
+            if      (unit == "ms")               tot += num / 1000
+            else if (unit == ""  || unit == "s") tot += num
+            else if (unit == "m")                tot += num * 60
+            else if (unit == "h")                tot += num * 3600
+            else if (unit == "d")                tot += num * 86400
         }
         printf "%d\n", tot
     }'
@@ -188,10 +189,14 @@ hist_record() {
     [[ -z "$host" ]]       && host="host"
     [[ -z "$kernel" ]]     && kernel="unknown"
 
-    # merge the shared snapshot with whatever this tool registered
+    # merge the shared snapshot with whatever this tool registered. One map,
+    # so a tool metric that reuses an auto key (speedz records disk_pct too)
+    # replaces it instead of leaving a duplicate key in the JSON object.
+    local -A merged=()
+    for k in "${!_HIST_AUTO[@]}";    do merged["$k"]="${_HIST_AUTO[$k]}"; done
+    for k in "${!_HIST_METRICS[@]}"; do merged["$k"]="${_HIST_METRICS[$k]}"; done
     local -a kv=() k
-    for k in "${!_HIST_AUTO[@]}";    do kv+=("\"$k\":${_HIST_AUTO[$k]}"); done
-    for k in "${!_HIST_METRICS[@]}"; do kv+=("\"$k\":${_HIST_METRICS[$k]}"); done
+    for k in "${!merged[@]}"; do kv+=("\"$k\":${merged[$k]}"); done
     local mjson=""
     (( ${#kv[@]} > 0 )) && mjson=$(IFS=,; printf '%s' "${kv[*]}")
 

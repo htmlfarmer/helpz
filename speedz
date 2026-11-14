@@ -137,13 +137,22 @@ add_advice() {
 
 # ─── SECTION 1: Boot time ──────────────────────────────────────────────────
 section "BOOT TIME — HOW LONG DOES STARTUP TAKE?"
-boot_total_ms=0
+boot_s=0
+boot_ms=0
 if has_cmd systemd-analyze; then
-    boot_total=$(systemd-analyze 2>/dev/null | head -1 | awk '{print $NF}')
-    boot_total_ms=$(awk '{print int($1)}' <<< "${boot_total:-0s}" | head -1)
-    boot_total_ms=${boot_total_ms:-0}
-    boot_s=$(( boot_total_ms / 1000 ))
-    boot_ms=$(( boot_total_ms % 1000 ))
+    # $NF of the systemd-analyze summary is only the tail of a sum
+    # ("53.242s") — the real total is what follows the final "=".
+    # int($1) used to turn that into 4 and report a 0.4s boot, so parse it
+    # as a duration instead (hist_secs lives in lib/hist.sh).
+    boot_line=$(systemd-analyze 2>/dev/null | head -1)
+    boot_total=$(sed -n 's/.*=[[:space:]]*//p' <<< "$boot_line")
+    [[ -z "$boot_total" ]] && boot_total=$(awk '{print $NF}' <<< "$boot_line")
+    if declare -f hist_secs >/dev/null 2>&1 && [[ -n "$boot_total" ]]; then
+        boot_s=$(hist_secs "$boot_total" 2>/dev/null || echo 0)
+    fi
+    [[ "$boot_s" =~ ^[0-9]+$ ]] || boot_s=0
+    [[ "${boot_total:-}" =~ \.([0-9]+)s ]] && boot_ms="${BASH_REMATCH[1]}"
+    boot_ms=${boot_ms:-0}
     color=$C_GREEN
     (( boot_s > 10 )) && color=$C_YELLOW
     (( boot_s > 30 )) && color=$C_RED
