@@ -284,18 +284,40 @@ run_journal() {
   fi
 }
 
+# sudo logs "a password is required ; ... ; COMMAND=..." at ALERT priority
+# for every non-interactive invocation without a cached password — and this
+# suite itself makes hundreds of those per run (`sudo -n true` probes in
+# lib/common.sh, plus $SUDO calls after the ticket expired). Left in, they
+# dominated the alert bucket (460 of 460 alert lines were this suite's own
+# probes) and were the #1 recurring message. Real failed logins log a
+# different message ("pam_unix(sudo:auth): authentication failure") which is
+# NOT filtered — SECTION 3 counts those separately.
+SUDO_NOISE='a password is required ; '
+
+# Every windowed journalctl query goes through here: same flags, same filter,
+# in one place. journalctl indents the continuation lines of a multi-line
+# message, so raw `wc -l` over-counts entries — journal_count() below counts
+# only lines that OPEN an entry (timestamp at column 0; continuation lines
+# are indented and journal headers start with "--").
+journal_window() {
+  ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q "$@" 2>/dev/null \
+    | grep -va "$SUDO_NOISE" || true
+}
+
+# journal_count <priority-spec>  -> number of ENTRIES, e.g. "warning..warning"
+# journalctl has no --count on systemd 252 (it errored into /dev/null and
+# every AT A GLANCE number read 0, which is why that panel claimed "the
+# journal is completely quiet" over 370 errors), and ranges must be explicit:
+# a bare "-p warning" means "warning AND MORE SEVERE", which nests every
+# bucket inside the next one.
+journal_count() {
+  journal_window -p "$1" | grep -ca '^[^ -]'
+}
+
 # Cache journal output ONCE for the whole run — turns 15+ sequential
 # journalctl invocations into one. Saves 5-15s on busy systems.
-JOURNAL_CACHE=""
-if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
-    JOURNAL_CACHE=$(mktemp -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp)
-    trap "rm -f '$JOURNAL_CACHE' 2>/dev/null" RETURN
-    cmd=()
-    [[ -n "$SUDO" ]] && cmd+=("$SUDO")
-    cmd+=(journalctl --no-pager -q)
-    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
-    "${cmd[@]}" > "$JOURNAL_CACHE" 2>/dev/null || true
-fi
+#
+# The cache is built AFTER the privilege check (see below), not here.
 
 START_TIME=$(date +%s)
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
@@ -340,7 +362,8 @@ if [[ $EUID -eq 0 ]]; then
   SUDO=""
   NEEDS_SUDO=false
 else
-  info "${#ACCESSIBLE_LOGS[@]} logs readable without root, ${#INACCESSIBLE_LOGS[@]} need root"
+  _n_inacc=${#INACCESSIBLE_LOGS[@]}
+  info "${#ACCESSIBLE_LOGS[@]} logs readable without root, $_n_inacc need$([[ $_n_inacc -eq 1 ]] && echo s) root"
   info "the system journal, unit status and failed services need root for full coverage"
 fi
 
@@ -378,6 +401,24 @@ else
   info "Time window: since boot"
 fi
 
+# ---------- Journal cache (AFTER the privilege check, see above) ----------
+# Built now, with $SUDO already decided, so the cache carries the FULL
+# journal when root is available — count_journal()/run_journal() below read
+# it for OOM, panics, segfaults, SSH auth and disk checks.
+JOURNAL_CACHE=""
+if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
+    JOURNAL_CACHE=$(mktemp -p "${TMPDIR:-/tmp}" 2>/dev/null || mktemp)
+    # EXIT, not RETURN: a top-level RETURN trap never fires for a script
+    # (only for sourced files/functions), so every run used to leak its
+    # journal dump into /tmp.
+    trap "rm -f '$JOURNAL_CACHE' 2>/dev/null" EXIT
+    cmd=()
+    [[ -n "$SUDO" ]] && cmd+=("$SUDO")
+    cmd+=(journalctl --no-pager -q)
+    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
+    "${cmd[@]}" > "$JOURNAL_CACHE" 2>/dev/null || true
+fi
+
 # ============================================================================
 # SECTION 0: AT A GLANCE — the whole scan on one screen
 # ============================================================================
@@ -389,10 +430,14 @@ if [[ $JSON_OUT -eq 0 ]]; then
   printf "\n"
 
   if [[ $HAVE_JOURNALCTL -eq 1 && ( -n "$SUDO" || $EUID -eq 0 ) ]]; then
-    # --count transfers no lines, so these calls stay cheap.
-    _jc=$( ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p emerg..err --no-pager -q --count 2>/dev/null | tail -1)
-    _jw=$( ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p warning   --no-pager -q --count 2>/dev/null | tail -1)
-    _jn=$( ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p notice..info --no-pager -q --count 2>/dev/null | tail -1)
+    # Count ENTRIES at explicit ranges: journalctl has no --count (it errored
+    # into /dev/null here, so all three numbers read 0 and this panel claimed
+    # "the journal is completely quiet" over 370 real errors), and a bare
+    # "-p warning" means "warning AND MORE SEVERE" — it included _jc and
+    # double-counted every problem into the warning segment of the bar.
+    _jc=$(journal_count "emerg..err")          # problems: emerg..err
+    _jw=$(journal_count "warning..warning")    # warnings only
+    _jn=$(journal_count "notice..info")        # notice + info
     [[ "$_jc" =~ ^[0-9]+$ ]] || _jc=0
     [[ "$_jw" =~ ^[0-9]+$ ]] || _jw=0
     [[ "$_jn" =~ ^[0-9]+$ ]] || _jn=0
@@ -422,13 +467,22 @@ if [[ $JSON_OUT -eq 0 ]]; then
 
     # --- trend: is it getting worse? -----------------------------------
     # Bucket the window into 12 slices and count problems in each.
-    _t0=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -o short-unix --no-pager -q 2>/dev/null | head -1 | awk '{print $1}')
+    # short-unix prints FRACTIONAL seconds ("1794654467.662412"), which
+    # failed the ^[0-9]+$ guard below — and since that guard is the only
+    # thing standing between a bad value and bash arithmetic, the trend row
+    # was simply never drawn. Strip the fraction (and the "@" some versions
+    # prefix) here.
+    _t0=$(journal_window -o short-unix | head -1 | awk '{ t=$1; sub(/^@/,"",t); sub(/\..*/,"",t); print t }')
     _tnow=$(date +%s)
     if [[ "$_t0" =~ ^[0-9]+$ ]] && (( _tnow - _t0 > 120 )); then
       _span=$(( _tnow - _t0 ))
-      _spark=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p warning..alert -o short-unix --no-pager -q 2>/dev/null \
+      # Same bucket the mix bar calls "problems" (emerg..err) — the old
+      # "warning..alert" range silently meant something else — and only
+      # timestamped lines count: continuation lines have no timestamp, and
+      # coercing their first word to a number dumped them all in slice 0.
+      _spark=$(journal_window -p emerg..err -o short-unix \
         | awk -v s="$_t0" -v sp="$_span" '
-            { b=int(($1-s)/(sp/12+1)); if(b<0)b=0; if(b>11)b=11; c[b]++ }
+            $1 ~ /^@?[0-9]+/ { b=int(($1-s)/(sp/12+1)); if(b<0)b=0; if(b>11)b=11; c[b]++ }
             END{ for(i=0;i<12;i++) printf "%d%s", c[i]+0, (i<11?" ":"") }')
       if [[ -n "$_spark" ]]; then
         printf "  ${C_BOLD}trend${C_RESET}     %s  ${C_DIM}problems per 1/12 of the window${C_RESET}\n" "$(chart_spark "$_spark")"
@@ -451,16 +505,28 @@ elif [[ -z "$SUDO" && $EUID -ne 0 ]]; then
 else
   subsec "Priority counts in window"
   for PRIO in emerg alert crit err warning; do
-    COUNT=$($SUDO journalctl ${SINCE:+--since "$SINCE"} -p "$PRIO" --no-pager -q 2>/dev/null | wc -l)
+    # Exact bucket ("-p alert" alone means "alert AND MORE SEVERE", which
+    # nested every row inside the next one: 330 alert / 339 crit / 370 err
+    # were largely the SAME messages counted repeatedly), and ENTRIES rather
+    # than physical lines (a 4-line NVRM warning was counted 4 times).
+    COUNT=$(journal_count "$PRIO..$PRIO")
+    [[ "$COUNT" =~ ^[0-9]+$ ]] || COUNT=0
     case "$PRIO" in
       emerg|alert|crit|err)
         if (( COUNT > 0 )); then
           crit "$COUNT ${PRIO} messages"
           # Show what they actually are - the count alone is not actionable.
           if [[ "$PRIO" == "err" ]]; then
-            ERR_LINES=$($SUDO journalctl ${SINCE:+--since "$SINCE"} -p err --no-pager -q 2>/dev/null | tail -6)
+            ERR_LINES=$(journal_window -p err..err | tail -6)
             [[ -n "$ERR_LINES" ]] && printf '%s\n' "$ERR_LINES" \
-              | awk -v d="$C_DIM" -v r="$C_RESET" '{$1=""; $2=""; $3=""; print "    " d "|" r " " substr($0,4)}'
+              | awk -v d="$C_DIM" -v r="$C_RESET" '
+                  # Only a timestamped line has fields to strip; a journal
+                  # continuation line is message text - show it, indented,
+                  # instead of eating its first three words.
+                  /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/ {
+                    $1=""; $2=""; $3=""; print "    " d "|" r " " substr($0,4); next
+                  }
+                  { sub(/^[ \t]+/, ""); print "    " d "|" r "   " $0 }'
           fi
         else
           ok "0 ${PRIO} messages"
@@ -480,8 +546,21 @@ else
   done
 
   subsec "Notice + info messages"
-  NCOUNT=$($SUDO journalctl ${SINCE:+--since "$SINCE"} -p notice --no-pager -q 2>/dev/null | wc -l)
+  # "-p notice" meant "notice AND MORE SEVERE" — it re-counted every error
+  # and warning above as if they were notice/info (their report: 1874
+  # "notice/info" that contained all 1623 warnings), and dropped real
+  # info-level lines. notice..info is the pair the label promises.
+  NCOUNT=$(journal_count "notice..info")
+  [[ "$NCOUNT" =~ ^[0-9]+$ ]] || NCOUNT=0
   info "$NCOUNT notice/info messages"
+
+  # Same for AT A GLANCE's mix bar: say what was left out instead of letting
+  # the numbers quietly disagree with `journalctl -p alert`.
+  _declined=$(journal_window -p emerg..warning | grep -ca "$SUDO_NOISE")
+  [[ "$_declined" =~ ^[0-9]+$ ]] || _declined=0
+  if (( _declined > 0 )); then
+    info "$_declined non-interactive sudo password prompts excluded (sudo -n without a cached ticket; raw: journalctl -p alert)"
+  fi
 fi
 
 # ============================================================================
@@ -670,11 +749,24 @@ $_sl"
 
   subsec "Recently restarted/crashed services"
   if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
-    _recent=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} _SYSTEMD_UNIT="*.service" --no-pager -q 2>/dev/null \
-      | grep -E "Started|Stopped|Failed" \
-      | grep -E "Failed|stopped.*result=signal" \
+    # journalctl does NOT glob field values (verified: _HOSTNAME='a*' matches
+    # 0 lines while _HOSTNAME=ashy matches thousands), so the old
+    # `_SYSTEMD_UNIT="*.service"` filter matched nothing and this line always
+    # read "No service crashes or restarts in this window" — even with five
+    # failed units. _COMM=systemd is an exact match on PID 1 / the user
+    # manager, which is what actually emits these; `.service` keeps the
+    # original "services only" scope (scopes/timers/mounts excluded).
+    _recent=$(journal_window _COMM=systemd \
+      | grep -aE "\.service" \
+      | grep -aE "Failed|Stopped" \
       | tail -10 \
-      | awk '{$1=""; $2=""; $3=""; print "    " substr($0,4)}')
+      | awk '
+          # Same as elsewhere: only strip a timestamp when there is one,
+          # otherwise this eats the first three words of continuation lines.
+          /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/ {
+            $1=""; $2=""; $3=""; print "    " substr($0,4); next
+          }
+          { sub(/^[ \t]+/, ""); print "        " $0 }')
     if [[ -n "$_recent" ]]; then
       printf '%s\n' "$_recent" | head -10
     else
@@ -854,7 +946,9 @@ scan_app_log() {
   ERR=$($READER grep -ciE "error|fail|emerg" "$f" 2>/dev/null | head -1)
   [[ -z "$ERR" ]] && ERR=0
   if (( ERR > 0 )); then
-    warn "$(basename "$f"): $ERR errors"
+    # The count is over the WHOLE file, not a recent window — say so, or it
+    # reads as "7051 errors just happened".
+    warn "$(basename "$f"): $ERR error-matching lines in whole file"
   else
     ok "$(basename "$f"): clean"
   fi
@@ -903,55 +997,125 @@ fi
 section "TOP RECURRING MESSAGES (window: $SINCE)"
 RECURRING_ROWS=""
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
-  info "Top $TOP_N unique messages by frequency (errors + warnings only)"
-  RECURRING_ROWS=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p warning --no-pager -q 2>/dev/null \
-    | awk '{
-      # Strip timestamp (first 3 fields: "Aug 27 10:30:15") and hostname
-      msg = ""
-      for (i=5; i<=NF; i++) msg = msg " " $i
-      # Only the genuinely volatile parts are masked. Replacing EVERY digit
-      # destroyed the meaning ("10-kill-slumber" became "N-kill-slumber"),
-      # so only the PID and IP addresses are touched.
-      gsub(/\[[0-9]+\]/, "[N]", msg)
-      gsub(/([0-9]{1,3}\.){3}[0-9]{1,3}/, "<ip>", msg)
-      gsub(/[ \t]+/, " ", msg)
-      sub(/^ /, "", msg)
-      print msg
-    }' \
+  info "Top $TOP_N unique messages by frequency, full text (errors + warnings only)"
+  # A journal entry is ONE logical message that journalctl may print across
+  # several physical lines: line 1 carries the "Mon DD HH:MM:SS host" prefix,
+  # every continuation line is indented and carries no timestamp. Counting
+  # physical lines turned one NVRM warning into four unrelated fragments
+  # ("version.", "Please make sure that this", ...) because the field-strip
+  # below ate the first words of each continuation line. So an entry is
+  # glued back together first - 0x1e marks the internal line breaks so
+  # sort/uniq still see a single line - and only whole messages are counted.
+  # No 110-character cut either: the point of the section is to read the
+  # message, not a fragment of it.
+  # -p warning (warnings and everything worse) is intentional here: this
+  # list wants errors AND warnings, unlike the per-bucket counts above.
+  RECURRING_ROWS=$(journal_window -p warning \
+    | awk '
+      BEGIN { SEP = sprintf("%c", 30) }
+      function flush() {
+        if (msg == "") return
+        # Only the genuinely volatile parts are masked. Replacing EVERY digit
+        # destroyed the meaning ("10-kill-slumber" became "N-kill-slumber"),
+        # so only the PID and IP addresses are touched.
+        gsub(/\[[0-9]+\]/, "[N]", msg)
+        gsub(/([0-9]{1,3}\.){3}[0-9]{1,3}/, "<ip>", msg)
+        gsub(/[ \t]+/, " ", msg)
+        sub(/^ /, "", msg)
+        print msg
+        msg = ""
+      }
+      # Journal headers ("-- No entries --", "-- Boot N --") carry no message.
+      /^--/ { next }
+      # A new entry always starts with the timestamp "Aug 27 10:30:15";
+      # anything else is a continuation line of the entry above it.
+      /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
+        flush()
+        # Strip timestamp (first 3 fields: "Aug 27 10:30:15") and hostname
+        msg = ""
+        for (i = 5; i <= NF; i++) msg = msg " " $i
+        next
+      }
+      {
+        line = $0
+        sub(/^[ \t]+/, "", line)   # journalctl indents continuation lines
+        sub(/[ \t]+$/, "", line)
+        if (line == "") next
+        msg = (msg == "" ? line : msg SEP line)
+      }
+      END { flush() }
+    ' \
     | sort | uniq -c | sort -rn | head -"$TOP_N" \
     | awk '{
       count = $1
       $1 = ""
-      msg = substr($0, 2)
-      if (length(msg) > 110) msg = substr(msg, 1, 110) "..."
-      printf "  %5d  %s\n", count, msg
+      # Full message, every word of it; the 0x1e line breaks are expanded
+      # to indented lines when the rows are printed below.
+      printf "  %5d  %s\n", count, substr($0, 2)
     }')
-  printf '%s\n' "$RECURRING_ROWS"
+  # Print each message in full: continuation lines (carried as 0x1e) get
+  # their own line, indented under the first one - 9 spaces to line up with
+  # the "  %5d  " count column above.
+  printf '%s\n' "$RECURRING_ROWS" \
+    | awk 'BEGIN { SEP = sprintf("%c", 30) }
+           {
+             n = split($0, parts, SEP)
+             printf "%s\n", parts[1]
+             for (i = 2; i <= n; i++) printf "         %s\n", parts[i]
+           }'
 
   # Bar chart visualizing counts of top recurring messages
   if [[ $JSON_OUT -eq 0 ]] && [[ -n "$RECURRING_ROWS" ]]; then
     subsec "Distribution chart (most -> least frequent)"
     local_chart_data=()
+    # First pass: program + full message text, TAB-separated so the message
+    # can keep its spaces.
+    declare -A _prog_n=()
     while IFS= read -r row; do
       [[ -z "$row" ]] && continue
       cnt=$(awk '{print $1}' <<< "$row")
-      # Label with the PROGRAM name, not the second word - "kernel:" three
-      # times in a row told the reader nothing.
-      lbl=$(awk '{$1=""; sub(/^[ \t]+/,""); print}' <<< "$row" | cut -d: -f1 | sed 's/\[N\]//' | tr -d ' ')
-      [[ -z "$lbl" ]] && lbl="?"
-      local_chart_data+=("$cnt $lbl")
+      # Only the first physical line counts: the 0x1e markers after it are
+      # the message's own line breaks, not separate messages.
+      first=${row%%$'\036'*}
+      body=$(awk '{$1=""; sub(/^[ \t]+/,""); print}' <<< "$first")
+      # "systemd[1]: Failed to start X" -> program "systemd", rest is text.
+      if [[ "$body" == *:* ]]; then
+        prog=${body%%:*}
+        msg=${body#*:}
+      else
+        prog="?"                       # no program prefix: whole line is text
+        msg="$body"
+      fi
+      prog=${prog// /}                            # program names have no spaces
+      [[ -z "$prog" ]] && prog="?"
+      local_chart_data+=("$cnt"$'\t'"$prog"$'\t'"$msg")
+      _prog_n["$prog"]=$(( ${_prog_n["$prog"]:-0} + 1 ))
     done <<< "$RECURRING_ROWS"
-    local_max=0 local_total=0
+    # Second pass: a bare program name is unreadable when the same program
+    # logs several different messages - three identical "systemd" bars
+    # appeared here. Duplicates get a short snippet of their own message.
+    _chart_out=()
     for r in "${local_chart_data[@]}"; do
-      cnt=$(awk '{print $1}' <<< "$r")
+      IFS=$'\t' read -r cnt prog msg <<< "$r"
+      if (( ${_prog_n["$prog"]:-0} > 1 )); then
+        snip=$(printf '%s' "$msg" | tr -s ' ' | cut -c1-24)
+        (( ${#msg} > 24 )) && snip="${snip}…"
+        lbl="$prog: $snip"
+      else
+        lbl="$prog"
+      fi
+      _chart_out+=("$cnt"$'\t'"$lbl")
+    done
+    local_max=0 local_total=0
+    for r in "${_chart_out[@]}"; do
+      cnt=$(awk -F'\t' '{print $1}' <<< "$r")
       (( cnt > local_max )) && local_max=$cnt
       local_total=$(( local_total + cnt ))
     done
     printf "${C_BOLD}${C_CYAN}  Top items (bar chart, total=%d):${C_RESET}\n" "$local_total"
     local_w=40
-    for r in "${local_chart_data[@]}"; do
-      cnt=$(awk '{print $1}' <<< "$r")
-      lbl=$(awk '{print $2}' <<< "$r")
+    for r in "${_chart_out[@]}"; do
+      IFS=$'\t' read -r cnt lbl <<< "$r"
       pct=$(( cnt * 100 / (local_max > 0 ? local_max : 1) ))
       col="$C_GREEN"; (( pct >= 60 )) && col="$C_YELLOW"; (( pct >= 85 )) && col="$C_RED"
       filled=$(( pct * local_w / 100 ))
@@ -968,7 +1132,9 @@ fi
 if [[ $TAIL_MODE -eq 1 ]]; then
   section "RECENT ERROR LOG (last 50)"
   if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
-    ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} -p err --no-pager -q 2>/dev/null \
+    # Same window/filter as every other journal query — otherwise the tail
+    # re-lists the sudo password prompts the rest of the report excluded.
+    journal_window -p err \
       | tail -50 \
       | awk '{
         # Color timestamps dim, keep rest
