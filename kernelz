@@ -12,7 +12,7 @@
 # The safety model: after `kernelz upgrade`, GRUB's permanent default stays
 # on the LAST KNOWN GOOD kernel while the NEW kernel is booted exactly once
 # via grub-reboot. If the new kernel fails, the next reboot falls back to
-# the good one automatically. `kernelz verify` promotes the new kernel to
+# the good one automatically. `kernelz verified` promotes the new kernel to
 # the permanent default once it has booted cleanly. `kernelz protect`
 # (apt-mark hold/manual + meta-package + removal simulation) makes sure a
 # later `sudo apt upgrade` can never void or remove the new kernel.
@@ -25,7 +25,7 @@
 #   ./kernelz latest                 Newest UPSTREAM kernel: apt when the distro ships
 #                                    that series, source build when it does not
 #   ./kernelz build                  Compile the latest mainline from source (toolchain audit + GRUB safety net)
-#   ./kernelz verify                 After reboot: promote new kernel or report fallback
+#   ./kernelz verified              After reboot: confirm the new kernel and promote it
 #   ./kernelz recover                Force GRUB back to the last known good kernel
 #   ./kernelz protect                Ensure `sudo apt upgrade` cannot void the kernel
 #   ./kernelz bench                  Benchmark this kernel+boot; compare across boots
@@ -718,7 +718,7 @@ DESCRIPTION
   wrong?" — then does the update with a safety net. After `kernelz upgrade`
   the GRUB *permanent* default stays on the last known good kernel and the
   new kernel boots exactly ONCE (grub-reboot). If it panics or fails, the
-  next reboot falls back to the good kernel by itself. `kernelz verify`
+  next reboot falls back to the good kernel by itself. `kernelz verified`
   promotes the new kernel to the default once it proves healthy.
   `kernelz protect` guarantees `sudo apt upgrade` can never void/remove
   the installed kernels (meta-package, apt-mark hold/manual, removal
@@ -776,7 +776,9 @@ USAGE
   ./kernelz build --git         Incremental mode: shallow git tags in one reused tree —
                                 a point release rebuilds only what changed (minutes)
   ./kernelz build --apply       Execute (default is plan + build-script only)
-  ./kernelz verify              Post-reboot: promote new kernel / report fallback
+  ./kernelz verified            Post-reboot: confirm the new kernel is good and make it
+                                the permanent default (or report the failed fallback).
+                                'verify' still works as an alias.
   ./kernelz recover             Force GRUB back to last known good kernel
   ./kernelz protect             Harden so `sudo apt upgrade` can't void the kernel
   ./kernelz bench               Benchmark this boot; save metrics for comparison
@@ -815,7 +817,7 @@ OPTIONS
 HOW RECOVERY WORKS
   1. upgrade → apt installs new kernel, GRUB default pinned to known-good,
      next_entry set to the NEW kernel (boots once only)
-  2. reboot  → new kernel either works (run `kernelz verify` → promoted to
+  2. reboot  → new kernel either works (run `kernelz verified` → promoted to
      default) or fails (next reboot returns to known-good automatically)
   3. stuck?  → at boot hold Shift → GRUB menu → "Advanced options" → pick
      the previous kernel → log in → run `kernelz recover`
@@ -1171,7 +1173,7 @@ section_howto_upgrade() {
 
     # 3 — promote it
     printf "  ${C_BOLD}3.${C_RESET} after the reboot, promote it to the permanent default:\n"
-    printf "       ${C_CYAN}%s verify${C_RESET}   ${C_DIM}(only after the new kernel proved healthy)${C_RESET}\n" "$call"
+    printf "       ${C_CYAN}%s verified${C_RESET}   ${C_DIM}(only after the new kernel proved healthy)${C_RESET}\n" "$call"
     printf "       ${C_DIM}until this runs the new kernel boots ONLY ONCE — the next reboot goes${C_RESET}\n"
     printf "       ${C_DIM}back to %s. 'kernelz' will offer to promote it for you.${C_RESET}\n" "$REL"
 
@@ -1500,9 +1502,9 @@ run_risk_checks() {
     if [[ -n "$pr" ]]; then
         pt=$(pending_get TS)
         if [[ "$pr" == "$REL" ]]; then
-            warnf "Pending" "New kernel $pr booted but was never verified/promoted" "run: kernelz verify"
+            warnf "Pending" "New kernel $pr booted but was never verified/promoted" "run: kernelz verified"
         elif [[ "$BOOT_EPOCH" -gt "${pt:-0}" ]]; then
-            critf "Pending" "Kernel $pr was installed but system is back on $REL — update failed" "run: kernelz verify (shows why), then kernelz recover or kernelz study"
+            critf "Pending" "Kernel $pr was installed but system is back on $REL — update failed" "run: kernelz verified (shows why), then kernelz recover or kernelz study"
         else
             info "Kernel $pr installed — waiting for reboot (GRUB armed with fallback)"
         fi
@@ -1577,7 +1579,7 @@ offer_pending() {
         command -v "$cmd" >/dev/null 2>&1 && call="sudo $cmd"
 
         if [[ ! -t 0 ]]; then
-            printf "  ${C_DIM}→ promote it now:  ${C_BOLD}%s verify${C_RESET}\n\n" "$call"
+            printf "  ${C_DIM}→ confirm it now:  ${C_BOLD}%s verified${C_RESET}\n\n" "$call"
             return 0
         fi
         if (( ASSUME_YES == 1 )); then
@@ -1585,13 +1587,13 @@ offer_pending() {
             cmd_verify
             return 0
         fi
-        printf "  ${C_GREEN}→${C_RESET} make %s the permanent default?  ${C_DIM}[y/N]${C_RESET} " "$REL"
+        printf "  ${C_GREEN}→${C_RESET} mark %s as verified and make it the permanent default?  ${C_DIM}[y/N]${C_RESET} " "$REL"
         local a; read -r a || a=""
         printf "\n"
         if [[ "${a,,}" == y* ]]; then
             cmd_verify
         else
-            info "not promoting — '$call verify' when you are satisfied with this kernel"
+            info "not promoting — '$call verified' when you are satisfied with this kernel"
             printf "  ${C_DIM}the old kernel stays the default until then${C_RESET}\n\n"
         fi
         return 0
@@ -1611,7 +1613,7 @@ offer_pending() {
         local call="sudo $path"
         command -v "$cmd" >/dev/null 2>&1 && call="sudo $cmd"
         printf "  ${C_DIM}→${C_RESET} what to do:\n"
-        printf "       ${C_BOLD}%s verify${C_RESET}    ${C_DIM}diagnose the failed boot (full analysis)${C_RESET}\n" "$call"
+        printf "       ${C_BOLD}%s verified${C_RESET}  ${C_DIM}diagnose the failed boot (full analysis)${C_RESET}\n" "$call"
         printf "       ${C_BOLD}%s recover${C_RESET}   ${C_DIM}pin GRUB to %s and clear the pending record${C_RESET}\n" "$call" "$REL"
         printf "       ${C_DIM}%s stays installed, so you can retry any time${C_RESET}\n\n" "$REL"
     fi
@@ -2062,7 +2064,7 @@ cmd_upgrade() {
     local cfg good_id new_id
     cfg=$(read_grubcfg)
     if [[ -z "$cfg" ]]; then
-        critf "GrubCfg" "cannot read grub.cfg" "sudo kernelz verify after reboot"
+        critf "GrubCfg" "cannot read grub.cfg" "sudo kernelz verified after reboot"
     else
         [[ -n "$target_rel" ]] || target_rel="$REL"
         if [[ "$target_rel" == "$REL" ]]; then
@@ -2112,7 +2114,7 @@ TS=$TS_EPOCH"
     section "NEXT STEPS"
     if [[ -n "$target_rel" && "$target_rel" != "$REL" ]]; then
         printf "  ${C_BOLD}1.${C_RESET} reboot now:            ${C_CYAN}sudo reboot${C_RESET}\n"
-        printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verify${C_RESET}  (promotes new kernel to default)\n" "${0##*/}"
+        printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verified${C_RESET}  (promotes new kernel to default)\n" "${0##*/}"
         printf "  ${C_BOLD}3.${C_RESET} if it fails at boot:   GRUB menu → Advanced options → %s → then %s recover\n" "$REL" "${0##*/}"
     else
         printf "  ${C_GREEN}Already on the newest kernel — protections applied, no reboot needed.${C_RESET}\n"
@@ -2133,7 +2135,7 @@ TS=$TS_EPOCH"
 #     · distro does not              → compile it, same GRUB one-shot net
 #
 # Either way the current kernel stays the permanent default until the new one
-# has proved itself (`kernelz verify`), so a bad jump boots itself back.
+# has proved itself (`kernelz verified`), so a bad jump boots itself back.
 # ============================================================================
 cmd_latest() {
     gather_kernel_facts
@@ -2574,7 +2576,7 @@ cmd_build() {
         "sudo dpkg -i the debs (initramfs + GRUB entries are created by the package hooks)" \
         "DKMS modules (nvidia et al) are recompiled against the new kernel by the package hooks — verified before the reboot" \
         "GRUB default stays on $REL; new kernel boots ONCE via grub-reboot (same net as kernelz upgrade)" \
-        "reboot → ./kernelz verify promotes it once the boot is healthy"; do
+        "reboot → ./kernelz verified promotes it once the boot is healthy"; do
         printf "  ${C_BOLD}%d.${C_RESET} %s\n" "$i" "$step"; i=$((i+1))
     done
 
@@ -2736,12 +2738,12 @@ cmd_build() {
         fi
     fi
 
-    heading "── D. pending record (so kernelz verify recognizes the source kernel) ──"
+    heading "── D. pending record (so kernelz verified recognizes the source kernel) ──"
     state_write pending.conf "TARGET_REL=$new_rel
 TARGET_PKG=source:$UP_VER
 PREV_REL=$REL
 TS=$(date +%s)"
-    ok "pending: $new_rel (source:$UP_VER) — verify after reboot"
+    ok "pending: $new_rel (source:$UP_VER) — confirm it after the reboot: kernelz verified"
 
     heading "── E. shield the fallback line from sudo apt upgrade ──"
     WANT_META=0
@@ -2786,7 +2788,7 @@ TS=$(date +%s)"
 
     section "NEXT STEPS"
     printf "  ${C_BOLD}1.${C_RESET} reboot now:            ${C_CYAN}sudo reboot${C_RESET}\n"
-    printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verify${C_RESET}  ${C_DIM}(promotes %s to permanent default)${C_RESET}\n" "${0##*/}" "$new_rel"
+    printf "  ${C_BOLD}2.${C_RESET} after boot:            ${C_CYAN}%s verified${C_RESET}  ${C_DIM}(promotes %s to permanent default)${C_RESET}\n" "${0##*/}" "$new_rel"
     printf "  ${C_BOLD}3.${C_RESET} if it fails at boot:   the reboot falls back to %s by itself — then %s recover\n" "$REL" "${0##*/}"
     printf "  ${C_DIM}Repo apt upgrades can never touch your %s kernel (not an apt package, apt-proof -kz suffix) — and kernelz protect now holds the fallback repo kernel safe too.${C_RESET}\n" "$new_rel"
     exit 0
@@ -2974,7 +2976,7 @@ cmd_verify() {
         if [[ -n "$id" ]]; then
             grub_set_default "$id" >/dev/null && ok "GRUB default promoted to $REL (entry $id)"
         else
-            warnf "GrubDefault" "entry for $REL not found to promote" "sudo update-grub && sudo kernelz verify"
+            warnf "GrubDefault" "entry for $REL not found to promote" "sudo update-grub && sudo kernelz verified"
         fi
         $SUDO grub-editenv /boot/grub/grubenv unset next_entry >/dev/null 2>&1 || true
         # keep the fallback kernel around
