@@ -652,6 +652,14 @@ if [[ $JSON_OUT -eq 1 ]]; then
     exec 1>&2
 fi
 
+# ---------- Metric history (./trendz) ----------
+# Shared snapshot is automatic; boot time and issue counts are bootz's own.
+if declare -f hist_metric >/dev/null 2>&1; then
+    hist_metric boot_s   "$(hist_secs "${TOTAL_TIME:-}")"
+    hist_metric issues   "${TOTAL_ISSUES:-}"
+    hist_metric messages "${TOTAL_MSG:-}"
+fi
+
 # ---------- Run Comparison Finalize ----------
 if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
 

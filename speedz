@@ -664,6 +664,18 @@ if [[ $JSON_OUT -eq 1 ]]; then
     exec 1>&2
 fi
 
+# ---------- Metric history (./trendz) ----------
+# Shared snapshot is automatic; these are speedz's own profile numbers.
+if declare -f hist_metric >/dev/null 2>&1; then
+    hist_metric score            "${score:-}"
+    hist_metric boot_s           "${boot_s:-}"
+    hist_metric running_services "${total_running:-}"
+    hist_metric mem_used_pct     "${mem_used_pct:-}"
+    hist_metric swap_pct         "${swap_pct:-}"
+    hist_metric disk_pct         "${disk_pct:-}"
+    hist_metric advice_count     "${#ADVICE[@]}"
+fi
+
 # ---------- Run Comparison Finalize ----------
 if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_finalize 2>/dev/null; fi
 

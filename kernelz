@@ -97,6 +97,8 @@ while [[ $# -gt 0 ]]; do
         --dir)       shift; BUILD_DIR="${1:-}" ;;
         --dir=*)     BUILD_DIR="${1#--dir=}" ;;
         --minimal)   BUILD_MINIMAL=1 ;;
+        --profile)   shift; BUILD_PROFILE="${1:-}" ;;
+        --profile=*) BUILD_PROFILE="${1#--profile=}" ;;
         --git)       BUILD_GIT=1 ;;
         --lts)       BUILD_LTS=1 ;;
         --settle)    shift; SETTLE_DAYS="${1:-}" ;;
@@ -799,6 +801,12 @@ OPTIONS
   --ver=X.Y.Z        (build) exact mainline version to compile
   --lts              (build) latest longterm series instead of current stable
   --minimal          (build) make localmodconfig after olddefconfig
+  --profile=P        (build) preemption profile: desktop | server | balanced
+                     Sets preempt=full / none / voluntary. Auto-detected from
+                     the boot target when omitted (graphical.target + an X
+                     socket ⇒ desktop, otherwise server). With
+                     CONFIG_PREEMPT_DYNAMIC=y this is a GRUB cmdline edit —
+                     no rebuild; without it the choice goes into .config.
   --git              (build) shallow-tag git tree, incremental rebuilds across point releases
   --jobs=N           (build) compile parallelism (default: nproc)
   --dir=PATH         (build) build location (default ~/linux-build, needs ~25-30G)
@@ -1932,6 +1940,109 @@ run_cmd() {
     $SUDO "$@"
 }
 
+# ── Preemption profile (server vs desktop) ────────────────────────────────
+#
+# A kernel built for a headless server wants a different preemption model
+# than one driving a desktop:
+#
+#   server  → preempt=none     no kernel preemption at all; a task in
+#                              kernel mode runs to the next explicit
+#                              cond_resched(). Highest raw throughput for
+#                              batch work, worst wake-up latency.
+#   desktop → preempt=full     preemptible kernel; lowest wake-up latency
+#                              and the snappiest UI/audio. ~1-3% throughput
+#                              overhead from preemption bookkeeping.
+#   balanced→ preempt=voluntary  preempts only at explicit points.
+#
+# IMPORTANT: with CONFIG_PREEMPT_DYNAMIC=y the model is chosen at BOOT via
+# the `preempt=` kernel command line, so it costs one GRUB edit — no
+# rebuild. Without it the choice is baked into .config and costs a full
+# 30-90 minute compile. Always prefer the cmdline path when available.
+#
+# Also important: the cmdline lands on the machine that runs `--apply`.
+# Building a server kernel on your desktop and applying it here would
+# put `preempt=none` on the desktop. detect_profile() exists so the
+# common case (build for this box) is right by default, and so we can
+# WARN loudly when the requested profile disagrees with this machine.
+
+detect_profile() {
+    # an explicit --profile flag always wins
+    [[ -n "${BUILD_PROFILE:-}" ]] && { printf '%s' "$BUILD_PROFILE"; return 0; }
+    local def_target graphical xsock
+    def_target=$(systemctl get-default 2>/dev/null || true)
+    graphical=$(systemctl is-active graphical.target 2>/dev/null || true)
+    xsock=$(ls /tmp/.X11-unix 2>/dev/null | wc -l); xsock=${xsock//[[:space:]]/}
+    if [[ "$def_target" == "graphical.target" || "$graphical" == "active" || "${xsock:-0}" -gt 0 ]]; then
+        printf 'desktop'
+    else
+        printf 'server'
+    fi
+}
+
+profile_preempt() {          # profile_preempt <profile> → the preempt= value
+    case "${1:-}" in
+        server)   printf 'none' ;;
+        balanced) printf 'voluntary' ;;
+        *)        printf 'full' ;;
+    esac
+}
+
+has_preempt_dynamic() {      # reads the BASE config this build will start from
+    local cfg=""
+    if [[ -r /proc/config.gz ]]; then
+        cfg=$(zcat /proc/config.gz 2>/dev/null || true)
+    elif [[ -n "${REL:-}" && -r "/boot/config-$REL" ]]; then
+        cfg=$(cat "/boot/config-$REL" 2>/dev/null || true)
+    fi
+    [[ "$cfg" == *"CONFIG_PREEMPT_DYNAMIC=y"* ]]
+}
+
+write_preempt_cmdline() {
+    local profile detected mode f=/etc/default/grub.d/60-preempt.cfg
+    profile=$(detect_profile)
+    detected=$(BUILD_PROFILE= detect_profile)
+    mode=$(profile_preempt "$profile")
+
+    if ! has_preempt_dynamic; then
+        warnf "Preempt" "base config has no CONFIG_PREEMPT_DYNAMIC — preempt=$mode cannot be set on the command line" \
+            "it must go into .config before the build (costs a full rebuild), or rebuild with CONFIG_PREEMPT_DYNAMIC=y"
+        return 1
+    fi
+
+    # Overriding what this machine actually is means the kernel is for a
+    # different box — say so rather than silently mis-configuring GRUB here.
+    if [[ "$profile" != "$detected" ]]; then
+        warnf "Preempt" "profile '$profile' overrides this machine's detected profile '$detected'" \
+            "the preempt= cmdline is written to THIS box's GRUB; on a different target machine set it there instead"
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf "  ${C_DIM}[dry-run] would write %s (preempt=%s for profile=%s)${C_RESET}\n" "$f" "$mode" "$profile"
+        return 0
+    fi
+
+    $SUDO mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    # Build the file in memory, then install with `tee` (the same pattern
+    # the rest of this script uses for root-owned files). The shell
+    # EXPANDS \${GRUB_CMDLINE_LINUX_DEFAULT} at write time unless it is
+    # escaped, so it must reach the file as a literal ${...} for grub to
+    # expand it when sourcing the drop-in.
+    local content
+    content="# Written by kernelz — preemption profile: ${profile} (preempt=${mode})
+# CONFIG_PREEMPT_DYNAMIC=y lets this be chosen at boot; no rebuild needed.
+# Delete this file and re-run grub-mkconfig to revert to the build default.
+GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} preempt=${mode}\"
+"
+    if ! printf '%s' "$content" | $SUDO tee "$f" >/dev/null; then
+        warnf "Preempt" "could not write $f" "run: sudo kernelz build --apply (needs root for GRUB)"
+        return 1
+    fi
+    info "preempt=${mode} (profile: ${profile}) → ${f}"
+    PREEMPT_MODE="$mode"
+    PREEMPT_PROFILE="$profile"
+    return 0
+}
+
 ensure_grub_savedefault() {
     local f=/etc/default/grub changed=0 line
     [[ -r "$f" ]] || { critf "GrubCfg" "/etc/default/grub missing/unreadable" "install grub-common"; return 1; }
@@ -1950,6 +2061,17 @@ ensure_grub_savedefault() {
         run_cmd sed -i -E "s|^GRUB_TIMEOUT=.*|GRUB_TIMEOUT=5|" "$f" || true; changed=1; }
     if [[ $changed -eq 1 ]]; then
         info "GRUB_DEFAULT → saved (default = last known good kernel)"
+    fi
+
+    # Preemption profile (server/desktop) → `preempt=` on the command line.
+    # With CONFIG_PREEMPT_DYNAMIC=y this is a GRUB edit, not a rebuild.
+    # Returns 1 when the base config cannot accept a cmdline choice — that
+    # is informational (the warning is already printed), not fatal here.
+    if write_preempt_cmdline; then
+        changed=1
+    fi
+
+    if [[ $changed -eq 1 ]]; then
         grub_regen || warnf "UpdateGrub" "GRUB config regeneration failed" "run update-grub / grub-mkconfig manually"
     fi
     return 0
@@ -2517,6 +2639,18 @@ build_config_plan() {
             "install linux-cloud-tools/kernel config module, or reuse an old /boot/config-*"
     fi
     info "config base: $CFG_LABEL → make olddefconfig$( ((BUILD_MINIMAL)) && echo ' + localmodconfig (minimal)')"
+
+    # Preemption profile: show what will be applied so a wrong
+    # auto-detection is visible in the plan, before any time is spent
+    # compiling.
+    local prof mode
+    prof=$(detect_profile)
+    mode=$(profile_preempt "$prof")
+    if has_preempt_dynamic; then
+        info "profile: ${prof} → preempt=${mode} (PREEMPT_DYNAMIC: set at boot, no rebuild)"
+    else
+        info "profile: ${prof} → preempt=${mode} (no PREEMPT_DYNAMIC: must be baked into .config)"
+    fi
 }
 
 build_script_write() {
