@@ -74,7 +74,14 @@ suggest_next() {
     fi
     # ssh brute force in journal → sshauditz
     if command -v journalctl >/dev/null 2>&1; then
-        v=$(timeout 2 journalctl -q --since "-30 min" --no-pager 2>/dev/null | grep -c "Failed password\|invalid user" || true)
+        # Require "sshd" and drop COMMAND= lines. A bare "Failed password"
+        # also matches any suite tool's own `sudo grep -ciE 'Failed
+        # password|...'` command, which sudo logs into the journal — that
+        # measured 1 hit / 0 real failures. The threshold below is 5, so a
+        # busy session of tool runs could have tripped a phantom brute force.
+        v=$(timeout 2 journalctl -q --since "-30 min" --no-pager 2>/dev/null \
+            | grep -E "sshd.*(Failed password|invalid user)" \
+            | grep -v "COMMAND=" | wc -l)
         (( ${v:-0} > 5 )) 2>/dev/null && S+=("29${_TAB}sshauditz${_TAB}${v} failed/invalid SSH login attempts in the last 30 minutes")
     fi
     # battery health → powerz

@@ -1213,6 +1213,94 @@ section_howto_upgrade() {
 }
 
 # ============================================================================
+# NETWORK SAFETY — will this box still be reachable after the reboot?
+# ----------------------------------------------------------------------------
+# On a remote box the network IS the lifeline: if the new kernel cannot drive
+# the NIC that carries your default route, the machine comes back and you
+# cannot reach it. Most NIC drivers are in-tree and therefore always present,
+# but some are not: Realtek's r8168 and most USB wireless dongles live in
+# DKMS and have to be REBUILT for every kernel. A box whose only route runs
+# over such a driver loses the network on the next boot if the rebuild is
+# missing. So: find the lifeline, find its driver, and prove the driver
+# exists for the kernel we are about to boot.
+# ============================================================================
+section_network_safety() {   # section_network_safety [target_release]
+    local target="${1:-}"
+    section "NETWORK SAFETY · will this box still be online after the reboot?"
+
+    # The interface that carries the default route is the lifeline.
+    local lifeline
+    lifeline=$(ip route show default 2>/dev/null \
+               | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    if [[ -n "$lifeline" ]]; then
+        printf "    ${C_BOLD}lifeline${C_RESET}  %s %s\n" "$lifeline" \
+            "${C_DIM}(carries the default route — this is what keeps you connected)${C_RESET}"
+    else
+        printf "    ${C_YELLOW}!${C_RESET} no default route found — check the network before rebooting\n"
+    fi
+
+    local any=0 lif_ok=1 target_ok=1
+    local i n drv kind target_ok_one is_life
+    local dkms_list
+    dkms_list=$(timeout 20 dkms status 2>/dev/null | awk '{print $1}' | sort -u)
+    for i in /sys/class/net/*; do
+        n="${i##*/}"
+        [[ "$n" == "lo" ]] && continue
+        case "$n" in docker*|br-*|veth*|virbr*|cni*|flannel*|cali*|kube*|tun*|tap*|sit*|gre*|ip6tnl*|erspan*) continue ;; esac
+        [[ -e "$i/device" || -d "$i/wireless" ]] || continue
+        drv=$(basename "$(readlink -f "$i/device/driver" 2>/dev/null)" 2>/dev/null)
+        [[ -z "$drv" ]] && continue
+        any=1
+        kind="wired"
+        [[ -d "$i/wireless" ]] && kind="wireless"
+        is_life=0
+        [[ "$n" == "$lifeline" ]] && is_life=1
+
+        printf "    %-9s %-8s driver %-14s" "$n" "$kind" "$drv"
+        if printf '%s\n' "$dkms_list" | grep -qx "$drv"; then
+            printf " ${C_YELLOW}(DKMS — out-of-tree, rebuilt per kernel)${C_RESET}"
+        else
+            printf " ${C_DIM}(in-tree — present in every kernel)${C_RESET}"
+        fi
+        printf "\n"
+
+        if [[ -n "$target" ]]; then
+            if modinfo -k "$target" "$drv" >/dev/null 2>&1; then
+                printf "              ${C_GREEN}✓${C_RESET} driver present for %s\n" "$target"
+            else
+                target_ok=0
+                printf "              ${C_RED}✗${C_RESET} driver MISSING for %s — this interface dies on the new kernel${C_RESET}\n" "$target"
+                (( is_life == 1 )) && lif_ok=0
+            fi
+        fi
+    done
+    (( any == 0 )) && info "no physical network interfaces found"
+
+    # Wireless gets its own line: a box whose only link is wifi needs the
+    # dongle's driver rebuilt just as much.
+    local wifs
+    wifs=$(ls -d /sys/class/net/*/wireless 2>/dev/null | sed 's|/wireless||')
+    if [[ -z "$wifs" ]]; then
+        printf "    ${C_DIM}wireless: none present${C_RESET}\n"
+    else
+        for i in $wifs; do
+            printf "    ${C_DIM}wireless:${C_RESET} %s\n" "${i##*/}"
+        done
+    fi
+
+    if [[ -n "$target" ]] && (( lif_ok == 0 )); then
+        warnf "NetworkSafety" "the NIC carrying your default route ($lifeline) has no driver for $target" \
+            "you will LOSE NETWORK ACCESS after the reboot — build it first: sudo dkms autoinstall -k $target && sudo depmod -a $target"
+    elif [[ -n "$target" ]] && (( target_ok == 0 )); then
+        warnf "NetworkSafety" "a network driver in use is missing for $target" \
+            "build it: sudo dkms autoinstall -k $target && sudo depmod -a $target"
+    elif [[ -n "$target" ]]; then
+        ok "every network driver in use is available for $target"
+    fi
+    printf "\n"
+}
+
+# ============================================================================
 # GRAPHICS — will the display still work on the new kernel?
 # ----------------------------------------------------------------------------
 # A kernel that boots fine can still come up with no display, because the
@@ -2710,6 +2798,9 @@ cmd_build() {
     fi
 
     section_graphics "$new_rel"
+
+    # ---- network: the lifeline must survive the reboot ----
+    section_network_safety "$new_rel"
 
     heading "── C. GRUB safety net (new kernel boots ONCE, default stays known-good) ──"
     state_write last_good "$REL"

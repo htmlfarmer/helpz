@@ -676,11 +676,19 @@ section "AUTHENTICATION & SECURITY"
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # "COMMAND=" lines are sudo recording what was run - the scanner's own
   # grep commands land there and would otherwise be counted as attacks.
-  SUDO_FAIL=$(count_journal "sudo.*authentication failure;|sudo.*incorrect password")
+  # The -v is what actually does that: this scanner greps for the literal
+  # text "authentication failure;", sudo logs that grep as a COMMAND= line,
+  # and without excluding it the tool counted ITS OWN probes (4 of the 5
+  # matches in a 7-day window were self-matches; the 1 real one is
+  # pam_unix(sudo:auth): authentication failure, which has no COMMAND=).
+  SUDO_FAIL=$(run_journal | grep -iE "sudo.*authentication failure;|sudo.*incorrect password" \
+              | grep -v "COMMAND=" | wc -l)
+  [[ "$SUDO_FAIL" =~ ^[0-9]+$ ]] || SUDO_FAIL=0
   if (( SUDO_FAIL > 0 )); then
     warn "$SUDO_FAIL failed sudo attempts"
-    _sf=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
-          | grep -iE "sudo.*(authentication failure;|incorrect password)" | tail -3)
+    _sf=$(run_journal \
+          | grep -iE "sudo.*(authentication failure;|incorrect password)" \
+          | grep -v "COMMAND=" | tail -3)
     [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{ if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " d "|" r " " $0; next } sub(/^[ \t]+/,""); print "    " d "|" r "   " $0 }'
   else
     ok "No failed sudo attempts"
@@ -698,8 +706,12 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     ok "No SSH auth failures"
   fi
 
-  # Other auth events
-  AUTH_FAIL=$(count_journal "authentication failure;")
+  # Other auth events. Exclude COMMAND= lines: this scanner greps the
+  # journal for the literal text "authentication failure;", sudo logs that
+  # grep as a COMMAND= line, and the bare pattern then matches the tool's
+  # own probe. In a 6-hour window that was 1 match / 0 real failures.
+  AUTH_FAIL=$(run_journal | grep -i "authentication failure;" | grep -v "COMMAND=" | wc -l)
+  [[ "$AUTH_FAIL" =~ ^[0-9]+$ ]] || AUTH_FAIL=0
   if (( AUTH_FAIL > SUDO_FAIL + SSH_FAIL )); then
     EXTRA=$(( AUTH_FAIL - SUDO_FAIL - SSH_FAIL ))
     warn "$EXTRA other authentication failures"
@@ -712,14 +724,21 @@ if [[ -r /var/log/auth.log || -n "$SUDO" ]]; then
   # Only real login failures. The broad pattern also matched logz's OWN
   # sudo command line ("grep -ciE 'authentication failure|failed
   # password|...'"), which sudo writes into auth.log — the scanner was
-  # reporting itself.
+  # reporting itself. Excluding COMMAND= is what actually stops that: the
+  # logged line contains every alternative in the pattern below, so no
+  # amount of narrowing the pattern can avoid it while still matching a
+  # real PAM failure (those contain "authentication failure;" too).
   AUTH_LOG_PAT="Failed password for|authentication failure;|Invalid user|FAILED LOGIN|authentication failure$"
-  AUTH_LOG_FAILS=$(count_sudo_grep "$AUTH_LOG_PAT" /var/log/auth.log)
+  AUTH_LOG_ALL=$(${SUDO:+$SUDO }grep -hiE "$AUTH_LOG_PAT" /var/log/auth.log 2>/dev/null \
+                 | grep -v "COMMAND=")
+  AUTH_LOG_FAILS=0
+  [[ -n "$AUTH_LOG_ALL" ]] && AUTH_LOG_FAILS=$(printf '%s\n' "$AUTH_LOG_ALL" | wc -l)
+  [[ "$AUTH_LOG_FAILS" =~ ^[0-9]+$ ]] || AUTH_LOG_FAILS=0
   if (( AUTH_LOG_FAILS > 0 )); then
     warn "$AUTH_LOG_FAILS failed-login attempts in auth.log ${C_DIM}(whole file, not just this window)${C_RESET}"
     # Show them - a count of "failures" is scarier and less useful than the
     # actual lines, which say whether it was you or someone else.
-    AUTH_LINES=$(${SUDO:+$SUDO }grep -hiE "$AUTH_LOG_PAT" /var/log/auth.log 2>/dev/null | tail -4)
+    AUTH_LINES=$(printf '%s\n' "$AUTH_LOG_ALL" | tail -4)
     [[ -n "$AUTH_LINES" ]] && printf '%s\n' "$AUTH_LINES" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "    " d "|" r " " $0}'
     printf "      ${C_GREEN}fix:${C_RESET} sudo grep -iE 'Failed password for|Invalid user' /var/log/auth.log | tail -20\n"
     printf "      ${C_DIM}if the source IPs are not yours, harden SSH: see ./sshauditz${C_RESET}\n"
