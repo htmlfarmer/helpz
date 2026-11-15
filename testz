@@ -14,6 +14,8 @@
 #   * every tool's normal run exits 0, 1 or 2 (never a crash)
 #   * every tool's --json output is valid JSON
 #   * no tool leaks shell errors to stderr
+#   * --no-color really means no ANSI — including on error paths
+#   * the symptom router and the README table stay in sync with the tools
 #   * the release builder's safety invariants still hold
 #
 # It is the suite's regression net. Run it before publishing.
@@ -84,13 +86,18 @@ declare -A SKIP_REASON=(
   [runz]="needs a trust state"
 )
 
-# Tools that need an argument before they do anything.
+# Tools that need an argument before they do anything — or whose BARE run
+# mutates state. setupz/installz link every tool and edit ~/.bashrc, dnsz
+# queries upstream resolvers: a self-test must feed them their read-only
+# mode, never run them bare (it used to rewrite the tester's own shell
+# config on every run).
 declare -A TOOL_ARGS=(
   [chartz]="bars"
   [publishz]="--dry-run --name testz"
   [dnsz]="--local"
   [allz]="--help"
   [installz]="--status"
+  [setupz]="--check"
 )
 
 # A tool that is listed in .gitignore is a PERSONAL tool — it lives on this
@@ -164,7 +171,9 @@ while IFS= read -r t; do
     if [[ -n "${SKIP_REASON[$t]:-}" ]] || is_personal "$t"; then
         note_skip; continue
     fi
-    out=$(timeout 300 "$SCRIPT_DIR/$t" --no-color </dev/null 2>&1); rc=$?
+    # Read-only mode for tools whose bare run changes state (see TOOL_ARGS).
+    extra="${TOOL_ARGS[$t]:-}"
+    out=$(timeout 300 "$SCRIPT_DIR/$t" $extra --no-color </dev/null 2>&1); rc=$?
     # 64 is the conventional "usage error" — a tool that requires an
     # argument is behaving correctly when it says so.
     if (( rc == 0 || rc == 1 || rc == 2 || rc == 64 )); then
@@ -179,12 +188,23 @@ while IFS= read -r t; do
     else
         note_pass
     fi
+    # --no-color must mean NO ANSI anywhere — raw \033 rotted into error
+    # paths while the happy path stayed clean, and nothing caught it.
+    if printf '%s' "$out" | grep -q $'\033'; then
+        note_fail "$t leaked ANSI color despite --no-color"
+    else
+        note_pass
+    fi
 done < <(tool_list)
 ok "$PASS check(s) passed"
 
 # ── 4. JSON validity ──────────────────────────────────────────────────────
 section "4 · JSON OUTPUT"
+# python3 is the house validator; without it every check would fail on a
+# missing judge, so skip honestly instead.
+HAVE_PY=0; command -v python3 >/dev/null 2>&1 && HAVE_PY=1
 while IFS= read -r t; do
+    if (( HAVE_PY == 0 )); then note_skip; continue; fi
     if [[ "$FULL" -eq 0 ]] && is_slow "$t"; then
         note_skip; continue
     fi
@@ -204,7 +224,11 @@ while IFS= read -r t; do
         note_fail "$t --json is not valid JSON"
     fi
 done < <(tool_list)
-ok "$PASS tool(s) emit valid JSON"
+if (( HAVE_PY )); then
+    ok "$PASS tool(s) emit valid JSON"
+else
+    ok "python3 unavailable — JSON validity not checked"
+fi
 
 # ── 5. release-builder safety ─────────────────────────────────────────────
 section "5 · PUBLISH SAFETY"
@@ -247,6 +271,33 @@ if [[ -r "$SCRIPT_DIR/README.md" ]]; then
     if [[ -z "$miss" ]]; then note_pass; else note_fail "not in README.md:$miss"; fi
 else
     note_skip
+fi
+# README rows must be unique — a bad merge can duplicate a tool's row and
+# the presence check above would still pass.
+if [[ -r "$SCRIPT_DIR/README.md" ]]; then
+    _dups=$(grep -o '^| `[a-z0-9]*`' "$SCRIPT_DIR/README.md" | sort | uniq -d)
+    if [[ -z "$_dups" ]]; then
+        note_pass
+    else
+        note_fail "duplicate README tool rows: $(tr '\n' ' ' <<<"$_dups")"
+    fi
+fi
+# Every tool helpz's symptom router names must exist — a renamed or dropped
+# tool leaves the entry pointing at a ghost: describe_line's -x test hides it,
+# so the router silently stops matching and nobody notices.
+if [[ -r "$SCRIPT_DIR/helpz" ]]; then
+    _badidx=""
+    while IFS='|' read -r _d _tl _kw; do
+        for _t in $_tl; do
+            [[ -z "$_t" ]] && continue
+            [[ -x "$SCRIPT_DIR/$_t" ]] || _badidx="$_badidx $_t"
+        done
+    done < <(sed -n '/^SYMPTOM_INDEX=(/,/^)/p' "$SCRIPT_DIR/helpz" | sed -n 's/^  "\(.*\)"$/\1/p')
+    if [[ -z "$_badidx" ]]; then
+        note_pass
+    else
+        note_fail "helpz SYMPTOM_INDEX names missing tools:$_badidx"
+    fi
 fi
 
 # ── report ─────────────────────────────────────────────────────────────────

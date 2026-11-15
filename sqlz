@@ -179,7 +179,9 @@ if ! command -v psql >/dev/null 2>&1; then
       "$TIMESTAMP" "$HOSTNAME_SHORT"
     exec 1>&2
   else
-    printf "\033[31m\033[1m✗\033[0m \033[31mpsql not found in PATH\033[0m — install it: sudo apt install postgresql-client\n" >&2
+    # C_* vars (from lib/common.sh) are empty under --no-color / non-tty —
+    # raw \033 here leaked ANSI into `sqlz --no-color` output on error paths.
+    printf "  ${C_RED}✗${C_RESET} ${C_RED}psql not found in PATH${C_RESET} — install it: sudo apt install postgresql-client\n" >&2
   fi
   exit 2
 fi
@@ -198,7 +200,7 @@ if [[ "$TEST_CONN" != "1" ]]; then
     printf '{"timestamp":"%s","hostname":"%s","status":"connection_failed","error":"%s","critical":1,"warnings":0}\n' \
       "$TIMESTAMP" "$HOSTNAME_SHORT" "$err_escaped"
   else
-    printf "\033[31m\033[1m✗\033[0m \033[31mCannot connect:\033[0m %s\n" "$TEST_CONN" >&2
+    printf "  ${C_RED}✗${C_RESET} ${C_RED}Cannot connect:${C_RESET} %s\n" "$TEST_CONN" >&2
       exec 1>&2
   fi
   exit 2
