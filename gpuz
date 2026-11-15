@@ -496,7 +496,11 @@ fi
 section "AMD/INTEL FALLBACK"
 
 if [[ -d /sys/class/drm ]]; then
-  CARDS=$(find /sys/class/drm -maxdepth 1 -name 'card[0-9]*' -type d 2>/dev/null | grep -v -- '-')
+  # /sys/class/drm/cardN are SYMLINKS into the device tree, not real
+  # directories — `find -type d` therefore matches nothing and the whole
+  # section silently reports "no display cards" on a laptop that has one.
+  # Match the name and let the shell glob do the rest.
+  CARDS=$(find /sys/class/drm -maxdepth 1 -name 'card[0-9]*' 2>/dev/null | grep -v -- '-')
   if [[ -n "$CARDS" ]]; then
     CARD_COUNT=$(printf '%s\n' "$CARDS" | wc -l)
     info "Found ${C_BOLD}${CARD_COUNT}${C_RESET} display card(s) via /sys/class/drm:"

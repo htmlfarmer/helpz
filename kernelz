@@ -1505,7 +1505,7 @@ dkms_audit() {   # dkms_audit <target_release>
         info "  (BUILD_EXCLUSIVE: the module does not apply to this kernel/config)"
     else
         ok "every DKMS module is built for $target:"
-        printf '%s\n' "$dk_new" | sed 's/^/      ${C_DIM}│${C_RESET} /'
+        printf '%s\n' "$dk_new" | sed "s|^|      ${C_DIM}│${C_RESET} |"
     fi
 
     # An "installed" DKMS module for the new kernel still has to have
@@ -1528,6 +1528,78 @@ dkms_audit() {   # dkms_audit <target_release>
         printf "      ${C_DIM}an nvidia GPU is in use on this box — its driver MUST build for ${target}${C_RESET}\n"
     fi
     return 0
+}
+
+# ============================================================================
+# GPU HEALTH — is the graphics driver actually working on THIS kernel?
+# ----------------------------------------------------------------------------
+# A new kernel can boot perfectly and still come up with a dead GPU: the
+# proprietary driver is a DKMS module compiled against a specific kernel,
+# and if it was never built for the new one, the adapter is simply gone.
+# The symptom is confusing — the machine boots, the desktop appears, but
+# the GPU "disappeared" and CUDA is gone.
+#
+# This runs after the reboot (kernelz verified) and answers it plainly.
+# ============================================================================
+verify_gpu_health() {   # verify_gpu_health <running_release>
+    local rel="${1:-$REL}"
+    section "GPU HEALTH · is the graphics driver working on $rel?"
+
+    # The display adapters this kernel can see.
+    local adapters found=0
+    adapters=$(lspci 2>/dev/null | grep -iE "vga compatible controller|3d controller|display controller")
+    if [[ -z "$adapters" ]]; then
+        info "no display adapters reported by lspci"
+    else
+        printf '%s\n' "$adapters" | sed 's/^/    /'
+        found=1
+    fi
+
+    # Every DRM card the kernel exposes — these ARE the drivers that bound.
+    local card nm drv
+    for card in /sys/class/drm/card[0-9]; do
+        [[ -d "$card" ]] || continue
+        nm="${card##*/}"
+        drv=$(basename "$(readlink -f "$card/device/driver" 2>/dev/null)" 2>/dev/null)
+        printf "    ${C_DIM}%-8s driver: %s${C_RESET}\n" "$nm" "${drv:-none}"
+    done
+
+    # nvidia is the one that matters: it is out-of-tree and per-kernel.
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local nvdrv nvver
+        nvdrv=$(lsmod 2>/dev/null | awk '$1=="nvidia"{print $1}')
+        if [[ -z "$nvdrv" ]]; then
+            if ls /lib/modules/"$rel"/updates/dkms/nvidia*.ko >/dev/null 2>&1; then
+                critf "GpuDriver" "the nvidia module is built for $rel but is NOT loaded" \
+                    "load it: sudo modprobe nvidia   (check: dmesg | grep -i nvidia)"
+            else
+                critf "GpuDriver" "the nvidia module was NOT built for $rel — the GPU is unusable on this kernel" \
+                    "build it: sudo dkms autoinstall -k $rel && sudo depmod -a $rel   (then reboot)"
+            fi
+        else
+            nvver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+            if [[ -n "$nvver" ]]; then
+                ok "nvidia driver loaded and working (version $nvver)"
+            else
+                warnf "GpuDriver" "the nvidia module is loaded but nvidia-smi cannot talk to the GPU" \
+                    "check: dmesg | grep -i nvidia"
+            fi
+        fi
+    elif (( found == 1 )); then
+        info "no nvidia-smi on this box — using the in-kernel drivers only"
+    fi
+
+    # DKMS modules in general, for this exact kernel.
+    if command -v dkms >/dev/null 2>&1; then
+        local dk_for_rel
+        dk_for_rel=$(timeout 30 dkms status 2>/dev/null | grep -cF "$rel")
+        if (( dk_for_rel > 0 )); then
+            ok "$dk_for_rel DKMS module(s) built for $rel"
+        else
+            warnf "Dkms" "no DKMS modules are built for $rel" "sudo dkms autoinstall -k $rel"
+        fi
+    fi
+    printf "\n"
 }
 
 # ============================================================================
@@ -3543,6 +3615,12 @@ cmd_verify() {
         else
             ok "zero error-level journal entries this boot"
         fi
+        # Did the GPU come back with the new kernel? A kernel can boot
+        # perfectly and still have no working graphics driver — the DKMS
+        # module was never built for it. That is exactly the "it installed
+        # fine but my GPU is gone" case, so check it here, on the kernel
+        # that is actually running.
+        verify_gpu_health "$REL"
         # promote to permanent default
         local cfg id
         cfg=$(read_grubcfg)
