@@ -709,6 +709,40 @@ declare -A SUGGESTION_CATALOG=(
     # --- Generic ---
     ["general"]="Review the issue and apply appropriate remediation. See script documentation and man pages for the affected subsystem. Re-run the audit after applying changes."
 
+    # --- kernelz: build / install / boot ---
+    # Looked up with the category lowercased (get_suggestion), so these keys
+    # are lowercase even though critf logs them as BuildToolchain / BuildFail.
+    ["buildtoolchain"]="A source build cannot start until the compiler toolchain is present. Run the exact line shown under '↳ Fix:' (it lists only what is missing), then re-run 'kernelz build' — it re-scans and proceeds. kernelz installs them itself the moment it detects them: you only type the sudo password, and the exact line under '↳ Fix:' appears only when it cannot install (no TTY, or the package is not in the repos). Missing flex/bison is what turns into a bare 'flex: not found' halfway through make."
+    ["buildfail"]="The compile stopped BEFORE anything was installed — you are still on your current kernel, nothing is broken. Read the first 'make: ***' error above: if it names a missing tool, install it (see BuildToolchain); if it says Killed/Out of memory, retry with fewer jobs ('kernelz build --jobs 2') or a smaller config ('kernelz build --minimal'). Then re-run — the download is cached, so it resumes instead of restarting."
+    ["installfail"]="The packages never reached /boot, so no reboot will pick them up. Re-run the install explicitly: 'sudo kernelz build --apply --ver <version>'. If sudo timed out at the password prompt (a common cause), run the whole command under sudo so the prompt is not swallowed."
+    ["grubcfg"]="Without a readable grub.cfg the one-shot fallback cannot be armed, so a bad kernel could become the default. Regenerate it: 'sudo update-grub' (Debian/Ubuntu) or 'sudo grub2-mkconfig -o /boot/grub2/grub.cfg' (Fedora), then re-run 'kernelz verified'."
+    ["grubentry"]="GRUB could not resolve entries for the running/new kernel, so the boot-once net cannot be armed. Run 'sudo update-grub', confirm the entry exists: 'grep -m1 menuentry /boot/grub/grub.cfg', then 'kernelz recover' to pin the last known-good kernel."
+    ["sourcenet"]="kernel.org could not be reached, so the newest version is unknown. Check connectivity ('curl -I https://www.kernel.org'), retry, or pin a version you already know: 'kernelz build --ver 7.3.4'. Offline with the tarball cached? 'kernelz build --ver <ver>' still works from $HOME/linux-build."
+    ["upstream"]="The kernel.org release table is unreadable, so 'latest' has nothing to rank. Retry when back online; until then take the distro's own kernel instead: 'kernelz upgrade' (tested and security-updated) or 'kernelz best' to see the pick."
+    ["target"]="The requested version/selector is not usable as given. Use 'kernelz build --ver X.Y.Z' (or --lts), and note 'kernelz latest' deliberately refuses --ver because it picks its own target — drop the flag there."
+    ["confirm"]="The run stopped at the confirmation prompt instead of doing 30-90 minutes of work unasked. Re-run with '-y' to answer yes: 'sudo kernelz build -y'. Use '--dry-run' first to review the plan without building."
+    ["privileges"]="Installing a kernel or changing GRUB needs root. Re-run with sudo: 'sudo kernelz <subcommand>'. Without it kernelz still reports (read-only), it just cannot change anything."
+    ["initrd"]="That kernel has no initramfs, so it cannot boot your root filesystem. Rebuild it: 'sudo mkinitramfs -o /boot/initrd.img-<ver> <ver>' (Debian/Ubuntu) or 'sudo dracut --force' (Fedora), then re-check with 'kernelz status'."
+    ["secureboot"]="Secure Boot is on and the kernel is unsigned/custom, so the firmware may refuse modules or the image. Either enroll a signing key ('mokutil --import' + build with CONFIG_MODULE_SIG), disable Secure Boot in firmware, or run a distro-signed repo kernel: 'kernelz upgrade'."
+    ["pending"]="A kernel install is half-applied: the package landed but the system came back on the old kernel. Run 'kernelz verified' to see why it was not promoted, then 'kernelz recover' (re-pin last good) or 'kernelz upgrade' to finish cleanly."
+    ["stalemodule"]="This copy of the suite is out of step — lib/kernelbest.sh is missing a function the tool calls, so part of the analysis was skipped. Update the clone: 'git -C <install-dir> pull --ff-only', then re-run the command."
+    ["binmissing"]="A tool the boot chain depends on is absent, so kernel/initramfs/GRUB steps would fail. Install what owns it: 'sudo apt install initramfs-tools' (mkinitramfs/lsinitramfs), 'sudo apt install grub-efi-amd64' (update-grub/grub-mkconfig), or 'sudo apt install kmod' (depmod/modprobe)."
+    ["downgrade"]="The requested kernel is OLDER than the one running, so this would be a downgrade. Confirm that is intended and add --force, or list what is installed: 'kernelz status'."
+    ["install"]="The package install failed and nothing changed — you are still on your current kernel. Read the manager's own error above (lock held, no space, or a held package), fix that one thing, then re-run. 'sudo kernelz fix --apply' repairs a broken dpkg/apt state."
+    ["cleanup"]="Old kernels/packages could not be removed, usually because a hold or dependency blocks them. Inspect holds: 'apt-mark showhold'; release one with 'apt-mark unhold <pkg>', then 'kernelz cleanup' again. /boot keeps filling until this succeeds."
+    ["verify"]="The install ran but the expected image never appeared in /boot, so nothing was promoted. Check the package manager's output above, then 'kernelz status' to list what actually landed and 'sudo kernelz build --apply --ver <ver>' to retry."
+    ["verifyfail"]="The new kernel did not boot healthy — but the fallback worked and you are safe on your current kernel. Diagnose: './bootz' (boot errors), then either fix the cause and retry or stay put: 'kernelz protect' holds the working one."
+    ["recover"]="Recovery could not find the target kernel's image or GRUB entry. Boot any remaining kernel (GRUB → Advanced options), then 'sudo update-grub' and 'kernelz recover'. If nothing boots, use a live USB and chroot."
+    ["aptdeps"]="apt has unmet dependencies, which will make any kernel upgrade fail. Repair first: 'sudo apt-get -f install -y', then 'kernelz upgrade'."
+    ["dpkgbroken"]="The dpkg database has unfinished installs, so kernel postinst hooks (initramfs, GRUB) would fail mid-way. Rebuild the state: 'sudo dpkg --configure -a && sudo apt-get -f install -y' — 'kernelz fix --apply' runs exactly that."
+    ["pkgmissing"]="A package required by the kernel/boot pipeline is absent. Install it with the line under '↳ Fix:' — 'kernelz fix' names every one and 'kernelz fix --apply' installs them."
+    ["holdmissing"]="The running kernel is not protected, so 'apt upgrade' could remove it. Fix: 'sudo kernelz protect' — it installs the meta-package, apt-mark holds the running kernel, and simulates removal to prove it sticks."
+    ["bootspace"]="There is not enough room for a new kernel's image+initramfs, so the install will fail part-way. Free space first: 'kernelz cleanup' previews a safe purge of superseded kernels, or move /home off a full /boot disk."
+    ["cpuvuln"]="CPU mitigation gaps (Spectre/Meltdown class) — a newer kernel usually carries the fixed microcode mitigations. Run 'kernelz' to compare, and check current exposure: 'kernelz study' lists every mitigation on/off."
+    ["gpudriver"]="The GPU driver is out of sync with the kernel — on NVIDIA this means a black screen after reboot. Rebuild it for the new kernel before rebooting: './driverz' (dkms status), and 'sudo dkms autoinstall'."
+    ["dkms"]="DKMS modules are out of sync with the running kernel, so third-party drivers (nvidia, wireguard, zfs) will not load. Rebuild: 'sudo dkms autoinstall' or reinstall the module package; './driverz' cross-checks each one."
+    ["preflight"]="A preflight check blocked the run so nothing was half-changed. Read the line above for the specific check, fix exactly that, then re-run the same command."
+
     # --- Inferred categories (from lib/common.sh category inference) ---
     ["missing_tool"]="Install the missing helper, then re-run: 'sudo apt install <package>' — run './depz' to see every optional helper the suite wants and what it maps to."
     ["insufficient_privileges"]="Some checks need root. Re-run with sudo: 'sudo ./<tool>'. Without it the tool degrades gracefully but cannot see everything."
@@ -761,7 +795,23 @@ declare -A NEXT_TOOL_MAP=(
     ["KernelMeta"]="kernelz|kernel meta-package missing — kernelz protect fixes apt tracking"
     ["HoldMissing"]="kernelz|running kernel unprotected from apt — kernelz protect"
     ["PkgMissing"]="kernelz fix|a required package is absent — kernelz fix names and installs them"
-    ["BuildToolchain"]="kernelz build|compiler toolchain incomplete for source builds — kernelz build lists every missing package + install line"
+    ["BuildToolchain"]="kernelz build|compiler toolchain incomplete for source builds — kernelz build installs them for you before downloading"
+    ["BuildFail"]="kernelz build|compile stopped before anything was installed — first 'make: ***' error above is the cause; --jobs 2 for OOM"
+    ["InstallFail"]="kernelz build|packages never reached /boot — retry with: sudo kernelz build --apply --ver <version>"
+    ["Confirm"]="kernelz build|stopped at the confirmation prompt — re-run with -y to build, or --dry-run to only review the plan"
+    ["SourceNet"]="kernelz build|kernel.org unreachable — retry online, or pin a known version: kernelz build --ver X.Y.Z"
+    ["Upstream"]="kernelz|kernel.org's release table unreadable — take the distro kernel instead: kernelz upgrade"
+    ["Target"]="kernelz build|bad version/selector — kernelz build --ver X.Y.Z (or --lts); latest picks its own target"
+    ["Privileges"]="kernelz|this action needs root — re-run with sudo: sudo kernelz <subcommand>"
+    ["Install"]="kernelz|package install failed, nothing changed — read the manager's error above, then retry"
+    ["Verify"]="kernelz status|install ran but no image landed in /boot — kernelz status lists what actually installed"
+    ["VerifyFail"]="bootz|new kernel failed its one boot and fell back — ./bootz shows the boot errors to fix"
+    ["Recover"]="kernelz recover|recovery target unresolved — kernelz recover re-pins the last known-good kernel"
+    ["Initrd"]="kernelz|kernel has no initramfs and cannot boot — rebuild it, then kernelz status to confirm"
+    ["SecureBoot"]="kernelz|unsigned kernel under Secure Boot — enroll a key, disable it, or run a signed repo kernel"
+    ["BinMissing"]="kernelz fix|a boot-chain tool is absent — kernelz fix names the package that provides it"
+    ["Cleanup"]="kernelz cleanup|old kernels could not be removed — kernelz cleanup previews a safe purge"
+    ["Downgrade"]="kernelz status|requested kernel is older than the running one — kernelz status shows what you run"
     ["AptDeps"]="kernelz fix|apt has unmet dependencies blocking upgrades — kernelz fix --apply"
     ["DpkgBroken"]="kernelz fix|dpkg database unfinished — kernelz fix --apply repairs it"
     ["Dkms"]="driverz|dkms modules out of sync with the running kernel — driverz cross-checks"
@@ -963,6 +1013,70 @@ chart_findings() {
             "$C_YELLOW" "$n_warn" "$C_RESET" "$C_DIM" "$total" "$C_RESET" \
             "$C_GREEN" "$C_RESET"
     fi
+}
+
+# ============================================================================
+# AUTO-PROVISION — a missing dependency gets installed, not reported
+# ----------------------------------------------------------------------------
+# The suite's rule: a tool must never die with "command not found" halfway
+# through a report, and must never stop to ask about a gap that has only one
+# answer. Declare what the tool cannot run without; this maps the gap to a
+# package, installs it on whatever package manager the box has, and re-checks.
+#
+#   ensure_cmds gawk                  # command and package share a name
+#   ensure_cmds "convert=imagemagick" # command=package when they differ
+#
+# Returns 0 when everything is present (before or after the install) and 1
+# when it could not be provided — no known package manager, or sudo with no
+# TTY to type a password — after printing the exact line to run. It reports
+# nothing beyond that: severity is the CALLER's decision, because a missing
+# tool that degrades one section is a warning and one that stops everything
+# is a critical.
+# ============================================================================
+ensure_cmds() {
+    local spec cmd pkg run="" mgr="" out="" line rc=0
+    local -a missing=() still=()
+    (( $# )) || return 0
+    for spec in "$@"; do
+        cmd="${spec%%=*}"
+        pkg="$cmd"; [[ "$spec" == *=* ]] && pkg="${spec#*=}"
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$pkg")
+    done
+    (( ${#missing[@]} == 0 )) && return 0
+
+    if   command -v apt-get >/dev/null 2>&1; then mgr=apt-get
+    elif command -v dnf      >/dev/null 2>&1; then mgr=dnf
+    elif command -v pacman   >/dev/null 2>&1; then mgr=pacman
+    fi
+    [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1 && run="sudo"
+
+    info "missing tool(s): ${missing[*]} — installing them now"
+    case "$mgr" in
+        apt-get) out=$($run apt-get install -y "${missing[@]}" 2>&1) ;;
+        dnf)     out=$($run dnf install -y "${missing[@]}" 2>&1) ;;
+        pacman)  out=$($run pacman -S --noconfirm "${missing[@]}" 2>&1) ;;
+    esac
+    rc=$?
+
+    for spec in "$@"; do
+        cmd="${spec%%=*}"
+        command -v "$cmd" >/dev/null 2>&1 || still+=("$cmd")
+    done
+    if (( ${#still[@]} == 0 )); then
+        ok "installed: ${missing[*]}"
+        return 0
+    fi
+    # Hand the caller the exact line and the manager's own last words — it
+    # decides how loud to be about it.
+    case "$mgr" in
+        apt-get) line="${run:+$run }apt-get install -y ${still[*]}" ;;
+        dnf)     line="${run:+$run }dnf install -y ${still[*]}" ;;
+        pacman)  line="${run:+$run }pacman -S --noconfirm ${still[*]}" ;;
+        *)       line="install them with your package manager: ${still[*]}" ;;
+    esac
+    (( rc != 0 )) && [[ -n "$out" ]] && printf '%s\n' "$out" | tail -3 | sed 's/^/  /'
+    printf "  ${C_DIM}↳ could not install — run it yourself: %s${C_RESET}\n" "$line"
+    return 1
 }
 
 emit_verdict() {

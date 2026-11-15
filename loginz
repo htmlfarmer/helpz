@@ -80,6 +80,14 @@ LOG_TEMP=$(mktemp /tmp/loginz_events.XXXXXX); trap 'rm -f "$LOG_TEMP"' EXIT
 # ────────────────────────── event collection ───────────────────────────────
 collect_events() {   # -> TSV rows: epoch<TAB>kind<TAB>ip<TAB>user<TAB>raw-ts
     local raw
+    # Degraded, not broken: without gawk the timestamps cannot be parsed, so
+    # say so in the findings instead of letting awk's error leak into a report
+    # that then lists zero events as if nothing had happened.
+    if ! command -v gawk >/dev/null 2>&1; then
+        warnf "Deps" "gawk is missing — journal/auth timestamps cannot be parsed, so no events are listed" \
+            "install it: sudo apt-get install gawk, then re-run loginz"
+        return 0
+    fi
     raw=$(mktemp /tmp/loginz_raw.XXXXXX)
     if command -v journalctl >/dev/null 2>&1; then
         journalctl --since "$SINCE" -u ssh -u sshd -u sshd.service -o short-iso --no-pager 2>/dev/null > "$raw" || true
@@ -305,6 +313,16 @@ run_dossier() {
 }
 
 # ══════════════════════════ dispatch ═══════════════════════════════════════
+# A missing dependency is installed, not reported: gawk's mktime() is what
+# turns journal timestamps into epochs, and Ubuntu ships mawk, which cannot.
+# Without this the event table used to come up empty behind a bare
+# "gawk: command not found" — now it is installed up front (or the report
+# says plainly that it degraded). Guarded: the no-common.sh fallback above
+# does not define the helper.
+if declare -F ensure_cmds >/dev/null 2>&1; then
+    ensure_cmds gawk || true
+fi
+
 case "$MODE" in
     watch) watch_stream ;;
     ip)    collect_events; ip_forensics "$FILTER_IP" ;;

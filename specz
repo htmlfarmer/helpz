@@ -704,7 +704,9 @@ section "BLUETOOTH"
 
 BT_FOUND=0
 if [[ $HAVE_BTCTL -eq 1 ]]; then
-  BT_INFO=$(bluetoothctl show 2>/dev/null)
+  # bluetoothctl waits on D-Bus indefinitely when the service is absent or
+  # wedged — this box sat here for minutes and the whole report died with it.
+  BT_INFO=$(timeout 5 bluetoothctl show 2>/dev/null)
   if [[ -n "$BT_INFO" ]]; then
     BT_FOUND=1
     BT_NAME=$(echo "$BT_INFO" | awk '/Name:/ && !/Alias/ {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}')

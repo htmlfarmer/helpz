@@ -173,7 +173,10 @@ chart_bar() {
     filled=$(awk -v v="$val" -v m="$max" -v w="$w" 'BEGIN{ if (m+0<=0) print 0; else { c=(v+0)/(m+0)*w; print (c<0)?0:((c>w)?w:int(c+0.5)) } }')
     local g_full g_part g_empty
     read -r g_full g_part g_empty <<< "$(chart_glyphs)"
-    printf "  %s %s%s%s\n" "$lbl" "$(chart_repeat "$g_full" "$filled")" \
+    # 5 arguments: label, filled bar, dim-on, empty bar, reset. The format
+    # must carry 5 conversions — with only 4, printf wrapped onto a second
+    # line and printed a junk row of two spaces under every bar.
+    printf "  %s %s%s%s%s\n" "$lbl" "$(chart_repeat "$g_full" "$filled")" \
         "$C_DIM" "$(chart_repeat "$g_empty" "$(( w - filled ))")" "$C_RESET"
 }
 
@@ -306,8 +309,12 @@ chart_donut() {
 
     local gap; gap=$(chart_repeat ' ' 12)
     printf "  %s%s%s%s%s%s\n" "$col" "$h_tl" "$h_tr" "$C_RESET" "$C_DIM" "$C_RESET"
-    printf "  %s%s%s%s%s%s\n" "$col" "$v_tl" "$gap" "$v_tr" "$C_RESET" "$C_DIM" "$C_RESET"
-    printf "  %s%s%s%s%s%s\n" "$col" "$v_bl" "$gap" "$v_br" "$C_RESET" "$C_DIM" "$C_RESET"
+    # The two side rows carry THREE pieces (left edge, gap, right edge), so
+    # they take 7 conversions, not 6. With 6, printf still had a 7th argument
+    # left over and re-ran the format on a following line — which is what
+    # painted the stray blank rows inside the ring.
+    printf "  %s%s%s%s%s%s%s\n" "$col" "$v_tl" "$gap" "$v_tr" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf "  %s%s%s%s%s%s%s\n" "$col" "$v_bl" "$gap" "$v_br" "$C_RESET" "$C_DIM" "$C_RESET"
     printf "  %s%s%s%s%s%s\n" "$col" "$h_bl" "$h_br" "$C_RESET" "$C_DIM" "$C_RESET"
     [[ -n "$lbl" ]] && printf "  %s%s%s %s%5.1f%%%s\n" "$C_BOLD" "$lbl" "$C_RESET" "$C_DIM" "$pct" "$C_RESET"
     return 0

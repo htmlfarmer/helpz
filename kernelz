@@ -3085,6 +3085,7 @@ KERNEL_ORG_JSON="https://www.kernel.org/releases.json"
 KERNEL_GIT="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
 BUILD_FLAVOR="deb"
 TOOLCHAIN_FIX_CMD=""
+TOOLCHAIN_INSTALL_HINT=""
 CFG_CMD=""
 CFG_LABEL=""
 BUILD_SCRIPT=""
@@ -3169,12 +3170,34 @@ build_latest_query() {   # sets UP_* on success
     return 0
 }
 
-toolchain_audit() {
-    local -a need=() missing=()
-    local mgr; mgr=$(build_pkg_manager)
+# The list of packages a source build needs is filled here and READ by the
+# plan, the build script and the BuildFail remediation — hence globals.
+TOOLCHAIN_MISSING=()
+TOOLCHAIN_NEEDED=0
+
+# toolchain_scan — pure DETECTION: fill TOOLCHAIN_MISSING[], TOOLCHAIN_FIX_CMD
+# and TOOLCHAIN_NEEDED, set BUILD_FLAVOR, and return 0 when nothing is missing.
+# It deliberately reports nothing: whether a gap is a dry-run finding, an
+# offer to install, or an abort is the CALLER's decision. Reporting here is
+# what used to let `kernelz build` print "missing build packages (5)" and then
+# go on to download, unpack and fail at `flex: not found` anyway.
+toolchain_scan() {
+    local -a need=()
+    local mgr p st
+    TOOLCHAIN_MISSING=()
+    TOOLCHAIN_FIX_CMD=""
+    TOOLCHAIN_NEEDED=0
+    TOOLCHAIN_INSTALL_HINT=""
+    mgr=$(build_pkg_manager)
     case "$mgr" in
+        # bindeb-pkg ends the compile with dpkg-checkbuilddeps, which demands
+        # debhelper-compat (= 12) and libdw-dev:native — and dwarves only
+        # pulls pahole, so neither arrives on its own. Without them the build
+        # compiles for 30-90 min and then aborts at the PACKAGE step, having
+        # spent all that time on a gap a 10-second scan could have seen.
         deb)    need=(build-essential bc flex bison libssl-dev libelf-dev dwarves
-                      rsync cpio dpkg-dev libncurses-dev git curl) ;;
+                      rsync cpio dpkg-dev libncurses-dev git curl
+                      debhelper libdw-dev) ;;
         rpm)    need=(gcc make bc flex bison openssl-devel elfutils-libelf-devel
                       dwarves rsync cpio rpm-build ncurses-devel git) ;;
         pacman) need=(base-devel bc flex bison openssl libelf rsync cpio pahole ncurses git) ;;
@@ -3184,26 +3207,65 @@ toolchain_audit() {
     [[ "$mgr" == "deb" ]] && BUILD_FLAVOR=deb
     [[ "$mgr" == "rpm" ]] && BUILD_FLAVOR=rpm
     [[ "$mgr" == "pacman" ]] && BUILD_FLAVOR=plain
-    local p st
+    TOOLCHAIN_NEEDED=${#need[@]}
+    # The install line for the WHOLE toolchain, missing or not: it is baked
+    # into the generated build script as its preflight hint, and that script
+    # can be run by hand long after this scan.
+    case "$mgr" in
+        deb)    TOOLCHAIN_INSTALL_HINT="sudo apt-get install -y ${need[*]}" ;;
+        rpm)    TOOLCHAIN_INSTALL_HINT="sudo dnf install -y ${need[*]}" ;;
+        pacman) TOOLCHAIN_INSTALL_HINT="sudo pacman -S --noconfirm ${need[*]}" ;;
+    esac
     for p in "${need[@]}"; do
         case "$mgr" in
             deb)    st=$(pkg_state "$p") ;;
             rpm)    rpm -q "$p" >/dev/null 2>&1 && st="ii" || st="" ;;
             pacman) pacman -Qi "$p" >/dev/null 2>&1 && st="ii" || st="" ;;
         esac
-        [[ "$st" == ii* || "$st" == hi* ]] || missing+=("$p")
+        [[ "$st" == ii* || "$st" == hi* ]] || TOOLCHAIN_MISSING+=("$p")
     done
-    if (( ${#missing[@]} > 0 )); then
-        case "$mgr" in
-            deb)    TOOLCHAIN_FIX_CMD="sudo apt-get install -y ${missing[*]}" ;;
-            rpm)    TOOLCHAIN_FIX_CMD="sudo dnf install -y ${missing[*]}" ;;
-            pacman) TOOLCHAIN_FIX_CMD="sudo pacman -S --noconfirm ${missing[*]}" ;;
-        esac
-        critf "BuildToolchain" "missing build packages (${#missing[@]}): ${missing[*]}" \
-            "$TOOLCHAIN_FIX_CMD"
-    else
-        ok "build toolchain complete — ${#need[@]} packages verified"
+    (( ${#TOOLCHAIN_MISSING[@]} == 0 )) && return 0
+    case "$mgr" in
+        deb)    TOOLCHAIN_FIX_CMD="sudo apt-get install -y ${TOOLCHAIN_MISSING[*]}" ;;
+        rpm)    TOOLCHAIN_FIX_CMD="sudo dnf install -y ${TOOLCHAIN_MISSING[*]}" ;;
+        pacman) TOOLCHAIN_FIX_CMD="sudo pacman -S --noconfirm ${TOOLCHAIN_MISSING[*]}" ;;
+    esac
+    return 1
+}
+
+# The scan found gaps. A build started anyway cannot work — make dies at
+# `flex: not found` only AFTER the tarball has been fetched and unpacked —
+# so offer to install them here, before any work starts. Declining, or an
+# install that does not stick, ABORTS with the exact command to run by hand.
+# Returns 0 only when the toolchain is provably complete.
+# Install whatever the scan found missing — no prompt, no "run this by hand
+# and re-run". A missing library is not a decision for the user to make: the
+# build either has it or it cannot run, so detect it, install it, verify it,
+# and only then fall back to the exact line when even THAT is impossible
+# (no TTY for the sudo password, or the package is not in the repos).
+toolchain_provision() {
+    (( ${#TOOLCHAIN_MISSING[@]} == 0 )) && return 0
+    local -a pkgs=("${TOOLCHAIN_MISSING[@]}")
+
+    info "missing build packages (${#pkgs[@]}): ${pkgs[*]} — installing them now"
+    if ! pkg_install "${pkgs[@]}"; then
+        # A stale (or never-updated) package list is the usual reason an
+        # install refuses a package that the repos do carry — refresh once
+        # and retry before giving up on the whole build.
+        info "the package manager refused them — refreshing its lists and retrying once"
+        pkg_refresh || true
+        if ! pkg_install "${pkgs[@]}"; then
+            critf "BuildToolchain" "could not install the build packages: ${pkgs[*]}" \
+                "$TOOLCHAIN_FIX_CMD   (run it by hand — the manager's own error is above)"
+            return 1
+        fi
     fi
+    if ! toolchain_scan; then
+        critf "BuildToolchain" "still missing after install: ${TOOLCHAIN_MISSING[*]}" "$TOOLCHAIN_FIX_CMD"
+        return 1
+    fi
+    ok "build toolchain complete — installed ${#pkgs[@]} package(s): ${pkgs[*]} · $TOOLCHAIN_NEEDED verified"
+    return 0
 }
 
 build_resource_check() {
@@ -3273,6 +3335,30 @@ VER="${UP_VER}"; SERIES="${UP_SERIES}"; TARBALL="${UP_TARBALL}"
 URL="${UP_URL}"; SHA_URL="${UP_SHAURL}"
 BUILDDIR="${BUILD_DIR}"; JOBS=${JOBS_N}; MINIMAL=${BUILD_MINIMAL}; TARGET="${BUILD_FLAVOR}"
 MODE="${BUILD_GIT}"; GITREPO="${KERNEL_GIT}"
+
+# --jobs N overrides parallelism from the command line. kernelz's build
+# auto-recovery uses it to retry a compile that was OOM-killed with fewer
+# jobs instead of dying on the same wall again. Must be escaped in this
+# heredoc: it is expanded when the script is WRITTEN, not when it runs.
+if [ "\${1:-}" = "--jobs" ] && [ -n "\${2:-}" ]; then JOBS="\$2"; fi
+
+# ── preflight ─────────────────────────────────────────────────────────────
+# The compiler must exist BEFORE the download, not at the olddefconfig step,
+# where a missing flex/bison used to surface 155 MB and a minute later as a
+# bare "flex: not found" with no hint of what to install. This script is also
+# offered for hand-running (NEXT STEPS), so it carries its own guard.
+NEED_TOOLS="gcc make flex bison openssl tar xz curl"
+MISSING_TOOLS=""
+for _t in \$NEED_TOOLS; do
+    command -v "\$_t" >/dev/null 2>&1 || MISSING_TOOLS="\$MISSING_TOOLS \$_t"
+done
+if [[ -n "\$MISSING_TOOLS" ]]; then
+    echo "  ✗ missing build tools:\$MISSING_TOOLS" >&2
+    echo "  ↳ install the build toolchain, then re-run this script:" >&2
+    echo "      ${TOOLCHAIN_INSTALL_HINT:-sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev dwarves libncurses-dev}" >&2
+    exit 1
+fi
+echo "── [0/3] toolchain preflight ok (\$NEED_TOOLS)"
 
 mkdir -p "\$BUILDDIR"
 if [[ "\$MODE" == "1" ]]; then
@@ -3364,8 +3450,38 @@ cmd_build() {
         ok "running $CUR_VER is already ≥ $UP_VER — nothing to build (use --force to rebuild anyway)"
     fi
 
+    # Is this kernel already built? A re-run must not offer to compile it
+    # again — the 90 minutes were already spent. It is checked HERE because
+    # it decides whether the compiler toolchain matters at all: installing
+    # flex/bison for a kernel whose debs already exist would be pointless.
+    BUILD_HAVE_DEBS=0
+    if ls "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb >/dev/null 2>&1; then
+        BUILD_HAVE_DEBS=1
+        ok "$UP_VER is already built — found in $BUILD_DIR (the compile will be skipped)"
+        local _d; for _d in "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb "$BUILD_DIR"/linux-headers-*"$UP_VER"*.deb; do
+            [[ -e "$_d" ]] && info "  $(basename "$_d")"
+        done
+    fi
+
     heading "── 2. Build toolchain ──"
-    toolchain_audit
+    # A missing toolchain used to be logged and then ignored: the run went on
+    # to fetch 155 MB, unpack it and die at `flex: not found` — and the fix
+    # only appeared afterwards, in the verdict. Scan first, then decide:
+    # nothing missing → go; already built → irrelevant; otherwise install the
+    # packages now (or stop and say exactly how), but NEVER reach `make`.
+    if toolchain_scan; then
+        ok "build toolchain complete — $TOOLCHAIN_NEEDED packages verified"
+    elif (( BUILD_HAVE_DEBS )); then
+        info "toolchain not needed — $UP_VER is already built, so nothing will be compiled"
+    elif (( DRY_RUN )); then
+        # --dry-run previews the plan; it changes nothing, so it must not
+        # install either. Report the gap and keep going — the NEXT STEPS
+        # block repeats the install line.
+        critf "BuildToolchain" "missing build packages (${#TOOLCHAIN_MISSING[@]}): ${TOOLCHAIN_MISSING[*]}" \
+            "$TOOLCHAIN_FIX_CMD"
+    elif ! toolchain_provision; then
+        emit_verdict
+    fi
 
     heading "── 3. Resources ──"
     build_resource_check
@@ -3376,17 +3492,6 @@ cmd_build() {
     build_config_plan
     if command -v dkms >/dev/null 2>&1 && [[ -d /var/lib/dkms ]]; then
         info "dkms present — third-party modules auto-rebuild on install; verify after: dkms status (./driverz)"
-    fi
-
-    # Is this kernel already built? A re-run must not offer to compile it
-    # again — the 90 minutes were already spent.
-    BUILD_HAVE_DEBS=0
-    if ls "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb >/dev/null 2>&1; then
-        BUILD_HAVE_DEBS=1
-        ok "$UP_VER is already built — found in $BUILD_DIR (the compile will be skipped)"
-        local _d; for _d in "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb "$BUILD_DIR"/linux-headers-*"$UP_VER"*.deb; do
-            [[ -e "$_d" ]] && info "  $(basename "$_d")"
-        done
     fi
 
     heading "── 5. The plan ──"
@@ -3457,9 +3562,13 @@ cmd_build() {
     if (( BUILD_HAVE_DEBS )); then
         ok "artifacts already present — skipping the compile (rebuild = delete \$BUILDDIR debs)"
     else
+        # TOOLCHAIN_FIX_CMD is empty whenever the scan passed, so name it as a
+        # cause only when it actually was one — an empty "(  )" in the fix line
+        # reads like a bug in the tool itself.
+        local bf_fix="read the first 'make: ***' error above — OOM is the common one: retry with fewer jobs (--jobs 2) or --minimal"
+        [[ -n "$TOOLCHAIN_FIX_CMD" ]] && bf_fix="missing toolchain: $TOOLCHAIN_FIX_CMD — then re-run; if it was OOM: retry with --jobs 2 or --minimal"
         run_cmd bash "$BUILD_SCRIPT" || {
-            critf "BuildFail" "compile failed — nothing was installed, you remain on $REL" \
-                "read the make output above; common causes: missing toolchain ($TOOLCHAIN_FIX_CMD), OOM (retry -j lower or --minimal)"
+            critf "BuildFail" "compile failed — nothing was installed, you remain on $REL" "$bf_fix"
             emit_verdict
         }
     fi
