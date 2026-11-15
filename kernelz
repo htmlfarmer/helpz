@@ -3086,6 +3086,8 @@ KERNEL_GIT="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
 BUILD_FLAVOR="deb"
 TOOLCHAIN_FIX_CMD=""
 TOOLCHAIN_INSTALL_HINT=""
+BUILD_LOG=""
+BUILD_LAST_ERR=""
 CFG_CMD=""
 CFG_LABEL=""
 BUILD_SCRIPT=""
@@ -3390,7 +3392,33 @@ fi
 cd "\$SRC"
 echo "── configure (base: ${CFG_LABEL})"
 [[ -f .config ]] || { ${CFG_CMD}; }
+# A distro config points at files the DISTRO's packaging ships — Ubuntu sets
+#   CONFIG_SYSTEM_TRUSTED_KEYS="debian/canonical-certs.pem"
+# which exists only inside its own source package. Against a vanilla tarball
+# that is a dead build, before a single line of C is compiled:
+#   No rule to make target 'debian/canonical-certs.pem'   (certs/)
+# Clear any key path this tree does not actually have; the modules are signed
+# with this build's own key anyway, so nothing of value is lost.
+sanitize_distro_paths() {
+    local _k _v _bad _p
+    for _k in SYSTEM_TRUSTED_KEYS SYSTEM_REVOCATION_KEYS SYSTEM_EXTRA_CERTS; do
+        _v=\$(sed -n -E "s/^CONFIG_\${_k}=\"(.*)\"\$/\1/p" .config 2>/dev/null || true)
+        [[ -n "\$_v" ]] || continue
+        _bad=""
+        for _p in \$_v; do [[ -e "\$_p" ]] || _bad="\$_bad \$_p"; done
+        [[ -n "\$_bad" ]] || continue
+        echo "  · CONFIG_\${_k} asks for\$_bad — absent from this source tree (a distro packaging path); clearing it"
+        sed -i -E "s|^CONFIG_\${_k}=.*|CONFIG_\${_k}=\"\"|" .config || return 1
+    done
+    return 0
+}
+sanitize_distro_paths
 make olddefconfig
+if [[ "\$MINIMAL" == "1" ]]; then make localmodconfig || true; make olddefconfig; fi
+# And again AFTER settling: olddefconfig re-reads Kconfig, so a distro's
+# default can walk straight back in. The value the build actually reads is
+# the one that must be clean.
+sanitize_distro_paths
 if [[ "\$MINIMAL" == "1" ]]; then make localmodconfig || true; make olddefconfig; fi
 echo '-kz' > localversion-kernelz    # uname becomes <ver>-kz: apt-proof, unmistakable in GRUB
 echo "── build (-j\$JOBS; first pass 30-90 min, --git reruns only rebuild what changed)"
@@ -3408,6 +3436,256 @@ echo "Done. Install + GRUB safety net: sudo ${SCRIPT_DIR}/kernelz build --apply 
 EOS
     chmod +x "$BUILD_SCRIPT" 2>/dev/null || true
     ok "build script written: $BUILD_SCRIPT"
+}
+
+# ---------- build: log the compile, then recover from what it says ----------
+# BUILD_LOG / BUILD_LAST_ERR / BUILD_MAX_TRIES are declared with the other
+# build globals (see BUILD_FLAVOR) — here be only the behaviour.
+#
+# The compile used to stream straight to the terminal: once those 90 minutes
+# scrolled away, all that remained was make's own cascade —
+#
+#     make[4]: *** [Makefile:2229: .] Error 2
+#
+# which names no cause at all, so a failure could only ever be reported as
+# "read the output above". Everything is now teed to a log, the first line
+# that is NOT make's cascade is pulled out of it, and the three failures with
+# an obvious fix — out of memory, a missing tool, unmet build-deps — are fixed
+# and RETRIED automatically. make is incremental, so a retry resumes from the
+# objects already compiled instead of spending the 90 minutes again.
+BUILD_MAX_TRIES=3
+
+build_log_path() { printf '%s\n' "${BUILD_SCRIPT%.sh}.log"; }
+
+# The first line that actually explains the failure. make's own recursion
+# ("make[1]: *** [...] Error 2") and dpkg's wrapper only say a sub-make
+# failed — they never say why, so they are skipped and the real line wins.
+#
+# Fallback: if the log holds nothing BUT that cascade (the failure happened
+# where no diagnostic was printed), the FIRST cascade line is returned — it
+# names the innermost failing target ("make[4]: *** [Makefile:2229: .]"),
+# which is the most specific thing available. An empty "no error line
+# captured" would tell the user nothing they can act on.
+build_first_error() {
+    local log="$1"
+    [[ -s "$log" ]] || return 1
+    awk '
+        /^[ \t]*(make(\[[0-9]+\])?: \*\*\*|dpkg-buildpackage: error: make )/ {
+            if (cascade == "") cascade=$0
+            next
+        }
+        /error:|Error [0-9]+|[Nn]ot found|undefined reference|Killed|memory exhausted|Out of memory|unmet build dependencies/ {
+            if (!found) { real=$0; found=1 }
+        }
+        { if ($0 !~ /^[ \t]*$/) last=$0 }
+        END {
+            if (found) print real
+            else if (cascade != "") print cascade
+            else if (last != "") print last
+        }
+    ' "$log"
+}
+
+# oom | deps | tool | unknown — which automatic fix is worth trying.
+build_classify() {
+    local log="$1" err="${2:-}"
+    # The OOM killer does not always get a line into the build's own output,
+    # so the kernel log is consulted too before ruling OOM out.
+    if grep -qiE 'virtual memory exhausted|out of memory|cannot allocate memory|killed signal|cc1:.*[Kk]illed' "$log" 2>/dev/null; then
+        printf 'oom'; return 0
+    fi
+    if journalctl -k --since "-45 min" --no-pager 2>/dev/null | grep -qiE 'oom-kill|Out of memory: Killed'; then
+        printf 'oom'; return 0
+    fi
+    grep -qi 'unmet build dependencies' "$log" 2>/dev/null && { printf 'deps'; return 0; }
+    # A config copied from a DISTRO kernel references files only that distro's
+    # packaging ships (debian/canonical-certs.pem). Against a vanilla tree
+    # make stops before compiling anything — a known cause with a known fix.
+    [[ "$err" == *"No rule to make target"* ]] && { printf 'cfgpath'; return 0; }
+    [[ "$err" =~ [Nn]ot\ found ]] && { printf 'tool'; return 0; }
+    printf 'unknown'
+}
+
+# command name from a shell's "not found" line → the package that provides it.
+build_tool_pkg() {
+    case "$1" in
+        flex) echo flex ;;          bison) echo bison ;;        bc) echo bc ;;
+        perl) echo perl ;;          python3|python) echo python3 ;;
+        make) echo make ;;          gcc|cc) echo gcc ;;
+        ld|as|objcopy|nm|strip|ranlib) echo binutils ;;
+        curl) echo curl ;;          cpio) echo cpio ;;
+        rsync) echo rsync ;;        tar) echo tar ;;
+        xz) echo xz-utils ;;        git) echo git ;;
+        pahole) echo dwarves ;;
+        dpkg-buildpackage|dpkg-checkbuilddeps|dpkg-architecture|dpkg-parsechangelog) echo dpkg-dev ;;
+        dh|dh_*|dh_listpackages) echo debhelper ;;
+        fakeroot) echo fakeroot ;;
+        *) echo "" ;;
+    esac
+}
+
+# The missing command's name out of "sh: 1: flex: not found" / "flex: command not found".
+build_missing_cmd() {
+    grep -oiE '[A-Za-z0-9_+.-]+: (command )?not found' "$1" 2>/dev/null \
+        | head -1 | sed -E 's/: (command )?[Nn]ot found//'
+}
+
+# The file make could not build, out of
+#   No rule to make target 'debian/canonical-certs.pem', needed by ...
+build_missing_cfg_path() {
+    local line="${1:-}"
+    line=$(printf '%s' "$line" | sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g')   # the log is teed WITH colour
+    printf '%s' "$line" | sed -nE "s/.*No rule to make target '([^']+)'.*/\1/p"
+}
+
+# Where the source tree lives — recovery runs from kernelz's own cwd.
+build_tree_dir() {
+    if (( BUILD_GIT )); then printf '%s/linux-git' "$BUILD_DIR"
+    else printf '%s/linux-%s' "$BUILD_DIR" "${UP_VER:-unknown}"; fi
+}
+
+# .config asks for a file this tree does not have — a DISTRO packaging path
+# (Ubuntu's debian/canonical-certs.pem) that exists only in the distro's own
+# source package. Clear the reference; the modules are signed with this
+# build's own key anyway, so nothing of value is lost, and the next pass gets
+# past certs/ instead of dying on the same line. Returns 0 only when it
+# actually changed something — no change means a retry cannot help, and the
+# loop must stop and report instead of burning passes.
+build_clear_cfg_ref() {
+    local want="$1" f line k v changed=0
+    local -a keys=()
+    f="$(build_tree_dir)/.config"
+    [[ -f "$f" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" == CONFIG_*'='* ]] || continue
+        k="${line%%=*}"; v="${line#*=}"
+        v="${v#\"}"; v="${v%\"}"
+        [[ "$v" == "$want" || "$v" == *"$want"* ]] || continue
+        keys+=("$k")
+    done < "$f"
+    (( ${#keys[@]} )) || return 1
+    for k in "${keys[@]}"; do
+        printf "  ${C_YELLOW}·${C_RESET} clearing %s — it references %s, which this source tree does not have\n" "$k" "$want"
+        # The tree is root-owned (the build script runs under sudo), so this
+        # must too — a silent sed failure here would burn a retry and then
+        # report the ORIGINAL error as if nothing had been tried.
+        $SUDO sed -i -E "s|^${k}=.*|${k}=\"\"|" "$f" || return 1
+        changed=1
+    done
+    (( changed ))
+}
+
+# "unmet build dependencies: debhelper-compat (= 12) libdw-dev:native" → package
+# names, with version constraints and arch qualifiers dropped. A virtual name
+# (debhelper-compat) is resolved to the package that Provides it, or apt would
+# refuse the very install that is meant to unblock the build.
+#
+# apt-cache show exits 0 for a VIRTUAL package while printing nothing, so
+# output must be tested — an exit-status test alone silently passed
+# debhelper-compat straight through and the recovery install then failed.
+build_unmet_pkgs() {
+    local line pkgs p prov out
+    line=$(grep -oiE 'unmet build dependencies:.*' "$1" 2>/dev/null | head -1)
+    [[ -z "$line" ]] && return 1
+    line=$(printf '%s' "$line" | sed -E 's/.*unmet build dependencies:[[:space:]]*//; s/\([^)]*\)//g; s/:[A-Za-z0-9-]+//g')
+    for p in $line; do
+        [[ "$p" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || continue
+        prov=""
+        out=$(apt-cache show "$p" 2>/dev/null | head -1)
+        if [[ -z "$out" ]]; then
+            prov=$(apt-cache showpkg "$p" 2>/dev/null | awk '/^Reverse Provides:/{f=1;next} f && NF {print $1; exit}')
+            [[ -z "$prov" ]] && continue
+            p="$prov"
+        fi
+        pkgs="$pkgs $p"
+    done
+    printf '%s' "${pkgs# }"
+}
+
+# Compile with every line teed to $BUILD_LOG, then recover from the failures
+# that have a known fix. Returns 0 when the packages are built.
+#
+# Recovery is bounded: each fix is attempted at most once, at most
+# BUILD_MAX_TRIES passes run, and anything unrecognized stops immediately with
+# the first real error line rather than burning another 90 minutes guessing.
+# A successful recovery leaves NO critical in the verdict — the run is clean,
+# because nothing is actually wrong once it has been fixed.
+build_compile() {
+    local jobs="${1:-$(nproc 2>/dev/null || echo 4)}"
+    local rc=0 err="" kind cmd pkg newj dpkgs cpath attempt=1
+    local tried_oom=0 tried_tool=0 tried_deps=0 tried_cfg=0
+    local -a args=()
+
+    BUILD_LOG=$(build_log_path)
+    : > "$BUILD_LOG" 2>/dev/null || BUILD_LOG="/tmp/kernelz-build-${UP_VER:-unknown}.log"
+    args=(--jobs "$jobs")
+
+    while true; do
+        (( attempt > 1 )) && info "retry #$((attempt - 1)) — resuming; make skips everything already compiled"
+        printf "  ${C_DIM}\$ %s bash %s --jobs %s  ${C_DIM}(every line logged to %s)${C_RESET}\n" \
+            "$SUDO" "$BUILD_SCRIPT" "$jobs" "$BUILD_LOG"
+        rc=0
+        # shellcheck disable=SC2086
+        $SUDO bash "$BUILD_SCRIPT" "${args[@]}" 2>&1 | tee -a "$BUILD_LOG"
+        rc=${PIPESTATUS[0]}
+        if (( rc == 0 )); then
+            (( attempt > 1 )) && ok "compile finished on retry #$((attempt - 1)) — the earlier work was reused"
+            return 0
+        fi
+
+        (( attempt >= BUILD_MAX_TRIES )) && break
+        err=$(build_first_error "$BUILD_LOG") || err=""
+        kind=$(build_classify "$BUILD_LOG" "$err")
+
+        case "$kind" in
+            oom)
+                (( tried_oom || jobs <= 2 )) && break
+                tried_oom=1
+                newj=$(( jobs / 2 )); (( newj < 2 )) && newj=2
+                info "ran out of memory at -j$jobs — retrying with -j$newj"
+                jobs=$newj; args=(--jobs "$jobs")
+                attempt=$(( attempt + 1 )); continue ;;
+            tool)
+                (( tried_tool )) && break
+                cmd=$(build_missing_cmd "$BUILD_LOG")
+                pkg=$(build_tool_pkg "$cmd")
+                [[ -z "$cmd" || -z "$pkg" ]] && break
+                tried_tool=1
+                info "tool '$cmd' is missing — installing $pkg, then retrying"
+                pkg_install "$pkg" || break
+                attempt=$(( attempt + 1 )); continue ;;
+            deps)
+                (( tried_deps )) && break
+                dpkgs=$(build_unmet_pkgs "$BUILD_LOG")
+                [[ -z "$dpkgs" ]] && break
+                tried_deps=1
+                info "build dependencies unmet — installing: $dpkgs"
+                # shellcheck disable=SC2086
+                pkg_install $dpkgs || break
+                attempt=$(( attempt + 1 )); continue ;;
+            cfgpath)
+                # The config points at a file this tree does not have. This is
+                # not a compile error at all: it happens before any C runs, so
+                # clearing the reference loses NOTHING and the pass resumes
+                # from the config instead of from zero.
+                (( tried_cfg )) && break
+                cpath=$(build_missing_cfg_path "$err")
+                [[ -z "$cpath" ]] && break
+                tried_cfg=1
+                info "the config asks for '$cpath', which this source tree does not have — clearing the reference"
+                build_clear_cfg_ref "$cpath" || break
+                attempt=$(( attempt + 1 )); continue ;;
+        esac
+        break                      # unrecognized, or a fix already tried
+    done
+
+    # ---- give up: say exactly WHAT failed and WHERE the evidence is ----
+    err=$(build_first_error "$BUILD_LOG") || err=""
+    [[ -z "$err" ]] && err="no error line captured — see the log"
+    printf "\n  ${C_RED}first error:${C_RESET} %s\n" "$err"
+    printf "  ${C_DIM}full log (survives scrollback): %s${C_RESET}\n" "$BUILD_LOG"
+    BUILD_LAST_ERR="$err"
+    return 1
 }
 
 confirm_or_abort() {   # $1 = prompt
@@ -3562,13 +3840,12 @@ cmd_build() {
     if (( BUILD_HAVE_DEBS )); then
         ok "artifacts already present — skipping the compile (rebuild = delete \$BUILDDIR debs)"
     else
-        # TOOLCHAIN_FIX_CMD is empty whenever the scan passed, so name it as a
-        # cause only when it actually was one — an empty "(  )" in the fix line
-        # reads like a bug in the tool itself.
-        local bf_fix="read the first 'make: ***' error above — OOM is the common one: retry with fewer jobs (--jobs 2) or --minimal"
-        [[ -n "$TOOLCHAIN_FIX_CMD" ]] && bf_fix="missing toolchain: $TOOLCHAIN_FIX_CMD — then re-run; if it was OOM: retry with --jobs 2 or --minimal"
-        run_cmd bash "$BUILD_SCRIPT" || {
-            critf "BuildFail" "compile failed — nothing was installed, you remain on $REL" "$bf_fix"
+        local bf_fix="see the first error above (it is printed even after the terminal scrolled past it) and the log next to the build script"
+        [[ -n "$TOOLCHAIN_FIX_CMD" ]] && bf_fix="missing toolchain: $TOOLCHAIN_FIX_CMD — install it, then re-run (the download and every object already built are kept)"
+        [[ "$BUILD_LAST_ERR" == *"No rule to make target"* ]] && bf_fix="the config references a file this source tree does not have (a distro packaging path such as debian/canonical-certs.pem) — kernelz clears it and retries; if it still failed, set that key to \"\" by hand in $(build_tree_dir)/.config and re-run"
+        build_compile "$JOBS_N" || {
+            critf "BuildFail" "compile failed after ${BUILD_MAX_TRIES} attempt(s) — nothing was installed, you remain on $REL" \
+                "$bf_fix"
             emit_verdict
         }
     fi
