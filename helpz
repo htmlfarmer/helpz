@@ -581,7 +581,6 @@ SYMPTOM_INDEX=(
   "Look someone up / find their profiles or contact info|searchz|person name facebook linkedin instagram twitter github phone address email osint"
   "Compare two tool runs|timingz|compare timing benchmark diff"
   "See what is normal for my machine|trendz|history trend common median baseline drift normal typical boot compare"
-  "Study my notes or the register|spiritz|register notes theme"
 )
 
 # Print the tools that answer a symptom, with their one-line descriptions.
