@@ -16,7 +16,7 @@
 # Per-repo line allowlist: .secret-guard-ignore (grep -vE patterns)
 # ============================================================================
 
-GUARD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|gh[ourps]_[A-Za-z0-9]{36}|xox[bpars]-[A-Za-z0-9-]{10,}|sk-(live|test|proj)-[A-Za-z0-9_\-]{20,}|AIza[0-9A-Za-z_-]{35}|ya29\.[0-9A-Za-z_-]{25,}|eyJ[A-Za-z0-9_-]{12,}\.eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+|whsec_[A-Za-z0-9]{16,}|GOCSPX-[A-Za-z0-9_-]{16,}|hf_[A-Za-z0-9]{30,}|[a-z][a-z0-9+.-]{2,10}://[^/[:space:]:@]+:[^/[:space:]@]{6,}@|Basic[[:space:]]+["'"'"']?[A-Za-z0-9+/=]{16,}|Buffer\.from\(["'"'"'][A-Za-z0-9_.+-]{2,30}:[^"'"'"'[:space:]]{8,}["'"'"']\)|b64decode\(["'"'"'][A-Za-z0-9+/]{20,}={0,2}["'"'"']\)|(password|passwd|pwd|secret|token|api[_-]?key|apikey|client[_-]?secret|access[_-]?key)[A-Za-z0-9_-]*["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+_./=:-]{12,}'
+GUARD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|gh[ourps]_[A-Za-z0-9]{36}|xox[bpars]-[A-Za-z0-9-]{10,}|sk-(live|test|proj)-[A-Za-z0-9_\-]{20,}|AIza[0-9A-Za-z_-]{35}|ya29\.[0-9A-Za-z_-]{25,}|eyJ[A-Za-z0-9_-]{12,}\.eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+|whsec_[A-Za-z0-9]{16,}|GOCSPX-[A-Za-z0-9_-]{16,}|hf_[A-Za-z0-9]{30,}|[a-z][a-z0-9+.-]{2,10}://[^/[:space:]:@]+:[^/[:space:]@]{6,}@|Basic[[:space:]]+["'"'"']?[A-Za-z0-9+/=]{16,}|Buffer\.from\(["'"'"'][A-Za-z0-9_.+-]{2,30}:[^"'"'"'[:space:]]{8,}["'"'"'][^)]*\)|b64decode\(["'"'"'][A-Za-z0-9+/]{20,}={0,2}["'"'"']\)|(password|passwd|pwd|secret|token|api[_-]?key|apikey|client[_-]?secret|access[_-]?key)[A-Za-z0-9_-]*["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+_./=:-]{12,}'
 
 # path tokens: substring match against staged/tracked paths
 # NOTE: the backup dir token below is deliberately narrow — it blocks the
@@ -32,16 +32,32 @@ guard_log() { printf '  guard: %s\n' "$*" >&2; }
 
 guard_allow() {   # repo-root .secret-guard-ignore regex lines filter
     local allowfile="${1:-}/.secret-guard-ignore"
-    [[ -r "$allowfile" ]] && cat "$allowfile" || true
+    # Comments and blank lines are dropped: the file is "one regex per line",
+    # so an explanatory line would otherwise become a pattern — and a pattern
+    # mentioning ".env.test" could then mask a real credential finding.
+    [[ -r "$allowfile" ]] && grep -vE '^[[:space:]]*(#|$)' "$allowfile" || true
 }
 
 guard_paths_check() {   # list of paths on stdin → echoes offenders
-    local f tok base
+    local f tok base allow
+    # The per-repo allowlist (.secret-guard-ignore) now covers PATHS as well
+    # as credential lines. Until 2026-11-14 it filtered guard_secrets_check
+    # only, so a repo could never exempt a path it deliberately ships — the
+    # documented "per-repo line allowlist" silently did not apply here. A
+    # real case: xyzo's api/.env.test is loaded by bunfig.toml and must be
+    # tracked, but the ".env" token blocked every commit forever. Exempting
+    # it is explicit and visible in the repo's own allowlist file.
+    allow=$(guard_allow "$(git rev-parse --show-toplevel 2>/dev/null || echo .)")
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
         # .example/.sample/.template files are templates by definition — skip.
         base="$(basename "$f")"
         [[ "$base" =~ $GUARD_SAFE_SUFFIX_RE ]] && continue
+        # Matches an allowlist pattern → not an offender. grep exits 1 when
+        # it has nothing left to print, i.e. when every line matched.
+        if [[ -n "$allow" ]] && ! printf '%s\n' "$f" | grep -viE "$allow" >/dev/null; then
+            continue
+        fi
         for tok in $GUARD_BLOCK_TOKENS; do
             [[ "$f" == *"$tok"* ]] && { printf '%s\n' "$f"; break; }
         done
@@ -51,7 +67,7 @@ guard_paths_check() {   # list of paths on stdin → echoes offenders
 guard_secrets_check() { # diff/content on stdin → echoes offenders (masked)
     local allow
     allow=$(guard_allow "$(git rev-parse --show-toplevel 2>/dev/null || echo .)")
-    grep -inE -e "$GUARD_SECRET_RE" | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" \
+    grep -ainE -e "$GUARD_SECRET_RE" | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" \
       | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]|your-' \
       | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; }
 }
@@ -60,14 +76,23 @@ guard_gate() {   # $1 = staged | tracked ; returns 1 on violation
     local mode="${1:-staged}" files content rc=0
     if [[ "$mode" == "staged" ]]; then
         files=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
-        content=$(git diff --cached -U0 --diff-filter=ACM 2>/dev/null)
+        # ONLY `+` lines. A credential on a REMOVED line is one this commit is
+        # DELETING — flagging it blocks the very commit that fixes the leak.
+        # Found 2026-11-14 scrubbing xyzo.org: the gate rejected the diff that
+        # replaced its production password with CHANGE_ME, because the old
+        # line is still visible as `-` in `git diff --cached`. The added half
+        # carries the only lines that reach the commit. Strip NUL bytes first,
+        # and pass -a: without it grep decides some text files are binary and
+        # prints "(standard input): binary file matches" — silently DROPPING
+        # the very `+` lines it found.
+        content=$(git diff --cached -U0 --diff-filter=ACM 2>/dev/null | tr -d '\0' | grep -a '^+' || true)
     else
         # tracked: scan every tracked file in the worktree
         files=$(git ls-files 2>/dev/null)
         content=""
         local f
         while IFS= read -r f; do
-            [[ -f "$f" ]] && content+=$(grep -inHE -e "$GUARD_SECRET_RE" "$f" 2>/dev/null | head -5) && content+=$'\n'
+            [[ -f "$f" ]] && content+=$(grep -inHE -e "$GUARD_SECRET_RE" "$f" 2>/dev/null | head -5 | tr -d '\0') && content+=$'\n'
         done <<< "$files"
     fi
     [[ -z "$files" ]] && return 0

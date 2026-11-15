@@ -224,6 +224,20 @@ section "6 · SUITE INTEGRITY"
 for req in lib/common.sh lib/chart.sh lib/duration.sh lib/guard.sh .helpz_log.sh; do
     if [[ -r "$SCRIPT_DIR/$req" ]]; then note_pass; else note_fail "missing required file: $req"; fi
 done
+# Every helper a tool CALLS must be defined in a lib/ file it loads. A
+# half-synced tree (one lib updated, its sibling not) makes a tool die at
+# runtime with "command not found" — long after the change that caused it.
+if declare -F suite_check_symbols >/dev/null 2>&1; then
+    _symbad=$(suite_check_symbols "$SCRIPT_DIR" 2>&1)
+    _symcnt=$(printf '%s' "$_symbad" | grep -c 'calls ' || true)
+    if [[ "$_symcnt" -eq 0 ]]; then
+        note_pass
+    else
+        note_fail "tools call helpers no lib/ defines: $(printf '%s' "$_symbad" | grep 'calls ' | head -3 | tr '\n' ';')"
+    fi
+else
+    note_skip
+fi
 # Every tool should be listed in the README table
 if [[ -r "$SCRIPT_DIR/README.md" ]]; then
     miss=""

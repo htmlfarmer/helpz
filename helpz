@@ -74,7 +74,14 @@ suggest_next() {
     fi
     # ssh brute force in journal → sshauditz
     if command -v journalctl >/dev/null 2>&1; then
-        v=$(timeout 2 journalctl -q --since "-30 min" --no-pager 2>/dev/null | grep -c "Failed password\|invalid user" || true)
+        # Require "sshd" and drop COMMAND= lines. A bare "Failed password"
+        # also matches any suite tool's own `sudo grep -ciE 'Failed
+        # password|...'` command, which sudo logs into the journal — that
+        # measured 1 hit / 0 real failures. The threshold below is 5, so a
+        # busy session of tool runs could have tripped a phantom brute force.
+        v=$(timeout 2 journalctl -q --since "-30 min" --no-pager 2>/dev/null \
+            | grep -E "sshd.*(Failed password|invalid user)" \
+            | grep -v "COMMAND=" | wc -l)
         (( ${v:-0} > 5 )) 2>/dev/null && S+=("29${_TAB}sshauditz${_TAB}${v} failed/invalid SSH login attempts in the last 30 minutes")
     fi
     # battery health → powerz
@@ -312,15 +319,28 @@ SAFE=$(cat "$hd/guard-safe-suffix" 2>/dev/null || true)
 files=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
 [[ -z "$files" ]] && exit 0
 rc=0
+allow=""
+# The per-repo allowlist exempts PATHS as well as credential lines, and its
+# `#` comment lines are dropped — a prose line would otherwise become a
+# pattern (one mentioning ".env.test" could then mask a real secret).
+[[ -r "$(git rev-parse --show-toplevel 2>/dev/null)/.secret-guard-ignore" ]] && allow=$(grep -vE '^[[:space:]]*(#|$)' "$(git rev-parse --show-toplevel)/.secret-guard-ignore" 2>/dev/null)
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   # template files (.example/.sample/.template) never carry live secrets
   [[ -n "$SAFE" && "$(basename "$f")" =~ $SAFE ]] && continue
+  # allowlisted path → the repo ships it deliberately (e.g. the placeholder
+  # env file its own test harness loads). grep exits 1 when every line
+  # matched, i.e. the path IS allowlisted.
+  if [[ -n "$allow" ]] && ! printf '%s\n' "$f" | grep -viE "$allow" >/dev/null; then continue; fi
   for t in $TOKS; do [[ "$f" == *"$t"* ]] && { echo "guard: BLOCKED personal path: $f" >&2; rc=1; break; }; done
 done <<< "$files"
-allow=""
-[[ -r "$(git rev-parse --show-toplevel 2>/dev/null)/.secret-guard-ignore" ]] && allow=$(cat "$(git rev-parse --show-toplevel)/.secret-guard-ignore")
-hits=$(git diff --cached -U0 --diff-filter=ACM 2>/dev/null | grep -inE -e "$RE" | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]' | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } | head -8)
+# ONLY `+` lines: a credential on a REMOVED line is one this commit is
+# DELETING, and flagging it blocks the very commit that fixes the leak
+# (2026-11-14 — the scrub of xyzo.org's production password was rejected
+# because the old line is still visible as `-` in `git diff --cached`).
+# `tr -d '\0'` + `grep -a` stop a binary diff from warning and silently
+# dropping the lines it did match.
+hits=$(git diff --cached -U0 --diff-filter=ACM 2>/dev/null | tr -d '\0' | grep -a '^+' | grep -inE -e "$RE" | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]' | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } | head -8)
 if [[ -n "$hits" ]]; then
   echo "guard: BLOCKED credential-shaped strings in staged content:" >&2
   printf '%s\n' "$hits" | sed 's/[A-Za-z0-9_-]\{16,\}/[REDACTED]/g; s/^/    /' >&2
@@ -337,7 +357,8 @@ hd="$HOME/.git-hooks"
 RE=$(cat "$hd/guard-patterns"); TOKS=$(cat "$hd/guard-paths")
 SAFE=$(cat "$hd/guard-safe-suffix" 2>/dev/null || true)
 allow=""
-[[ -r "$(git rev-parse --show-toplevel 2>/dev/null)/.secret-guard-ignore" ]] && allow=$(cat "$(git rev-parse --show-toplevel)/.secret-guard-ignore")
+# comment/blank lines dropped — see the note in the pre-commit hook above
+[[ -r "$(git rev-parse --show-toplevel 2>/dev/null)/.secret-guard-ignore" ]] && allow=$(grep -vE '^[[:space:]]*(#|$)' "$(git rev-parse --show-toplevel)/.secret-guard-ignore" 2>/dev/null)
 rc=0
 while read -r refname local_sha remote_sha; do
   [[ "$local_sha" =~ ^0+$ ]] && continue
@@ -345,10 +366,12 @@ while read -r refname local_sha remote_sha; do
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     [[ -n "$SAFE" && "$(basename "$f")" =~ $SAFE ]] && continue
+    # allowlisted path → the repo ships it deliberately
+    if [[ -n "$allow" ]] && ! printf '%s\n' "$f" | grep -viE "$allow" >/dev/null; then continue; fi
     for t in $TOKS; do [[ "$f" == *"$t"* ]] && { echo "guard: BLOCKED personal path in pushed tree: $f" >&2; rc=1; break; }; done
   done < <(git ls-tree -r --name-only "$local_sha" 2>/dev/null)
   # credential scan over pushed blobs only
-  hits=$(git grep -niE -e "$RE" "$local_sha" -- 2>/dev/null | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]' | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } | head -8)
+  hits=$(git grep -a -n -i -E -e "$RE" "$local_sha" -- 2>/dev/null | grep -vE "GUARD_SECRET_RE='-----|SEC_GREP='-----|HIST_PATTERNS='\(" | grep -viE 'EXAMPLE|CHANGE[_-]?ME|PLACEHOLDER|YOUR[_-]|dummy|sample|template|xxxx|yyyy|<[^>]*>|\$\{|<your|insecure[_-]' | { [[ -n "$allow" ]] && grep -viE "$allow" || cat; } | head -8)
   [[ -n "$hits" ]] && { echo "guard: BLOCKED credential-shaped strings in pushed content:" >&2
     printf '%s\n' "$hits" | sed 's/[A-Za-z0-9_-]\{16,\}/[REDACTED]/g; s/^/    /' >&2; rc=1; }
 done
@@ -455,6 +478,21 @@ path_install() {
         printf '%s\n' "    printf '  make it permanent: source ~/.bashrc\\n' >&2"
         printf '%s\n' "    return 127"
         printf '%s\n' "}"
+        printf '%s\n' "# --- kernelz: a new kernel that has booted but not been confirmed yet ---"
+        printf '%s\n' "__helpz_kernel_hint() {"
+        printf '%s\n' "    local _p _f='' _t"
+        printf '%s\n' "    for _p in \"\$HOME/.kernelz/pending.conf\" /var/lib/kernelz/pending.conf; do"
+        printf '%s\n' "        [ -r \"\$_p\" ] && { _f=\$_p; break; }"
+        printf '%s\n' "    done"
+        printf '%s\n' "    [ -n \"\$_f\" ] || return 0"
+        printf '%s\n' "    _t=\$(sed -n 's/^TARGET_REL=//p' \"\$_f\" 2>/dev/null | head -1)"
+        printf '%s\n' "    [ -n \"\$_t\" ] || return 0"
+        printf '%s\n' "    [ \"\$(uname -r)\" = \"\$_t\" ] || return 0"
+        printf '%s\n' "    printf '\n  \\033[1;33m*\\033[0m  New kernel %s booted but is not confirmed yet.\n' \"\$_t\""
+        printf '%s\n' "    printf '     Confirm it:  \\033[1msudo kernelz verified\\033[0m\n'"
+        printf '%s\n' "    printf '     It becomes the permanent default; the old kernel stays as your fallback.\n\n'"
+        printf '%s\n' "}"
+        printf '%s\n' "__helpz_kernel_hint"
         printf '%s\n' "$PATH_HOOK_END"
     } >> "$f"
     bash -n "$f" 2>/dev/null || {
@@ -542,6 +580,7 @@ SYMPTOM_INDEX=(
   "Search the web from the terminal|searchz|search web query google bing duckduckgo engine url find lookup"
   "Look someone up / find their profiles or contact info|searchz|person name facebook linkedin instagram twitter github phone address email osint"
   "Compare two tool runs|timingz|compare timing benchmark diff"
+  "See what is normal for my machine|trendz|history trend common median baseline drift normal typical boot compare"
   "Study my notes or the register|spiritz|register notes theme"
 )
 

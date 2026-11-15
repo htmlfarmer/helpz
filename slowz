@@ -1434,6 +1434,15 @@ if [[ "${AI_VERDICT:-}" == "1" ]]; then
     ai_emit_verdict "summarize" "Slowz diagnostic complete on $(hostname -s)" 2>/dev/null || true
 fi
 
+# ---------- Metric history (./trendz) ----------
+# The shared snapshot (load, mem, swap, disk, PSI, verdict counts, duration)
+# is recorded automatically; these are slowz's own numbers.
+if declare -f hist_metric >/dev/null 2>&1 && [[ $JSON_OUT -eq 0 ]] && [[ $WATCH -eq 0 ]]; then
+    hist_metric oom_events   "${OOM_COUNT:-}"
+    hist_metric hot_core_pct "${HOT_PCT:-}"
+    hist_metric err_last_hr  "${ERR_COUNT:-}"
+fi
+
 # ---------- Run comparison (skip for JSON/watch modes) ----------
 if [[ $JSON_OUT -eq 0 ]] && [[ $WATCH -eq 0 ]]; then
     run_comparison_finalize

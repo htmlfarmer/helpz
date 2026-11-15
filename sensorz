@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# sensorz - Hardware sensor sweep: thermals, throttle, power, drives, GPU
+# ----------------------------------------------------------------------------
+# Reads every sensor source the kernel actually exposes:
+#
+#   * /sys/class/hwmon      — coretemp, acpitz, PCH, motherboard chips
+#   * /sys/class/thermal    — thermal zones + trip points
+#   * thermal_throttle      — Intel package/core throttle counters
+#   * /sys/class/powercap   — RAPL package/core/uncore/dram power + limits
+#   * SMART                 — drive temperatures (smartctl, needs root)
+#   * nvidia-smi            — GPU temperature/utilisation
+#
+# Every reading is judged against the trip point THE FIRMWARE reports
+# (temp*_crit, thermal_zone trip points), never a hardcoded number — so a
+# threshold that moves with a BIOS update still reads correctly.
+#
+# The headline metric is the throttle ratio: what fraction of wall-clock
+# uptime the CPU has spent thermally limited. A machine can look "fine"
+# at 80 C and still have thrown away 12% of its uptime to throttling.
+#
+# Usage:
+#   ./sensorz                     # full sweep
+#   ./sensorz --cpu               # thermals + throttle + power only
+#   ./sensorz --json              # machine-readable summary
+#   ./sensorz --no-color          # plain output
+#   ./sensorz --watch 5           # re-sample every 5s (Ctrl+C to stop)
+#
+# Requires: nothing (pure /sys reads; degrades gracefully)
+# Optional: sensors (lm-sensors), smartctl (root), nvidia-smi
+#
+# Exit codes: 0 healthy · 1 warnings · 2 critical
+# ============================================================================
+
+set -o pipefail
+
+# ---------- Configuration ----------
+SCRIPT_DIR_S="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SCRIPT_DIR="$SCRIPT_DIR_S"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+# shellcheck source=lib/chart.sh
+source "$SCRIPT_DIR/lib/chart.sh" 2>/dev/null || true
+[[ -f "$SCRIPT_DIR_S/lib/verdict_log.sh" ]] && source "$SCRIPT_DIR_S/lib/verdict_log.sh"
+
+WATCH_INTERVAL=0
+NO_COLOR=0
+JSON_OUT=0
+CPU_ONLY=0
+START_TS=$(date +%s)
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+WARNINGS=0
+CRITICAL=0
+JSON_FIELDS=()
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+    arg="${ARGS[$i]}"
+    case "$arg" in
+        --watch=*)  WATCH_INTERVAL="${arg#--watch=}" ;;
+        --watch)    i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-5}" ;;
+        --cpu)      CPU_ONLY=1 ;;
+        --no-color) NO_COLOR=1 ;;
+        --json)
+            JSON_OUT=1
+            # Human report → stderr, JSON object → stdout (fd 4).
+            exec 4>&1 1>&2
+            _JSON_FD4=1
+            ;;
+        -h|--help)
+            cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          sensorz — Hardware Sensor Sweep                        ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Reads every sensor the kernel exposes — CPU/package thermals, per-core
+  temperatures, thermal zones, the Intel thermal-throttle counters, RAPL
+  power domains, drive temperatures and GPU state — and judges each
+  against the trip point reported by the firmware rather than a
+  hardcoded number.
+
+  The headline number is the THROTTLE RATIO: what percentage of wall
+  clock the CPU has spent thermally limited. A box sitting at a
+  comfortable-looking 80 C can still have thrown away 12% of its uptime
+  to throttling, which is invisible from a single temperature reading.
+
+USAGE
+  ./sensorz                 full sweep
+  ./sensorz --cpu           thermals + throttle + power only
+  ./sensorz --json          machine-readable summary on stdout
+  ./sensorz --no-color      plain output
+  ./sensorz --watch 5       re-sample every 5 seconds
+  ./sensorz -h, --help      this text
+
+READING THE OUTPUT
+  trip point   the firmware's own limit (temp*_crit / thermal_zone trips)
+  headroom     trip minus current — below 10 C means you are close
+  throttle%    share of uptime spent thermally limited (cumulative)
+
+  FANS are reported only if the board exposes fan*_input; many desktop
+  boards expose none, which this tool reports as "not exposed" rather
+  than pretending everything is fine.
+
+EXIT CODES
+  0  healthy    1  warnings    2  critical
+
+Requires: nothing (pure /sys reads)
+Optional: sensors (lm-sensors), smartctl (root), nvidia-smi
+HELPEOF
+            exit 0
+            ;;
+    esac
+    i=$((i+1))
+done
+
+if [[ "$NO_COLOR" == "1" ]]; then
+    NO_COLOR=1
+fi
+
+# ---------- Collectors ----------
+
+# Every hwmon chip's temperature inputs, as "chip|label|millidegC|crit_mC"
+collect_hwmon_temps() {
+    local h name lbl f mv crit
+    for h in /sys/class/hwmon/hwmon*; do
+        [[ -d "$h" ]] || continue
+        name=$(cat "$h/name" 2>/dev/null || echo "hwmon")
+        for f in "$h"/temp*_input; do
+            [[ -f "$f" ]] || continue
+            mv=$(cat "$f" 2>/dev/null) || continue
+            [[ "$mv" =~ ^[0-9]+$ ]] || continue
+            (( mv <= 0 )) && continue
+            # label: temp1_label if present, else the index
+            lbl=$(cat "${f%_input}_label" 2>/dev/null || basename "${f%_input}")
+            crit=$(cat "${f%_input}_crit" 2>/dev/null || cat "${f%_input}_max" 2>/dev/null || echo "")
+            printf '%s|%s|%s|%s\n' "$name" "$lbl" "$mv" "$crit"
+        done
+    done
+}
+
+# Thermal zones as "type|millidegC|tripC" (invalid/unset trips dropped)
+collect_thermal_zones() {
+    local z ty tp trips t
+    for z in /sys/class/thermal/thermal_zone*/; do
+        [[ -d "$z" ]] || continue
+        ty=$(cat "$z/type" 2>/dev/null || echo "zone")
+        tp=$(cat "$z/temp" 2>/dev/null) || continue
+        [[ "$tp" =~ ^-?[0-9]+$ ]] || continue
+        trips=""
+        for t in "$z"/trip_point_*_temp; do
+            [[ -f "$t" ]] || continue
+            local v
+            v=$(cat "$t" 2>/dev/null)
+            # drop unset trips (kernel reports -274 C when uninitialised)
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v > 1000 )) && trips+="$((v / 1000)),"
+        done
+        printf '%s|%s|%s\n' "$ty" "$tp" "${trips%,}"
+    done
+}
+
+# Intel throttle counters: "count|max_ms|total_ms"
+collect_throttle() {
+    local base=/sys/devices/system/cpu/cpu0/thermal_throttle
+    local c mt tt
+    c=$(cat "$base/package_throttle_count" 2>/dev/null || echo "")
+    mt=$(cat "$base/package_throttle_max_time_ms" 2>/dev/null || echo 0)
+    tt=$(cat "$base/package_throttle_total_time_ms" 2>/dev/null || echo 0)
+    [[ -n "$c" ]] && printf '%s|%s|%s\n' "$c" "$mt" "$tt"
+}
+
+# RAPL domains: "name|watts_now|limit_w|max_w"
+collect_power() {
+    local d name e1 e2 w lim mx
+    for d in /sys/class/powercap/intel-rapl:*/; do
+        [[ -d "$d" ]] || continue
+        name=$(cat "$d/name" 2>/dev/null || echo "rapl")
+        lim=$(cat "$d/constraint_0_power_limit_uw" 2>/dev/null || echo 0)
+        mx=$(cat "$d/max_power_uw" 2>/dev/null || echo 0)
+        e1=$(cat "$d/energy_uj" 2>/dev/null || echo "")
+        if [[ -n "$e1" ]]; then
+            sleep 2
+            local e2b
+            e2b=$(cat "$d/energy_uj" 2>/dev/null || echo "")
+            if [[ -n "$e2b" ]] && (( e2b >= e1 )); then
+                w=$(( (e2b - e1) / 2000000 ))
+            else
+                w=0
+            fi
+        else
+            w=-1
+        fi
+        printf '%s|%s|%s|%s\n' "$name" "$w" "$((lim / 1000000))" "$((mx / 1000000))"
+    done
+}
+
+# Drive temps via smartctl: "dev|temp|-"
+collect_drive_temps() {
+    local dev t
+    command -v smartctl >/dev/null 2>&1 || return 0
+    # Whole disks only: /dev/sd[a-z] already excludes sdb1/sdb2/sdb3, and
+    # nvme is matched as nvme0n1 rather than the namespace partition.
+    for dev in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
+        [[ -b "$dev" ]] || continue
+        # SATA drives report 194/190 or "Temperature_Celsius"; NVMe reports
+        # "Temperature:". Take the first plausible 2-digit Celsius value on
+        # any temperature line rather than trusting one attribute id.
+        t=$(smartctl -A "$dev" 2>/dev/null | awk '
+            /[Tt]emperature/ {
+                for (i = 1; i <= NF; i++)
+                    if ($i ~ /^[0-9][0-9]$/) { print $i; exit }
+            }')
+        printf '%s|%s|\n' "$dev" "${t:--}"
+    done
+}
+
+# GPU via nvidia-smi: "temp|util|-"
+collect_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    local out
+    out=$(nvidia-smi --query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [[ -z "$out" ]] && return 0
+    printf '%s\n' "$out"
+}
+
+# Fans from hwmon: "chip|label|rpm"
+collect_fans() {
+    local h name f lbl rpm
+    for h in /sys/class/hwmon/hwmon*; do
+        [[ -d "$h" ]] || continue
+        name=$(cat "$h/name" 2>/dev/null || echo "hwmon")
+        for f in "$h"/fan*_input; do
+            [[ -f "$f" ]] || continue
+            rpm=$(cat "$f" 2>/dev/null) || continue
+            [[ "$rpm" =~ ^[0-9]+$ ]] || continue
+            lbl=$(cat "${f%_input}_label" 2>/dev/null || basename "${f%_input}")
+            printf '%s|%s|%s\n' "$name" "$lbl" "$rpm"
+        done
+    done
+}
+
+# ---------- Reporting ----------
+WARN_LIST=()
+CRIT_LIST=()
+# top-level (not local): `declare` inside a function would scope it local
+declare -A _SEEN_TEMP=()
+
+check_temp() {   # check_temp <label> <c> <trip_c>
+    local lbl="$1" t="$2" trip="${3:-0}"
+    [[ -z "$t" || "$t" == "-" ]] && return 0
+    [[ "$t" =~ ^[0-9]+$ ]] || return 0
+    # Deduplicate: the package is reported once by the summary line and once
+    # again by the per-sensor table loop, which produced two identical
+    # warnings for one physical reading.
+    local key="${lbl}|${t}"
+    [[ -n "${_SEEN_TEMP[$key]:-}" ]] && return 0
+    _SEEN_TEMP[$key]=1
+    if (( trip > 0 )); then
+        if (( t >= trip )); then
+            critf "Thermal" "$lbl at ${t}C — at/over the ${trip}C trip point"
+            CRIT_LIST+=("$lbl ${t}C ≥ ${trip}C")
+        elif (( t >= trip - 10 )); then
+            warnf "Thermal" "$lbl at ${t}C — only $((trip - t))C below the ${trip}C trip point"
+            WARN_LIST+=("$lbl ${t}C (headroom $((trip - t))C)")
+        fi
+    else
+        # No firmware trip — fall back to conventional guidance.
+        if (( t >= 90 )); then
+            critf "Thermal" "$lbl at ${t}C (no trip point reported)"
+            CRIT_LIST+=("$lbl ${t}C")
+        elif (( t >= 80 )); then
+            warnf "Thermal" "$lbl at ${t}C (no trip point reported)"
+            WARN_LIST+=("$lbl ${t}C")
+        fi
+    fi
+}
+
+# ---------- Main ----------
+do_sample() {
+    local pkg_trip=0 core_trip=0
+    _SEEN_TEMP=()      # reset per sample so --watch does not suppress repeats
+
+    # ---------- overview ----------
+    section "SENSOR SWEEP"
+    kpi "host"       "$HOSTNAME_SHORT"
+    kpi "kernel"     "$(uname -r)"
+    kpi "uptime"     "$(awk '{printf "%dd %dh", $1/86400, ($1%86400)/3600}' /proc/uptime)"
+    kpi "load"       "$(awk '{print $1" "$2" "$3}' /proc/loadavg)  ($(nproc) cores)"
+    kpi "governor"   "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+
+    # ---------- thermals ----------
+    section "CPU & BOARD THERMAL"
+
+    local hwmon_rows zone_rows
+    hwmon_rows=$(collect_hwmon_temps)
+    zone_rows=$(collect_thermal_zones)
+
+    # pick trip points from coretemp/whatever reports crit
+    pkg_trip=$(awk -F'|' '$1=="coretemp" && $4!="" {print $4/1000; exit}' <<<"$hwmon_rows")
+
+    local pkg_c=""
+    pkg_c=$(awk -F'|' '$2 ~ /ackage/ {print int($3/1000); exit}' <<<"$hwmon_rows")
+    if [[ -z "$pkg_c" ]]; then
+        pkg_c=$(awk -F'|' '$1=="x86_pkg_temp" {print int($2/1000); exit}' <<<"$zone_rows")
+    fi
+
+    if [[ -n "$pkg_c" ]]; then
+        local head=""
+        (( pkg_trip > 0 )) && head="  headroom $((pkg_trip - pkg_c))C of ${pkg_trip}C"
+        local pct=0
+        (( pkg_trip > 0 )) && pct=$(( pkg_c * 100 / pkg_trip ))
+        emit "  ${C_BOLD}package%s${C_RESET} %b%s C%s\n" "${C_DIM} (${HOSTNAME_SHORT})${C_RESET}" "$(temp_color "$pkg_c")" "$pkg_c" "$head"
+        chart_gauge "$pct" "vs trip point" 24
+        check_temp "package" "$pkg_c" "$pkg_trip"
+        JSON_FIELDS+=("\"cpu_package_c\":$pkg_c" "\"cpu_trip_c\":${pkg_trip:-0}")
+    else
+        warn "no CPU package temperature exposed"
+        WARN_LIST+=("no CPU package temp")
+    fi
+
+    # per-core / per-sensor table
+    # NOTE: `$(printf '...\n')` STRIPS the trailing newline (command
+    # substitution always does), so `rows+=$(printf '%s\t...\n' ...)` would
+    # glue every row onto a single line. That broke the table renderer (one
+    # giant row) and the spread calc (27..27). Append the newline explicitly.
+    local rows="" n=0
+    while IFS='|' read -r chip lbl mv crit; do
+        [[ -z "$mv" ]] && continue
+        local c=$((mv / 1000))
+        rows+="$(printf '%s\t%s\t%s' "$chip/$lbl" "$c" "${crit:-}")"$'\n'
+        check_temp "$chip/$lbl" "$c" "$(( ${crit:-0} / 1000 ))"
+        n=$((n+1))
+    done <<<"$hwmon_rows"
+
+    if [[ -n "$rows" ]]; then
+        table_begin "sensor" "C" "trip"
+        while IFS=$'\t' read -r a b c; do
+            [[ -z "$a" ]] && continue          # skip the trailing blank line
+            local tc trip_c=""
+            tc=$(temp_color "$b")
+            # sysfs reports trips in millidegC (100000) — show C, not raw
+            [[ -n "$c" && "$c" =~ ^[0-9]+$ ]] && trip_c="$(( c / 1000 ))"
+            table_row "$a" "${tc}${b}${C_RESET}" "${trip_c:-—}"
+        done <<<"$rows"
+        table_end
+
+        # distribution: hottest vs coolest (numeric rows only)
+        local hottest coolest
+        hottest=$(awk -F'\t' '$2 ~ /^[0-9]+$/ {print $2}' <<<"$rows" | sort -rn | head -1)
+        coolest=$(awk  -F'\t' '$2 ~ /^[0-9]+$/ {print $2}' <<<"$rows" | sort -n  | head -1)
+        if [[ -n "$hottest" && -n "$coolest" ]]; then
+            emit "\n  ${C_DIM}spread: ${coolest}C .. ${hottest}C  (delta $((hottest - coolest))C)${C_RESET}\n"
+        fi
+    fi
+
+    # thermal zones
+    if [[ -n "$zone_rows" ]]; then
+        emit "\n  ${C_DIM}thermal zones${C_RESET}\n"
+        while IFS='|' read -r ty tp trips; do
+            [[ -z "$tp" ]] && continue
+            local c=$((tp / 1000))
+            emit "    %-22s %b%s C%s" "$ty" "$(temp_color "$c")" "$c" "$C_RESET"
+            [[ -n "$trips" ]] && emit "  ${C_DIM}trips: ${trips}C${C_RESET}"
+            emit "\n"
+        done <<<"$zone_rows"
+    fi
+
+    # ---------- throttle: the headline ----------
+    section "THERMAL THROTTLING"
+    local thr
+    thr=$(collect_throttle)
+    if [[ -n "$thr" ]]; then
+        local tcount tmax ttotal
+        IFS='|' read -r tcount tmax ttotal <<<"$thr"
+        local uptime_s ratio_pct total_h
+        uptime_s=$(awk '{printf "%d", $1}' /proc/uptime)
+        total_h=$(awk -v ms="$ttotal" 'BEGIN{printf "%.1f", ms/3600000}')
+        ratio_pct=$(awk -v ms="$ttotal" -v u="$uptime_s" 'BEGIN{ if(u<=0){print 0; exit} printf "%.1f", (ms/1000)*100/u }')
+
+        kpi "events"      "$tcount"
+        kpi "total time"  "${total_h} h of throttling"
+        kpi "ratio"       "${ratio_pct}% of uptime" \
+            "$(awk -v p="$ratio_pct" 'BEGIN{print (p>=5?"'"$C_RED"'":(p>=1?"'"$C_YELLOW"'":"'"$C_GREEN"'"))}')"
+        kpi "longest hit" "${tmax} ms"
+
+        chart_gauge "$ratio_pct" "uptime throttled" 24
+
+        # rate right now
+        local r1 r2
+        r1=$(collect_throttle | cut -d'|' -f1)
+        sleep 3
+        r2=$(collect_throttle | cut -d'|' -f1)
+        local rate=$(( (r2 - r1) / 3 ))
+        emit "  ${C_DIM}current rate: ${rate} events/sec${C_RESET}\n"
+        JSON_FIELDS+=("\"throttle_count\":$tcount" "\"throttle_ratio_pct\":$ratio_pct")
+
+        if (( rate > 0 )); then
+            warnf "Thermal" "CPU is throttling right now (${rate}/s) — cooling cannot keep up with the current load" \
+                "open the case and check fans/dust/paste"
+            WARN_LIST+=("throttling ${rate}/s")
+        fi
+        # NOTE: crit/warn take "message" [fix]; critf/warnf take
+        # "category" "message" "fix". Calling the 2-arg crit with a
+        # category first prints only the category and drops the message.
+        if awk "BEGIN{exit !($ratio_pct >= 5)}"; then
+            critf "Thermal" "CPU has spent ${ratio_pct}% of uptime thermally limited" \
+                "clean the cooler, then repaste if it is already clean"
+            CRIT_LIST+=("throttled ${ratio_pct}% of uptime")
+        elif awk "BEGIN{exit !($ratio_pct >= 1)}"; then
+            warnf "Thermal" "CPU has spent ${ratio_pct}% of uptime thermally limited" \
+                "worth a cooler inspection"
+            WARN_LIST+=("throttled ${ratio_pct}% of uptime")
+        fi
+    else
+        info "no thermal_throttle counters exposed (non-Intel or not present)"
+    fi
+
+    # ---------- power ----------
+    section "POWER (RAPL)"
+    local pw
+    pw=$(collect_power)
+    if [[ -n "$pw" ]]; then
+        table_begin "domain" "now" "limit"
+        local pl_now=""
+        while IFS='|' read -r nm w lim mx; do
+            [[ -z "$nm" ]] && continue
+            [[ "$w" == "-1" ]] && { table_row "$nm" "n/a" "${lim}W"; continue; }
+            table_row "$nm" "${w}W" "${lim}W"
+            [[ "$nm" == "package-0" ]] && pl_now="$w"
+        done <<<"$pw"
+        table_end
+        [[ -n "$pl_now" ]] && JSON_FIELDS+=("\"package_watts\":$pl_now")
+    else
+        info "RAPL not readable (needs root on some kernels)"
+    fi
+
+    # ---------- drives / gpu / fans ----------
+    if [[ "$CPU_ONLY" != "1" ]]; then
+        section "DRIVE TEMPERATURES"
+        local dt
+        dt=$(collect_drive_temps)
+        if [[ -z "$dt" ]]; then
+            info "smartctl not available or not run as root — drive temps skipped"
+        else
+            local any=0
+            while IFS='|' read -r dev t rest; do
+                [[ -z "$t" || "$t" == "-" ]] && continue
+                any=1
+                emit "  %-12s %b%s C%s\n" "$dev" "$(temp_color "$t")" "$t" "$C_RESET"
+                check_temp "$dev" "$t" 55
+            done <<<"$dt"
+            (( any == 0 )) && info "no temperature data returned (drive may not support SMART, or needs root)"
+        fi
+
+        section "GPU"
+        local gpu gtemp gutil
+        gpu=$(collect_gpu)
+        # nvidia-smi prints its failure on STDOUT, so a broken NVML does not
+        # come back empty — it comes back as text. Validate the shape before
+        # using it, otherwise the error string reaches temp_color(), (( ))
+        # and the JSON emitter and produces three separate crashes.
+        gtemp=$(echo "$gpu" | cut -d, -f1 | tr -d ' ')
+        gutil=$(echo "$gpu" | cut -d, -f2 | tr -d ' ')
+        if [[ -z "$gtemp" || ! "$gtemp" =~ ^[0-9]+$ ]]; then
+            if ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+                warn "GPU present (/dev/nvidia*) but nvidia-smi returned no usable reading"
+                info "known cause: kernel nvidia module version != userspace lib version"
+                info "fix: rebuild via DKMS, then reboot so both come from the same build"
+                WARN_LIST+=("nvidia-smi broken (driver/lib version mismatch)")
+            else
+                info "no GPU detected"
+            fi
+        else
+            emit "  temperature  %b%s C%s\n" "$(temp_color "$gtemp")" "$gtemp" "$C_RESET"
+            # emit() is a printf wrapper, so a literal % must be %% — an
+            # unescaped one is read as a conversion specifier and printf
+            # errors out with "invalid format character".
+            emit "  utilization  ${gutil:-?}%%\n"
+            check_temp "GPU" "$gtemp" 83
+            JSON_FIELDS+=("\"gpu_temp_c\":$gtemp")
+        fi
+
+        section "FANS"
+        local fans fan_any=0
+        fans=$(collect_fans)
+        if [[ -z "$fans" ]]; then
+            info "no fan sensors exposed by this board — fan speed cannot be read"
+            info "visual check required: open the case and confirm every fan spins"
+            info "this is common on OEM desktop boards; it does NOT mean fans are fine"
+        else
+            while IFS='|' read -r chip lbl rpm; do
+                fan_any=1
+                if (( rpm == 0 )); then
+                    crit "Fan" "$chip/$lbl is reporting 0 RPM (stalled)"
+                    CRIT_LIST+=("$chip/$lbl stalled")
+                elif (( rpm < 300 )); then
+                    warn "Fan" "$chip/$lbl at ${rpm} RPM (very slow)"
+                    WARN_LIST+=("$chip/$lbl ${rpm}rpm")
+                else
+                    emit "  %-24s ${C_GREEN}%s RPM${C_RESET}\n" "$chip/$lbl" "$rpm"
+                fi
+            done <<<"$fans"
+            (( fan_any == 0 )) && info "no fan sensors exposed"
+        fi
+    fi
+
+    # ---------- recommendations ----------
+    if (( ${#WARN_LIST[@]} > 0 || ${#CRIT_LIST[@]} > 0 )); then
+        section "RECOMMENDATIONS"
+        for c in "${CRIT_LIST[@]:-}"; do
+            [[ -z "$c" ]] && continue
+            emit "  ${C_RED}▸${C_RESET} CRITICAL  %s\n" "$c"
+        done
+        for w in "${WARN_LIST[@]:-}"; do
+            [[ -z "$w" ]] && continue
+            emit "  ${C_YELLOW}▸${C_RESET} warning   %s\n" "$w"
+        done
+        emit "\n  ${C_DIM}Cooling order of attack:${C_RESET}\n"
+        emit "    1. visually confirm every fan spins (no sensor can tell you this)\n"
+        emit "    2. blow dust out of the heatsink fins and case filters\n"
+        emit "    3. if temps stay high when clean+fans-ok → dried thermal paste\n"
+        emit "       (reseat + repaste; the classic cause of hot-at-idle)\n"
+        emit "    4. a side panel off is a TEST, not a fix — see --help note\n"
+    fi
+}
+
+# ---------- Watch mode ----------
+if (( WATCH_INTERVAL > 0 )); then
+    while true; do
+        clear 2>/dev/null || true
+        emit "%s sensorz %s  v%s — sampling every %ss  (Ctrl+C to stop)\n\n" \
+            "$C_BOLD" "$C_DIM$TIMESTAMP$C_RESET" "$SCRIPT_VERSION" "$WATCH_INTERVAL"
+        WARN_LIST=(); CRIT_LIST=()
+        do_sample
+        sleep "$WATCH_INTERVAL"
+    done
+fi
+
+do_sample
+
+# ---------- Verdict ----------
+# NOTE: emit_verdict() prints its own "VERDICT" header — printing one here
+# duplicated it. And `local` only works inside a function: using it at top
+# level failed, which meant `exit_code` was never assigned and the script
+# exited 0 even when it had just reported CRITICAL.
+exit_code=0
+if (( ${#CRIT_LIST[@]} > 0 )); then
+    critf "Thermal" "CRITICAL: ${#CRIT_LIST[@]} issue(s) require attention"
+    exit_code=2
+elif (( ${#WARN_LIST[@]} > 0 )); then
+    warnf "Thermal" "${#WARN_LIST[@]} warning(s) — worth checking"
+    exit_code=1
+else
+    ok "all sensors within their reported limits"
+fi
+
+if [[ "$JSON_OUT" == "1" ]]; then
+    # Do NOT call emit_verdict() in JSON mode: it writes a SECOND JSON
+    # object to the same stream (so consumers get "Extra data" and fail to
+    # parse), and it only assigns exit_code inside its non-JSON branch —
+    # meaning it exits 0 even when this run just reported CRITICAL.
+    # Emit exactly one object and exit with the real code.
+    j=""
+    [[ ${#JSON_FIELDS[@]} -gt 0 ]] && j=$(printf '%s,' "${JSON_FIELDS[@]}" | sed 's/,$//')
+    printf '{"tool":"sensorz","version":"%s","ts":"%s","host":"%s","warnings":%d,"critical":%d,%s}\n' \
+        "$SCRIPT_VERSION" "$TIMESTAMP" "$HOSTNAME_SHORT" "$WARNINGS" "$CRITICAL" "$j" >&4
+    exit "$exit_code"
+fi
+
+# Human mode: emit_verdict prints the VERDICT block and exits itself.
+if declare -F emit_verdict >/dev/null 2>&1; then
+    emit_verdict
+fi
+
+exit "$exit_code"

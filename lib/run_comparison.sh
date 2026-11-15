@@ -22,6 +22,13 @@ COMPARISON_SCRIPT_NAME=""
 COMPARISON_TEMP_FILE=""
 COMPARISON_ENABLED="${COMPARISON_ENABLED:-1}"
 
+# ---------- metric history (lib/hist.sh) ----------
+# Sourced here, not by each tool: every tool that keeps a last-run capture
+# also gets one metrics line per run, which is what ./trendz reads.
+# shellcheck source=lib/hist.sh
+[[ -r "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/hist.sh" ]] && \
+    source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/hist.sh"
+
 run_comparison_init() {
     COMPARISON_SCRIPT_NAME="$1"
     [[ -z "$COMPARISON_SCRIPT_NAME" ]] && return 1
@@ -39,6 +46,14 @@ run_comparison_init() {
 run_comparison_finalize() {
     [[ "${COMPARISON_FINALIZED:-}" == "1" ]] && return 0
     COMPARISON_FINALIZED=1
+
+    # One metrics line per finished run — recorded BEFORE anything below can
+    # return early, so history survives COMPARISON_ENABLED=0 too. `|| true`
+    # keeps a hiccup here from failing a `set -e` tool at the finish line.
+    if declare -f hist_record >/dev/null 2>&1; then
+        hist_record "${COMPARISON_SCRIPT_NAME:-${0##*/}}" 2>/dev/null || true
+    fi
+
     [[ "${COMPARISON_ENABLED:-1}" != "1" ]] && return 0
     [[ -z "$COMPARISON_SCRIPT_NAME" ]] && return 1
     [[ -z "$COMPARISON_TEMP_FILE" ]] && return 1

@@ -1,0 +1,769 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# trendz - Run history: common values, drift, boot-to-boot comparison
+# ----------------------------------------------------------------------------
+# Every suite tool appends one metrics line per run (lib/hist.sh). trendz
+# turns those lines into three answers:
+#
+#   ./trendz              what has each command been reporting lately?
+#   ./trendz slowz        what is NORMAL for this one, and what changed now?
+#   ./trendz --boot       how does this boot compare with the previous ones?
+#
+# "Common" is the median of the previous 50 runs — one wild run never becomes
+# the baseline. Records are tagged with the boot they ran in, so a whole boot
+# can be compared with the boot before it.
+#
+# Usage:
+#   ./trendz                 Overview of every tool that has history
+#   ./trendz <tool>          One tool: every metric, now vs common
+#   ./trendz --boot [tool]   This boot vs previous boots (all tools, or one)
+#   ./trendz --window N      Common = median of the last N runs (default 50)
+#   ./trendz --json          Machine-readable
+#   ./trendz --no-color      Plain output
+#
+# Requires: lib/common.sh, lib/hist.sh (same directory)
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/hist.sh
+[[ -r "$SCRIPT_DIR/lib/hist.sh" ]] && source "$SCRIPT_DIR/lib/hist.sh"
+
+HIST_DIR="${HIST_DIR:-$HOME/.security-runs/history}"
+
+# The metrics every tool records (lib/hist.sh) — the boot view leans on these
+# so boots can be compared even across different tools.
+PRI_COMMON="load1 load5 mem_pct swap_pct disk_pct psi_cpu psi_io psi_mem failed_units"
+# A single tool's view adds its verdict and runtime on top.
+PRI_TOOL="crit warn dur ${PRI_COMMON}"
+# "dur" wanders with machine load, and the psi_* numbers are single-second
+# samples — both jump every run and would always win the drift contest.
+# They are still recorded and still shown in the detail view.
+NO_DRIFT="dur psi_cpu psi_io psi_memory"
+
+MODE="overview"          # overview | detail | boots
+ARG_TOOL=""
+WINDOW="${HIST_WINDOW:-50}"
+JSON_OUT="${JSON_OUT:-0}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --boot|--boots)   MODE="boots" ;;
+        --boot=*)         MODE="boots"; ARG_TOOL="${1#--boot=}" ;;
+        --window)         shift; WINDOW="${1:-50}" ;;
+        --window=*)       WINDOW="${1#--window=}" ;;
+        --json)
+                JSON_OUT=1
+                shift
+                # JSON mode: the human report goes to stderr, stdout carries only
+                # the JSON object. fd 4 is opened HERE — before any output — and is
+                # this tool's own real stdout. It is never inherited from a parent
+                # shell, so a tool that does not source lib/common.sh still writes
+                # its JSON to the right place.
+                exec 4>&1 1>&2
+                _JSON_FD4=1
+                ;;
+        --no-color)       NO_COLOR=1; init_colors ;;
+        -h|--help)
+                cat << 'HELPEOF'
+
+  ╭─────────────────────────────────────────────────────────────╮
+  │        trendz — run history · common values · boots        │
+  ╰─────────────────────────────────────────────────────────────╯
+
+DESCRIPTION
+  Every tool saves one metrics line per run (lib/hist.sh) into
+  ~/.security-runs/history/<tool>.jsonl. trendz compares those runs
+  against what this machine usually reports, and groups them by boot.
+
+USAGE
+  ./trendz                 Overview: every tool, runs, biggest drift
+  ./trendz <tool>          One tool: every metric, now vs common
+  ./trendz --boot [tool]   This boot vs previous boots (all tools, or one)
+  ./trendz --window N      Common = median of the last N runs (default 50)
+  ./trendz --json          Machine-readable
+  ./trendz --no-color      Plain output
+
+WHAT GETS RECORDED
+  shared (every tool)   load1/5/15, mem%, swap%, root disk%, PSI pressure,
+                        failed systemd units, criticals, warnings, duration
+  per tool              whatever it registers — speedz score, bootz boot
+                        time, slowz OOM count, …
+  meta                  timestamp, boot id, boot start, uptime, kernel
+
+READING IT
+  COMMON   median of the previous N runs — what is normal here
+  Δ        how far this run sits from that normal (▲/▼ + percent)
+  * in --boot marks the boot you are on now
+
+EXAMPLES
+  ./trendz slowz              # has slowz been getting worse?
+  ./trendz --boot speedz      # did this boot start slower than the last?
+  ./trendz --json | jq .tools[]   # feed it to jq
+
+HELPEOF
+                exit 0 ;;
+        -*) printf 'trendz: unknown option %s (try --help)\n' "$1" >&2; exit 64 ;;
+        *)
+                [[ -n "$ARG_TOOL" ]] && { printf 'trendz: unexpected argument %s\n' "$1" >&2; exit 64; }
+                ARG_TOOL="$1"
+                # a bare name selects the detail view — but a name given
+                # AFTER --boot belongs to the boot view
+                [[ "$MODE" == "overview" ]] && MODE="detail"
+                ;;
+    esac
+    shift
+done
+
+[[ "$WINDOW" =~ ^[0-9]+$ ]] || WINDOW=50
+(( WINDOW < 1 )) && WINDOW=1
+[[ -n "$ARG_TOOL" && ! "$ARG_TOOL" =~ ^[A-Za-z0-9._-]+$ ]] && {
+    printf 'trendz: bad tool name %s\n' "$ARG_TOOL" >&2; exit 64
+}
+
+json_stdout_only
+
+# ============================================================================
+# The history reader.
+# ----------------------------------------------------------------------------
+# One awk program, three modes. It parses the exact lines lib/hist.sh writes
+# (flat JSON, values are numbers or quote-free strings — no parser to
+# dependency-hunt for) and answers:
+#
+#   overview  one row per tool:  tool, runs, boots, first, last, crit, warn,
+#                                and the metric furthest from its common value
+#   detail    @meta line, then one @m line per metric: now, common, min, max,
+#                                 count, and the last 30 values
+#   boots     one @boot line per boot: window, run count, tool count and the
+#                                 median of every metric seen in that boot
+# ============================================================================
+HIST_AWK='
+BEGIN { W = (window + 0 >= 1) ? window + 0 : 50
+        # padded with spaces so index() can look for " key " and still
+        # match the FIRST and LAST entry of the list
+        PRI = " " pri " "
+        NODRIFT = " " nodrift " " }
+
+function unq(s) { gsub(/^"|"$/, "", s); return s }
+
+function parse(line, p, mm, n, a, i, k, v) {
+    split("", M); split("", MK)
+    mm = ""
+    if (match(line, /"m":\{[^}]*\}/)) {
+        mm = substr(line, RSTART + 5, RLENGTH - 6)
+        line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
+    }
+    if (substr(line, 1, 1) == "{") line = substr(line, 2)
+    if (line != "" && substr(line, length(line), 1) == "}") line = substr(line, 1, length(line) - 1)
+    n = split(line, a, ",")
+    for (i = 1; i <= n; i++) {
+        if (a[i] == "") continue
+        p = index(a[i], ":"); if (p == 0) continue
+        k = substr(a[i], 1, p - 1); gsub(/"/, "", k)
+        v = substr(a[i], p + 1)
+        if (k != "") MK[k] = unq(v)
+    }
+    if (mm != "") {
+        n = split(mm, a, ",")
+        for (i = 1; i <= n; i++) {
+            if (a[i] == "") continue
+            p = index(a[i], ":"); if (p == 0) continue
+            k = substr(a[i], 1, p - 1); gsub(/"/, "", k)
+            v = substr(a[i], p + 1)
+            if (k != "" && v ~ /^-?[0-9]+(\.[0-9]+)?$/) M[k] = v + 0
+        }
+    }
+}
+
+function med(k, from, to,   i, n, a, j, tmp, id) {
+    n = 0
+    for (i = from; i <= to; i++) {
+        id = k SUBSEP i
+        if (id in V) { n++; a[n] = V[id] + 0 }
+    }
+    if (n == 0) return ""
+    for (i = 2; i <= n; i++) {
+        tmp = a[i]; j = i - 1
+        while (j >= 1 && a[j] > tmp) { a[j+1] = a[j]; j-- }
+        a[j+1] = tmp
+    }
+    if (n % 2 == 1) return a[(n + 1) / 2]
+    return (a[n / 2] + a[n / 2 + 1]) / 2
+}
+
+function medb(b, k,   i, n, a, j, tmp, id) {
+    id = b SUBSEP k
+    n = MC[id]
+    if (n == 0) return ""
+    for (i = 1; i <= n; i++) a[i] = MV[id, i] + 0
+    for (i = 2; i <= n; i++) {
+        tmp = a[i]; j = i - 1
+        while (j >= 1 && a[j] > tmp) { a[j+1] = a[j]; j-- }
+        a[j+1] = tmp
+    }
+    if (n % 2 == 1) return a[(n + 1) / 2]
+    return (a[n / 2] + a[n / 2 + 1]) / 2
+}
+
+# priority-ordered, alphabetically tie-broken (bash hash order never leaks)
+function prank(k) { return (index(PRI, " " k " ") > 0) ? 1 : 2 }
+function kless(a, b,   ra, rb) {
+    ra = prank(a); rb = prank(b)
+    if (ra != rb) return ra < rb
+    return a < b
+}
+function excluded(k) { return index(NODRIFT, " " k " ") > 0 }
+
+{
+    parse($0)
+    if (!("ts" in MK)) next
+    N++
+    R_TS[N]   = MK["ts"] + 0
+    R_BOOT[N] = MK["boot"]
+    R_TOOL[N] = MK["tool"]
+    R_DATE[N] = MK["date"]
+    R_BS[N]   = MK["boot_start"]
+    R_KERN[N] = MK["kernel"]
+    R_UP[N]   = MK["uptime_s"] + 0
+    for (k in M) { C[k]++; V[k, C[k]] = M[k]; TB[k, C[k]] = MK["boot"] }
+}
+
+END {
+    if (N == 0) exit 0
+
+    nboots = 0
+    for (i = 1; i <= N; i++)
+        if (!(R_BOOT[i] in BSEEN)) { BSEEN[R_BOOT[i]] = 1; nboots++ }
+
+    # ---- overview: which metric drifted furthest from its common value ----
+    if (mode == "overview") {
+        dkey = ""; dnow = ""; dmed = ""; best = -1
+        for (k in C) {
+            if (excluded(k)) continue
+            c = C[k]
+            if (c < 2) continue
+            from = c - W; if (from < 1) from = 1
+            m = med(k, from, c - 1)
+            if (m == "") continue
+            now = V[k, c]
+            if (m == 0)      pct = (now == 0) ? 0 : (now > 0 ? 1000 : -1000)
+            else             pct = (now - m) / ((m < 0) ? -m : m) * 100
+            ap = (pct < 0) ? -pct : pct
+            if (ap > best || (ap == best && k < dkey)) {
+                best = ap; dkey = k; dnow = now; dmed = m
+            }
+        }
+        crit = (C["crit"] > 0) ? sprintf("%g", V["crit", C["crit"]]) : "-"
+        warn = (C["warn"] > 0) ? sprintf("%g", V["warn", C["warn"]])  : "-"
+        printf "%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
+            R_TOOL[N], N, nboots, R_TS[1], R_TS[N], crit, warn,
+            dkey, (dkey == "" ? "" : sprintf("%g", dnow)),
+            (dkey == "" ? "" : sprintf("%g", dmed))
+        exit 0
+    }
+
+    # ---- detail: one line for the header, one per metric ----
+    if (mode == "detail") {
+        printf "@meta\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
+            N, R_TS[1], R_TS[N], nboots, R_BOOT[N], R_DATE[N],
+            R_BS[N], R_KERN[N], R_UP[N]
+
+        nkeys = 0
+        for (k in C) K[++nkeys] = k
+        for (i = 2; i <= nkeys; i++) {
+            t = K[i]; j = i - 1
+            while (j >= 1 && kless(t, K[j])) { K[j+1] = K[j]; j-- }
+            K[j+1] = t
+        }
+        for (i = 1; i <= nkeys; i++) {
+            k = K[i]; c = C[k]
+            from = c - W; if (from < 1) from = 1
+            m = med(k, from, c - 1)
+            mn = V[k, 1] + 0; mx = mn
+            for (j = 1; j <= c; j++) {
+                x = V[k, j] + 0
+                if (x < mn) mn = x
+                if (x > mx) mx = x
+            }
+            s = ""; sf = c - 29; if (sf < 1) sf = 1
+            for (j = sf; j <= c; j++) s = s (j == sf ? "" : " ") sprintf("%g", V[k, j])
+            printf "@m\t%s\t%g\t%s\t%g\t%g\t%d\t%s\n",
+                k, V[k, c], (m == "" ? "-" : sprintf("%g", m)), mn, mx, c, s
+        }
+        exit 0
+    }
+
+    # ---- boots: one line per boot, medians of everything seen in it ----
+    for (i = 1; i <= N; i++) {
+        b = R_BOOT[i]
+        if (!(b in BF)) { BF[b] = R_TS[i]; BL[b] = R_TS[i]; ORD[++nb] = b
+                          BS[b] = R_BS[i]; BK[b] = R_KERN[i] }
+        if (R_TS[i] < BF[b]) BF[b] = R_TS[i]
+        if (R_TS[i] > BL[b]) BL[b] = R_TS[i]
+        BR[b]++
+        id = b SUBSEP R_TOOL[i]
+        if (!(id in BT)) { BT[id] = 1; BN[b]++ }
+    }
+    for (k in C) {
+        for (c = 1; c <= C[k]; c++) {
+            b = TB[k, c]
+            id = b SUBSEP k
+            m = ++MC[id]
+            MV[id, m] = V[k, c]
+            if (index(BKL[b], " " k " ") == 0) BKL[b] = BKL[b] " " k " "
+        }
+    }
+    for (i = 2; i <= nb; i++) {                     # newest boot first
+        t = ORD[i]; j = i - 1
+        while (j >= 1 && BF[ORD[j]] < BF[t]) { ORD[j+1] = ORD[j]; j-- }
+        ORD[j+1] = t
+    }
+    for (i = 1; i <= nb; i++) {
+        b = ORD[i]
+        printf "@boot\t%s\t%d\t%d\t%d\t%d\t%s\t%s", b, BF[b], BL[b], BR[b], BN[b], BS[b], BK[b]
+        for (j = 1; j <= PKn; j++) delete PK[j]     # portable: no `delete PK`
+        PKn = 0
+        n = split(BKL[b], raw, " ")
+        for (j = 1; j <= n; j++) if (raw[j] != "") PK[++PKn] = raw[j]
+        for (j = 2; j <= PKn; j++) {
+            t = PK[j]; m = j - 1
+            while (m >= 1 && kless(t, PK[m])) { PK[m + 1] = PK[m]; m-- }
+            PK[m + 1] = t
+        }
+        for (j = 1; j <= PKn; j++) printf "\t%s=%g", PK[j], medb(b, PK[j])
+        printf "\n"
+    }
+    exit 0
+}
+'
+
+# ---------- small display helpers ----------
+fmt_num() {                       # 7.170000 → 7.17 · 61.00 → 61
+    local v="${1:-}"
+    [[ -z "$v" || "$v" == "-" ]] && { printf '%s' "—"; return 0; }
+    if [[ "$v" == *.* ]]; then
+        printf '%.2f' "$v" | sed 's/0*$//; s/\.$//'
+    else
+        printf '%s' "$v"
+    fi
+}
+
+ago_text() {                      # epoch → "12m ago"
+    local ts="${1:-0}" now delta
+    [[ "$ts" =~ ^[0-9]+$ ]] || { printf '—'; return 0; }
+    now=$(date +%s); delta=$(( now - ts ))
+    (( delta < 0 )) && delta=0
+    if   (( delta < 60 ));    then printf '%ds ago' "$delta"
+    elif (( delta < 3600 ));  then printf '%dm ago' $(( delta / 60 ))
+    elif (( delta < 86400 )); then printf '%dh ago' $(( delta / 3600 ))
+    elif (( delta < 2592000 )); then printf '%dd ago' $(( delta / 86400 ))
+    else printf '%dmo ago' $(( delta / 2592000 ))
+    fi
+}
+
+started_short() {                 # "2026-11-14 11:59:02" → "11-14 11:59"
+    local s="${1:-}"
+    s="${s#????-}"
+    printf '%s' "${s:0:11}"
+}
+
+jstr() {                          # quoted + escaped, for --json
+    local s="${1:-}"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$s"
+}
+
+# delta_of <now> <common> — sets _d_arrow / _d_label / _d_col for one cell.
+# "Common" is the median of the previous runs; no previous runs means the
+# metric is new, and a common value of 0 means "was never seen" (→ new).
+delta_of() {
+    local now="${1:-}" com="${2:-}" pct p abs
+    if [[ -z "$com" || "$com" == "-" ]]; then
+        _d_arrow=" "; _d_label="first run"; _d_col="$C_DIM"; return 0
+    fi
+    pct=$(awk -v a="$now" -v b="$com" 'BEGIN {
+        if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
+        printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
+    p="${pct#[+-]}"                # "+0" is still zero — strip the sign first
+    if [[ "$p" == "0" ]]; then
+        _d_arrow=""; _d_label="="; _d_col="$C_GREEN"
+    elif [[ "$pct" == "9999" ]]; then
+        _d_arrow="▲"; _d_label="new"; _d_col="$C_RED"
+    elif [[ "$pct" == "-9999" ]]; then
+        _d_arrow="▼"; _d_label="gone"; _d_col="$C_GREEN"
+    else
+        [[ "$pct" == -* ]] && _d_arrow="▼" || _d_arrow="▲"
+        _d_label="${pct}%"
+        abs="$p"
+        if   (( abs >= 50 )); then _d_col="$C_RED"
+        elif (( abs >= 10 )); then _d_col="$C_YELLOW"
+        else _d_col="$C_GREEN"
+        fi
+    fi
+    return 0
+}
+
+no_history() {
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        json_emit "$(printf '{"mode":"overview","history_dir":%s,"tools":[],"runs":0}' "$(jstr "$HIST_DIR")")"
+    else
+        section "NO HISTORY YET"
+        info "Nothing recorded in ${C_CYAN}$HIST_DIR${C_RESET}"
+        info "Run a few tools — each one records its numbers automatically:"
+        info "  ${C_CYAN}./slowz${C_RESET}   ${C_CYAN}./speedz${C_RESET}   ${C_CYAN}./bootz${C_RESET}   ${C_CYAN}./cpuz${C_RESET}"
+        info "then come back: ${C_CYAN}./trendz${C_RESET} shows what is normal for this machine"
+    fi
+    exit 0
+}
+
+# ============================================================================
+# OVERVIEW — every tool that has history
+# ============================================================================
+if [[ "$MODE" == "overview" ]]; then
+    shopt -s nullglob
+    files=( "$HIST_DIR"/*.jsonl )
+    shopt -u nullglob
+    (( ${#files[@]} == 0 )) && no_history
+
+    # one awk pass per file: mode=overview describes a single tool, and a
+    # shared counter would silently fold every file into one row
+    rows=""
+    for f in "${files[@]}"; do
+        r=$(awk -v mode=overview -v window="$WINDOW" -v pri="$PRI_TOOL" -v nodrift="$NO_DRIFT" \
+            "$HIST_AWK" "$f" 2>/dev/null)
+        [[ -n "$r" ]] && rows+="$r"$'\n'
+    done
+    rows=$(printf '%s' "$rows" | sort -t$'\t' -k5,5nr)
+
+    if [[ -z "$rows" ]]; then
+        no_history
+    fi
+
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        total=0; oldest=""
+        json_parts=()
+        while IFS=$'\t' read -r t n b first last crit warn dkey dnow dmed; do
+            [[ -z "$t" ]] && continue
+            total=$(( total + n ))
+            [[ -z "$oldest" || "$first" -lt "$oldest" ]] && oldest=$first
+            pct=""
+            if [[ -n "$dkey" ]]; then
+                pct=$(awk -v a="$dnow" -v b="$dmed" 'BEGIN {
+                    if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
+                    printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
+                pct="${pct#+}"      # JSON numbers carry no sign prefix
+            fi
+            json_parts+=("$(printf '{"tool":%s,"runs":%d,"boots":%d,"first_ts":%d,"last_ts":%d,"crit":%s,"warn":%s,"drift_key":%s,"drift_pct":%s}' \
+                "$(jstr "$t")" "$n" "$b" "$first" "$last" \
+                "$([[ "$crit" == "-" ]] && echo null || echo "$crit")" \
+                "$([[ "$warn" == "-" ]] && echo null || echo "$warn")" \
+                "$([[ -z "$dkey" ]] && echo null || jstr "$dkey")" \
+                "$([[ -z "$dkey" ]] && echo null || echo "$pct")")")
+        done <<< "$rows"
+        json_emit "$(printf '{"mode":"overview","history_dir":%s,"window":%d,"runs":%d,"tools":[%s]}' \
+            "$(jstr "$HIST_DIR")" "$WINDOW" "$total" "$(IFS=,; echo "${json_parts[*]}")")"
+        exit 0
+    fi
+
+    section "RUN HISTORY — what each tool has been reporting"
+    total=0; toolcount=0; oldest=""
+    while IFS=$'\t' read -r t n b first last crit warn dkey dnow dmed; do
+        [[ -z "$t" ]] && continue
+        total=$(( total + n )); toolcount=$(( toolcount + 1 ))
+        [[ -z "$oldest" || "$first" -lt "$oldest" ]] && oldest=$first
+    done <<< "$rows"
+    (( toolcount == 1 )) && tw="tool" || tw="tools"
+    (( total == 1 ))     && rw="run"  || rw="runs"
+    info "${C_BOLD}$toolcount${C_RESET} $tw · ${C_BOLD}$total${C_RESET} $rw since ${C_DIM}$(date -d "@$oldest" '+%Y-%m-%d' 2>/dev/null || echo "?")${C_RESET} · ${C_DIM}$HIST_DIR${C_RESET}"
+    info "${C_DIM}Δ = this run vs the median of the previous $WINDOW runs (\"common\") · drift skips dur/psi_* — they are live samples${C_RESET}"
+
+    printf -v h1 '%-16s' "TOOL"
+    printf -v h2 '%6s'   "RUNS"
+    printf -v h3 '%7s'   "BOOTS"
+    printf -v h4 '%10s'  "LAST RUN"
+    printf -v h5 '%-6s'  "CRIT"
+    printf -v h6 '%-6s'  "WARN"
+    printf "\n  ${C_DIM}%s%s%s%s   %s%s   %s${C_RESET}\n" \
+        "$h1" "$h2" "$h3" "$h4" "$h5" "$h6" "DRIFT FROM COMMON"
+    printf "  ${C_DIM}%s${C_RESET}\n" "$(printf '─%.0s' {1..78})"
+
+    while IFS=$'\t' read -r t n b first last crit warn dkey dnow dmed; do
+        [[ -z "$t" ]] && continue
+
+        # pad every cell as plain text first, colour second: ANSI codes must
+        # never be counted by the column widths
+        printf -v p_name '%-16s' "$t";                 p_name="${C_BOLD}${p_name}${C_RESET}"
+        printf -v p_runs '%6s'  "$n";                  p_runs="${C_DIM}${p_runs}${C_RESET}"
+        printf -v p_boots '%7s' "$b";                  p_boots="${C_DIM}${p_boots}${C_RESET}"
+        printf -v p_last '%10s' "$(ago_text "$last")"; p_last="${C_DIM}${p_last}${C_RESET}"
+        if [[ "$crit" == "-" ]]; then
+            printf -v p_crit '%-6s' "—"; p_crit="${C_DIM}${p_crit}${C_RESET}"
+        else
+            printf -v p_crit '%-6s' "$crit"; p_crit="${C_RED}${p_crit}${C_RESET}"
+        fi
+        if [[ "$warn" == "-" ]]; then
+            printf -v p_warn '%-6s' "—"; p_warn="${C_DIM}${p_warn}${C_RESET}"
+        else
+            printf -v p_warn '%-6s' "$warn"; p_warn="${C_YELLOW}${p_warn}${C_RESET}"
+        fi
+
+        p_drift=""
+        if [[ -n "$dkey" ]]; then
+            delta_of "$dnow" "$dmed"
+            printf -v p_pct '%8s' "${_d_arrow}${_d_label}"
+            p_drift="${C_BOLD}${dkey}${C_RESET} ${_d_col}${p_pct}${C_RESET}"
+        else
+            printf -v p_pct '%8s' "—"
+            p_drift="${C_DIM}${p_pct}${C_RESET}"
+        fi
+
+        printf "  %s%s%s%s   %s%s   %s\n" \
+            "$p_name" "$p_runs" "$p_boots" "$p_last" "$p_crit" "$p_warn" "$p_drift"
+    done <<< "$rows"
+
+    printf "\n  ${C_DIM}detail: ./trendz <tool>   ·   boots: ./trendz --boot${C_RESET}\n"
+    exit 0
+fi
+
+# ============================================================================
+# DETAIL — one tool, every metric, now vs common
+# ============================================================================
+if [[ "$MODE" == "detail" ]]; then
+    file="$HIST_DIR/$ARG_TOOL.jsonl"
+    if [[ ! -s "$file" ]]; then
+        if [[ "$JSON_OUT" -eq 1 ]]; then
+            json_emit "$(printf '{"mode":"detail","tool":%s,"runs":0,"metrics":[]}' "$(jstr "$ARG_TOOL")")"
+        else
+            section "$ARG_TOOL"
+            info "no history in ${C_DIM}$file${C_RESET} — run ${C_CYAN}./$ARG_TOOL${C_RESET} first"
+        fi
+        exit 0
+    fi
+
+    out=$(awk -v mode=detail -v window="$WINDOW" -v pri="$PRI_TOOL" -v nodrift="$NO_DRIFT" \
+          "$HIST_AWK" "$file" 2>/dev/null)
+
+    meta=""; declare -a M_ROWS=()
+    # @meta carries 9 fields, @m carries 7 — both tab separated, and the
+    # metric series (last field) may contain spaces, so IFS must stay a tab
+    while IFS=$'\t' read -r tag f1 f2 f3 f4 f5 f6 f7 f8 f9; do
+        [[ -z "$tag" ]] && continue
+        if   [[ "$tag" == "@meta" ]]; then meta="$f1|$f2|$f3|$f4|$f5|$f6|$f7|$f8|$f9"
+        elif [[ "$tag" == "@m" ]];     then M_ROWS+=("$f1|$f2|$f3|$f4|$f5|$f6|$f7")
+        fi
+    done <<< "$out"
+
+    IFS='|' read -r nruns first_ts last_ts nboots rboot rdate rbs rkern rup <<< "${meta:-}"
+    nruns=${nruns:-0}
+    declare -a J_MET=()
+
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        for row in "${M_ROWS[@]:-}"; do
+            [[ -z "$row" ]] && continue
+            IFS='|' read -r key now com mn mx cnt _series <<< "$row"
+            com_json="null"; [[ "$com" != "-" ]] && com_json="$com"
+            pct_json="null"
+            if [[ "$com" != "-" ]]; then
+                pct_json=$(awk -v a="$now" -v b="$com" 'BEGIN {
+                    if (b == 0) { print (a == 0 ? 0 : (a > 0 ? 9999 : -9999)); exit }
+                    printf "%+.0f", (a - b) / (b < 0 ? -b : b) * 100 }')
+                pct_json="${pct_json#+}"   # JSON numbers carry no sign prefix
+            fi
+            J_MET+=("$(printf '{"key":%s,"now":%s,"common":%s,"min":%s,"max":%s,"runs":%s,"delta_pct":%s}' \
+                "$(jstr "$key")" "$now" "$com_json" "$mn" "$mx" "$cnt" "$pct_json")")
+        done
+        json_emit "$(printf '{"mode":"detail","tool":%s,"runs":%d,"boots":%d,"first_ts":%d,"last_ts":%d,"boot":%s,"boot_start":%s,"kernel":%s,"metrics":[%s]}' \
+            "$(jstr "$ARG_TOOL")" "${nruns:-0}" "${nboots:-0}" "${first_ts:-0}" "${last_ts:-0}" \
+            "$(jstr "${rboot:-}")" "$(jstr "${rbs:-}")" "$(jstr "${rkern:-}")" \
+            "$(IFS=,; echo "${J_MET[*]}")")"
+        exit 0
+    fi
+
+    section "$ARG_TOOL — RUN HISTORY"
+    (( nruns == 1 )) && rw="run"  || rw="runs"
+    (( nboots == 1 )) && bw="boot" || bw="boots"
+    info "${C_BOLD}${nruns:-0}${C_RESET} $rw · ${C_BOLD}${nboots:-0}${C_RESET} $bw · first ${C_DIM}$(date -d "@$first_ts" '+%Y-%m-%d' 2>/dev/null || echo '?')${C_RESET} · last ${C_BOLD}$(ago_text "$last_ts")${C_RESET}"
+    info "boot ${C_DIM}${rboot:0:8}…${C_RESET} started ${C_DIM}${rbs:-?}${C_RESET} · kernel ${C_DIM}${rkern:-?}${C_RESET} · uptime at last run ${C_DIM}${rup:-?}s${C_RESET}"
+    info "${C_DIM}COMMON = median of the previous $WINDOW runs; Δ compares NOW with it${C_RESET}"
+
+    # header and rows share one format string: same cells, same separators
+    printf -v h_key '%-14s' "METRIC"
+    printf -v h_now '%8s'   "NOW"
+    printf -v h_com '%9s'   "COMMON"
+    printf -v h_min '%7s'   "MIN"
+    printf -v h_max '%7s'   "MAX"
+    printf -v h_dlt '%11s'  "Δ vs common"
+    printf -v h_cnt '%5s'   "RUNS"
+    printf "\n  ${C_DIM}%s %s %s %s %s  %s %s  %s${C_RESET}\n" \
+        "$h_key" "$h_now" "$h_com" "$h_min" "$h_max" "$h_dlt" "$h_cnt" "LAST 20 RUNS"
+    printf "  ${C_DIM}%s${C_RESET}\n" "$(printf '─%.0s' {1..80})"
+
+    for row in "${M_ROWS[@]:-}"; do
+        [[ -z "$row" ]] && continue
+        IFS='|' read -r key now com mn mx cnt series <<< "$row"
+
+        # delta vs the common value
+        delta_of "$now" "$com"
+        arrow="$_d_arrow"; label="$_d_label"; col="$_d_col"
+
+        # sparkline of the last 20 runs (the full series stays in the file)
+        glyphs=""
+        if [[ -n "$series" ]]; then
+            read -ra _sv <<< "$series"
+            _start=$(( ${#_sv[@]} > 20 ? ${#_sv[@]} - 20 : 0 ))
+            glyphs=$(spark "${_sv[@]:$_start}" 2>/dev/null | awk '{print $1}')
+        fi
+
+        # pad as plain text first, colour second: ANSI codes must never be
+        # counted by the column widths
+        printf -v c_key '%-14s' "$key"
+        printf -v c_now '%8s'   "$(fmt_num "$now")"
+        printf -v c_com '%9s'   "$([[ "$com" == "-" || -z "$com" ]] && echo '—' || fmt_num "$com")"
+        printf -v c_min '%7s'   "$(fmt_num "$mn")"
+        printf -v c_max '%7s'   "$(fmt_num "$mx")"
+        printf -v c_dlt '%11s'  "${arrow}${label}"
+        printf -v c_cnt '%5s'   "$cnt"
+
+        printf "  %s %s %s %s %s  %s %s  %s\n" \
+            "${C_DIM}${c_key}${C_RESET}" \
+            "${C_BOLD}${c_now}${C_RESET}" \
+            "${C_CYAN}${c_com}${C_RESET}" \
+            "${C_DIM}${c_min}${C_RESET}" \
+            "${C_DIM}${c_max}${C_RESET}" \
+            "${col}${c_dlt}${C_RESET}" \
+            "${C_DIM}${c_cnt}${C_RESET}" \
+            "${C_CYAN}${glyphs}${C_RESET}"
+    done
+
+    printf "\n  ${C_DIM}recorded by lib/hist.sh · one line per run · cap %s lines${C_RESET}\n" "${HIST_MAX_LINES:-500}"
+    exit 0
+fi
+
+# ============================================================================
+# BOOTS — this boot against the boots before it
+# ============================================================================
+if [[ "$MODE" == "boots" ]]; then
+    pri="$PRI_COMMON"
+    [[ -n "$ARG_TOOL" ]] && pri="$PRI_TOOL"
+
+    shopt -s nullglob
+    if [[ -n "$ARG_TOOL" ]]; then
+        files=( "$HIST_DIR/$ARG_TOOL.jsonl" )
+    else
+        files=( "$HIST_DIR"/*.jsonl )
+    fi
+    shopt -u nullglob
+    (( ${#files[@]} == 0 )) && no_history
+
+    out=$(awk -v mode=boots -v window="$WINDOW" -v pri="$pri" -v nodrift="$NO_DRIFT" \
+          "$HIST_AWK" "${files[@]}" 2>/dev/null)
+
+    declare -a B_ID=() B_FIRST=() B_LAST=() B_RUNS=() B_TOOLS=() B_BS=() B_KERN=()
+    declare -A B_MET=()
+    nboot=0
+    while IFS=$'\t' read -r tag id first last runs ntools bs kern metrics; do
+        [[ "$tag" != "@boot" ]] && continue
+        nboot=$(( nboot + 1 ))
+        B_ID[$nboot]="$id"; B_FIRST[$nboot]="$first"; B_LAST[$nboot]="$last"
+        B_RUNS[$nboot]="$runs"; B_TOOLS[$nboot]="$ntools"
+        B_BS[$nboot]="$bs"; B_KERN[$nboot]="$kern"
+        for pair in $metrics; do
+            [[ "$pair" == *=* ]] || continue
+            # no space after the comma: the subscript must be "1,load1"
+            B_MET[$nboot,"${pair%%=*}"]="${pair#*=}"
+        done
+    done <<< "$out"
+
+    if (( nboot == 0 )); then no_history; fi
+
+    live_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+
+    # columns: whatever at least one boot recorded, priority list first,
+    # then the rest alphabetically, capped so the table still fits a terminal
+    declare -a COLS=()
+    declare -A HAVE=()
+    for key in "${!B_MET[@]}"; do HAVE["${key#*,}"]=1; done
+    for k in $pri; do
+        (( ${#COLS[@]} >= 8 )) && break
+        [[ -n "${HAVE[$k]:-}" ]] && COLS+=("$k")
+    done
+    for k in $(printf '%s\n' "${!HAVE[@]}" | sort); do
+        (( ${#COLS[@]} >= 8 )) && break
+        [[ " ${COLS[*]} " == *" $k "* ]] && continue
+        COLS+=("$k")
+    done
+
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        parts=()
+        for ((i = 1; i <= nboot; i++)); do
+            mp=""
+            for k in "${COLS[@]}"; do
+                v="${B_MET[$i,$k]:-}"
+                [[ -z "$v" ]] && continue
+                mp+="${mp:+,}$(jstr "$k"):$v"
+            done
+            parts+=("$(printf '{"boot":%s,"started":%s,"first_ts":%d,"last_ts":%d,"runs":%d,"tools":%d,"current":%s,"metrics":{%s}}' \
+                "$(jstr "${B_ID[$i]}")" "$(jstr "${B_BS[$i]}")" "${B_FIRST[$i]}" "${B_LAST[$i]}" \
+                "${B_RUNS[$i]}" "${B_TOOLS[$i]}" \
+                "$([[ "${B_ID[$i]}" == "$live_boot" ]] && echo true || echo false)" "$mp")")
+        done
+        json_emit "$(printf '{"mode":"boots","tool":%s,"boots":[%s]}' \
+            "$([[ -n "$ARG_TOOL" ]] && jstr "$ARG_TOOL" || echo null)" "$(IFS=,; echo "${parts[*]}")")"
+        exit 0
+    fi
+
+    if [[ -n "$ARG_TOOL" ]]; then
+        section "BOOT COMPARISON — $ARG_TOOL"
+    else
+        section "BOOT COMPARISON — system snapshot across every tool"
+    fi
+    info "${C_DIM}$nboot boot$([ "$nboot" -eq 1 ] && echo '' || echo 's') in history${C_RESET} · ${C_DIM}* = the boot you are on now${C_RESET}"
+
+    printf "\n  ${C_DIM}%-10s %-12s %6s %6s" "BOOT" "STARTED" "RUNS" "TOOLS"
+    for k in "${COLS[@]}"; do printf " %9s" "$k"; done
+    printf "%s${C_RESET}\n"
+    printf "  ${C_DIM}%s${C_RESET}\n" "$(printf '─%.0s' {1..78})"
+
+    for ((i = 1; i <= nboot; i++)); do
+        mark=" "
+        [[ "${B_ID[$i]}" == "$live_boot" ]] && mark="*"
+        printf "  %s%-9s%s %-12s %6s %6s" \
+            "$([[ "$mark" == "*" ]] && printf '%s' "$C_GREEN$C_BOLD" || printf '%s' "$C_DIM")" \
+            "${B_ID[$i]:0:8}" "$C_RESET" "$(started_short "${B_BS[$i]}")" \
+            "${B_RUNS[$i]}" "${B_TOOLS[$i]}"
+        for k in "${COLS[@]}"; do
+            v="${B_MET[$i,$k]:-}"
+            if [[ -z "$v" ]]; then
+                printf " %9s" "—"
+            else
+                printf " %9s" "$(fmt_num "$v")"
+            fi
+        done
+        printf "\n"
+    done
+
+    # ---- delta: this boot vs the one before it ----
+    if (( nboot >= 2 )); then
+        printf "\n  ${C_BOLD}${C_BLUE}━━━ Δ THIS BOOT vs PREVIOUS BOOT (median per boot) ━━━${C_RESET}\n"
+        line="  "
+        for k in "${COLS[@]}"; do
+            a="${B_MET[1,${k}]:-}"; b="${B_MET[2,${k}]:-}"
+            [[ -z "$a" || -z "$b" ]] && continue
+            delta_of "$a" "$b"
+            line+="${C_DIM}${k}${C_RESET} ${_d_col}${_d_arrow}${_d_label}${C_RESET}  "
+        done
+        printf '%s\n' "$line"
+    else
+        printf "\n  ${C_DIM}only one boot recorded — reboot and run a few tools to get a comparison${C_RESET}\n"
+    fi
+
+    printf "\n  ${C_DIM}per tool: ./trendz --boot <tool>   ·   overview: ./trendz${C_RESET}\n"
+    exit 0
+fi
+
+exit 0

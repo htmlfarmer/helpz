@@ -3,6 +3,29 @@
 # lib/common.sh - Shared utilities for Security & Diagnostic Suite
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# sudo resets HOME to /root. That is wrong for this suite: the state
+# directory, the build directory, the logs and the saved reports all belong
+# to the human, not to root. It also makes tools forget what they did —
+# "sudo kernelz build" would look in /root/linux-build and happily compile a
+# kernel that is already sitting in $HOME/linux-build. Put HOME back
+# before anything below reads it.
+# ---------------------------------------------------------------------------
+_kz_uid="${EUID:-$(id -u)}"
+if [[ "$_kz_uid" -eq 0 ]]; then
+    _kz_home=""
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        _kz_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    elif [[ -n "${SUDO_UID:-}" && "$SUDO_UID" != "0" ]]; then
+        _kz_home=$(getent passwd "$SUDO_UID" 2>/dev/null | cut -d: -f6)
+    fi
+    if [[ -n "$_kz_home" && -d "$_kz_home" ]]; then
+        export HOME="$_kz_home"
+    fi
+    unset _kz_home
+fi
+unset _kz_uid
+
 # ---------- Global Counters & State ----------
 WARNINGS=0
 CRITICAL=0
@@ -49,6 +72,165 @@ init_colors() {
         C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
         C_MAGENTA=""; C_CYAN=""; C_WHITE=""
     fi
+}
+
+# ============================================================================
+# SUITE BOOTSTRAP — run the tools from anywhere, including under sudo
+# ----------------------------------------------------------------------------
+# Two things stop a suite tool from "just working":
+#
+#   1. it is not on PATH              -> link it into ~/.local/bin
+#   2. sudo RESETS PATH to its secure_path, which normally does NOT include
+#      ~/.local/bin -> "sudo kernelz" says "command not found" even though
+#      the tool is sitting right there
+#
+# So the suite links itself into both places. The sudo-visible link needs
+# root, so it is asked for once, the first time, and never again.
+# ============================================================================
+suite_links_to() {   # <link> <srcdir> — true when the link points into srcdir
+    [[ -L "$1" ]] || return 1
+    local t; t="$(readlink -f "$1" 2>/dev/null)" || return 1
+    [[ "$t" == "$2"/* ]]
+}
+
+suite_link_all() {   # suite_link_all <srcdir> <bindir> [sudo-prefix]
+    local src="$1" bin="$2" pre="${3:-}"
+    local -a P=()
+    [[ -n "$pre" ]] && P=("$pre")
+    "${P[@]}" mkdir -p "$bin" 2>/dev/null || return 1
+    local f n
+    for f in "$src"/*z; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        n="${f##*/}"
+        [[ "$n" == "publishz" ]] && continue
+        "${P[@]}" ln -sf "$f" "$bin/$n" 2>/dev/null
+    done
+    return 0
+}
+
+BOOTSTRAP_DONE=0
+suite_bootstrap() {
+    [[ "$BOOTSTRAP_DONE" -eq 1 ]] && return 0
+    BOOTSTRAP_DONE=1
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    [[ "${SUITE_NO_BOOTSTRAP:-0}" -eq 1 ]] && return 0
+    [[ "$EUID" -eq 0 ]] && return 0            # already root: nothing to gain
+    local tool="${0##*/}"
+    [[ -z "$tool" || "$tool" == */* ]] && return 0
+    local dir; dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+    [[ -d "$dir" ]] || return 0
+
+    # 1) the user's PATH. An existing, working link is left alone — otherwise
+    #    running the source tree and the published tree would keep flipping
+    #    ~/.local/bin back and forth.
+    local userbin="$HOME/.local/bin"
+    if ! suite_links_to "$userbin/$tool" "$dir"; then
+        if [[ -L "$userbin/$tool" ]] && ! suite_links_to "$userbin/$tool" "$dir" \
+           && [[ -e "$(readlink -f "$userbin/$tool" 2>/dev/null)" ]]; then
+            :   # points at another live copy of the suite — leave it alone
+        else
+            mkdir -p "$userbin" 2>/dev/null
+            suite_link_all "$dir" "$userbin" "" || true
+            [[ -L "$userbin/$tool" ]] && \
+                printf "  ${C_DIM}linked the suite into %s so the tools work from anywhere${C_RESET}\n" "$userbin" >&2
+        fi
+        case ":$PATH:" in
+            *":$userbin:"*) : ;;
+            *) printf "  ${C_DIM}%s is not on your PATH yet — add it to ~/.bashrc: export PATH=\"%s:$PATH\"${C_RESET}\n" \
+                   "$userbin" "$userbin" >&2 ;;
+        esac
+    fi
+
+    # 2) what sudo can see
+    local sysbin="/usr/local/bin"
+    suite_links_to "$sysbin/$tool" "$dir" && return 0
+    [[ -d "$sysbin" ]] || return 0
+    if [[ -w "$sysbin" ]]; then
+        suite_link_all "$dir" "$sysbin" "" && \
+            printf "  ${C_DIM}linked the suite into %s — 'sudo %s' works now${C_RESET}\n" "$sysbin" "$tool" >&2
+        return 0
+    fi
+    if sudo -n true 2>/dev/null; then
+        suite_link_all "$dir" "$sysbin" "sudo" && \
+            printf "  ${C_DIM}linked the suite into %s — 'sudo %s' works now${C_RESET}\n" "$sysbin" "$tool" >&2
+        return 0
+    fi
+    # No cached sudo and root is needed — ask once, out loud, and explain why.
+    if [[ -t 0 ]] && [[ -t 2 ]]; then
+        printf "\n  ${C_YELLOW}sudo cannot see these tools${C_RESET} ${C_DIM}('sudo %s' would say 'command not found')${C_RESET}\n" "$tool" >&2
+        printf "  ${C_BOLD}Install them into %s so sudo finds them? [Y/n]${C_RESET} " "$sysbin" >&2
+        local ans; read -r ans || ans=""
+        if [[ -z "$ans" || "${ans,,}" == y* ]]; then
+            if suite_link_all "$dir" "$sysbin" "sudo"; then
+                printf "  ${C_GREEN}✓${C_RESET} done — ${C_BOLD}sudo %s${C_RESET} works now\n" "$tool" >&2
+            else
+                printf "  ${C_YELLOW}!${C_RESET} could not write %s — try: sudo %s/installz --system\n" \
+                    "$sysbin" "$dir" >&2
+            fi
+        else
+            printf "  ${C_DIM}skipping. Later: sudo %s/installz --system${C_RESET}\n" "$dir" >&2
+        fi
+    fi
+    return 0
+}
+
+# ============================================================================
+# CROSS-MODULE SYMBOL CHECK
+# ----------------------------------------------------------------------------
+# A tool and its lib/ files must agree. When one lib file is updated and
+# its sibling is not, the tool dies at runtime with "command not found" —
+# long after the change that caused it. This walks the tools, collects the
+# helpers they CALL, and checks that the libs they load actually define
+# them. Run before publishing.
+# ============================================================================
+suite_check_symbols() {   # suite_check_symbols <dir> — prints problems, returns count
+    local dir="${1:-.}" bad=0 f t sym called
+    local -A defined=()
+    for f in "$dir"/lib/*.sh; do
+        [[ -f "$f" ]] || continue
+        while read -r sym; do
+            [[ -n "$sym" ]] && defined["$sym"]=1
+        done < <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{' "$f" 2>/dev/null | sed 's/().*//')
+    done
+    for t in "$dir"/*z; do
+        [[ -f "$t" && -x "$t" ]] || continue
+        local -A own=()
+        # functions the tool defines itself
+        while read -r sym; do
+            [[ -n "$sym" ]] && own["$sym"]=1
+        done < <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{' "$t" 2>/dev/null | sed 's/().*//')
+        # ...and its own local/array variables, which are not calls either
+        while read -r sym; do
+            [[ -n "$sym" ]] && own["$sym"]=1
+        done < <(grep -oE '(^|[[:space:]])(local|declare|typeset)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*[A-Za-z_][A-Za-z0-9_]*' "$t" 2>/dev/null \
+                  | grep -oE '[A-Za-z_][A-Za-z0-9_]*$' | sort -u)
+        while read -r sym; do
+            [[ -n "$sym" ]] && own["$sym"]=1
+        done < <(grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$t" 2>/dev/null | grep -oE '[A-Za-z_][A-Za-z0-9_]*=' | tr -d '=' | sort -u)
+        # Only identifiers in COMMAND position count. String literals and
+        # variable references are stripped first, so a local array named
+        # chart_rows or a JSON key "suite_dir" is not mistaken for a call.
+        called=$(awk '
+            { line = " " $0                       # a leading space guarantees
+                                                 # a preceding character to
+                                                 # anchor on, even at line start
+              gsub(/"[^"]*"/, " ", line)           # string literals
+              gsub(/\047[^\047]*\047/, " ", line)  # single-quoted literals
+              gsub(/\$\{[^}]*\}/, " ", line)      # ${var}
+              gsub(/\$[A-Za-z_][A-Za-z0-9_]*/, " ", line)
+              while (match(line, /[^A-Za-z0-9_](kb|chart|suite)_[A-Za-z0-9_]+/)) {
+                  print substr(line, RSTART + 1, RLENGTH - 1)
+                  line = substr(line, RSTART + RLENGTH)
+              } }' "$t" 2>/dev/null | sort -u)
+        for sym in $called; do
+            [[ -n "${own[$sym]:-}" ]] && continue
+            [[ -n "${defined[$sym]:-}" ]] && continue
+            printf '  %s calls %s() but no lib/ file defines it\n' "${t##*/}" "$sym"
+            bad=$((bad + 1))
+        done
+    done
+    printf '%s' "$bad"
+    return 0
 }
 
 # Run color initialization initially
@@ -862,3 +1044,140 @@ emit_verdict() {
 
     exit "$exit_code"
 }
+
+# ============================================================================
+# UPDATE CHECK — is the local copy older than the published one?
+# ----------------------------------------------------------------------------
+# The suite is a git clone. A clone that has fallen behind runs OLD code: a
+# bug that was already fixed upstream still misbehaves, and a new tool is
+# simply missing. Nobody notices until something breaks in a confusing way.
+#
+# So before a tool does its work, compare the local HEAD with the upstream
+# one and say so. The check is RATE LIMITED — at most one network round trip
+# per HELPZ_UPDATE_INTERVAL hours (default 24) — so it costs one cheap
+# `git ls-remote` a day, not one per command.
+#
+# Everything here is best-effort and silent on failure: no network, no git,
+# a detached HEAD, a non-repo directory or a machine with no clone at all
+# means the check is skipped. A tool must never fail because a version
+# check could not run.
+#
+# With HELPZ_UPDATE_AUTO=1 (the default) the pull is DONE for the user:
+# fast-forward only, and only on a clean tree, so local work is never
+# overwritten and no merge commit is ever created. Under sudo the pull is
+# deliberately NOT attempted — root-owned files in the user's .git are a
+# trap that breaks the next `git pull` — so the warning is printed instead.
+#
+# Escape hatches:
+#   HELPZ_NO_UPDATE_CHECK=1     never check
+#   HELPZ_UPDATE_INTERVAL=6     check every 6 hours instead of 24
+#   HELPZ_UPDATE_AUTO=0         warn, but never pull
+#   HELPZ_FORCE_UPDATE_CHECK=1  check now, ignoring the rate limit
+# ============================================================================
+_SUITE_REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd 2>/dev/null)"
+
+suite_update_check() {
+    [[ "${HELPZ_NO_UPDATE_CHECK:-0}" -eq 1 ]] && return 0
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+
+    local repo="$_SUITE_REPO_DIR"
+    [[ -n "$repo" && -d "$repo/.git" ]] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+
+    # Is the clone dirty? Asked BEFORE anything is written, so our own
+    # bookkeeping can never be mistaken for the user's local work.
+    # Only TRACKED changes count: a fast-forward never clobbers an untracked
+    # file, and the suite's own reports/history live untracked in the repo.
+    local dirty=0
+    [[ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]] && dirty=1
+
+    local interval="${HELPZ_UPDATE_INTERVAL:-24}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=24
+    # The bookkeeping file lives inside .git, so `git status` can never see
+    # it and mistake our own bookkeeping for the user's local work.
+    local stamp_file
+    if [[ -d "$repo/.git" ]]; then
+        stamp_file="$repo/.git/helpz-update-check"
+    else
+        stamp_file="${LOG_DIR:-$HOME/.security-logs}/.update-check"
+    fi
+    local now; now=$(date +%s)
+
+    # Rate limit: one network round trip per interval, not per command.
+    if [[ "${HELPZ_FORCE_UPDATE_CHECK:-0}" -ne 1 && -r "$stamp_file" ]]; then
+        local last; last=$(cat "$stamp_file" 2>/dev/null || echo 0)
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        (( now - last < interval * 3600 )) && return 0
+    fi
+    # Record the attempt up front: a machine with no network must not turn
+    # every single command into a timeout.
+    mkdir -p "$(dirname "$stamp_file")" 2>/dev/null
+    printf '%s' "$now" > "$stamp_file" 2>/dev/null
+    local remote branch
+    remote=$(git -C "$repo" remote 2>/dev/null | head -1)
+    [[ -n "$remote" ]] || return 0
+    branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || return 0
+
+    # Cheap check first: `ls-remote` transfers a few hundred bytes and tells
+    # us whether upstream HEAD differs from ours at all.
+    # GIT_TERMINAL_PROMPT / BatchMode keep a missing key or an SSH passphrase
+    # from turning this into a HANG — a tool that waits for a password is
+    # worse than a tool that says nothing.
+    local remote_sha local_sha
+    remote_sha=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+                 timeout 20 git -c core.askPass=true -c credential.helper= \
+                 -C "$repo" ls-remote "$remote" HEAD 2>/dev/null | awk 'NR==1{print $1}')
+    local_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
+    [[ -n "$remote_sha" && -n "$local_sha" ]] || return 0
+    [[ "$remote_sha" != "$local_sha" ]] || return 0
+
+    # It differs — now work out HOW MUCH, which needs the objects.
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+        timeout 180 git -c core.askPass=true -c credential.helper= \
+        -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null || true
+    local behind
+    behind=$(git -C "$repo" rev-list --count "HEAD..$remote/$branch" 2>/dev/null)
+    [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
+    (( behind > 0 )) || return 0
+
+    local b='' y='' g='' r=''
+    if [[ -t 2 ]]; then b=$'\033[1m'; y=$'\033[33m'; g=$'\033[32m'; r=$'\033[0m'; fi
+
+    if [[ "${HELPZ_UPDATE_AUTO:-1}" -eq 1 && $dirty -eq 0 && $EUID -ne 0 ]]; then
+        if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+           timeout 300 git -c core.askPass=true -c credential.helper= \
+           -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
+            printf "  %s%s✓%s  suite updated: %s new commit(s) from %s%s\n" \
+                "$g" "$b" "$r" "$behind" "$remote" >&2
+            printf "  %s(the running tool still uses the old code — run it again for the new behaviour)%s\n" \
+                "$b" "$r" >&2
+        else
+            printf "  %s%s!%s  the suite is %s commit(s) behind %s/%s — the pull failed\n" \
+                "$y" "$b" "$r" "$behind" "$remote" "$branch" >&2
+            printf "  %s%srun it by hand:  git -C %s pull --ff-only%s\n" "$b" "$r" "$repo" >&2
+        fi
+    else
+        local why=""
+        [[ $dirty -eq 1 ]] && why=" (your clone has local changes)"
+        [[ $EUID -eq 0 ]] && why=" (running as root — pull it yourself)"
+        printf "  %s%s!%s  the suite is %s commit(s) behind %s/%s%s\n" \
+            "$y" "$b" "$r" "$behind" "$remote" "$branch" "$why" >&2
+        printf "  %s%sget the latest:  git -C %s pull --ff-only%s\n" "$b" "$r" "$repo" >&2
+    fi
+    return 0
+}
+
+# ============================================================================
+# SELF-BOOTSTRAP — run at source time so EVERY tool is runnable from
+# anywhere and visible to sudo, without the user having to remember
+# installz. Skipped for --json (the notes would interleave with the report)
+# and for anything non-interactive that cannot answer a prompt.
+# ============================================================================
+case " $* " in
+    *" --json "*|*" --json="*) _SUITE_BOOTSTRAP_SKIP=1 ;;
+esac
+if [[ "${_SUITE_BOOTSTRAP_SKIP:-0}" -eq 0 && "${JSON_OUT:-0}" -eq 0 ]]; then
+    suite_update_check
+    suite_bootstrap
+fi

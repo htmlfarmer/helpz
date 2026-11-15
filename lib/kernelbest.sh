@@ -601,6 +601,98 @@ kb_better() {   # dateA verA dateB verB -> 0 when A is newer
 }
 
 # ---------------------------------------------------------------------------
+# "LATEST" — the newest upstream kernel worth trusting, and how to get it
+# ---------------------------------------------------------------------------
+# `kb_recommend` answers "what does my DISTRO ship?" (repo candidates only).
+# These two answer the different question "what does UPSTREAM have?" — used
+# by `kernelz latest`, which must then pick a delivery route (apt if the
+# distro packages that branch, source build if it does not).
+#
+# kb_latest_trusted [stable|lts] -> sets KB_LATEST_* and returns 0/1
+#   KB_LATEST_VER    e.g. 7.3.4            KB_LATEST_SER   e.g. 7.3
+#   KB_LATEST_DATE   epoch of that release KB_LATEST_TIER  1 settled / 2 fresh / 3 LTS
+#   KB_LATEST_WHY    one-line justification
+#   KB_LATEST_FRESH  1 = still inside the settle window
+#   KB_LATEST_WAIT   days until it settles (0 when settled)
+#
+# Rule: upstream's CURRENT STABLE branch, never an end-of-life one. Its age
+# is measured against the branch's birth (the X.Y.0 release), exactly like
+# kb_tier does, so a 25-day-old branch with 3-day-old patches counts as
+# settled. A fresh branch is still the target — `latest` means latest — but
+# it is reported as fresh so nobody mistakes "brand new" for "baked".
+KB_LATEST_VER=""; KB_LATEST_SER=""; KB_LATEST_DATE=0; KB_LATEST_TIER=0
+KB_LATEST_WHY=""; KB_LATEST_FRESH=0; KB_LATEST_WAIT=0
+
+kb_latest_trusted() {   # [stable|lts]
+    local mode="${1:-stable}" ver="" ser="" age=-1
+    KB_LATEST_VER=""; KB_LATEST_SER=""; KB_LATEST_DATE=0; KB_LATEST_TIER=0
+    KB_LATEST_WHY=""; KB_LATEST_FRESH=0; KB_LATEST_WAIT=0
+
+    kb_load_upstream || return 1
+
+    if [[ "$mode" != "lts" && -n "$KB_STABLE_VER" && -n "$KB_STABLE_SER" ]]; then
+        ver="$KB_STABLE_VER"; ser="$KB_STABLE_SER"
+        age=$(kb_series_age_days "$ser" 2>/dev/null) || age=-1
+        if (( age >= 0 && age < KB_SETTLE_DAYS )); then
+            KB_LATEST_FRESH=1
+            KB_LATEST_WAIT=$(( KB_SETTLE_DAYS - age ))
+            KB_LATEST_WHY="upstream's current stable · branch $ser open ${age}d · settles in ${KB_LATEST_WAIT}d"
+        elif (( age >= 0 )); then
+            KB_LATEST_WHY="upstream's current stable · branch $ser open ${age}d · settled (window ${KB_SETTLE_DAYS}d)"
+        else
+            KB_LATEST_WHY="upstream's current stable · branch $ser (age unknown — offline?)"
+        fi
+    else
+        # --lts (or a feed with no stable row): the newest maintained
+        # long-term branch. KB_LTS_LIST is already newest-first.
+        local cand
+        for cand in $KB_LTS_LIST; do
+            ser=$(kb_series_of "$cand") || continue
+            [[ "$(kb_series_is_eol "$ser")" == "1" ]] && continue
+            ver="$cand"; break
+        done
+        [[ -n "$ver" && -n "$ser" ]] || return 1
+        age=$(kb_series_age_days "$ser" 2>/dev/null) || age=-1
+        if [[ "$mode" == "lts" ]]; then
+            KB_LATEST_WHY="newest maintained long-term branch $ser · open ${age}d"
+        else
+            KB_LATEST_WHY="no current-stable row in the feed — newest long-term branch $ser · open ${age}d"
+        fi
+    fi
+
+    [[ -n "$ver" && -n "$ser" ]] || return 1
+    KB_LATEST_VER="$ver"
+    KB_LATEST_SER="$ser"
+    KB_LATEST_DATE="${KB_SER_DATE[$ser]:-0}"
+    KB_LATEST_TIER=$(kb_tier "$ser" "$KB_LATEST_DATE")
+    return 0
+}
+
+# The repository package that covers a given upstream series — the distro's
+# own copy of the branch we want (or something newer). Sets KB_PICK_*;
+# returns 1 when the distro ships nothing that new.
+#   KB_PICK_PKG KB_PICK_VER KB_PICK_UP
+KB_PICK_PKG=""; KB_PICK_VER=""; KB_PICK_UP=""
+kb_repo_pick_for() {   # $1 = target series
+    local tser="$1" i best_i=-1
+    KB_PICK_PKG=""; KB_PICK_VER=""; KB_PICK_UP=""
+    [[ -n "$tser" ]] || return 1
+    for ((i = 0; i < ${#KB_C_PKG[@]}; i++)); do
+        [[ "${KB_C_TIER[i]}" == "4" ]] && continue          # never an EOL branch
+        [[ "${KB_C_SERIES[i]}" == "$tser" ]] || series_gt "${KB_C_SERIES[i]}" "$tser" || continue
+        if (( best_i < 0 )) || kb_better "${KB_C_DATE[i]:-0}" "${KB_C_VER[i]}" \
+                                          "${KB_C_DATE[best_i]:-0}" "${KB_C_VER[best_i]}"; then
+            best_i=$i
+        fi
+    done
+    (( best_i >= 0 )) || return 1
+    KB_PICK_PKG="${KB_C_PKG[best_i]}"
+    KB_PICK_VER="${KB_C_VER[best_i]}"
+    KB_PICK_UP="${KB_C_UP[best_i]}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # release facts for "what is fixed in that kernel"
 # ---------------------------------------------------------------------------
 kb_release_changelog() {   # upstream release (or series) -> path to its ChangeLog

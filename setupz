@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# setupz - One command to make the whole suite work from anywhere
+# ----------------------------------------------------------------------------
+# `installz` puts the tools on your PATH. `setupz` is the front door: it does
+# the whole job in one run and then PROVES it, instead of leaving you to
+# guess whether the install worked.
+#
+# It performs, in order:
+#
+#   1. links every tool into ~/.local/bin (the per-user PATH directory)
+#   2. links them into a directory sudo can see, so "sudo logz" works
+#   3. writes the PATH block + shell completion into ~/.bashrc
+#   4. checks the optional helpers the suite probes for (jq, bc, lspci…)
+#   5. runs a real tool to prove the wiring end to end
+#
+# Every step is idempotent: run it twice and nothing breaks.
+#
+# Usage:
+#   ./setupz                 Full setup + verification
+#   ./setupz --check         Only verify an existing setup (change nothing)
+#   ./setupz --dir DIR       Link the tools into DIR instead of ~/.local/bin
+#   ./setupz --system        Also link into a directory sudo can see
+#   ./setupz --no-completion Skip the shell completion
+#   ./setupz --no-deps       Skip the optional-helper check
+#   ./setupz --uninstall     Remove the links and the PATH block
+#   ./setupz --status        Show what is currently installed
+#   ./setupz --update        Pull the latest code from the git remote
+#   ./setupz --json          Machine-readable result
+#
+# Requires: coreutils. Optional: sudo (for the system-wide links).
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+[[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; }
+
+TARGET_DIR="${HOME}/.local/bin"
+SUDO_DIR="/usr/local/bin"
+ACTION="setup"; COMPLETION=1; DO_DEPS=1; DO_SYSTEM=0; CHECK_ONLY=0
+JSON_OUT="${JSON_OUT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dir)   shift; TARGET_DIR="${1:-}" ;;
+        --dir=*) TARGET_DIR="${1#--dir=}" ;;
+        --system)    DO_SYSTEM=1 ;;
+        --sudo-dir)  shift; SUDO_DIR="${1:-}" ;;
+        --sudo-dir=*) SUDO_DIR="${1#--sudo-dir=}" ;;
+        --no-completion) COMPLETION=0 ;;
+        --no-deps)  DO_DEPS=0 ;;
+        --check)    CHECK_ONLY=1 ;;
+        --update)   ACTION="update" ;;
+        --status)   ACTION="status" ;;
+        --uninstall) ACTION="uninstall" ;;
+        --json)
+                JSON_OUT=1
+                # JSON mode: the human report goes to stderr, stdout carries only
+                # the JSON object. fd 4 is opened HERE — before any output — and is
+                # this tool's own real stdout. It is never inherited from a parent
+                # shell, so a tool that does not source lib/common.sh still writes
+                # its JSON to the right place.
+                # NOTE: no `shift` here — the loop shifts once at the end of every
+                # iteration. An extra shift would swallow the NEXT flag.
+                exec 4>&1 1>&2
+                _JSON_FD4=1
+                ;;
+        --no-color) NO_COLOR=1; init_colors ;;
+        -h|--help) sed -n '6,32p' "$0"; exit 0 ;;
+        *) echo "setupz: unknown option $1" >&2; exit 64 ;;
+    esac
+    shift
+done
+TARGET_DIR="${TARGET_DIR%/}"
+SUDO_DIR="${SUDO_DIR%/}"
+
+# The PATH block setupz owns. Marked so it can be removed again cleanly and
+# so a second run replaces it instead of stacking copies.
+PATH_BLOCK_BEGIN="# >>> helpz suite (managed by setupz) >>>"
+PATH_BLOCK_END="# <<< helpz suite (managed by setupz) <<<"
+RC_FILE="${HOME}/.bashrc"
+COMPLETION_FILE="$TARGET_DIR/helpz-completion.bash"
+
+# The tools to link: every executable *z in the suite. installz is excluded
+# because it is the low-level installer; setupz is the front door.
+suite_tools() {
+    local f n
+    for f in "$SCRIPT_DIR"/*z; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        n="${f##*/}"
+        [[ "$n" == "installz" ]] && continue
+        printf '%s\n' "$n"
+    done
+}
+
+is_our_link() {   # is_our_link <path> — true if it is a symlink into this suite
+    [[ -L "$1" ]] || return 1
+    local tgt; tgt=$(readlink -f "$1" 2>/dev/null) || return 1
+    [[ "$tgt" == "$SCRIPT_DIR"/* ]]
+}
+
+# Is a directory inside sudo's secure_path? If not, "sudo <tool>" cannot
+# find the tools at all.
+sudo_path_has() {   # sudo_path_has <dir> -> 0/1
+    local dir="$1" sp
+    sp=$(sudo -n -l 2>/dev/null | grep -i 'secure_path' | head -1)
+    [[ -z "$sp" ]] && sp=$(grep -ih 'secure_path' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | head -1)
+    if [[ -z "$sp" ]]; then
+        case "$dir" in
+            /usr/local/bin|/usr/local/sbin|/usr/bin|/usr/sbin|/bin|/sbin) return 0 ;;
+        esac
+        return 1
+    fi
+    sp="${sp#*=}"
+    sp="${sp//\\/}"; sp="${sp//\"/}"; sp="${sp//,/}"
+    case ":$sp:" in *":$dir:"*) return 0 ;; esac
+    return 1
+}
+
+# ---------- the PATH block in ~/.bashrc ----------
+path_block_present() {
+    [[ -r "$RC_FILE" ]] || return 1
+    grep -qF -- "$PATH_BLOCK_BEGIN" "$RC_FILE" && grep -qF -- "$PATH_BLOCK_END" "$RC_FILE"
+}
+
+# Strip the marked block, leaving everything else byte-identical.
+path_strip_block() {
+    local f="$1" tmp
+    [[ -r "$f" ]] || return 0
+    tmp=$(mktemp) || return 1
+    awk -v b="$PATH_BLOCK_BEGIN" -v e="$PATH_BLOCK_END" '
+        index($0,b) { skip=1 }
+        !skip      { print }
+        index($0,e) { skip=0 }
+    ' "$f" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+path_install() {
+    local f="$RC_FILE"
+    [[ -f "$f" ]] || { warnf "Shell" "no $f — the tools will work in this shell but not in new ones" "create $f, or add $TARGET_DIR to your PATH"; return 1; }
+    [[ -w "$f" ]] || { warnf "Shell" "$f is not writable — the PATH block was skipped" "sudo chown $USER $f"; return 1; }
+    [[ -f "$HOME/.bashrc.setupz.bak" ]] || cp -p "$f" "$HOME/.bashrc.setupz.bak" 2>/dev/null
+    path_strip_block "$f"
+    {
+        printf '%s\n' "$PATH_BLOCK_BEGIN"
+        printf '%s\n' "# The helpz suite lives in these folders — put them on PATH."
+        printf 'case ":$PATH:" in\n'
+        printf '    *:%s:*) ;;\n' "$TARGET_DIR"
+        printf '    *) export PATH="%s:$PATH" ;;\n' "$TARGET_DIR"
+        printf 'esac\n'
+        if (( COMPLETION )); then
+            printf '%s\n' "# bash completion for 'helpz <TAB>'"
+            printf '[ -f "%s" ] && . "%s"\n' "$COMPLETION_FILE" "$COMPLETION_FILE"
+        fi
+        printf '%s\n' "$PATH_BLOCK_END"
+    } >> "$f"
+    bash -n "$f" 2>/dev/null || {
+        cp -p "$HOME/.bashrc.setupz.bak" "$f" 2>/dev/null
+        warnf "Shell" "$f had a syntax error — restored from backup" "check $f"
+        return 1
+    }
+    ok "PATH block written to $f"
+    return 0
+}
+
+path_uninstall() {
+    if path_block_present; then
+        path_strip_block "$RC_FILE"
+        ok "PATH block removed from $RC_FILE"
+    else
+        info "no setupz PATH block in $RC_FILE"
+    fi
+}
+
+# ---------- linking ----------
+# Link every tool into <dir>. Only symlinks that point INTO this suite are
+# ever removed later; a real file that happens to share the name is left
+# alone and reported.
+link_tools() {   # link_tools <dir> [needs_root]
+    local dir="$1" need_root="${2:-0}" n=0 skipped=0 t link
+    local -a PRE=()
+    # A directory that does not exist yet is not "unwritable" — it is simply
+    # not there. Try the cheap path first: create it as the current user.
+    if [[ "$need_root" -eq 0 ]]; then
+        mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]] && need_root=0 || need_root=1
+    fi
+    if [[ "$need_root" -eq 1 ]]; then
+        if [[ $EUID -eq 0 ]]; then
+            :   # already root
+        elif command -v sudo >/dev/null 2>&1; then
+            if ! sudo -n true 2>/dev/null; then
+                warnf "Install" "$dir needs root and sudo could not authenticate" \
+                    "run it with a password: sudo $0 --system"
+                return 1
+            fi
+            PRE=(sudo)
+        else
+            warnf "Install" "cannot write $dir without root and sudo is missing" "run as root: sudo $0 --system"
+            return 1
+        fi
+    fi
+    "${PRE[@]}" mkdir -p "$dir" 2>/dev/null || {
+        warnf "Install" "cannot create $dir" "check the permissions"; return 1; }
+    while IFS= read -r t; do
+        link="$dir/$t"
+        if [[ -e "$link" && ! -L "$link" ]]; then
+            skipped=$((skipped+1))
+            printf "  ${C_YELLOW}!${C_RESET} %s already exists (not a symlink) — left alone\n" "$t"
+            continue
+        fi
+        if ! "${PRE[@]}" ln -sf "$SCRIPT_DIR/$t" "$link" 2>/dev/null; then
+            printf "  ${C_RED}✗${C_RESET} could not link %s\n" "$t"; continue
+        fi
+        n=$((n+1))
+    done < <(suite_tools)
+    (( n == 0 && skipped == 0 )) && {
+        warnf "Install" "no links could be created in $dir" "check permissions"; return 1; }
+    ok "$n tool(s) linked into $dir"
+    (( skipped > 0 )) && warn "$skipped existing file(s) were left untouched"
+    return 0
+}
+
+# The completion script setupz drops in.
+write_completion() {
+    {
+        printf '%s\n' "# helpz / *z suite completion — installed by setupz"
+        printf '%s\n' "_helpsuite_complete() {"
+        printf '%s\n' "    local cur=\"\${COMP_WORDS[COMP_CWORD]}\" dir=\"\${HELPZ_SUITE_DIR:-}\""
+        printf '%s\n' "    [[ -z \"\$dir\" ]] && for dir in \"\$HOME/helpz\" \"\$HOME/security\"; do"
+        printf '%s\n' "        [[ -x \"\$dir/helpz\" ]] && break"
+        printf '%s\n' "    done"
+        printf '%s\n' "    [[ -d \"\$dir\" ]] || return 0"
+        printf '%s\n' "    if [[ \"\$cur\" == -* ]]; then"
+        printf '%s\n' "        COMPREPLY=( \$(compgen -W \"--help --json --no-color --ai --no-ai\" -- \"\$cur\") )"
+        printf '%s\n' "    else"
+        printf '%s\n' "        COMPREPLY=( \$(compgen -W \"\$(cd \"\$dir\" && ls *z 2>/dev/null | sed \"s/\\.z\$//\")\" -- \"\$cur\") )"
+        printf '%s\n' "    fi"
+        printf '%s\n' "}"
+        printf '%s\n' "complete -F _helpsuite_complete helpz"
+        printf 'export HELPZ_SUITE_DIR="%s"\n' "$SCRIPT_DIR"
+    } > "$COMPLETION_FILE" 2>/dev/null && ok "wrote $COMPLETION_FILE" || warn "could not write the completion file"
+}
+
+# ---------- pulling the latest code ----------
+# The suite is a git clone. Every tool also checks for a newer upstream
+# version (rate-limited to once a day) and pulls it for you when the clone
+# is clean. This is the manual escape hatch: force a check right now.
+do_update() {
+    section "UPDATE"
+    # This tool sits at the root of the clone, so its own folder IS the repo.
+    local repo; repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    if [[ ! -d "$repo/.git" ]]; then
+        warnf "Update" "$repo is not a git clone" "nothing to update — re-clone it instead"
+        return 1
+    fi
+    local remote branch
+    remote=$(git -C "$repo" remote 2>/dev/null | head -1)
+    [[ -n "$remote" ]] || { warnf "Update" "no git remote configured" "git remote add origin <url>"; return 1; }
+    branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || { warnf "Update" "detached HEAD" "git checkout $branch"; return 1; }
+
+    local before; before=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)
+    # GIT_TERMINAL_PROMPT/BatchMode keep a missing key or an SSH passphrase
+    # from turning an update into a HANG.
+    if ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+         timeout 180 git -c core.askPass=true -c credential.helper= \
+         -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null; then
+        warnf "Update" "could not reach $remote" "check the network and the remote URL"
+        return 1
+    fi
+    local behind
+    behind=$(git -C "$repo" rev-list --count "HEAD..$remote/$branch" 2>/dev/null)
+    [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
+    if (( behind == 0 )); then
+        ok "already up to date ($before)"
+        return 0
+    fi
+    ok "$behind new commit(s) on $remote/$branch"
+    if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        warnf "Update" "your clone has local changes — not touching them" "git -C $repo pull --ff-only"
+        return 1
+    fi
+    if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+       timeout 300 git -c core.askPass=true -c credential.helper= \
+       -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
+        ok "updated: $before -> $(git -C "$repo" rev-parse --short HEAD)"
+        info "run 'setupz' again to relink the tools against the new code"
+    else
+        warnf "Update" "the pull failed" "git -C $repo pull --ff-only"
+        return 1
+    fi
+    return 0
+}
+
+# ---------- the optional helpers the suite probes for ----------
+OPTIONAL_HELPERS=(jq bc lspci smartctl nvtop sensors ethtool iotop acpi_call_leds dmidecode systemd-analyze)
+
+check_optional_deps() {
+    local missing=() h
+    for h in "${OPTIONAL_HELPERS[@]}"; do
+        command -v "$h" >/dev/null 2>&1 || missing+=("$h")
+    done
+    if (( ${#missing[@]} == 0 )); then
+        ok "every optional helper the suite probes for is present"
+        return 0
+    fi
+    info "${#missing[@]} optional helper(s) missing: ${missing[*]}"
+    info "they are optional — the suite works without them, but reports get thinner"
+    info "install them with: depz --fix"
+    return 0
+}
+
+# ---------- verification ----------
+# The only proof that counts: run a real tool the way the user will.
+verify_setup() {
+    local n=0 linked=0 t probe="" p
+    while IFS= read -r t; do
+        n=$((n+1))
+        is_our_link "$TARGET_DIR/$t" && linked=$((linked+1))
+    done < <(suite_tools)
+    ok "$linked of $n tool(s) linked into $TARGET_DIR"
+
+    # Is TARGET_DIR on the PATH a NEW shell would see? That is the question
+    # that matters — not the PATH of the shell running setupz.
+    local live
+    live=$(bash -lc 'printf "%s" "$PATH"' 2>/dev/null)
+    case ":$live:" in
+        *":$TARGET_DIR:"*) ok "$TARGET_DIR is on the PATH of a fresh login shell" ;;
+        *) warnf "Path" "$TARGET_DIR is NOT on the PATH of a fresh login shell" \
+                  "run: source $RC_FILE   (then check again)" ;;
+    esac
+
+    if path_block_present; then
+        ok "PATH block present in $RC_FILE"
+    else
+        warnf "Path" "no PATH block in $RC_FILE" "new shells will not find the tools"
+    fi
+
+    # sudo visibility — the thing that bites with "sudo logz".
+    local ssys=0
+    while IFS= read -r t; do
+        is_our_link "$SUDO_DIR/$t" && ssys=$((ssys+1))
+    done < <(suite_tools)
+    if (( ssys > 0 )); then
+        ok "$ssys tool(s) linked into $SUDO_DIR — 'sudo <tool>' works"
+    elif sudo_path_has "$TARGET_DIR"; then
+        ok "$TARGET_DIR is inside sudo's secure_path — 'sudo <tool>' works"
+    else
+        warnf "Sudo" "'sudo <tool>' will fail: sudo's PATH does not include $TARGET_DIR" \
+              "fix it with: sudo $0 --system   (links the tools into $SUDO_DIR)"
+    fi
+
+    # The end-to-end proof: a real tool, resolved through PATH.
+    for p in "$SCRIPT_DIR"/*z; do [[ -x "$p" ]] && { probe="${p##*/}"; break; }; done
+    if [[ -n "$probe" ]]; then
+        if command -v "$probe" >/dev/null 2>&1; then
+            ok "'$probe' resolves on PATH"
+        elif [[ -x "$TARGET_DIR/$probe" ]]; then
+            ok "'$probe' resolves at $TARGET_DIR/$probe (open a new shell for bare '$probe')"
+        else
+            warnf "Path" "'$probe' is not resolvable" "re-run setupz"
+        fi
+    fi
+    return 0
+}
+
+do_status() {
+    section "SETUP STATUS"
+    local n=0 linked=0 t
+    while IFS= read -r t; do
+        n=$((n+1))
+        is_our_link "$TARGET_DIR/$t" && linked=$((linked+1))
+    done < <(suite_tools)
+    printf "  ${C_DIM}suite dir :${C_RESET} %s\n" "$SCRIPT_DIR"
+    printf "  ${C_DIM}target    :${C_RESET} %s\n" "$TARGET_DIR"
+    printf "  ${C_DIM}tools     :${C_RESET} %d (%d linked)\n" "$n" "$linked"
+    if path_block_present; then
+        ok "PATH block installed in $RC_FILE"
+    else
+        info "no PATH block in $RC_FILE"
+    fi
+    [[ -e "$COMPLETION_FILE" ]] && ok "completion at $COMPLETION_FILE" || info "no completion file"
+    local ssys=0
+    while IFS= read -r t; do
+        is_our_link "$SUDO_DIR/$t" && ssys=$((ssys+1))
+    done < <(suite_tools)
+    (( ssys > 0 )) && ok "$ssys tool(s) linked into $SUDO_DIR" || info "nothing linked into $SUDO_DIR"
+}
+
+do_uninstall() {
+    section "UNINSTALL"
+    local n=0 t
+    while IFS= read -r t; do
+        if is_our_link "$TARGET_DIR/$t"; then
+            rm -f "$TARGET_DIR/$t" && n=$((n+1))
+        fi
+    done < <(suite_tools)
+    ok "$n symlink(s) removed from $TARGET_DIR"
+
+    local sn=0
+    while IFS= read -r t; do
+        if is_our_link "$SUDO_DIR/$t"; then
+            rm -f "$SUDO_DIR/$t" 2>/dev/null && sn=$((sn+1))
+        fi
+    done < <(suite_tools)
+    (( sn > 0 )) && ok "$sn symlink(s) removed from $SUDO_DIR"
+
+    [[ -e "$COMPLETION_FILE" ]] && { rm -f "$COMPLETION_FILE" && ok "completion removed"; }
+    path_uninstall
+    printf "\n"
+}
+
+do_setup() {
+    section "SETUP"
+    if (( CHECK_ONLY )); then
+        info "check-only — nothing will be changed"
+    else
+        link_tools "$TARGET_DIR" 0
+
+        # sudo visibility: link where sudo can see, when asked or when needed.
+        if (( DO_SYSTEM )) || ! sudo_path_has "$TARGET_DIR"; then
+            if (( DO_SYSTEM )) || [[ -w "$SUDO_DIR" ]] || sudo -n true 2>/dev/null; then
+                link_tools "$SUDO_DIR" 1
+            else
+                warnf "Sudo" "'sudo <tool>' will not work — sudo cannot write $SUDO_DIR" \
+                      "run: sudo $0 --system   (then re-run 'sudo setupz --check')"
+            fi
+        fi
+
+        if (( COMPLETION )); then
+            write_completion
+        fi
+        path_install
+    fi
+
+    section "VERIFY"
+    verify_setup
+
+    if (( DO_DEPS )); then
+        section "OPTIONAL HELPERS"
+        check_optional_deps
+    fi
+
+    section "NEXT STEPS"
+    printf "  ${C_BOLD}1.${C_RESET} open a new shell (or run: source %s)\n" "$RC_FILE"
+    printf "  ${C_BOLD}2.${C_RESET} run: ${C_CYAN}helpz${C_RESET}   ${C_DIM}(lists every tool)${C_RESET}\n"
+    printf "  ${C_BOLD}3.${C_RESET} run: ${C_CYAN}gpuz${C_RESET} · ${C_CYAN}kernelz${C_RESET} · ${C_CYAN}logz${C_RESET} · ${C_CYAN}cpuz${C_RESET} ${C_DIM}(from anywhere)${C_RESET}\n"
+    printf "  ${C_BOLD}4.${C_RESET} for the GPU/kernel check: ${C_CYAN}kernelz latest${C_RESET}\n\n"
+}
+
+case "$ACTION" in
+    setup)     do_setup ;;
+    status)    do_status ;;
+    uninstall) do_uninstall ;;
+    update)    do_update ;;
+esac
+
+if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+    json_n=0; json_linked=0; json_t
+    while IFS= read -r json_t; do
+        json_n=$((json_n+1))
+        is_our_link "$TARGET_DIR/$json_t" && json_linked=$((json_linked+1))
+    done < <(suite_tools)
+    printf '{"tool":"setupz","action":"%s","suite_dir":"%s","target":"%s","tools":%d,"linked":%d,"path_block":%s}\n' \
+        "$ACTION" "$SCRIPT_DIR" "$TARGET_DIR" "$json_n" "$json_linked" \
+        "$(path_block_present && echo true || echo false)" >&4
+    exec 1>&2
+fi
+exit 0
