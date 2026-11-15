@@ -3273,9 +3273,12 @@ cmd_build() {
         # when the reader got here through `kernelz latest`, the copy-pasteable
         # way back is `latest` (it picks the same target again) — not `build`.
         local sub="build"; [[ "$COMMAND" == "latest" ]] && sub="latest"
-        # Keep the version pinned: without --ver the next run would pick
-        # whatever upstream published since, not the version just built.
-        local vpin=""; [[ -n "$BUILD_VER" ]] && vpin="--ver $BUILD_VER "
+        # Keep the version pinned for `build`: without --ver the next run
+        # would pick whatever upstream published since, not the version just
+        # built. `latest` REFUSES --ver (it picks its own target — see the
+        # critf in cmd_latest), so its line must not carry one or the
+        # copy-pasted command dies with "picks its own target".
+        local vpin=""; [[ "$COMMAND" != "latest" && -n "$BUILD_VER" ]] && vpin="--ver $BUILD_VER "
         printf "  ${C_GREEN}→${C_RESET} run everything now (build + install + safety net):\n"
         printf "      ${C_BOLD}sudo %s %s %s-y${C_RESET}\n" "${0##*/}" "$sub" "$vpin"
         if ls "$BUILD_DIR"/linux-image-*"$UP_VER"*.deb >/dev/null 2>&1; then
