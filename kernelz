@@ -373,6 +373,50 @@ apt_candidate() {
     esac
 }
 
+# The headers package that MATCHES a given kernel release.
+#
+# This matters more than it looks. The generic meta package
+# (linux-headers-generic / linux-headers-amd64) tracks the DEFAULT track —
+# NOT the flavour you are actually installing. Install an OEM kernel with
+# the generic headers and the kernel's own postinst hook silently skips
+# the DKMS build:
+#
+#   "Automatic installation of modules for kernel 7.3.0-1004-oem was
+#    skipped since the kernel headers for this kernel do not seem to be
+#    installed."
+#
+# The result is a new kernel with NO NVIDIA driver: the GPU is dead on the
+# new kernel even though the install looked perfectly clean.
+#
+# The naming is not a simple string swap. Debian/Ubuntu use:
+#   linux-image-6.1.0-39-cloud-amd64 -> linux-headers-6.1.0-39-cloud-amd64
+#   linux-image-6.1.0-39-generic     -> linux-headers-6.1.0-39-amd64
+#                                        (the "generic" flavour has no
+#                                        headers package of its own — the
+#                                        arch one carries it)
+# so the candidates are tried in order and the first one the repository
+# actually knows about wins.
+headers_pkg_for_release() {   # headers_pkg_for_release <release> -> pkg name
+    local rel="${1:-}"
+    [[ -z "$rel" ]] && return 1
+    local arch cand
+    arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+    # Split the release into its ABI ("6.1.0-39") and flavour ("cloud-amd64").
+    local abi="$rel" flavour=""
+    if [[ "$rel" =~ ^([0-9]+(\.[0-9]+)*-[0-9]+)-(.+)$ ]]; then
+        abi="${BASH_REMATCH[1]}"; flavour="${BASH_REMATCH[3]}"
+    fi
+    local -a try=()
+    [[ -n "$flavour" ]] && try+=("linux-headers-$rel")
+    try+=("linux-headers-$abi-$arch")
+    try+=("linux-headers-$abi")
+    for cand in "${try[@]}"; do
+        local v; v=$(apt_candidate "$cand" 2>/dev/null)
+        [[ -n "$v" && "$v" != "(none)" ]] && { printf '%s' "$cand"; return 0; }
+    done
+    return 1
+}
+
 # A candidate version can exist only on this machine ("***" in the version
 # table means "installed, no repository provides it"). Such a kernel gets no
 # security updates from apt, so it must not count as "from the repos".
@@ -1392,6 +1436,101 @@ section_graphics() {   # section_graphics [target_release]
 }
 
 # ============================================================================
+# DKMS AUDIT — are the third-party modules built for THIS kernel?
+# ----------------------------------------------------------------------------
+# The proprietary drivers (nvidia and friends) are DKMS modules: they are
+# compiled AGAINST one kernel and do not work on another. A new kernel
+# without them boots to a black screen, or a desktop with no CUDA.
+#
+# This is the check that answers "will my GPU still work after the reboot?"
+# — and it must run on BOTH routes:
+#   * the apt route  (a distro kernel package)
+#   * the build route (a kernel compiled from source)
+# The apt route used to skip it entirely, so a machine with an NVIDIA card
+# could be told "reboot now" while the driver for the new kernel was never
+# built. That is exactly the failure this function now prevents.
+#
+# The kernel package's own postinst hook tries to build the modules, but it
+# SILENTLY SKIPS when the matching headers package is not installed. So the
+# check also asks: are the headers for THIS kernel present?
+# ============================================================================
+dkms_audit() {   # dkms_audit <target_release>
+    local target="${1:-}"
+    [[ -z "$target" ]] && return 0
+    heading "── third-party modules (DKMS) for $target ──"
+
+    if ! command -v dkms >/dev/null 2>&1; then
+        info "dkms not installed — no third-party modules to rebuild"
+        return 0
+    fi
+
+    local dk_all dk_new dk_missing
+    dk_all=$(timeout 30 dkms status 2>/dev/null)
+    dk_new=$(printf '%s\n' "$dk_all" | grep -F "$target" || true)
+    # Per module: every DKMS module that exists for some other kernel
+    # should exist for the new one too. nvidia is the one that matters.
+    # "dkms status" prints "name/version, kernel, arch: state" - the
+    # commas are part of the fields, so strip them before comparing.
+    dk_missing=$(printf '%s\n' "$dk_all" | awk -v k="$target" '
+        { gsub(/,/, "", $1); gsub(/,/, "", $2)
+          mods[$1]=1; if ($2==k) built[$1]=1 }
+        END { for (m in mods) if (!(m in built)) printf "%s ", m }')
+
+    # The headers are what the module is compiled against. Without them the
+    # package hook skips the build SILENTLY — this is why "it installed the
+    # kernel but the GPU stopped working" happens.
+    if [[ ! -d "/lib/modules/$target/build" ]]; then
+        warnf "Headers" "the headers for $target are not installed" \
+            "the DKMS modules cannot be built without them: sudo apt-get install linux-headers-$target"
+    fi
+
+    # Only modules that are actually IN USE matter. A DKMS module that
+    # was skipped for this kernel (BUILD_EXCLUSIVE) is not a problem
+    # unless something is using it right now.
+    local dk_missing_inuse="" _m _base
+    for _m in $dk_missing; do
+        _base="${_m%%/*}"
+        if grep -qE "^${_base} " /proc/modules 2>/dev/null; then
+            dk_missing_inuse="${dk_missing_inuse} ${_m}"
+        fi
+    done
+    if [[ -z "$dk_all" ]]; then
+        info "dkms reports no modules at all"
+    elif [[ -n "$dk_missing_inuse" ]]; then
+        warnf "Dkms" "DKMS module(s) in use are not built for $target:${dk_missing_inuse}" \
+            "build them now: sudo dkms autoinstall -k $target && sudo depmod -a $target"
+        printf "      ${C_DIM}without them the box boots without that driver (black screen / no 3D / no CUDA)${C_RESET}\n"
+    elif [[ -n "$dk_missing" ]]; then
+        info "DKMS module(s) not built for $target:${dk_missing} — they are not in use, and DKMS skipped them"
+        info "  (BUILD_EXCLUSIVE: the module does not apply to this kernel/config)"
+    else
+        ok "every DKMS module is built for $target:"
+        printf '%s\n' "$dk_new" | sed 's/^/      ${C_DIM}│${C_RESET} /'
+    fi
+
+    # An "installed" DKMS module for the new kernel still has to have
+    # produced its .ko — that is what the module loader actually needs.
+    local ko_missing="" mod ver inst
+    while read -r mod ver inst; do
+        [[ -z "$mod" ]] && continue
+        [[ "$inst" != "installed" ]] && continue
+        [[ "$ver" != "$target" ]] && continue
+        if ! ls /lib/modules/"$target"/updates/dkms/"$mod"*.ko >/dev/null 2>&1; then
+            ko_missing="$ko_missing $mod"
+        fi
+    done < <(dkms status 2>/dev/null | awk '{print $1, $2, $3}')
+    if [[ -n "$ko_missing" ]]; then
+        warnf "Dkms" "DKMS module(s) installed but no .ko in /lib/modules/$target/updates/dkms/:${ko_missing}" \
+            "rebuild them: sudo dkms autoinstall -k $target && sudo depmod -a $target"
+    fi
+    # A running nvidia GPU makes this a hard requirement, not a nicety.
+    if command -v nvidia-smi >/dev/null 2>&1 && pgrep -x nvidia-smi >/dev/null 2>&1; then
+        printf "      ${C_DIM}an nvidia GPU is in use on this box — its driver MUST build for ${target}${C_RESET}\n"
+    fi
+    return 0
+}
+
+# ============================================================================
 # WHY UPGRADE · WHAT IS FIXED
 # ============================================================================
 section_fixes() {
@@ -2406,6 +2545,22 @@ cmd_upgrade() {
     local pkgs_to_install=()
     [[ -n "$target_pkg" ]] && pkgs_to_install+=("${target_pkg}${target_pin}")
     if [[ -n "$target_pkg" && -n "$HDR_PKG" ]]; then pkgs_to_install+=("$HDR_PKG"); fi
+    # The generic headers meta package tracks the DEFAULT track, not the
+    # flavour being installed. When the target is a concrete kernel, add the
+    # headers that MATCH it, or the DKMS build is silently skipped and the
+    # new kernel boots without the NVIDIA driver.
+    local match_hdr=""
+    if [[ -n "$target_pkg" && "$PKG_MGR" == "deb" ]]; then
+        local trel="${target_pkg#linux-image-}"
+        trel="${trel%%=*}"
+        [[ "$trel" == "$target_pkg" ]] && trel=""      # not an image package
+        if [[ -n "$trel" ]]; then
+            match_hdr=$(headers_pkg_for_release "$trel" 2>/dev/null || true)
+            if [[ -n "$match_hdr" && "$match_hdr" != "$HDR_PKG" ]]; then
+                pkgs_to_install+=("$match_hdr")
+            fi
+        fi
+    fi
 
     # Arch replaces the kernel package in place — after -Syu the old kernel is
     # GONE from /boot. A second kernel package is the only boot fallback, so
@@ -2472,6 +2627,19 @@ cmd_upgrade() {
     if [[ ${#pkgs_to_install[@]} -gt 0 && ! -f "/boot/vmlinuz-$target_rel" ]]; then
         critf "Verify" "install ran but /boot/vmlinuz-$target_rel is missing" "check apt output; kernelz status to inspect"
         exit 2
+    fi
+
+    # ── will the GPU survive the reboot? ──────────────────────────────────
+    # The proprietary drivers (nvidia) are DKMS modules: they are compiled
+    # AGAINST each kernel. A new kernel without them boots to a black
+    # screen, or a desktop with no CUDA. This is checked BEFORE the reboot,
+    # not after — the apt route used to skip this entirely, so a box with
+    # an NVIDIA card could be told "reboot now" while the driver for the
+    # new kernel was never built.
+    if [[ -n "$target_rel" && "$target_rel" != "$REL" ]]; then
+        dkms_audit "$target_rel"
+        section_graphics "$target_rel"
+        section_network_safety "$target_rel"
     fi
 
     heading "── 2. Snapshot current state ──"
@@ -3111,65 +3279,7 @@ cmd_build() {
     # The proprietary drivers (nvidia) are DKMS modules: they are compiled
     # AGAINST each kernel. A new kernel without them boots to a black
     # screen, so this is checked before the reboot, not after.
-    heading "── B2. third-party modules (DKMS) for $new_rel ──"
-    if ! command -v dkms >/dev/null 2>&1; then
-        info "dkms not installed — no third-party modules to rebuild"
-    else
-        local dk_all dk_new dk_missing
-        dk_all=$(timeout 30 dkms status 2>/dev/null)
-        dk_new=$(printf '%s\n' "$dk_all" | grep -F "$new_rel" || true)
-        # Per module: every DKMS module that exists for some other kernel
-        # should exist for the new one too. nvidia is the one that matters.
-        # "dkms status" prints "name/version, kernel, arch: state" - the
-        # commas are part of the fields, so strip them before comparing.
-        dk_missing=$(printf '%s\n' "$dk_all" | awk -v k="$new_rel" '
-            { gsub(/,/, "", $1); gsub(/,/, "", $2)
-              mods[$1]=1; if ($2==k) built[$1]=1 }
-            END { for (m in mods) if (!(m in built)) printf "%s ", m }')
-        # Only modules that are actually IN USE matter. A DKMS module that
-        # was skipped for this kernel (BUILD_EXCLUSIVE) is not a problem
-        # unless something is using it right now.
-        dk_missing_inuse=""
-        for _m in $dk_missing; do
-            _base="${_m%%/*}"
-            if grep -qE "^${_base} " /proc/modules 2>/dev/null; then
-                dk_missing_inuse="${dk_missing_inuse} ${_m}"
-            fi
-        done
-        if [[ -z "$dk_all" ]]; then
-            info "dkms reports no modules at all"
-        elif [[ -n "$dk_missing_inuse" ]]; then
-            warnf "Dkms" "DKMS module(s) in use are not built for $new_rel:${dk_missing_inuse}" \
-                "build them now: sudo dkms autoinstall -k $new_rel && sudo depmod -a $new_rel"
-            printf "      ${C_DIM}without them the box boots without that driver (black screen / no 3D)${C_RESET}\n"
-        elif [[ -n "$dk_missing" ]]; then
-            info "DKMS module(s) not built for $new_rel:${dk_missing} — they are not in use, and DKMS skipped them"
-            info "  (BUILD_EXCLUSIVE: the module does not apply to this kernel/config)"
-        else
-            ok "every DKMS module is built for $new_rel:"
-            printf '%s\n' "$dk_new" | sed 's/^/      ${C_DIM}│${C_RESET} /'
-        fi
-        # An "installed" DKMS module for the new kernel still has to have
-        # produced its .ko — that is what the module loader actually needs.
-        local ko_missing=""
-        local mod ver inst
-        while read -r mod ver inst; do
-            [[ -z "$mod" ]] && continue
-            [[ "$inst" != "installed" ]] && continue
-            [[ "$ver" != "$new_rel" ]] && continue
-            if ! ls /lib/modules/"$new_rel"/updates/dkms/"$mod"*.ko >/dev/null 2>&1; then
-                ko_missing="$ko_missing $mod"
-            fi
-        done < <(dkms status 2>/dev/null | awk '{print $1, $2, $3}')
-        if [[ -n "$ko_missing" ]]; then
-            warnf "Dkms" "DKMS module(s) installed but no .ko in /lib/modules/$new_rel/updates/dkms/:${ko_missing}" \
-                "rebuild them: sudo dkms autoinstall -k $new_rel && sudo depmod -a $new_rel"
-        fi
-        # A running nvidia GPU makes this a hard requirement, not a nicety.
-        if command -v nvidia-smi >/dev/null 2>&1 && pgrep -x nvidia-smi >/dev/null 2>&1; then
-            printf "      ${C_DIM}an nvidia GPU is in use on this box — its driver MUST build for ${new_rel}${C_RESET}\n"
-        fi
-    fi
+    dkms_audit "$new_rel"
 
     section_graphics "$new_rel"
 

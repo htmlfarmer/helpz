@@ -1046,6 +1046,120 @@ emit_verdict() {
 }
 
 # ============================================================================
+# UPDATE CHECK — is the local copy older than the published one?
+# ----------------------------------------------------------------------------
+# The suite is a git clone. A clone that has fallen behind runs OLD code: a
+# bug that was already fixed upstream still misbehaves, and a new tool is
+# simply missing. Nobody notices until something breaks in a confusing way.
+#
+# So before a tool does its work, compare the local HEAD with the upstream
+# one and say so. The check is RATE LIMITED — at most one network round trip
+# per HELPZ_UPDATE_INTERVAL hours (default 24) — so it costs one cheap
+# `git ls-remote` a day, not one per command.
+#
+# Everything here is best-effort and silent on failure: no network, no git,
+# a detached HEAD, a non-repo directory or a machine with no clone at all
+# means the check is skipped. A tool must never fail because a version
+# check could not run.
+#
+# With HELPZ_UPDATE_AUTO=1 (the default) the pull is DONE for the user:
+# fast-forward only, and only on a clean tree, so local work is never
+# overwritten and no merge commit is ever created. Under sudo the pull is
+# deliberately NOT attempted — root-owned files in the user's .git are a
+# trap that breaks the next `git pull` — so the warning is printed instead.
+#
+# Escape hatches:
+#   HELPZ_NO_UPDATE_CHECK=1     never check
+#   HELPZ_UPDATE_INTERVAL=6     check every 6 hours instead of 24
+#   HELPZ_UPDATE_AUTO=0         warn, but never pull
+#   HELPZ_FORCE_UPDATE_CHECK=1  check now, ignoring the rate limit
+# ============================================================================
+_SUITE_REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd 2>/dev/null)"
+
+suite_update_check() {
+    [[ "${HELPZ_NO_UPDATE_CHECK:-0}" -eq 1 ]] && return 0
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+
+    local repo="$_SUITE_REPO_DIR"
+    [[ -n "$repo" && -d "$repo/.git" ]] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+
+    # Is the clone dirty? Asked BEFORE anything is written, so our own
+    # bookkeeping can never be mistaken for the user's local work.
+    # Only TRACKED changes count: a fast-forward never clobbers an untracked
+    # file, and the suite's own reports/history live untracked in the repo.
+    local dirty=0
+    [[ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]] && dirty=1
+
+    local interval="${HELPZ_UPDATE_INTERVAL:-24}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=24
+    # The bookkeeping file lives inside .git, so `git status` can never see
+    # it and mistake our own bookkeeping for the user's local work.
+    local stamp_file
+    if [[ -d "$repo/.git" ]]; then
+        stamp_file="$repo/.git/helpz-update-check"
+    else
+        stamp_file="${LOG_DIR:-$HOME/.security-logs}/.update-check"
+    fi
+    local now; now=$(date +%s)
+
+    # Rate limit: one network round trip per interval, not per command.
+    if [[ "${HELPZ_FORCE_UPDATE_CHECK:-0}" -ne 1 && -r "$stamp_file" ]]; then
+        local last; last=$(cat "$stamp_file" 2>/dev/null || echo 0)
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        (( now - last < interval * 3600 )) && return 0
+    fi
+    # Record the attempt up front: a machine with no network must not turn
+    # every single command into a timeout.
+    mkdir -p "$(dirname "$stamp_file")" 2>/dev/null
+    printf '%s' "$now" > "$stamp_file" 2>/dev/null
+    local remote branch
+    remote=$(git -C "$repo" remote 2>/dev/null | head -1)
+    [[ -n "$remote" ]] || return 0
+    branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || return 0
+
+    # Cheap check first: `ls-remote` transfers a few hundred bytes and tells
+    # us whether upstream HEAD differs from ours at all.
+    local remote_sha local_sha
+    remote_sha=$(timeout 20 git -C "$repo" ls-remote "$remote" HEAD 2>/dev/null | awk 'NR==1{print $1}')
+    local_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
+    [[ -n "$remote_sha" && -n "$local_sha" ]] || return 0
+    [[ "$remote_sha" != "$local_sha" ]] || return 0
+
+    # It differs — now work out HOW MUCH, which needs the objects.
+    timeout 180 git -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null || true
+    local behind
+    behind=$(git -C "$repo" rev-list --count "HEAD..$remote/$branch" 2>/dev/null)
+    [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
+    (( behind > 0 )) || return 0
+
+    local b='' y='' g='' r=''
+    if [[ -t 2 ]]; then b=$'\033[1m'; y=$'\033[33m'; g=$'\033[32m'; r=$'\033[0m'; fi
+
+    if [[ "${HELPZ_UPDATE_AUTO:-1}" -eq 1 && $dirty -eq 0 && $EUID -ne 0 ]]; then
+        if timeout 300 git -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
+            printf "  %s%s✓%s  suite updated: %s new commit(s) from %s%s\n" \
+                "$g" "$b" "$r" "$behind" "$remote" >&2
+            printf "  %s(the running tool still uses the old code — run it again for the new behaviour)%s\n" \
+                "$b" "$r" >&2
+        else
+            printf "  %s%s!%s  the suite is %s commit(s) behind %s/%s — the pull failed\n" \
+                "$y" "$b" "$r" "$behind" "$remote" "$branch" >&2
+            printf "  %s%srun it by hand:  git -C %s pull --ff-only%s\n" "$b" "$r" "$repo" >&2
+        fi
+    else
+        local why=""
+        [[ $dirty -eq 1 ]] && why=" (your clone has local changes)"
+        [[ $EUID -eq 0 ]] && why=" (running as root — pull it yourself)"
+        printf "  %s%s!%s  the suite is %s commit(s) behind %s/%s%s\n" \
+            "$y" "$b" "$r" "$behind" "$remote" "$branch" "$why" >&2
+        printf "  %s%sget the latest:  git -C %s pull --ff-only%s\n" "$b" "$r" "$repo" >&2
+    fi
+    return 0
+}
+
+# ============================================================================
 # SELF-BOOTSTRAP — run at source time so EVERY tool is runnable from
 # anywhere and visible to sudo, without the user having to remember
 # installz. Skipped for --json (the notes would interleave with the report)
@@ -1055,5 +1169,6 @@ case " $* " in
     *" --json "*|*" --json="*) _SUITE_BOOTSTRAP_SKIP=1 ;;
 esac
 if [[ "${_SUITE_BOOTSTRAP_SKIP:-0}" -eq 0 && "${JSON_OUT:-0}" -eq 0 ]]; then
+    suite_update_check
     suite_bootstrap
 fi
