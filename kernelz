@@ -3034,6 +3034,22 @@ cmd_latest() {
         if [[ -z "$cup" ]] || ver_gt "$cup" "$CUR_VER"; then
             ok "your distro packages series $tser — installing through apt (distro-tested + security-updated)"
             info "target: $KB_PICK_PKG $KB_PICK_VER${cup:+  (upstream $cup)}"
+            # The distro's copy of the branch can be based on an OLDER
+            # upstream release than upstream's current stable — Ubuntu
+            # versions kernels by ABI (7.3.0-1004.4 IS the 7.3 branch, not
+            # upstream 7.3.0). Without this, "TARGET 7.3.4" over
+            # "install 7.3.0" reads like a downgrade, and the way to take
+            # upstream's exact release stays invisible.
+            if [[ -n "$cup" ]] && ver_gt "$tgt" "$cup"; then
+                local gap="behind upstream's current stable ($tgt)"
+                if [[ "$cup" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$tgt" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ \
+                      && "${cup%.*}" == "${tgt%.*}" ]] && (( ${tgt##*.} > ${cup##*.} )); then
+                    gap="$(( ${tgt##*.} - ${cup##*.} )) stable release(s) behind $tgt"
+                fi
+                printf "  ${C_YELLOW}·${C_RESET} the distro's copy is based on upstream %s — %s\n" "$cup" "$gap"
+                printf "  ${C_DIM}  it still carries the distro's own security backports; to take upstream's exact release:\n"
+                printf "  ${0##*/} build --ver %s${C_RESET}\n" "$tgt"
+            fi
             add_json_field latest_target "$tgt"
             add_json_field latest_series "$tser"
             add_json_field latest_route "apt"
