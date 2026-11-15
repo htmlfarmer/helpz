@@ -31,6 +31,8 @@
 #   ./kernelz bench                  Benchmark this kernel+boot; compare across boots
 #   ./kernelz fix                    Package doctor: which packages are missing & how to install them
 #   ./kernelz cleanup                Preview safe purge of old kernels (keeps current)
+#   ./kernelz boots                  Score every boot's log (fewest errors wins) + speed
+#                                    evidence; picks the long-term backup kernel
 #   ./kernelz history                Show past kernelz actions
 # ============================================================================
 
@@ -43,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # ---------- Commands & flags ----------
 COMMAND="status"
 case "${1:-}" in
-    status|check|study|about|info|upgrade|update|latest|build|verify|verified|recover|protect|bench|cleanup|history|fix|best|recommend)
+    status|check|study|about|info|upgrade|update|latest|build|verify|verified|recover|protect|bench|cleanup|boots|history|fix|best|recommend)
         COMMAND="$1"; shift ;;
     -h|--help) COMMAND="help" ;;
     ""|-*) ;;
@@ -605,6 +607,136 @@ record_boot() {
     fi
 }
 
+# ---------- boot health + speed evidence (the "cleanest boot" ledger) ----------
+# boot-health.tsv — one row per boot:
+#   boot_id \t kernel \t boot_epoch \t errors \t warnings \t speedz_score \t speedz_boot_s \t counted_ts
+# errors/warnings are `journalctl -b <id> -p err|warning` line counts
+# (warning ⊇ err — journal severities), refreshed every scan so a boot that
+# is still running stays current. speedz_score is ONE composite snapshot per
+# boot (score + boot seconds) — recorded once, preserved across rescans.
+BOOT_HEALTH="$STATE_USR/boot-health.tsv"
+
+boot_health_scan() {
+    command -v journalctl >/dev/null 2>&1 || { warnf "BootHealth" "journalctl not available — boot scoring skipped" "install systemd"; return 1; }
+    mkdir -p "$STATE_USR" 2>/dev/null
+    local now line idx id f1 d1 t1 tz1 f2 d2 t2 tz2 krel epoch err warn
+    now=$(date +%s)
+    local delta; delta=$(mktemp) || return 1
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == IDX* ]] && continue
+        read -r idx id f1 d1 t1 tz1 f2 d2 t2 tz2 krel <<< "$line"
+        # journalctl prints boot ids WITHOUT dashes; /proc, the boot ledger
+        # and bench.tsv all use the dashed form. Normalize or rows for the
+        # same boot never merge and $BOOT_ID comparisons silently fail.
+        if [[ "$id" != *-* ]]; then
+            id=$(printf '%s' "$id" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/')
+        fi
+        # …but `journalctl -b` itself only matches the journal's DASHLESS
+        # form — querying with the dashed id silently returns nothing.
+        jid="${id//-/}"
+        # This systemd's --list-boots carries no kernel column at all — the
+        # ledger may know it, else the boot's own dmesg banner does.
+        if [[ -z "$krel" || "$krel" == "?" ]]; then
+            krel=$(awk -F'\t' -v b="$id" '$1==b{print $2; exit}' "$LEDGER" 2>/dev/null)
+        fi
+        if [[ -z "$krel" || "$krel" == "?" ]]; then
+            krel=$(journalctl -b "$jid" -k --no-pager -q 2>/dev/null | grep -m1 -oE 'Linux version [0-9][^ ]*' | awk '{print $3}')
+            krel="${krel:-?}"
+        fi
+        epoch=$(date -d "$f1 $d1 $t1 $tz1" +%s 2>/dev/null || echo 0)
+        err=$(journalctl -b "$jid" -p err --no-pager -q 2>/dev/null | grep -c '')
+        warn=$(journalctl -b "$jid" -p warning --no-pager -q 2>/dev/null | grep -c '')
+        # "-" placeholders, never empty: bash `read` collapses consecutive
+        # tab delimiters, so an empty field would shift every later column.
+        printf '%s\t%s\t%s\t%s\t%s\t-\t-\t%s\n' "$id" "$krel" "$epoch" "$err" "$warn" "$now" >> "$delta"
+    done < <(journalctl --list-boots --no-pager -q 2>/dev/null | tail -15)
+    # Merge: fresh counts win, but keep the speedz columns and any boot the
+    # journal has already rotated away.
+    local tmp; tmp=$(mktemp) || { rm -f "$delta"; return 1; }
+    if [[ -s "$BOOT_HEALTH" ]]; then
+        awk -F'\t' 'BEGIN{OFS="\t"}
+            FNR==NR { old[$1]=$0; next }
+            {
+                id=$1; split(old[id], o, "\t")
+                k=($2=="?" && o[2]!="") ? o[2] : $2
+                e=($3+0==0 && o[3]+0>0) ? o[3] : $3
+                sc=(o[6]!="" ? o[6] : $6); bs=(o[7]!="" ? o[7] : $7)
+                print id, k, e, $4, $5, sc, bs, $8
+                seen[id]=1
+            }
+            END { for (k in old) if (!(k in seen)) print old[k] }' "$BOOT_HEALTH" "$delta" > "$tmp"
+    else
+        cat "$delta" > "$tmp"
+    fi
+    mv "$tmp" "$BOOT_HEALTH" 2>/dev/null || { cp "$tmp" "$BOOT_HEALTH" && rm -f "$tmp"; }
+    rm -f "$delta"
+}
+
+speedz_record() {
+    # One composite speed snapshot per boot, saved into the same row as the
+    # journal counts it belongs to. Skipped when this boot already scored.
+    [[ -x "$SCRIPT_DIR/speedz" ]] || return 0
+    local cur score bsec out tmp s6
+    cur=$(grep -F "$BOOT_ID" "$BOOT_HEALTH" 2>/dev/null | tail -1)
+    if [[ -n "$cur" ]]; then
+        s6=$(cut -f6 <<< "$cur")
+        [[ -n "$s6" && "$s6" != "-" ]] && return 0
+    fi
+    out=$(timeout 30 "$SCRIPT_DIR/speedz" --json </dev/null 2>/dev/null) || return 0
+    score=$(grep -o '"score":"[0-9]*"' <<< "$out" | head -1 | grep -o '[0-9]*' | head -1)
+    bsec=$(grep -o '"boot_seconds":"[0-9]*"' <<< "$out" | head -1 | grep -o '[0-9]*' | head -1)
+    [[ -z "$score" ]] && return 0
+    mkdir -p "$STATE_USR" 2>/dev/null
+    if [[ -n "$cur" ]]; then
+        tmp=$(mktemp)
+        awk -F'\t' -v id="$BOOT_ID" -v s="$score" -v b="${bsec:-0}" 'BEGIN{OFS="\t"} $1==id{$6=s;$7=b} {print}' "$BOOT_HEALTH" > "$tmp" \
+            && mv "$tmp" "$BOOT_HEALTH"
+    else
+        printf '%s\t%s\t%s\t-\t-\t%s\t%s\t%s\n' "$BOOT_ID" "$REL" "${BOOT_EPOCH:-0}" "$score" "${bsec:-0}" "$(date +%s)" >> "$BOOT_HEALTH"
+    fi
+}
+
+bench_once_per_boot() {
+    # One quick benchmark row per boot (same schema as `kernelz bench`), so
+    # `bench compare` gains per-kernel evidence automatically — deduped by
+    # boot id so repeated runs don't pollute the averages.
+    [[ -f "$BENCH" ]] && grep -qF "$BOOT_ID" "$BENCH" 2>/dev/null && return 0
+    local cpu cry fkr mem bsec
+    cpu=$(bench_cpu_ms); cry=$(bench_crypto); fkr=$(bench_fork); mem=$(bench_mem)
+    bsec=$(grep -F "$BOOT_ID" "$LEDGER" 2>/dev/null | cut -f4 | tail -1)
+    [[ -z "$bsec" || "$bsec" == "0" ]] && bsec=$(bench_boot_sec)
+    mkdir -p "$STATE_USR" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$TS_EPOCH" "$REL" "$BOOT_ID" "$cpu" "$cry" "$fkr" "$mem" 0 0 "${bsec:-0}" >> "$BENCH"
+    kz_hist "bench kernel=$REL (boots) cpu=$cpu cry=$cry fork=$fkr mem=$mem boot=$bsec"
+}
+
+best_boot_kernel() {
+    # Cleanest = fewest errors per boot; ties → fewer warnings → higher
+    # speedz score → more recent. Prints the kernel release ("" if no data).
+    [[ -s "$BOOT_HEALTH" ]] || return 0
+    awk -F'\t' '
+        $2 == "?" || $4 !~ /^[0-9]+$/ { next }
+        {
+            n[$2]++; e[$2] += $4; w[$2] += $5
+            if ($6 != "") { s[$2] = $6 + 0; has_s[$2] = 1 }
+            if ($3 + 0 > last[$2]) last[$2] = $3 + 0
+        }
+        END {
+            best = ""; be = -1; bw = -1; bs = -1; bl = -1
+            for (k in n) {
+                ae = e[k] / n[k]; aw = w[k] / n[k]
+                sc = (has_s[k] ? s[k] : -1); lt = last[k] + 0
+                if (be < 0 || ae < be || (ae == be && aw < bw) ||
+                    (ae == be && aw == bw && sc > bs) ||
+                    (ae == be && aw == bw && sc == bs && lt > bl)) {
+                    best = k; be = ae; bw = aw; bs = sc; bl = lt
+                }
+            }
+            if (best != "") printf "%s", best
+        }' "$BOOT_HEALTH"
+}
+
 # ---------- GRUB entry parsing (submenu-aware) ----------
 read_grubcfg() {
     local f
@@ -838,6 +970,9 @@ USAGE
   ./kernelz fix                 Package doctor: study errors/missing pkgs that
                                 would break a kernel build/install, print fixes
   ./kernelz cleanup             Preview safe purge of old kernels
+  ./kernelz boots               Boot history: score every boot's log (fewest errors
+                                wins), speedz + bench evidence per kernel, and pick
+                                the long-term backup that cleanup protects
   ./kernelz history             Past kernelz actions
 
 OPTIONS
@@ -864,7 +999,8 @@ OPTIONS
   --full             Include full benchmarkz run in `bench`
   --dry-run          Print what upgrade/protect would do, change nothing
   --yes              No confirmation prompt (cleanup/upgrade)
-  --force            Allow downgrade with --to
+  --force            Allow downgrade with --to; release the cleanest-boot
+                     long-term-backup protection in cleanup
   --json             Machine-readable verdict (status/study)
   --no-color         Plain output
   -h, --help         Show this help
@@ -3604,6 +3740,11 @@ cmd_protect() {
 cmd_verify() {
     gather_kernel_facts
     record_boot
+    # A fresh verified boot is the best moment to capture evidence: score
+    # this boot's log and snapshot speed + benchmarks for the new kernel.
+    boot_health_scan
+    speedz_record
+    bench_once_per_boot
     local target prev pts
     target=$(pending_get TARGET_REL); prev=$(pending_get PREV_REL); pts=$(pending_get TS)
 
@@ -3727,6 +3868,69 @@ EOF
 # ============================================================================
 # CLEANUP
 # ============================================================================
+cmd_boots() {
+    # Journal + ledger read only — no apt facts needed (REL/BOOT_ID/
+    # BOOT_EPOCH are set at load time). json_muffle keeps the human tables
+    # off stdout in --json mode, same pattern as status.
+    json_muffle
+    section "BOOT HISTORY — the cleanest logs win"
+    local scanned=0
+    if boot_health_scan; then
+        scanned=$(grep -c '' "$BOOT_HEALTH" 2>/dev/null || echo 0)
+        speedz_record
+        bench_once_per_boot
+        record_boot
+    fi
+
+    local golden; golden=$(best_boot_kernel)
+    add_json_field boots_scanned "${scanned:-0}"
+    add_json_field backup_kernel "$golden"
+
+    subsec "recent boots (journal errors/warnings — lower is cleaner)"
+    printf "  ${C_DIM}%-13s %-24s %6s %7s %7s %7s${C_RESET}\n" "BOOTED" "KERNEL" "ERRS" "WARNS" "SPEEDZ" "BOOT-S"
+    local id krel epoch err warn score bsec ts date_s mark n=0
+    while IFS=$'\t' read -r id krel epoch err warn score bsec ts; do
+        n=$((n+1)); (( n > 15 )) && break
+        date_s=$(date -d "@${epoch:-0}" '+%m-%d %H:%M' 2>/dev/null || echo "?")
+        mark=""; [[ "$id" == "$BOOT_ID" ]] && mark=" ${C_GREEN}◀ now${C_RESET}"
+        [[ -n "$golden" && "$krel" == "$golden" ]] && mark="$mark ${C_BOLD}★ backup${C_RESET}"
+        printf "  %-13s %-24s %6s %7s %7s %7s%b\n" "$date_s" "$krel" "$err" "$warn" "${score:--}" "${bsec:--}" "$mark"
+    done < <(sort -t$'\t' -k3,3nr "$BOOT_HEALTH" 2>/dev/null)
+
+    subsec "per-kernel evidence (the proof for \"which kernel is best\")"
+    local agg r boots ae aw sc lt bav sha mark2
+    agg=$(awk -F'\t' 'BEGIN{OFS="\t"}
+        $2=="?" || $4 !~ /^[0-9]+$/ { next }
+        { n[$2]++; e[$2]+=$4; w[$2]+=$5; if($6!~/^[0-9]+$/){} else {s[$2]=$6; hs[$2]=1}; if($3+0>l[$2]) l[$2]=$3+0 }
+        END { for (k in n) printf "%s\t%d\t%.1f\t%.1f\t%s\n", k, n[k], e[k]/n[k], w[k]/n[k], (hs[k]?s[k]:"-") }' \
+        "$BOOT_HEALTH" 2>/dev/null | sort -t$'\t' -k3,3n -k4,4n)
+    while IFS=$'\t' read -r r boots ae aw sc; do
+        [[ -z "$r" ]] && continue
+        mark2=""; [[ "$r" == "$REL" ]] && mark2=" ${C_GREEN}◀ running${C_RESET}"
+        [[ -n "$golden" && "$r" == "$golden" ]] && mark2="$mark2 ${C_BOLD}★ long-term backup${C_RESET}"
+        bav=""
+        if [[ -f "$BENCH" ]]; then
+            bav=$(bench_avg_by_kernel "$r" 2>/dev/null)
+            if [[ -n "$bav" && "$bav" != "none" ]]; then
+                bav=" · bench cpu=$(cut -f1 <<<"$bav")ms sha=$(cut -f2 <<<"$bav")kB/s fork=$(cut -f3 <<<"$bav")/s mem=$(cut -f4 <<<"$bav")MB/s"
+            else bav=""; fi
+        fi
+        printf "  %-24s %2s boots · errs %s · warns %s · speedz %s%s%b\n" "$r" "$boots" "$ae" "$aw" "$sc" "$bav" "$mark2"
+    done <<< "$agg"
+
+    if [[ -n "$golden" ]]; then
+        section "RECOMMENDATION"
+        ok "long-term backup: $golden — the cleanest boot logs on this machine"
+        info "kernelz cleanup protects it automatically — only 'kernelz cleanup --force --yes' can remove it"
+        [[ "$golden" != "$REL" ]] && info "you run $REL; the backup stays installed as the proven-clean fallback"
+    else
+        info "not enough boot data yet — run kernelz boots after a few reboots"
+    fi
+    kz_hist "boots scan=$scanned best=${golden:-none}"
+    json_unmuffle
+    emit_verdict
+}
+
 cmd_cleanup() {
     gather_kernel_facts
     section "CLEANUP — old kernel purge preview"
@@ -3741,10 +3945,30 @@ cmd_cleanup() {
     local lg; lg=$(pkg_for_release "$(state_read last_good)")
     [[ -n "$lg" && "$lg" != "$keep_current" && "$lg" != "$keep1" && "$lg" != "$keep2" ]] && printf "  ${C_GREEN}keep:${C_RESET} %s (last known good)\n" "$lg"
 
+    # The cleanest-boot kernel is the long-term backup: routine cleanup
+    # never touches it. Only an explicit --force releases that protection —
+    # and the release is stated out loud, never silent.
+    local golden_rel golden_pkg="" keep_extra=""
+    golden_rel=$(best_boot_kernel)
+    [[ -n "$golden_rel" ]] && golden_pkg=$(pkg_for_release "$golden_rel")
+    if [[ -n "$golden_pkg" ]]; then
+        case " $keep_current $keep1 $keep2 $lg " in
+            *" $golden_pkg "*) ;;
+            *)
+                if [[ "$FORCE" -eq 0 ]]; then
+                    keep_extra="$golden_pkg"
+                    printf "  ${C_GREEN}keep:${C_RESET} %s (cleanest boot — long-term backup; only --force removes)\n" "$golden_pkg"
+                else
+                    info "--force releases the long-term backup: $golden_pkg (cleanest boot logs)"
+                fi
+                ;;
+        esac
+    fi
+
     list=""
     local pkg ver stat
     while IFS=$'\t' read -r pkg ver stat; do
-        case " $keep_current $keep1 $keep2 $lg $META_PKG " in *" $pkg "*) continue ;; esac
+        case " $keep_current $keep1 $keep2 $lg $keep_extra $META_PKG " in *" $pkg "*) continue ;; esac
         printf "  ${C_YELLOW}remove:${C_RESET} %-36s %s %s\n" "$pkg" "$ver" "$stat"
         list="$list $pkg"
     done < <(installed_image_pkgs)
@@ -4210,6 +4434,7 @@ case "$COMMAND" in
     bench)   cmd_bench "${ARGS[@]+"${ARGS[@]}"}" ;;
     fix)     cmd_fix ;;
     cleanup) cmd_cleanup ;;
+    boots)   cmd_boots ;;
     history) cmd_history ;;
     *)       show_help ;;
 esac
