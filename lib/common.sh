@@ -1121,14 +1121,21 @@ suite_update_check() {
 
     # Cheap check first: `ls-remote` transfers a few hundred bytes and tells
     # us whether upstream HEAD differs from ours at all.
+    # GIT_TERMINAL_PROMPT / BatchMode keep a missing key or an SSH passphrase
+    # from turning this into a HANG — a tool that waits for a password is
+    # worse than a tool that says nothing.
     local remote_sha local_sha
-    remote_sha=$(timeout 20 git -C "$repo" ls-remote "$remote" HEAD 2>/dev/null | awk 'NR==1{print $1}')
+    remote_sha=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+                 timeout 20 git -c core.askPass=true -c credential.helper= \
+                 -C "$repo" ls-remote "$remote" HEAD 2>/dev/null | awk 'NR==1{print $1}')
     local_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
     [[ -n "$remote_sha" && -n "$local_sha" ]] || return 0
     [[ "$remote_sha" != "$local_sha" ]] || return 0
 
     # It differs — now work out HOW MUCH, which needs the objects.
-    timeout 180 git -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null || true
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+        timeout 180 git -c core.askPass=true -c credential.helper= \
+        -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null || true
     local behind
     behind=$(git -C "$repo" rev-list --count "HEAD..$remote/$branch" 2>/dev/null)
     [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
@@ -1138,7 +1145,9 @@ suite_update_check() {
     if [[ -t 2 ]]; then b=$'\033[1m'; y=$'\033[33m'; g=$'\033[32m'; r=$'\033[0m'; fi
 
     if [[ "${HELPZ_UPDATE_AUTO:-1}" -eq 1 && $dirty -eq 0 && $EUID -ne 0 ]]; then
-        if timeout 300 git -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
+        if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+           timeout 300 git -c core.askPass=true -c credential.helper= \
+           -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
             printf "  %s%s✓%s  suite updated: %s new commit(s) from %s%s\n" \
                 "$g" "$b" "$r" "$behind" "$remote" >&2
             printf "  %s(the running tool still uses the old code — run it again for the new behaviour)%s\n" \

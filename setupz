@@ -265,7 +265,11 @@ do_update() {
     [[ -n "$branch" && "$branch" != "HEAD" ]] || { warnf "Update" "detached HEAD" "git checkout $branch"; return 1; }
 
     local before; before=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)
-    if ! timeout 180 git -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null; then
+    # GIT_TERMINAL_PROMPT/BatchMode keep a missing key or an SSH passphrase
+    # from turning an update into a HANG.
+    if ! GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+         timeout 180 git -c core.askPass=true -c credential.helper= \
+         -C "$repo" fetch --quiet --no-tags "$remote" 2>/dev/null; then
         warnf "Update" "could not reach $remote" "check the network and the remote URL"
         return 1
     fi
@@ -281,7 +285,9 @@ do_update() {
         warnf "Update" "your clone has local changes — not touching them" "git -C $repo pull --ff-only"
         return 1
     fi
-    if timeout 300 git -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
+    if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
+       timeout 300 git -c core.askPass=true -c credential.helper= \
+       -C "$repo" pull --ff-only "$remote" "$branch" >/dev/null 2>&1; then
         ok "updated: $before -> $(git -C "$repo" rev-parse --short HEAD)"
         info "run 'setupz' again to relink the tools against the new code"
     else
