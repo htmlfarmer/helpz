@@ -1,0 +1,875 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# searchz — Command-line web search & person lookup
+#
+# A search engine for the shell: type a question, get ranked results with
+# titles, URLs and snippets — no API key, no browser. Two modes:
+#
+#   web mode      ./searchz "something" — one query, N results
+#   person mode   ./searchz --person "jane doe" — fans one name out across
+#                 social networks (linkedin, facebook, instagram, x, github)
+#                 plus contact-oriented queries (phone, address, email),
+#                 then summarises which networks actually had a hit.
+#
+# Engines (auto-fallback, no keys needed):
+#   duck   DuckDuckGo's HTML endpoint — privacy-first, rate-limits fast
+#   bing   Bing's HTML SERP — reliable, used as the fallback
+#   auto   start with duck, switch to bing for the rest of the run the
+#          moment duck blocks (default)
+#
+# Usage:
+#   ./searchz "linus torvalds"
+#   ./searchz --person "jane doe"
+#   ./searchz --site github.com "torvalds"
+#   ./searchz -n 20 "query" --json
+#   ./searchz --engine bing "query"
+#
+# Requires: curl.
+# Optional: xdg-open (--open), jq (not required — parsing is pure bash/sed).
+#
+# Exit codes: 0 results found · 1 no results · 2 engines failed · 64 usage
+# ============================================================================
+
+set +o pipefail
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+if [[ -f "$SCRIPT_DIR/lib/run_comparison.sh" ]]; then source "$SCRIPT_DIR/lib/run_comparison.sh"; fi
+
+# ---------- Configuration ----------
+QUERY=""
+MODE="web"                          # web | person
+PERSON_NAME=""
+SITE_PREFIX=""                      # --site DOMAIN → site:DOMAIN query prefix
+PERSON_SITES="linkedin.com,facebook.com,instagram.com,x.com,github.com"
+CONTACT=1                           # person mode: also run phone/address/email
+ENGINE="${SEARCHZ_ENGINE:-auto}"    # auto | duck | bing
+COUNT=0                             # 0 → default: 10 web / 5 person
+OPEN_N=0
+REQ_TIMEOUT=12
+JSON_OUT="${JSON_OUT:-0}"
+NO_COLOR="${NO_COLOR:-0}"
+
+ACTIVE_ENGINE=""                    # sticky engine once one proves itself
+PARSE_STATUS=""                     # ok | zero | blocked  (set by parse_*)
+DUCK_SEEDED=0
+DUCK_USED=0
+DUCK_BLOCKED=0                      # duck failed once this run — don't retry
+OP_MODE="site"                      # site: | soft — see site_search()
+LAST_Q=""                           # the query site_search actually ran
+ENGINE_FAILURES=0
+declare -a RESULTS=()               # per-query:   url<TAB>title<TAB>snippet
+declare -a PERSON_META=()           # per-fanout:  label<TAB>query
+declare -a PERSON_ENTRIES=()        # per-fanout:  label<TAB>url<TAB>title<TAB>snippet
+declare -a QPARTS=()
+
+UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+
+TMPD=$(mktemp -d 2>/dev/null || printf '/tmp/searchz.%s' "$$")
+CJ="$TMPD/cookies.txt"
+cleanup() { rm -rf "$TMPD" 2>/dev/null; }
+trap cleanup EXIT
+
+# ---------- Help ----------
+show_help() {
+    cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║  searchz — web search from the command line                     ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Search the web without a browser or an API key. web mode runs one
+  query and prints ranked results (title, URL, snippet). person mode
+  fans one name out across social networks and contact queries, then
+  summarises which sites actually had a hit.
+
+  site: queries are verified client-side: a hit only counts if the URL
+  really comes from the named host. Engines that silently drop the
+  site: operator (Bing does) are compensated with a soft
+  "<name> <network>" query plus a host filter.
+
+USAGE
+  ./searchz "linus torvalds"              Web search (10 results)
+  ./searchz --person "jane doe"           Person lookup across 5 networks
+  ./searchz --site github.com "myname"    Shortcut for site:github.com myname
+  ./searchz -n 20 "query"                 More results
+  ./searchz --engine bing "query"         Pick an engine
+  ./searchz --open "query"                Open result #1 in the browser
+  ./searchz --person "jane doe" --json    Machine-readable
+  ./searchz                               Interactive prompt (on a TTY)
+
+OPTIONS
+  --person NAME      Person lookup mode (name may also be positional)
+  --sites a,b,c      Networks for person mode (default: linkedin.com,
+                     facebook.com, instagram.com, x.com, github.com)
+  --no-contact       Skip the phone/address/email queries in person mode
+  --site DOMAIN      Restrict results to DOMAIN (verified by host)
+  --engine E         auto (default), duck (DuckDuckGo), bing
+  -n, --count N      Results per query (default 10 web / 5 person)
+  --open[=N]         Open result N (default 1) in the default browser
+  --timeout SECS     Per-request timeout (default 12)
+  --json             JSON on stdout, human report on stderr
+  --no-color         Plain output
+  -h, --help         This help
+
+PERSON LOOKUP EXAMPLES
+  ./searchz --person "jane doe"              all networks + contact queries
+  ./searchz --person "jane doe" --sites linkedin.com,facebook.com
+  ./searchz --person "jane doe" --no-contact profiles only
+  ./searchz --person "jane doe" --json | jq '.queries[] | {label, n: (.results|length)}'
+
+ENGINES
+  auto   try DuckDuckGo first, fall back to Bing the moment it blocks
+  duck   html.duckduckgo.com (privacy-first; rate-limits fast)
+  bing   www.bing.com (most reliable; no key needed)
+  default via env: SEARCHZ_ENGINE=duck|bing|auto
+
+ALTERNATIVE COMMANDS
+  curl -s 'https://html.duckduckgo.com/html/?q=QUERY'   raw DuckDuckGo HTML
+  curl -s 'https://www.bing.com/search?q=QUERY'        raw Bing HTML
+  xdg-open 'https://www.google.com/search?q=QUERY'     open in a browser
+
+HELPEOF
+}
+
+# ---------- Args ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        help|\?)      show_help; exit 0 ;;
+        --person)     MODE="person"; shift ;;
+        --person=*)   MODE="person"; PERSON_NAME="${1#--person=}"; shift ;;
+        --engine)     ENGINE="${2:-auto}"; shift 2 ;;
+        --engine=*)   ENGINE="${1#--engine=}"; shift ;;
+        -n|--count)   COUNT="${2:-0}"; shift 2 ;;
+        --count=*)    COUNT="${1#--count=}"; shift ;;
+        --site)       SITE_PREFIX="${2:-}"; shift 2 ;;
+        --site=*)     SITE_PREFIX="${1#--site=}"; shift ;;
+        --sites)      PERSON_SITES="${2:-}"; shift 2 ;;
+        --sites=*)    PERSON_SITES="${1#--sites=}"; shift ;;
+        --no-contact) CONTACT=0; shift ;;
+        --open)       OPEN_N=1; shift ;;
+        --open=*)     OPEN_N="${1#--open=}"; shift ;;
+        --timeout)    REQ_TIMEOUT="${2:-12}"; shift 2 ;;
+        --timeout=*)  REQ_TIMEOUT="${1#--timeout=}"; shift ;;
+        --json)
+                JSON_OUT=1
+                shift
+                # JSON mode: the human report goes to stderr, stdout carries only
+                # the JSON object. fd 4 is opened HERE — before any output — and is
+                # this tool's own real stdout. It is never inherited from a parent
+                # shell, so a tool that does not source lib/common.sh still writes
+                # its JSON to the right place.
+                json_stdout_only
+                ;;
+        --no-color)   NO_COLOR=1; shift; init_colors ;;
+        -h|--help)    show_help; exit 0 ;;
+        --)           shift; while [[ $# -gt 0 ]]; do QPARTS+=("$1"); shift; done ;;
+        -*)           printf 'searchz: unknown flag: %s\n' "$1" >&2; printf '  try: searchz --help\n' >&2; exit 2 ;;
+        *)            QPARTS+=("$1"); shift ;;
+    esac
+done
+[[ ${#QPARTS[@]} -gt 0 ]] && QUERY="${QPARTS[*]}"
+[[ -z "$PERSON_NAME" && "$MODE" == "person" ]] && PERSON_NAME="$QUERY"
+
+case "$ENGINE" in
+    auto|duck|bing) ;;
+    *) printf 'searchz: unknown engine: %s (use auto, duck or bing)\n' "$ENGINE" >&2; exit 64 ;;
+esac
+if [[ "$COUNT" -eq 0 ]] 2>/dev/null; then
+    if [[ "$MODE" == "person" ]]; then COUNT=8; else COUNT=10; fi
+fi
+
+# ---------- No query: interactive prompt, JSON error, or usage ----------
+if [[ -z "$QUERY" ]]; then
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        json_emit '{"tool":"searchz","error":"no query provided","usage":"searchz \"query\" | searchz --person \"Name\" | searchz --help"}'
+        exit 64
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        :   # interactive — handled below
+    else
+        printf 'searchz: no query given.\n' >&2
+        printf '  web:    searchz "what you want to find"\n' >&2
+        printf '  person: searchz --person "full name"\n' >&2
+        printf '  help:   searchz --help\n' >&2
+        exit 64
+    fi
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        json_emit '{"tool":"searchz","error":"curl not installed","fix":"apt install curl"}'
+    else
+        crit "searchz needs curl" "apt install curl"
+    fi
+    exit 2
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+urlencode() {
+    local s="$1"
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$s" | jq -sRr @uri 2>/dev/null && return 0
+    fi
+    local LC_ALL=C i c out=""
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# first_before TEXT DELIM — everything before the FIRST occurrence of DELIM
+first_before() {
+    local s="$1" d="$2"
+    local i="${s%%"$d"*}"
+    printf '%s' "$i"
+}
+
+# first_of TEXT DELIM... — everything before the earliest occurrence
+first_of() {
+    local s="$1"; shift
+    local d i best=""
+    for d in "$@"; do
+        i="${s%%"$d"*}"
+        [[ "$i" == "$s" ]] && continue          # delimiter absent
+        if [[ -z "$best" || ${#i} -lt ${#best} ]]; then best="$i"; fi
+    done
+    if [[ -n "$best" ]]; then printf '%s' "$best"; else printf '%s' "$s"; fi
+}
+
+strip_tags() { printf '%s' "$1" | sed 's/<[^>]*>//g'; }
+
+html_decode() {
+    local s="$1" r m n i
+    # numeric character references &#NNN; / &#xHH; (bounded — one per pass)
+    for (( i = 0; i < 100; i++ )); do
+        if [[ "$s" =~ \&\#x([0-9a-fA-F]{1,4})\; ]]; then
+            m="${BASH_REMATCH[0]}"; n=$(( 16#${BASH_REMATCH[1]} ))
+        elif [[ "$s" =~ \&\#([0-9]{1,5})\; ]]; then
+            m="${BASH_REMATCH[0]}"; n=$(( 10#${BASH_REMATCH[1]} ))
+        else
+            break
+        fi
+        case "$n" in
+            34)  r='"' ;;  38)  r='&' ;;   39) r="'" ;;  47)  r='/' ;;
+            60)  r='<' ;;  62)  r='>' ;;   160) r=' ' ;; 169) r='©' ;;
+            174) r='®' ;;  183) r='·' ;;   8211) r='–' ;; 8212) r='—' ;;
+            8216) r='‘' ;; 8217) r='’' ;;  8220) r='“' ;; 8221) r='”' ;;
+            8230) r='…' ;; 8242) r='′' ;;  8243) r='″' ;; 8364) r='€' ;;
+            8482) r='™' ;; 9679) r='●' ;;  12298) r='《' ;; 12299) r='》' ;;
+            *)    r='' ;;
+        esac
+        s="${s/"$m"/"$r"}"
+    done
+    # named entities — &amp; LAST so "&amp;lt;" does not become "<"
+    s=${s//&quot;/\"};  s=${s//&#39;/'}
+    s=${s//&apos;/'}
+    s=${s//&nbsp;/ };   s=${s//&lt;/\<};   s=${s//&gt;/>}
+    s=${s//&hellip;/…}; s=${s//&ndash;/–}; s=${s//&mdash/—}
+    s=${s//&rsquo;/’};  s=${s//&lsquo;/‘}
+    s=${s//&rdquo;/”};  s=${s//&ldquo;/“}
+    s=${s//&trade;/™};  s=${s//&copy;/©};  s=${s//&middot;/·}
+    s=${s//&amp;/\&}
+    printf '%s' "$s"
+}
+
+# base64url (Bing's u=a1… redirect parameter) → plain URL
+b64url_decode() {
+    local s="$1"
+    s=${s//-/+}; s=${s//_/\/}
+    while (( ${#s} % 4 != 0 )); do s+="="; done
+    printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+# percent-encoded (DuckDuckGo's uddg=…) → plain URL
+pct_decode() {
+    local s="$1"
+    [[ "$s" == *%* ]] || { printf '%s' "$s"; return 0; }
+    printf '%b' "${s//%/\\x}" 2>/dev/null || printf '%s' "$s"
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
+}
+
+host_of() {
+    local h="${1#*://}"
+    h="${h%%/*}"; h="${h%%\?*}"; h="${h%%:*}"
+    printf '%s' "${h#www.}"
+}
+
+tsv_clean() {   # keep one line of TSV per field
+    local s="$1"
+    s=${s//$'\t'/ }; s=${s//$'\n'/ }; s=${s//$'\r'/ }
+    printf '%s' "$s"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fetch + parse
+# ═══════════════════════════════════════════════════════════════════════════
+
+fetch_url() {   # url outfile use_cookies → prints http code
+    local url="$1" out="$2" ck="${3:-0}" code
+    local -a extra=()
+    [[ "$ck" == "1" ]] && extra=(-b "$CJ" -c "$CJ")
+    code=$(curl -sSL --max-time "$REQ_TIMEOUT" \
+        -A "$UA" \
+        -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+        -H 'Accept-Language: en-US,en;q=0.9' \
+        ${extra[@]+"${extra[@]}"} \
+        -o "$out" -w '%{http_code}' \
+        "$url" 2>/dev/null)
+    printf '%s' "${code:-000}"
+}
+
+seed_duck() {   # DuckDuckGo wants a cookie before html.duckduckgo.com answers
+    [[ "$DUCK_SEEDED" == 1 ]] && return 0
+    curl -sSL --max-time 8 -A "$UA" -o /dev/null -c "$CJ" \
+        "https://duckduckgo.com/" 2>/dev/null
+    DUCK_SEEDED=1
+}
+
+# ---------- DuckDuckGo ----------
+parse_duck() {  # htmlfile count → RESULTS[] + PARSE_STATUS
+    RESULTS=(); PARSE_STATUS="blocked"
+    [[ -s "$1" ]] || return 0
+    local content block u t s w
+    content=$(tr '\n' ' ' < "$1")
+    if [[ "$content" == *'result__a'* ]]; then
+        PARSE_STATUS="ok"
+    elif [[ "$content" == *'result--no-result'* || "$content" == *'No results'* ]]; then
+        PARSE_STATUS="zero"; return 0
+    else
+        return 0   # anomaly page / captcha / empty — caller falls back
+    fi
+    while IFS= read -r block; do
+        [[ "$block" == *'result__a'* ]] || continue
+        u=$(printf '%s' "$block" | grep -oE 'uddg=[^"&]+' | head -1)
+        u=$(pct_decode "${u#uddg=}")
+        t=$(printf '%s' "$block" | grep -oE 'class="result__a"[^>]*>.{0,400}' | head -1)
+        t="${t#*>}"; t=$(first_before "$t" "</a>"); t=$(html_decode "$(strip_tags "$t")")
+        s=$(printf '%s' "$block" | grep -oE 'class="result__snippet"[^>]*>.{0,700}' | head -1)
+        s="${s#*>}"; s=$(first_before "$s" "</a>"); s=$(html_decode "$(strip_tags "$s")")
+        [[ -n "$u" ]] || continue
+        RESULTS+=("$(tsv_clean "$u")"$'\t'"$(tsv_clean "$t")"$'\t'"$(tsv_clean "$s")")
+        (( ${#RESULTS[@]} >= $2 )) && break
+    done < <(printf '%s' "$content" | sed 's/<div class="result results_links/\n&/g')
+    return 0
+}
+
+# ---------- Bing ----------
+bing_url() {    # one b_algo block → plain URL
+    local b="$1" enc u cite
+    enc=$(printf '%s' "$b" | grep -oE '[^A-Za-z0-9]u=a1[A-Za-z0-9_-]+' | head -1)
+    enc="${enc##*u=a1}"
+    [[ -n "$enc" ]] && u=$(b64url_decode "$enc")
+    if [[ -z "$u" ]]; then
+        cite=$(printf '%s' "$b" | grep -oE '<cite>[^<]*' | head -1 | sed 's/<cite>//')
+        cite=$(html_decode "$(strip_tags "$cite")")
+        cite="${cite// › //}"      # display form: "host › path" → "host/path"
+        cite="${cite//›//}"
+        if [[ -n "$cite" ]]; then
+            [[ "$cite" == http* ]] || cite="https://$cite"
+            u="$cite"
+        fi
+    fi
+    printf '%s' "$u"
+}
+
+parse_bing() {  # htmlfile count → RESULTS[] + PARSE_STATUS
+    RESULTS=(); PARSE_STATUS="blocked"
+    [[ -s "$1" ]] || return 0
+    local content block u t s w
+    content=$(tr '\n' ' ' < "$1")
+    if [[ "$content" == *'b_algo'* ]]; then
+        PARSE_STATUS="ok"
+    elif [[ "$content" == *'class="b_no"'* || "$content" == *'No results found'* ]]; then
+        PARSE_STATUS="zero"; return 0
+    else
+        return 0   # challenge page or markup change — caller falls back
+    fi
+    while IFS= read -r block; do
+        [[ "$block" == *'b_algo'* ]] || continue
+        u=$(bing_url "$block")
+        w=$(printf '%s' "$block" | grep -oE '<h2[^>]*><a[^>]*>.{0,400}' | head -1)
+        [[ -z "$w" ]] && w=$(printf '%s' "$block" | grep -oE '<h2[^>]*>.{0,400}' | head -1)
+        t=$(html_decode "$(strip_tags "$(first_of "$w" "</h2>")")")
+        w=$(printf '%s' "$block" | grep -oE 'class="b_lineclamp[0-9]"[^>]*>.{0,700}' | head -1)
+        [[ -z "$w" ]] && w=$(printf '%s' "$block" | grep -oE 'class="b_snippet"[^>]*>.{0,700}' | head -1)
+        if [[ -n "$w" ]]; then
+            w="${w#*>}"
+            s=$(html_decode "$(strip_tags "$(first_of "$w" "</p>" "</div>" "</a>")")")
+        else
+            s=""
+        fi
+        [[ -n "$u" ]] || continue
+        RESULTS+=("$(tsv_clean "$u")"$'\t'"$(tsv_clean "$t")"$'\t'"$(tsv_clean "$s")")
+        (( ${#RESULTS[@]} >= $2 )) && break
+    done < <(printf '%s' "$content" | sed 's/<li class="b_algo"/\n<li class="b_algo"/g')
+    return 0
+}
+
+# ---------- one search, with engine fallback ----------
+# do_search QUERY COUNT → 0 = answered (RESULTS may be empty), 1 = all blocked
+do_search() {
+    local q="$1" n="$2"
+    local -a cand=()
+    RESULTS=()
+    case "$ENGINE" in
+        auto)
+            if [[ -n "$ACTIVE_ENGINE" ]]; then
+                cand=("$ACTIVE_ENGINE")
+                [[ "$ACTIVE_ENGINE" == "duck" ]] && cand+=("bing") || cand+=("duck")
+            else
+                cand=(duck bing)
+            fi
+            ;;
+        *)   cand=("$ENGINE") ;;
+    esac
+
+    local e f="$TMPD/page.html" code
+    for e in "${cand[@]}"; do
+        if [[ "$e" == "duck" ]]; then
+            [[ "$DUCK_BLOCKED" == 1 ]] && continue
+            seed_duck
+            # polite pause: DuckDuckGo rate-limits bursts almost immediately
+            [[ "$DUCK_USED" == 1 ]] && sleep 1.5
+            DUCK_USED=1
+            code=$(fetch_url "https://html.duckduckgo.com/html/?q=$(urlencode "$q")&kl=us-en" "$f" 1)
+            if [[ "$code" == "200" || "$code" == "302" ]]; then
+                parse_duck "$f" "$n"
+            else
+                PARSE_STATUS="blocked"
+            fi
+        else
+            code=$(fetch_url "https://www.bing.com/search?q=$(urlencode "$q")&count=$n&setlang=en&setmkt=en-US" "$f" 0)
+            if [[ "$code" == "200" ]]; then
+                parse_bing "$f" "$n"
+            else
+                PARSE_STATUS="blocked"
+            fi
+        fi
+        if [[ "$PARSE_STATUS" == "ok" || "$PARSE_STATUS" == "zero" ]]; then
+            ACTIVE_ENGINE="$e"
+            return 0
+        fi
+        [[ "$e" == "duck" ]] && DUCK_BLOCKED=1   # don't burn time retrying it
+        [[ "$ENGINE" == "auto" ]] && [[ ${#cand[@]} -gt 1 ]] && {
+            [[ "$JSON_OUT" -eq 0 ]] && info "${C_DIM}$e blocked or empty — falling back${C_RESET}"
+        }
+    done
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Modes
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ---------- site: handling ----------
+# Search engines silently drop the site: operator for some clients (Bing does
+# it from this network: it echoes the query in <title> but ranks unfiltered
+# results). So every site-restricted search is VERIFIED client-side: results
+# must actually come from the requested host. If a site: query returns plenty
+# of results but none from the site, the operator was stripped — switch to a
+# soft "<name> <network>" query (and stay switched for the rest of the run).
+
+filter_results_by_host() {  # keep only RESULTS whose host is site (or alias)
+    local site="$1" alias="" r u host hit
+    case "$site" in
+        x.com)        alias="twitter.com" ;;   # same network, two domains
+        twitter.com)  alias="x.com" ;;
+    esac
+    local -a kept=()
+    for r in "${RESULTS[@]:-}"; do
+        [[ -z "$r" ]] && continue
+        u="${r%%$'\t'*}"
+        host=$(host_of "$u")
+        hit=0
+        [[ "$host" == "$site"  || "$host" == *".$site"  ]] && hit=1
+        if [[ -n "$alias" && ( "$host" == "$alias" || "$host" == *".$alias" ) ]]; then
+            hit=1
+        fi
+        (( hit )) && kept+=("$r")
+    done
+    RESULTS=("${kept[@]}")
+}
+
+soft_word() {  # linkedin.com → linkedin (what people actually type)
+    local s="$1" w
+    w="${s%%.*}"          # NOT in the same `local` line: expansions run first
+    case "$s" in
+        x.com|twitter.com) w="twitter" ;;
+    esac
+    printf '%s' "$w"
+}
+
+filter_results_by_pattern() {  # contact queries: keep only results whose
+    local kind="$1" r u t s blob   # title/snippet actually LOOKS like the thing
+    local -a kept=()
+    for r in "${RESULTS[@]:-}"; do
+        [[ -z "$r" ]] && continue
+        IFS=$'\t' read -r u t s <<< "$r"
+        blob="$t $s"
+        case "$kind" in
+            phone)
+                printf '%s' "$blob" | grep -qE '[0-9]{2,4}[-. ()]+[0-9]{2,4}[-. ()]+[0-9]{3,4}|\+[0-9][0-9 ().-]{6,}' \
+                    && kept+=("$r")
+                ;;
+            email)
+                printf '%s' "$blob" | grep -qiE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+                    && kept+=("$r")
+                ;;
+            address)
+                printf '%s' "$blob" | grep -qiE '[0-9]{1,5}[[:space:]]+[A-Za-z0-9 .]+[[:space:]]+(street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|court|ct|way|place|pl|circle|terrace)\b|[A-Za-z]{2}[[:space:]]+[0-]{0,1}[0-9]{5}(-[0-9]{4})?' \
+                    && kept+=("$r")
+                ;;
+        esac
+    done
+    RESULTS=("${kept[@]}")
+}
+
+# site_search SITE NAME COUNT → RESULTS[] verified against SITE, LAST_Q set
+site_search() {
+    local site="$1" name="$2" n="$3" q word unfiltered want
+    # widen the net: when the operator is stripped, only the top slice of a
+    # generic SERP can still contain the target host
+    want=$(( n < 15 ? 15 : n ))
+    LAST_Q=""
+    if [[ "$OP_MODE" == "site" ]]; then
+        q="site:$site \"$name\""
+        if ! do_search "$q" "$want"; then return 1; fi
+        unfiltered=${#RESULTS[@]}
+        filter_results_by_host "$site"
+        LAST_Q="$q"
+        if (( ${#RESULTS[@]} == 0 && unfiltered >= 3 )); then
+            OP_MODE="soft"   # operator was stripped — compensate below, from now on
+        else
+            return 0
+        fi
+    fi
+    word=$(soft_word "$site")
+    q="\"$name\" $word"
+    if ! do_search "$q" "$want"; then return 1; fi
+    filter_results_by_host "$site"
+    LAST_Q="$q"
+    return 0
+}
+
+print_results() {   # from RESULTS[]
+    local i u t s
+    for (( i = 0; i < ${#RESULTS[@]}; i++ )); do
+        IFS=$'\t' read -r u t s <<< "${RESULTS[$i]}"
+        printf "\n  ${C_BOLD}%2d.${C_RESET} %s\n" $((i + 1)) "${t:-$u}"
+        printf "      ${C_CYAN}%s${C_RESET}\n" "$u"
+        [[ -n "$s" ]] && printf "      ${C_DIM}%s${C_RESET}\n" "$s"
+    done
+}
+
+run_web_search() {
+    local q="$QUERY" ok=1
+    [[ -n "$SITE_PREFIX" ]] && q="site:$SITE_PREFIX \"$QUERY\""
+
+    [[ "$JSON_OUT" -eq 0 ]] && {
+        printf "\n  ${C_BOLD}${C_CYAN}━━ SEARCH ━━${C_RESET}\n"
+        printf "  ${C_DIM}query:${C_RESET} %s\n" "$q"
+    }
+
+    if [[ -n "$SITE_PREFIX" ]]; then
+        site_search "$SITE_PREFIX" "$QUERY" "$COUNT" || ok=0
+        q="$LAST_Q"
+    else
+        do_search "$QUERY" "$COUNT" || ok=0
+    fi
+
+    if (( ok == 0 )); then
+        ENGINE_FAILURES=$((ENGINE_FAILURES + 1))
+        if [[ "$JSON_OUT" -eq 1 ]]; then
+            emit_web_json
+            return 2
+        fi
+        warn "every engine was blocked or unreachable" \
+             "retry later, or pick the other engine: searchz --engine bing \"…\""
+        printf "  ${C_DIM}engines tried: %s${C_RESET}\n" \
+            "$([[ "$ENGINE" == auto ]] && printf 'duck, bing' || printf '%s' "$ENGINE")"
+        return 2
+    fi
+
+    # site: may have been swapped for a soft query mid-flight — say so
+    if [[ "$JSON_OUT" -eq 0 && -n "$SITE_PREFIX" && "$LAST_Q" != "site:$SITE_PREFIX \"$QUERY\"" ]]; then
+        info "${C_DIM}site: not honored by ${ACTIVE_ENGINE:-the engine} — ran: $LAST_Q (hits verified against $SITE_PREFIX)${C_RESET}"
+    fi
+
+    if [[ "$JSON_OUT" -eq 0 ]]; then
+        printf "  ${C_DIM}engine:${C_RESET} %s  ${C_DIM}results:${C_RESET} %d\n" \
+            "$ACTIVE_ENGINE" "${#RESULTS[@]}"
+    fi
+
+    if (( ${#RESULTS[@]} == 0 )); then
+        [[ "$JSON_OUT" -eq 0 ]] && info "no results for: $q"
+        [[ "$JSON_OUT" -eq 1 ]] && emit_web_json
+        return 1
+    fi
+
+    [[ "$JSON_OUT" -eq 0 ]] && print_results
+
+    if (( OPEN_N > 0 )); then
+        if (( OPEN_N <= ${#RESULTS[@]} )); then
+            local u
+            IFS=$'\t' read -r u _ <<< "${RESULTS[$((OPEN_N - 1))]}"
+            if command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "$u" >/dev/null 2>&1 &
+                [[ "$JSON_OUT" -eq 0 ]] && info "opening #${OPEN_N}: $u"
+            else
+                [[ "$JSON_OUT" -eq 0 ]] && info "xdg-open not installed — copy: $u"
+            fi
+        else
+            [[ "$JSON_OUT" -eq 0 ]] && info "only ${#RESULTS[@]} result(s) — no #${OPEN_N}"
+        fi
+    fi
+
+    [[ "$JSON_OUT" -eq 1 ]] && emit_web_json
+    return 0
+}
+
+run_person_search() {
+    local name="$PERSON_NAME" site label q
+    local -a sites=()
+    IFS=',' read -ra sites <<< "$PERSON_SITES"
+    PERSON_META=()
+    PERSON_ENTRIES=()
+
+    # fan-out plan: one site-restricted search per network, then contact queries
+    local -a plan_labels=() plan_kinds=()
+    for site in "${sites[@]}"; do
+        site="${site#"${site%%[![:space:]]*}"}"; site="${site%"${site##*[![:space:]]}"}"
+        [[ -z "$site" ]] && continue
+        plan_labels+=("$site")
+        plan_kinds+=("site")
+    done
+    if (( CONTACT )); then
+        plan_labels+=(phone address email)
+        plan_kinds+=(contact contact contact)
+    fi
+    if (( ${#plan_labels[@]} == 0 )); then
+        printf 'searchz: --sites list is empty\n' >&2
+        return 64
+    fi
+
+    [[ "$JSON_OUT" -eq 0 ]] && {
+        printf "\n  ${C_BOLD}${C_CYAN}━━ PERSON LOOKUP ━━${C_RESET} %s\n" "$name"
+        printf "  ${C_DIM}networks:${C_RESET} %s\n" "$PERSON_SITES"
+        (( CONTACT )) && printf "  ${C_DIM}contact queries:${C_RESET} phone · address · email\n"
+    }
+
+    local hits=0 answered=0 idx kind r u t s
+    for idx in "${!plan_labels[@]}"; do
+        label="${plan_labels[$idx]}"
+        kind="${plan_kinds[$idx]}"
+        if [[ "$kind" == "site" ]]; then
+            if ! site_search "$label" "$name" "$COUNT"; then
+                ENGINE_FAILURES=$((ENGINE_FAILURES + 1))
+                [[ "$JSON_OUT" -eq 0 ]] && info "[$label] engines blocked — skipped"
+                continue
+            fi
+            q="$LAST_Q"
+        else
+            case "$label" in
+                phone)   q="\"$name\" \"phone number\"" ;;
+                address) q="\"$name\" address" ;;
+                *)       q="\"$name\" email" ;;
+            esac
+            if ! do_search "$q" "$COUNT"; then
+                ENGINE_FAILURES=$((ENGINE_FAILURES + 1))
+                [[ "$JSON_OUT" -eq 0 ]] && info "[$label] engines blocked — skipped"
+                continue
+            fi
+            # a hit only counts if the snippet really shows the thing
+            filter_results_by_pattern "$label"
+        fi
+        PERSON_META+=("$label"$'\t'"$q")
+        answered=$((answered + 1))
+        [[ "$JSON_OUT" -eq 0 ]] && {
+            printf "\n  ${C_BOLD}▸ %-12s${C_RESET} ${C_DIM}%s${C_RESET} ${C_DIM}(%d)${C_RESET}\n" \
+                "$label" "$q" "${#RESULTS[@]}"
+        }
+        for r in "${RESULTS[@]:-}"; do
+            [[ -z "$r" ]] && continue
+            IFS=$'\t' read -r u t s <<< "$r"
+            PERSON_ENTRIES+=("$label"$'\t'"$u"$'\t'"$t"$'\t'"$s")
+            hits=$((hits + 1))
+            [[ "$JSON_OUT" -eq 0 ]] && {
+                printf "     ${C_GREEN}•${C_RESET} %s\n" "${t:-$u}"
+                printf "       ${C_CYAN}%s${C_RESET}\n" "$u"
+                [[ -n "$s" ]] && printf "       ${C_DIM}%s${C_RESET}\n" "$s"
+            }
+        done
+        if [[ "$JSON_OUT" -eq 0 && ${#RESULTS[@]} -eq 0 ]]; then
+            if [[ "$kind" == "contact" ]]; then
+                info "[$label] no $label visible in any result snippet"
+            else
+                info "[$label] no hits"
+            fi
+        fi
+    done
+
+    if (( answered == 0 )); then
+        [[ "$JSON_OUT" -eq 1 ]] && emit_person_json
+        if [[ "$JSON_OUT" -eq 0 ]]; then
+            warn "every engine was blocked or unreachable" \
+                 "retry later, or: searchz --person \"name\" --engine bing"
+        fi
+        return 2
+    fi
+
+    # ---------- summary ----------
+    [[ "$JSON_OUT" -eq 0 ]] && {
+        printf "\n  ${C_BOLD}${C_CYAN}━━ SUMMARY ━━${C_RESET}\n"
+        local lbl n=0 first_url
+        for lbl in "${sites[@]}"; do
+            lbl="${lbl#"${lbl%%[![:space:]]*}"}"; lbl="${lbl%"${lbl##*[![:space:]]}"}"
+            [[ -z "$lbl" ]] && continue
+            n=0; first_url=""
+            local e2
+            for e2 in "${PERSON_ENTRIES[@]:-}"; do
+                [[ -z "$e2" ]] && continue
+                [[ "${e2%%$'\t'*}" == "$lbl" ]] || continue
+                n=$((n + 1))
+                [[ -z "$first_url" ]] && first_url=$(printf '%s' "$e2" | cut -f2)
+            done
+            if (( n > 0 )); then
+                printf "  ${C_GREEN}✓${C_RESET} %-16s %s hit(s)   ${C_DIM}%s${C_RESET}\n" "$lbl" "$n" "$first_url"
+            else
+                printf "  ${C_DIM}✗ %-16s no hits${C_RESET}\n" "$lbl"
+            fi
+        done
+        if (( CONTACT )); then
+            local cl cn out=""
+            for cl in phone address email; do
+                cn=0
+                local e3
+                for e3 in "${PERSON_ENTRIES[@]:-}"; do
+                    [[ -z "$e3" ]] && continue
+                    [[ "${e3%%$'\t'*}" == "$cl" ]] && cn=$((cn + 1))
+                done
+                out+="${out:+ · }$cl $cn"
+            done
+            printf "  ${C_DIM}contact: %s${C_RESET}\n" "$out"
+        fi
+        printf "  ${C_DIM}engine: %s · %d query(s) answered · %d result(s) total${C_RESET}\n" \
+            "${ACTIVE_ENGINE:-?}" "$answered" "$hits"
+    }
+    [[ "$JSON_OUT" -eq 1 ]] && emit_person_json
+
+    (( hits > 0 )) && return 0
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# JSON emitters
+# ═══════════════════════════════════════════════════════════════════════════
+
+emit_web_json() {
+    local out r u t s first=1
+    out=$(printf '{"tool":"searchz","mode":"web","query":"%s","engine":"%s","results":[' \
+        "$(json_escape "$QUERY")" "$(json_escape "${ACTIVE_ENGINE:-none}")")
+    for r in "${RESULTS[@]:-}"; do
+        [[ -z "$r" ]] && continue
+        IFS=$'\t' read -r u t s <<< "$r"
+        (( first )) || out+=','
+        first=0
+        out+=$(printf '{"url":"%s","title":"%s","snippet":"%s"}' \
+            "$(json_escape "$u")" "$(json_escape "$t")" "$(json_escape "$s")")
+    done
+    out+=']}'
+    json_emit "$out"
+}
+
+emit_person_json() {
+    local out entry label q e u t s first=1 firstR i
+    out=$(printf '{"tool":"searchz","mode":"person","query":"%s","engine":"%s","queries":[' \
+        "$(json_escape "$PERSON_NAME")" "$(json_escape "${ACTIVE_ENGINE:-none}")")
+    for i in "${!PERSON_META[@]}"; do
+        entry="${PERSON_META[$i]}"
+        label="${entry%%$'\t'*}"
+        q="${entry#*$'\t'}"
+        (( first )) || out+=','
+        first=0
+        out+=$(printf '{"label":"%s","query":"%s","results":[' \
+            "$(json_escape "$label")" "$(json_escape "$q")")
+        firstR=1
+        for e in "${PERSON_ENTRIES[@]:-}"; do
+            [[ -z "$e" ]] && continue
+            [[ "${e%%$'\t'*}" == "$label" ]] || continue
+            IFS=$'\t' read -r _ u t s <<< "$e"
+            (( firstR )) || out+=','
+            firstR=0
+            out+=$(printf '{"url":"%s","title":"%s","snippet":"%s"}' \
+                "$(json_escape "$u")" "$(json_escape "$t")" "$(json_escape "$s")")
+        done
+        out+=']}'
+    done
+    out+=']}'
+    json_emit "$out"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════
+
+finish() {
+    if declare -f run_comparison_finalize >/dev/null 2>&1; then
+        run_comparison_finalize 2>/dev/null
+    fi
+    exit "$1"
+}
+
+if declare -f run_comparison_init >/dev/null 2>&1; then
+    run_comparison_init "searchz" "mode=$MODE engine=$ENGINE" 2>/dev/null
+fi
+
+if [[ "$JSON_OUT" -eq 0 && -z "$QUERY" ]]; then
+    # interactive: keep asking until an empty line, Ctrl-D, quit or exit
+    printf "  ${C_BOLD}${C_CYAN}searchz${C_RESET} ${C_DIM}— type a query (empty line or Ctrl-D to quit)${C_RESET}\n"
+    while true; do
+        printf "\n  ${C_BOLD}searchz ›${C_RESET} "
+        IFS= read -r QUERY || break
+        [[ -z "${QUERY// /}" ]] && break
+        [[ "$QUERY" == "quit" || "$QUERY" == "exit" ]] && break
+        [[ "$MODE" == "person" ]] && PERSON_NAME="$QUERY"
+        if [[ "$MODE" == "person" ]]; then
+            run_person_search
+        else
+            run_web_search
+        fi
+        PERSON_META=(); PERSON_ENTRIES=()
+    done
+    finish 0
+fi
+
+if [[ "$MODE" == "person" ]]; then
+    run_person_search
+    rc=$?
+else
+    run_web_search
+    rc=$?
+fi
+finish "$rc"

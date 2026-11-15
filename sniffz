@@ -1,0 +1,1416 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# sniffz — Locate the person on the other end of your call
+#
+# Watches this machine's socket table for the flow that is carrying your
+# audio/video call, picks the peer out of the browser and system noise, then
+# traces the route to it and geolocates the far end. One command, no
+# packet-capture setup required — though it gets sharper with it.
+#
+# What it does:
+#   1. Discovery  — enumerates connected UDP sockets with ss(8); WebRTC/SRTP,
+#                    QUIC, STUN/TURN and RTP all ride UDP, so the call shows
+#                    up here as a socket with a real peer address
+#   2. Watch      — samples the socket table for a couple of seconds so flows
+#                    that are genuinely alive (and their receive queues) beat
+#                    flows that are merely open
+#   3. Score      — a media-flow model: known call ports (Zoom 8801-8810,
+#                    STUN/TURN 3478-3481 & 5349, Teams 49152-57343, RTP
+#                    10000+), the owning process from ss(8) -p, and browser /
+#                    system-daemon traffic demoted so QUIC never wins
+#   4. Sniff      — with root, `--sniff N` captures N seconds of inbound UDP
+#                    with tcpdump and ranks endpoints by real packet counts
+#                    instead of by guess
+#   5. Route      — traceroute (or mtr) to the selected peer: every hop + RTT
+#   6. Locate     — city/region/country, ISP/ASN, coordinates, reverse DNS,
+#                    via lib/enrich.sh (ip-api.com, cached — one lookup per IP)
+#   7. Judge      — flags when the far end is a TURN/datacenter relay, a
+#                    VPN/proxy exit or a local address rather than the person
+#   8. All        — `--all` drops the call model and shows everything:
+#                    every connected socket on this machine (established TCP
+#                    + connected UDP — your browser, downloads, chats, calls)
+#                    with city/state/country + network for each remote
+#                    address. One batched ip-api request covers them all.
+#
+# Usage:
+#   ./sniffz
+#   ./sniffz --all
+#   ./sniffz --sniff 10
+#   ./sniffz --ip 203.0.113.7
+#   ./sniffz --list
+#   ./sniffz --watch 5
+#   ./sniffz --no-trace --no-geo
+#   ./sniffz --json
+#
+# Requires: ss (iproute2), traceroute or mtr, curl + jq (lib/enrich.sh).
+# Optional: tcpdump + root for --sniff, ip(8) for interface hints.
+# The only network call this tool makes on your behalf is one geolocation
+# lookup per remote address (ip-api.com; --all batches them into a single
+# request) — cached in ~/.cache/.
+#
+# Exit codes: 0 peer found · 1 no peer/connections found · 2 missing tools ·
+#             64 usage error
+# ============================================================================
+
+set +e
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"  2>/dev/null || true
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/enrich.sh"  2>/dev/null || true
+
+# ---------- Help: print the banner block between the two "# ===" rules ------
+show_help() {
+    awk 'NR==1{next} /^#[[:space:]]*={5,}/{n++; if(n==2) exit} n>=1{print}' "$0"
+}
+
+# ---------- Defaults --------------------------------------------------------
+PEER_IP=""
+PEER_PORT=""
+WATCH_SECS=2
+SNIFF_SECS=0
+IFACE=""
+LIST_ONLY=0
+ALL_MODE=0             # --all: every connected socket, each one located
+DO_TRACE=1
+DO_GEO=1
+MODE="heuristic"          # heuristic | capture | explicit
+MIN_SCORE=30              # heuristic mode: what counts as "probably a call"
+CAP_TIER=5                # capture mode: heuristic floor for a media flow
+SELECT_THRESHOLD=30
+
+# ---------- Selection results (emitted as JSON on every exit path) ----------
+SEL_IP=""; SEL_PORT=""; SEL_LIP=""; SEL_LPORT=""
+SEL_PROC="-"; SEL_SVC=""; SEL_SCORE=0; SEL_HEUR=0; SEL_REASON=""; SEL_LOCAL_SRC=""; SEL_LOCAL_DEV=""
+GEO_LOCAL=0
+GEO_CITY=""; GEO_REGION=""; GEO_RCODE=""; GEO_COUNTRY=""; GEO_CCODE=""
+GEO_ORG=""; GEO_HOST=""; GEO_LAT=""; GEO_LON=""; GEO_ISP=""; GEO_AS=""
+GEO_PROXY=""; GEO_HOSTING=""; GEO_MOBILE=""
+declare -a TR_HOPS=() TR_IPS=() TR_RTTS=()
+TR_REACHED=0; TR_LAST_RTT=""; TR_HOPCOUNT=0; TR_TOOL=""
+declare -a HINTS=()
+
+# ---------- Argument parsing ------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        help|\?)
+            show_help; exit 0 ;;
+        --ip)
+            [[ $# -ge 2 ]] || { printf 'sniffz: --ip needs an address\n' >&2; exit 64; }
+            PEER_IP="$2"; shift 2 ;;
+        --ip=*)      PEER_IP="${1#*=}"; shift ;;
+        --port)
+            [[ $# -ge 2 ]] || { printf 'sniffz: --port needs a number\n' >&2; exit 64; }
+            PEER_PORT="$2"; shift 2 ;;
+        --sniff)
+            [[ $# -ge 2 ]] || { printf 'sniffz: --sniff needs seconds\n' >&2; exit 64; }
+            SNIFF_SECS="$2"; shift 2 ;;
+        --sniff=*)   SNIFF_SECS="${1#*=}"; shift ;;
+        --watch)
+            [[ $# -ge 2 ]] || { printf 'sniffz: --watch needs seconds\n' >&2; exit 64; }
+            WATCH_SECS="$2"; shift 2 ;;
+        --watch=*)   WATCH_SECS="${1#*=}"; shift ;;
+        --no-watch)  WATCH_SECS=0; shift ;;
+        --iface)
+            [[ $# -ge 2 ]] || { printf 'sniffz: --iface needs a name\n' >&2; exit 64; }
+            IFACE="$2"; shift 2 ;;
+        --iface=*)   IFACE="${1#*=}"; shift ;;
+        --list)      LIST_ONLY=1; shift ;;
+        --all)       ALL_MODE=1; shift ;;
+        --no-trace)  DO_TRACE=0; shift ;;
+        --no-geo)    DO_GEO=0; shift ;;
+        --json)
+            JSON_OUT=1
+            shift
+            # JSON mode: the human report goes to stderr, stdout carries only
+            # the JSON object. fd 4 is opened HERE — before any output — and is
+            # this tool's own real stdout. It is never inherited from a parent
+            # shell, so a tool that does not source lib/common.sh still writes
+            # its JSON to the right place.
+            exec 4>&1 1>&2
+            _JSON_FD4=1 ;;
+        --no-color)  NO_COLOR=1; shift ;;
+        -h|--help)   show_help; exit 0 ;;
+        --)          shift; break ;;
+        -*)          printf 'sniffz: unknown option %s (try ./sniffz --help)\n' "$1" >&2; exit 64 ;;
+        *)           printf 'sniffz: unexpected argument %s (try ./sniffz --help)\n' "$1" >&2; exit 64 ;;
+    esac
+done
+
+init_colors
+
+[[ "$WATCH_SECS" =~ ^[0-9]+$ ]] || WATCH_SECS=2
+[[ "$SNIFF_SECS" =~ ^[0-9]+$ ]] || SNIFF_SECS=0
+(( WATCH_SECS > 30 )) && WATCH_SECS=30
+(( SNIFF_SECS > 60 )) && SNIFF_SECS=60
+
+# ============================================================================
+# Address helpers
+# ============================================================================
+
+# split_addr <ip:port | [v6]:port | ip%zone:port> → SPLIT_IP / SPLIT_PORT
+split_addr() {
+    local a="${1-}"
+    a="${a%%\%*}"                                  # strip %iface zone id
+    if [[ "$a" == \[* ]]; then
+        SPLIT_IP="${a%%]*}"
+        SPLIT_IP="${SPLIT_IP#\[}"
+        SPLIT_PORT="${a##*:}"
+    else
+        SPLIT_IP="${a%:*}"
+        SPLIT_PORT="${a##*:}"
+    fi
+    [[ "$SPLIT_PORT" =~ ^[0-9]+$ ]] || SPLIT_PORT=0
+}
+
+# classify_ip <ip> → local | private | public
+classify_ip() {
+    case "${1-}" in
+        127.*|0.*|255.*|22[4-9].*|23[0-9].*|24[0-3].*) printf 'local' ;;
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|169.254.*) printf 'private' ;;
+        ::1|::) printf 'local' ;;
+        fe80:*|FE80:*) printf 'private' ;;
+        [fF][cCdD]*:*) printf 'private' ;;   # fc00::/7 ULA (tailscale, iot)
+        ff*:*) printf 'local' ;;
+        *) printf 'public' ;;
+    esac
+}
+
+# service_guess <port> → a short human label for what usually lives there
+service_guess() {
+    local p="${1-}"
+    [[ "$p" =~ ^[0-9]+$ ]] || { printf 'unknown'; return; }
+    case "$p" in
+        3478|3479|3480|3481|5349) printf 'STUN/TURN relay'; return ;;
+        443)     printf 'QUIC / HTTP3'; return ;;
+        5004|5005) printf 'RTP/RTCP'; return ;;
+        1194|51820) printf 'VPN tunnel'; return ;;
+        53|5353|5355) printf 'DNS/mDNS'; return ;;
+        67|68)   printf 'DHCP'; return ;;
+        123)     printf 'NTP'; return ;;
+    esac
+    if (( p >= 8801 && p <= 8810 )); then printf 'Zoom media'; return; fi
+    if (( p >= 49152 && p <= 57343 )); then printf 'dynamic RTP (Teams/RTC)'; return; fi
+    if (( p >= 10000 )); then printf 'RTP/media'; return; fi
+    if (( p >= 1024 )); then printf 'unprivileged UDP'; return; fi
+    printf 'well-known service'
+}
+
+# service_for <proto> <port> → service_guess, corrected for the protocol:
+# port 443 is HTTPS on TCP and HTTP/3 (QUIC) on UDP.
+service_for() {
+    local proto="${1-}" p="${2-}"
+    [[ "$p" =~ ^[0-9]+$ ]] || { printf 'unknown'; return; }
+    if [[ "$proto" == tcp ]]; then
+        case "$p" in
+            21)    printf 'FTP'; return ;;
+            22)    printf 'SSH'; return ;;
+            25|465|587) printf 'SMTP mail'; return ;;
+            53)    printf 'DNS over TCP'; return ;;
+            80)    printf 'HTTP'; return ;;
+            110)   printf 'POP3 mail'; return ;;
+            143)   printf 'IMAP mail'; return ;;
+            443)   printf 'HTTPS/TLS'; return ;;
+            993)   printf 'IMAPS mail'; return ;;
+            995)   printf 'POP3S mail'; return ;;
+            3306)  printf 'MySQL'; return ;;
+            3389)  printf 'RDP remote desktop'; return ;;
+            5432)  printf 'PostgreSQL'; return ;;
+            8443)  printf 'HTTPS alt'; return ;;
+        esac
+        if (( p >= 1024 )); then printf 'TCP session'; return; fi
+        printf 'well-known TCP service'
+    else
+        service_guess "$p"
+    fi
+}
+
+# is_noise_port <port> → 0 when the port is never a person you are talking to
+is_noise_port() {
+    case "${1-}" in
+        53|5353|5355|67|68|123|137|138|1900|500|4500|623|546|547|161|162|514|69|1434) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ============================================================================
+# Scoring — fills F_SCORE / F_SVC / F_REASON for one candidate flow
+# ============================================================================
+score_flow() {
+    local rport="${1-}" rproc="${2-}" rclass="${3-}" key="${4-}"
+    F_SCORE=0
+    F_SVC="$(service_guess "$rport")"
+    F_REASON=""
+
+    if [[ ! "$rport" =~ ^[0-9]+$ ]] || (( rport == 0 )); then
+        F_SCORE=-100; F_REASON="no usable peer port"; return 0
+    fi
+    if [[ "$rclass" == local ]]; then
+        F_SCORE=-100; F_REASON="non-routable address"; return 0
+    fi
+    if is_noise_port "$rport"; then
+        F_SCORE=-100; F_REASON="system service port $rport"; return 0
+    fi
+
+    # --- port signature ----------------------------------------------------
+    local base=0 reason=""
+    case "$rport" in
+        3478|3479|3480|3481|5349) base=45; reason="STUN/TURN port — WebRTC relay candidate" ;;
+        443)                      base=-50; reason="QUIC/HTTP3 — normally browser traffic" ;;
+        1194|51820)               base=-30; reason="VPN tunnel" ;;
+    esac
+    if (( rport >= 8801 && rport <= 8810 )); then
+        base=55; reason="Zoom media port range"
+    elif (( rport >= 49152 && rport <= 57343 )); then
+        base=45; reason="dynamic RTP range (Teams / WebRTC)"
+    elif (( rport == 5004 || rport == 5005 )); then
+        base=40; reason="classic RTP/RTCP pair"
+    elif (( rport >= 10000 )); then
+        base=35; reason="high UDP port — typical RTP media"
+    fi
+    F_SCORE=$base
+    F_REASON="$reason"
+
+    # --- owning process ----------------------------------------------------
+    local p="${rproc,,}"
+    case "$p" in
+        zoom*|teams*|ms-teams*|discord*|slack*|signal*|whatsapp*|telegram*|skype*|\
+        webex*|obs*|jitsi*|element*|wire*|mattermost*|tox*|linphone*|zoiper*|meet*)
+            F_SCORE=$(( F_SCORE + 25 ))
+            F_REASON="${F_REASON:+$F_REASON · }call app '$rproc'" ;;
+        chrome*|chromium*|firefox*|edge*|brave*|opera*|vivaldi*|librewolf*|zen*)
+            F_SCORE=$(( F_SCORE + 10 ))
+            F_REASON="${F_REASON:+$F_REASON · }browser '$rproc' (WebRTC possible)" ;;
+        systemd-resolved|chrony|dhclient|networkmanager|wpa_supplicant|avahi*|\
+        tailscaled|dockerd|sshd|gnome-shell|pipewire*|pulseaudio|wireplumber|\
+        systemd-journal|bluetoothd|cups-browsed|rpc.statd|nfsd)
+            F_SCORE=$(( F_SCORE - 40 ))
+            F_REASON="${F_REASON:+$F_REASON · }local service '$rproc'" ;;
+    esac
+
+    # --- liveness from the watch ------------------------------------------
+    if (( ${RXQ_PEAK:-0} > 0 )); then
+        F_SCORE=$(( F_SCORE + 15 ))
+        F_REASON="${F_REASON:+$F_REASON · }receive queue seen active"
+    fi
+    if (( ${STABLE:-0} )); then
+        F_SCORE=$(( F_SCORE + 10 ))
+        F_REASON="${F_REASON:+$F_REASON · }alive across the whole watch"
+    fi
+    if (( ${IS_NEW:-0} )); then
+        F_SCORE=$(( F_SCORE + 10 ))
+        F_REASON="${F_REASON:+$F_REASON · }appeared during the watch"
+    fi
+    [[ -n "$F_REASON" ]] || F_REASON="no distinguishing signature"
+    return 0
+}
+
+# ============================================================================
+# Discovery — one TSV line per connected UDP socket
+#   recvq <TAB> state <TAB> local <TAB> peer <TAB> process
+# ============================================================================
+ss_flows() {
+    ss -H -uanp 2>/dev/null | awk '
+        NF < 5            { next }
+        $2 !~ /^[0-9]+$/  { next }   # header row (no -H support on old iproute2)
+        $5 !~ /:/         { next }   # malformed — needs ip:port
+        $5 ~ /:\*$/       { next }   # unconnected: no peer address to follow
+        {
+            state = $1; recvq = $2; loc = $4; peer = $5
+            proc = "-"
+            if (match($0, /users:\(\("[^"]+"/))
+                proc = substr($0, RSTART + 9, RLENGTH - 10)
+            printf "%s\t%s\t%s\t%s\t%s\n", recvq, state, loc, peer, proc
+        }'
+}
+
+# ============================================================================
+# Watch — sample the socket table N times, remember who stayed alive and
+# whether their receive queue ever held bytes (a real activity signal).
+# ============================================================================
+declare -A W_COUNT=() W_MAXQ=() W_SEEN1=()
+
+watch_flows() {
+    local secs="${1:-0}" key q
+    [[ "$secs" =~ ^[0-9]+$ ]] || return 0
+    (( secs > 0 )) || return 0
+    local n=5 i=1 interval
+    interval=$(awk -v s="$secs" -v n="$n" 'BEGIN{printf "%.3f", s/(n-1)}')
+    while (( i <= n )); do
+        while IFS=$'\t' read -r q _st _loc peer _proc; do
+            [[ -n "${peer:-}" ]] || continue
+            key="$peer"
+            W_COUNT[$key]=$(( ${W_COUNT[$key]:-0} + 1 ))
+            if [[ "${q:-}" =~ ^[0-9]+$ ]] && (( q > ${W_MAXQ[$key]:-0} )); then
+                W_MAXQ[$key]=$q
+            fi
+            if (( i == 1 )); then W_SEEN1[$key]=1; fi
+        done < <(ss_flows)
+        (( i < n )) && sleep "$interval"
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
+# ============================================================================
+# Sniff — with root, rank remote endpoints by real inbound packet counts
+# ============================================================================
+declare -A CAP_PKTS=() CAP_BYTES=()
+
+default_iface() {
+    ip -4 route show default 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+sniff_rank() {
+    local secs="$1"
+    command -v tcpdump >/dev/null 2>&1 || {
+        printf '  %s!%s tcpdump not installed — falling back to socket heuristics\n' "$C_YELLOW" "$C_RESET" >&2
+        return 1
+    }
+    if [[ "$(id -u)" != "0" ]]; then
+        printf '  %s!%s packet capture needs root — rerun: sudo ./sniffz --sniff %s\n' "$C_YELLOW" "$C_RESET" "$secs" >&2
+        return 1
+    fi
+    [[ -n "$IFACE" ]] || IFACE="$(default_iface)"
+    [[ -n "$IFACE" ]] || { printf '  ! sniffz: could not determine an interface (use --iface)\n' >&2; return 1; }
+
+    info "capturing ${secs}s of inbound UDP on ${IFACE} (tcpdump)…"
+    local out
+    out=$(timeout $(( secs + 3 )) tcpdump -i "$IFACE" -nn -l -Q in -c 50000 udp 2>/dev/null | awk '
+        {
+            src = $3
+            idx = match(src, /\.[0-9]+$/)          # ip.port (works for v6 too)
+            if (idx == 0) next
+            ip   = substr(src, 1, idx - 1)
+            port = substr(src, idx + 1)
+            bytes = 0
+            for (i = 1; i <= NF; i++) if ($i == "length") bytes = $(i + 1)
+            key = ip ":" port
+            pkt[key]++
+            byt[key] += bytes + 8                  # + UDP header
+        }
+        END { for (k in pkt) printf "%d\t%d\t%s\n", pkt[k], byt[k], k }')
+
+    [[ -n "$out" ]] || { printf '  ! sniffz: capture returned no UDP packets\n' >&2; return 1; }
+
+    local line pkts byt addr
+    while IFS=$'\t' read -r pkts byt addr; do
+        [[ -n "${addr:-}" ]] || continue
+        split_addr "$addr"
+        is_noise_port "$SPLIT_PORT" && continue
+        [[ "$(classify_ip "$SPLIT_IP")" != local ]] || continue
+        CAP_PKTS[$addr]="$pkts"
+        CAP_BYTES[$addr]="$byt"
+    done <<< "$out"
+    return 0
+}
+
+# ============================================================================
+# Traceroute
+# ============================================================================
+parse_traceroute() {
+    awk '
+        /^[ \t]*[0-9]+[ \t]/ {
+            hop = $1; ip = ""; rtt = ""; prev = ""
+            for (i = 2; i <= NF; i++) {
+                t = $i
+                if (t == "*") { if (ip == "") ip = "*"; prev = t; continue }
+                if (t == "ms") { if (rtt == "" && prev ~ /^[0-9]+\.[0-9]+$/) rtt = prev; prev = t; continue }
+                if (t ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)      { if (ip == "" || ip == "*") ip = t }
+                else if (t ~ /:/ && t ~ /^[0-9a-fA-F:.]+$/)      { if (ip == "" || ip == "*") ip = t }
+                prev = t
+            }
+            printf "%s\t%s\t%s\n", hop, (ip == "" ? "?" : ip), rtt
+        }'
+}
+
+parse_mtr() {
+    awk '
+        /^[ \t]*[0-9]+\.\|--/ {
+            line = $0
+            sub(/^[ \t]*/, "", line)
+            hop = line; sub(/\..*/, "", hop)
+            rest = line; sub(/^[0-9]+\.\|--[ \t]*/, "", rest)
+            n = split(rest, a, /[ \t]+/)
+            ip = (n >= 1 ? a[1] : "?")
+            rtt = (n >= 4 ? a[4] : "")
+            if (ip == "???") { ip = "*"; rtt = "" }   # no answer → show "-"
+            printf "%s\t%s\t%s\n", hop, ip, rtt
+        }'
+}
+
+run_traceroute() {
+    local ip="$1" out="" parsed=""
+    TR_HOPS=(); TR_IPS=(); TR_RTTS=(); TR_REACHED=0; TR_LAST_RTT=""; TR_HOPCOUNT=0; TR_TOOL=""
+    if command -v traceroute >/dev/null 2>&1; then
+        TR_TOOL="traceroute"
+        out=$(timeout 45 traceroute -n -q 1 -m 20 -w 1 "$ip" 2>/dev/null)
+        parsed=$(printf '%s\n' "$out" | parse_traceroute)
+    elif command -v mtr >/dev/null 2>&1; then
+        TR_TOOL="mtr"
+        out=$(timeout 45 mtr -r -c 1 -n -m 20 "$ip" 2>/dev/null)
+        parsed=$(printf '%s\n' "$out" | parse_mtr)
+    else
+        return 1
+    fi
+
+    # Parsed in-memory — no predictable temp file to race when run as root.
+    local h a r
+    while IFS=$'\t' read -r h a r; do
+        [[ -n "${h:-}" ]] || continue
+        TR_HOPS+=("$h"); TR_IPS+=("$a"); TR_RTTS+=("${r:--}")
+    done <<< "$parsed"
+
+    TR_HOPCOUNT=${#TR_HOPS[@]}
+    if (( TR_HOPCOUNT > 0 )); then
+        TR_LAST_RTT="${TR_RTTS[$(( TR_HOPCOUNT - 1 ))]}"
+        [[ "${TR_IPS[$(( TR_HOPCOUNT - 1 ))]}" == "$ip" ]] && TR_REACHED=1
+    fi
+    (( TR_HOPCOUNT > 0 ))
+}
+
+# ============================================================================
+# Geolocation — enrich.sh gives the shared cached base; one extra ip-api call
+# adds coordinates, ISP/ASN and the proxy/hosting/mobile flags that tell us
+# whether the far end is a person, a relay or a VPN exit.
+# ============================================================================
+GEO_CACHE_DIR="${HOME}/.cache"
+GEO_CACHE="$GEO_CACHE_DIR/sniffz-geo.json"
+
+geo_base() {
+    local ip="$1" line
+    GEO_LOCAL=0
+    GEO_CITY=""; GEO_REGION=""; GEO_RCODE=""; GEO_COUNTRY=""; GEO_CCODE=""
+    GEO_ORG=""; GEO_HOST=""
+    declare -f enrich_ip >/dev/null 2>&1 || return 1
+    line=$(enrich_ip "$ip" 2>/dev/null)
+    [[ -n "$line" ]] || return 1
+    local IFS='|'
+    local f1 f2 f3 f4 f5 f6 f7 f8
+    read -r f1 f2 f3 f4 f5 f6 f7 f8 <<< "$line"
+    if [[ "$f1" == "local network" ]]; then GEO_LOCAL=1; return 0; fi
+    GEO_CITY="$f2"; GEO_REGION="$f3"; GEO_RCODE="$f4"
+    GEO_COUNTRY="$f5"; GEO_CCODE="$f6"; GEO_ORG="$f7"; GEO_HOST="$f8"
+    return 0
+}
+
+geo_detail() {
+    local ip="$1" resp cached
+    GEO_LAT=""; GEO_LON=""; GEO_ISP=""; GEO_AS=""
+    GEO_PROXY=""; GEO_HOSTING=""; GEO_MOBILE=""
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v jq   >/dev/null 2>&1 || return 0
+
+    mkdir -p "$GEO_CACHE_DIR" 2>/dev/null || true
+    if [[ -f "$GEO_CACHE" ]]; then
+        cached=$(jq -c --arg ip "$ip" '.[$ip] // empty' "$GEO_CACHE" 2>/dev/null)
+        if [[ -n "$cached" && "$cached" != "null" ]]; then
+            resp="$cached"
+        fi
+    fi
+
+    if [[ -z "${resp:-}" ]]; then
+        resp=$(curl -s --max-time 6 \
+            "http://ip-api.com/json/$ip?fields=status,lat,lon,isp,org,as,proxy,hosting,mobile,query" 2>/dev/null)
+        [[ -n "$resp" ]] || return 0
+        printf '%s' "$resp" | jq -e '.status == "success"' >/dev/null 2>&1 || return 0
+        # Merge into the cache instead of overwriting it — one IP per run
+        # must not evict every address looked up before it.
+        local tmp="$GEO_CACHE.$$" merged=""
+        if [[ -s "$GEO_CACHE" ]]; then
+            merged=$(jq --arg ip "$ip" --argjson r "$resp" '. + {($ip): $r}' "$GEO_CACHE" 2>/dev/null)
+        fi
+        [[ -n "$merged" ]] || merged=$(printf '{"%s":%s}' "$ip" "$resp")
+        if printf '%s\n' "$merged" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$GEO_CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+        else
+            rm -f "$tmp" 2>/dev/null
+            printf '{"%s":%s}\n' "$ip" "$resp" > "$GEO_CACHE" 2>/dev/null || true
+        fi
+    fi
+
+    GEO_LAT=$(printf '%s' "$resp" | jq -r '.lat   // empty' 2>/dev/null)
+    GEO_LON=$(printf '%s' "$resp" | jq -r '.lon   // empty' 2>/dev/null)
+    GEO_ISP=$(printf '%s' "$resp" | jq -r '.isp   // empty' 2>/dev/null)
+    GEO_AS=$(printf '%s' "$resp" | jq -r '.as    // empty' 2>/dev/null)
+    GEO_PROXY=$(printf '%s' "$resp" | jq -r 'if .proxy   == true then "true" elif .proxy   == false then "false" else "" end' 2>/dev/null)
+    GEO_HOSTING=$(printf '%s' "$resp" | jq -r 'if .hosting == true then "true" elif .hosting == false then "false" else "" end' 2>/dev/null)
+    GEO_MOBILE=$(printf '%s' "$resp" | jq -r 'if .mobile  == true then "true" elif .mobile  == false then "false" else "" end' 2>/dev/null)
+    return 0
+}
+
+# Which local address / interface would carry the packet to this peer
+local_route() {
+    local ip="$1" out
+    SEL_LOCAL_SRC=""; SEL_LOCAL_DEV=""
+    command -v ip >/dev/null 2>&1 || return 0
+    out=$(ip -4 route get "$ip" 2>/dev/null | head -1)
+    [[ -n "$out" ]] || out=$(ip -6 route get "$ip" 2>/dev/null | head -1)
+    [[ -n "$out" ]] || return 0
+    SEL_LOCAL_SRC=$(printf '%s' "$out" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    SEL_LOCAL_DEV=$(printf '%s' "$out" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    return 0
+}
+
+# ============================================================================
+# --all mode — every connected socket on this box, each one located
+# ----------------------------------------------------------------------------
+# Discovery: established TCP + connected UDP from ss(8), grouped per remote
+# endpoint (proto + ip:port), with the owning process(es) attached.
+# Location:  cache first, then ONE batched ip-api request for every public
+#            address — a browser with 30 sockets costs one HTTP call, not 30.
+# Traceroute is deliberately not run here: it is per-endpoint and slow.
+#            ./sniffz --ip <address> still traces a single endpoint.
+# ============================================================================
+declare -a ALL_ROWS=() ALL_PUBLIC_IPS=()
+declare -A ALL_CNT=() ALL_PROTO=() ALL_IP=() ALL_PORT=() ALL_PROCS=()
+declare -A GEO_ALL_JSON=()
+declare -A GEO_ALL_STR=() GEO_ALL_NET=() GEO_ALL_ORG=()
+declare -A GEO_ALL_CITY=() GEO_ALL_REGION=() GEO_ALL_COUNTRY=() GEO_ALL_CC=()
+ALL_SORTED=""
+ALL_SOCKETS=0; ALL_EPS=0; ALL_PUB_EPS=0; ALL_LOC_EPS=0
+ALL_PUB_SOCKS=0; ALL_LOC_SOCKS=0
+ALL_GEO_HITS=0; ALL_GEO_MISSES=0
+
+# fmt_endpoint <ip> <port> → "1.2.3.4:443" / "[2001:db8::1]:443"
+fmt_endpoint() {
+    if [[ "$1" == *:* ]]; then printf '[%s]:%s' "$1" "$2"; else printf '%s:%s' "$1" "$2"; fi
+}
+
+# clip_procs <"a, b, c"> → "a, b +1 more" (keeps the table readable)
+clip_procs() {
+    printf '%s' "$1" | awk -F', ' \
+        '{ if (NF <= 2) print $0; else printf "%s, %s +%d more", $1, $2, NF - 2 }'
+}
+
+# all_socket_lines → "proto<TAB>state<TAB>local<TAB>peer<TAB>process"
+all_socket_lines() {
+    local prog='
+        $2 !~ /^[0-9]+$/ { next }               # header row (old iproute2)
+        NF < 4           { next }
+        {
+            # ss drops the State column once you filter on one
+            n = ($1 ~ /^[A-Z][A-Z-]*$/) ? 2 : 1
+            loc = $(n + 2); peer = $(n + 3)
+            if (loc !~ /:/ || peer !~ /:/ || peer ~ /:\*$/) next
+            proc = "-"
+            if (match($0, /users:\(\("[^"]+"/)) proc = substr($0, RSTART + 9, RLENGTH - 10)
+            printf "%s\t%s\t%s\t%s\t%s\n", PROTO, $1, loc, peer, proc
+        }'
+    ss -H -tanp state established 2>/dev/null | awk -v PROTO=tcp "$prog"
+    ss -H -uanp 2>/dev/null                | awk -v PROTO=udp "$prog"
+    return 0
+}
+
+# build_all_flows → ALL_SORTED: rank<TAB>proto<TAB>ip<TAB>port<TAB>sockets
+#                   <TAB>processes<TAB>service   (public first, busiest first)
+build_all_flows() {
+    local proto state loc peer proc ip port key rank svc cls
+    ALL_ROWS=(); ALL_PUBLIC_IPS=()
+    ALL_CNT=(); ALL_PROTO=(); ALL_IP=(); ALL_PORT=(); ALL_PROCS=()
+    ALL_SOCKETS=0; ALL_EPS=0; ALL_PUB_EPS=0; ALL_LOC_EPS=0
+    ALL_PUB_SOCKS=0; ALL_LOC_SOCKS=0
+
+    while IFS=$'\t' read -r proto state loc peer proc; do
+        [[ -n "${peer:-}" && -n "${loc:-}" ]] || continue
+        [[ "$peer" == *:* ]] || continue
+        split_addr "$peer"; ip="$SPLIT_IP"; port="$SPLIT_PORT"
+        [[ -n "$ip" && -n "$port" && "$port" != 0 ]] || continue
+        [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || continue       # junk peer
+        ip="${ip#::ffff:}"                                # v4-mapped → plain v4
+
+        ALL_SOCKETS=$(( ALL_SOCKETS + 1 ))
+        key="$proto|$peer"
+        ALL_CNT[$key]=$(( ${ALL_CNT[$key]:-0} + 1 ))
+        ALL_PROTO[$key]="$proto"
+        ALL_IP[$key]="$ip"
+        ALL_PORT[$key]="$port"
+        if [[ -n "$proc" && "$proc" != "-" ]]; then
+            case ", ${ALL_PROCS[$key]:-}, " in
+                *", $proc, "*) ;;
+                # ${ARR[$k]:+${ARR[$k]}, } — the inner reference MUST be
+                # braced: "$ARR[$k]" inside a :+ word parses as "$ARR" plus
+                # the literal text "[$k]" and corrupts the list.
+                *) ALL_PROCS[$key]="${ALL_PROCS[$key]:+${ALL_PROCS[$key]}, }$proc" ;;
+            esac
+        fi
+    done < <(all_socket_lines)
+
+    local seen=""
+    for key in "${!ALL_CNT[@]}"; do
+        ip="${ALL_IP[$key]}"; port="${ALL_PORT[$key]}"; proto="${ALL_PROTO[$key]}"
+        cls=$(classify_ip "$ip")
+        if [[ "$cls" == public ]]; then
+            rank=0
+            ALL_PUB_EPS=$(( ALL_PUB_EPS + 1 ))
+            ALL_PUB_SOCKS=$(( ALL_PUB_SOCKS + ${ALL_CNT[$key]} ))
+            case ", $seen, " in
+                *", $ip, "*) ;;
+                *) ALL_PUBLIC_IPS+=("$ip"); seen="${seen:+$seen, }$ip" ;;
+            esac
+        else
+            rank=1
+            ALL_LOC_EPS=$(( ALL_LOC_EPS + 1 ))
+            ALL_LOC_SOCKS=$(( ALL_LOC_SOCKS + ${ALL_CNT[$key]} ))
+        fi
+        svc=$(service_for "$proto" "$port")
+        ALL_ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+            "$rank" "$proto" "$ip" "$port" "${ALL_CNT[$key]}" \
+            "${ALL_PROCS[$key]:--}" "$svc")")
+    done
+    ALL_EPS=$(( ALL_PUB_EPS + ALL_LOC_EPS ))
+
+    if (( ${#ALL_ROWS[@]} > 0 )); then
+        ALL_SORTED=$(printf '%s\n' "${ALL_ROWS[@]}" | sort -t$'\t' -k1,1n -k5,5nr -k3,3)
+    else
+        ALL_SORTED=""
+    fi
+    return 0
+}
+
+# _geo_from_pipe <ip> <enrich.sh cache line> → the ip-api object shape
+_geo_from_pipe() {
+    local ip="$1" line="$2" city rgn rcode ctry ccode org host
+    local IFS='|'
+    read -r _ city rgn rcode ctry ccode org host <<< "$line"
+    jq -nc --arg ip "$ip" --arg city "${city:-}" --arg rgn "${rgn:-}" \
+              --arg rcode "${rcode:-}" --arg ctry "${ctry:-}" \
+              --arg ccode "${ccode:-}" --arg org "${org:-}" \
+        '{status:"success", query:$ip, city:$city, regionName:$rgn, region:$rcode,
+          country:$ctry, countryCode:$ccode, org:$org}' 2>/dev/null
+}
+
+# _geo_batch_post <ip>... → one ip-api batch call, merged into the cache
+_geo_batch_post() {
+    local -a ips=("$@")
+    local payload resp tmp merged
+    (( ${#ips[@]} > 0 )) || return 1
+
+    payload=$(printf '%s\n' "${ips[@]}" | jq -R . | jq -s -c .)
+    resp=$(curl -s --max-time 15 -H 'Content-Type: application/json' \
+        --data "$payload" \
+        'http://ip-api.com/batch?fields=status,message,country,countryCode,region,regionName,city,lat,lon,isp,org,as,query,proxy,hosting,mobile' \
+        2>/dev/null)
+    [[ -n "$resp" ]] || return 1
+    printf '%s' "$resp" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+
+    merged=$(jq --argjson new "$resp" \
+        '. + (reduce ($new[] | select(.status == "success" and (.query | type == "string")))
+              as $o ({}; .[$o.query] = $o))' "$GEO_CACHE" 2>/dev/null)
+    [[ -n "$merged" ]] || return 1
+    tmp="$GEO_CACHE.$$"
+    if printf '%s\n' "$merged" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$GEO_CACHE" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    else
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    # Teach the shared enrich.sh cache too, so the other tools stay quiet.
+    if declare -f _enrich_cache_write >/dev/null 2>&1; then
+        local q city rgn rcode ctry ccode org
+        while IFS=$'\t' read -r q city rgn rcode ctry ccode org; do
+            [[ -n "${q:-}" ]] || continue
+            org="${org#AS[0-9]* }"
+            _enrich_cache_write "$q" "${city:-?}" "${rgn:-?}" "${rcode:-?}" \
+                                "${ctry:-?}" "${ccode:-?}" "${org:-?}" "—"
+        done < <(printf '%s' "$resp" | jq -r '
+            [.[] | select(.status == "success") |
+             [.query, (.city // "?"), (.regionName // "?"), (.region // "?"),
+              (.country // "?"), (.countryCode // "?"), (.org // "?")] | @tsv]' 2>/dev/null)
+    fi
+    return 0
+}
+
+# geo_batch <ip>... — fill GEO_ALL_JSON for every public address:
+# sniffz-geo.json → enrich.sh cache → one batched ip-api request.
+geo_batch() {
+    local -a want=("$@")
+    local ip obj line
+    (( ${#want[@]} > 0 )) || return 0
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v jq   >/dev/null 2>&1 || return 1
+
+    mkdir -p "$GEO_CACHE_DIR" 2>/dev/null || true
+    [[ -s "$GEO_CACHE" ]] || printf '{}\n' > "$GEO_CACHE" 2>/dev/null || true
+    # Self-heal a corrupted cache rather than failing every lookup after it
+    if [[ -s "$GEO_CACHE" ]] && ! jq -e 'type == "object"' "$GEO_CACHE" >/dev/null 2>&1; then
+        printf '{}\n' > "$GEO_CACHE" 2>/dev/null || true
+    fi
+
+    local -a missing=()
+    for ip in "${want[@]}"; do
+        obj=""
+        if [[ -s "$GEO_CACHE" ]]; then
+            obj=$(jq -c --arg ip "$ip" \
+                '.[$ip] | select(type == "object" and has("city"))' \
+                "$GEO_CACHE" 2>/dev/null)
+        fi
+        if [[ -z "$obj" ]] && declare -f _enrich_cache_lookup >/dev/null 2>&1; then
+            line=$(_enrich_cache_lookup "$ip" 2>/dev/null)
+            [[ -n "$line" ]] && obj=$(_geo_from_pipe "$ip" "$line")
+        fi
+        if [[ -n "$obj" ]]; then GEO_ALL_JSON[$ip]="$obj"; else missing+=("$ip"); fi
+    done
+    (( ${#missing[@]} > 0 )) || return 0
+
+    # ip-api allows 100 addresses per request — chunk, and pace the chunks.
+    local n=0 batch_ok=0
+    local -a chunk=()
+    while (( ${#missing[@]} > 0 )); do
+        chunk=("${missing[@]:0:100}")
+        missing=("${missing[@]:100}")
+        (( n > 0 )) && sleep 1.6
+        if _geo_batch_post "${chunk[@]}"; then batch_ok=1; fi
+        n=$(( n + 1 ))
+    done
+
+    for ip in "${want[@]}"; do
+        [[ -n "${GEO_ALL_JSON[$ip]:-}" ]] && continue
+        obj=""
+        if [[ -s "$GEO_CACHE" ]]; then
+            obj=$(jq -c --arg ip "$ip" '.[$ip] | select(type == "object")' \
+                "$GEO_CACHE" 2>/dev/null)
+        fi
+        [[ -n "$obj" ]] && GEO_ALL_JSON[$ip]="$obj"
+    done
+
+    # Batch refused (offline / rate limit): fall back to enrich.sh, which
+    # has its own cache and its own single-address endpoint.
+    if (( batch_ok == 0 )); then
+        for ip in "${want[@]}"; do
+            [[ -n "${GEO_ALL_JSON[$ip]:-}" ]] && continue
+            line=$(enrich_ip "$ip" 2>/dev/null)
+            [[ -n "$line" && "$line" != "—|—|—" ]] || continue
+            obj=$(_geo_from_pipe "$ip" "$line")
+            [[ -n "$obj" ]] && GEO_ALL_JSON[$ip]="$obj"
+        done
+    fi
+    return 0
+}
+
+# geo_finalize — turn GEO_ALL_JSON into the strings the table and JSON use
+geo_finalize() {
+    GEO_ALL_STR=(); GEO_ALL_NET=(); GEO_ALL_ORG=()
+    GEO_ALL_CITY=(); GEO_ALL_REGION=(); GEO_ALL_COUNTRY=(); GEO_ALL_CC=()
+    ALL_GEO_HITS=0; ALL_GEO_MISSES=0
+    local ip row str city rgn ctry ccode org as hosting
+    for ip in "${ALL_PUBLIC_IPS[@]:-}"; do
+        [[ -n "$ip" ]] || continue
+        if [[ -z "${GEO_ALL_JSON[$ip]:-}" ]]; then
+            GEO_ALL_STR[$ip]="lookup failed"
+            ALL_GEO_MISSES=$(( ALL_GEO_MISSES + 1 ))
+            continue
+        fi
+        row=$(printf '%s' "${GEO_ALL_JSON[$ip]}" | jq -r '
+            [ ([ (.city // ""), (.region // ""), (.country // "") ]
+                 | map(select(. != "" and . != "?" and . != "-")) | join(", ")),
+              (.city // ""), (.region // ""), (.country // ""), (.countryCode // ""),
+              (.org // .isp // ""), (.as // ""),
+              (if .hosting == true then "datacenter" else "" end) ] | @tsv' 2>/dev/null)
+        IFS=$'\t' read -r str city rgn ctry ccode org as hosting <<< "$row"
+        [[ -n "$str" ]] || str="unknown"
+        GEO_ALL_STR[$ip]="$str"
+        GEO_ALL_CITY[$ip]="$city"
+        GEO_ALL_REGION[$ip]="$rgn"
+        GEO_ALL_COUNTRY[$ip]="$ctry"
+        GEO_ALL_CC[$ip]="$ccode"
+        GEO_ALL_ORG[$ip]="$org"
+        local net="$org"
+        [[ -n "$as" && "$as" != "$org" ]] && net="${net:+$net · }$as"
+        [[ -n "$hosting" ]] && net="${net:+$net }[datacenter]"
+        [[ -n "$net" ]] || net="unknown"
+        GEO_ALL_NET[$ip]="$net"
+        ALL_GEO_HITS=$(( ALL_GEO_HITS + 1 ))
+    done
+    return 0
+}
+
+report_all() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    section "ALL ACTIVE CONNECTIONS"
+    if [[ -z "$ALL_SORTED" ]]; then
+        info "no connected sockets — nothing on this machine is talking right now"
+        return 0
+    fi
+    info "${ALL_SOCKETS} socket(s) → ${ALL_EPS} remote endpoint(s): ${ALL_PUB_EPS} public, ${ALL_LOC_EPS} local"
+    (( DO_GEO == 0 )) && info "geolocation disabled (--no-geo)"
+
+    table_begin "#" "PROTO" "REMOTE ENDPOINT" "CONN" "PROCESS" "SERVICE" "LOCATION" "NETWORK"
+    local i=0 rank proto ip port cnt procs svc loc net color
+    while IFS=$'\t' read -r rank proto ip port cnt procs svc; do
+        [[ -n "${ip:-}" ]] || continue
+        i=$(( i + 1 ))
+        if [[ "$(classify_ip "$ip")" == public ]]; then
+            loc="${GEO_ALL_STR[$ip]:-—}"
+            net="${GEO_ALL_NET[$ip]:-—}"
+            if [[ "$loc" == "lookup failed" || "$loc" == "unknown" ]]; then
+                color="$C_YELLOW"
+            elif [[ "$loc" == "—" || "$net" == "—" ]]; then
+                color="$C_DIM"          # geolocation switched off
+            else
+                color="$C_GREEN"
+            fi
+        else
+            loc="local network"
+            net="this machine / your LAN"
+            color="$C_DIM"
+        fi
+        table_row "$i" "$proto" "$(fmt_endpoint "$ip" "$port")" "$cnt" \
+                  "$(clip_procs "$procs")" "$(trunc "$svc" 20)" \
+                  "${color}$(trunc "$loc" 46)${C_RESET}" \
+                  "${color}$(trunc "$net" 36)${C_RESET}"
+    done <<< "$ALL_SORTED"
+    table_end
+
+    info "${ALL_PUB_SOCKS} socket(s) to public addresses, ${ALL_LOC_SOCKS} to local ones"
+    if (( DO_GEO == 1 && ALL_GEO_MISSES > 0 )); then
+        info "${ALL_GEO_MISSES} address(es) could not be located — offline or past ip-api's rate limit (cached in ~/.cache/sniffz-geo.json)"
+    fi
+    info "traceroute is per endpoint: ./sniffz --ip <address>"
+    return 0
+}
+
+# emit_json_all — the --all shape of the --json output
+emit_json_all() {
+    local out
+    out='{"tool":"sniffz"'
+    out+=',"timestamp":'"$(jstr "$TIMESTAMP")"
+    out+=',"hostname":'"$(jstr "$HOSTNAME_SHORT")"
+    out+=',"mode":"all"'
+    out+=',"sockets":'$(jint "$ALL_SOCKETS")
+    out+=',"endpoints":'$(jint "$ALL_EPS")
+    out+=',"public_endpoints":'$(jint "$ALL_PUB_EPS")
+    out+=',"local_endpoints":'$(jint "$ALL_LOC_EPS")
+    out+=',"connections":['
+    local first=1 rank proto ip port cnt procs svc
+    while IFS=$'\t' read -r rank proto ip port cnt procs svc; do
+        [[ -n "${ip:-}" ]] || continue
+        (( first )) || out+=','
+        first=0
+        if [[ "$(classify_ip "$ip")" == public ]]; then out+='{"local":false'
+        else                                          out+='{"local":true'; fi
+        out+=',"proto":'"$(jstr "$proto")"
+        out+=',"ip":'"$(jstr "$ip")"',"port":'$(jint "$port")
+        out+=',"sockets":'$(jint "$cnt")
+        if [[ -n "$procs" && "$procs" != "-" ]]; then
+            out+=',"processes":'"$(jq -nc --arg s "$procs" '$s | split(", ")' 2>/dev/null || printf '[]')"
+        else
+            out+=',"processes":[]'
+        fi
+        out+=',"service":'"$(jstr "$svc")"
+        out+=',"city":'"$(jstr "${GEO_ALL_CITY[$ip]:-}")"
+        out+=',"region":'"$(jstr "${GEO_ALL_REGION[$ip]:-}")"
+        out+=',"country":'"$(jstr "${GEO_ALL_COUNTRY[$ip]:-}")"
+        out+=',"country_code":'"$(jstr "${GEO_ALL_CC[$ip]:-}")"
+        out+=',"org":'"$(jstr "${GEO_ALL_ORG[$ip]:-}")"
+        out+='}'
+    done <<< "$ALL_SORTED"
+    out+=']'
+    out+=',"hints":['
+    local first_h=1 h
+    for h in "${HINTS[@]:-}"; do
+        [[ -n "$h" ]] || continue
+        (( first_h )) || out+=','
+        first_h=0
+        out+=$(jstr "$h")
+    done
+    out+=']}'
+    out=$(printf '%s' "$out" | tr -d '\000-\010\013\014\016-\037')
+    json_emit "$out"
+    return 0
+}
+
+# run_all — the whole --all path, end to end
+run_all() {
+    build_all_flows
+    if [[ -n "$ALL_SORTED" && "$DO_GEO" -eq 1 ]]; then
+        geo_batch "${ALL_PUBLIC_IPS[@]}" || true
+        geo_finalize || true
+    fi
+
+    HINTS+=("A location is where the *server* sits (CDN node, datacenter, office) — not where a person lives.")
+    HINTS+=("WebRTC/video calls hide behind relays; ./sniffz with no flags finds the one flow that is a call.")
+    HINTS+=("Traceroute runs per endpoint: ./sniffz --ip <address> traces and enriches a single one.")
+
+    report_all
+    report_hints
+    suggest_tool whoisz   "registration record behind any of these addresses"
+    suggest_tool networkz "full network review of this host"
+    emit_next_steps
+
+    if [[ -z "$ALL_SORTED" ]]; then
+        warnf "network_issue" \
+              "no connected sockets at all — nothing to locate" \
+              "open a page or start a call, then run ./sniffz --all again"
+        finish 1
+    fi
+    finish 0
+}
+
+# ============================================================================
+# Flow table construction
+# ============================================================================
+declare -a FLOWS=()
+SORTED_FLOWS=""
+NOISE_COUNT=0
+WATCH_NOTE=""
+
+build_flows() {
+    local q st loc peer proc
+    local lip lport rip rport rclass key
+    local H S pkts
+    FLOWS=(); NOISE_COUNT=0
+
+    while IFS=$'\t' read -r q st loc peer proc; do
+        [[ -n "${peer:-}" ]] || continue
+        split_addr "$loc";  lip="$SPLIT_IP";  lport="$SPLIT_PORT"
+        split_addr "$peer"; rip="$SPLIT_IP";  rport="$SPLIT_PORT"
+        [[ -n "$rip" && -n "$lip" ]] || continue
+        [[ "$rip" != "$lip" ]] || continue          # hairpin to ourselves
+        rclass=$(classify_ip "$rip")
+
+        key="$peer"
+        RXQ_PEAK="${W_MAXQ[$key]:-0}"
+        STABLE=0; IS_NEW=0
+        if [[ -n "${W_COUNT[$key]:-}" ]]; then
+            (( ${W_COUNT[$key]} >= 4 )) && STABLE=1
+            [[ -z "${W_SEEN1[$key]:-}" ]] && IS_NEW=1
+        fi
+
+        score_flow "$rport" "$proc" "$rclass" "$key"
+        H="$F_SCORE"
+
+        if (( H <= -100 )); then
+            NOISE_COUNT=$(( NOISE_COUNT + 1 ))
+            continue
+        fi
+
+        S="$H"
+        if [[ "$MODE" == capture ]]; then
+            pkts="${CAP_PKTS[$rip:$rport]:-0}"
+            [[ "$pkts" =~ ^[0-9]+$ ]] || pkts=0
+            if (( H >= CAP_TIER )); then S=$(( 100000 + pkts ))
+            else                         S=$(( pkts - 1000000 ))
+            fi
+        fi
+
+        FLOWS+=("$rip"$'\t'"$rport"$'\t'"$lip"$'\t'"$lport"$'\t'"$proc"$'\t'"$F_SVC"$'\t'"$H"$'\t'"$S"$'\t'"$F_REASON")
+    done < <(ss_flows)
+
+    if (( ${#FLOWS[@]} > 0 )); then
+        SORTED_FLOWS=$(printf '%s\n' "${FLOWS[@]}" | sort -t$'\t' -k8,8nr)
+    else
+        SORTED_FLOWS=""
+    fi
+    return 0
+}
+
+# peer_display → "ip:port", or just "ip" when no port is known (--ip mode)
+peer_display() {
+    if [[ -n "${SEL_PORT:-}" && "$SEL_PORT" != "0" ]]; then
+        printf '%s:%s' "$SEL_IP" "$SEL_PORT"
+    else
+        printf '%s' "$SEL_IP"
+    fi
+}
+
+# pick_peer → sets SEL_* from the best row meeting SELECT_THRESHOLD
+pick_peer() {
+    local row
+    local -a c
+    SEL_IP=""
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS=$'\t' read -ra c <<< "$row"
+        (( ${#c[@]} >= 9 )) || continue
+        [[ "${c[7]}" =~ ^-?[0-9]+$ ]] || continue
+        if (( c[7] >= SELECT_THRESHOLD )); then
+            SEL_IP="${c[0]}"; SEL_PORT="${c[1]}"
+            SEL_LIP="${c[2]}"; SEL_LPORT="${c[3]}"
+            SEL_PROC="${c[4]}"; SEL_SVC="${c[5]}"
+            SEL_HEUR="${c[6]}"; SEL_SCORE="${c[7]}"; SEL_REASON="${c[8]}"
+            return 0
+        fi
+    done <<< "$SORTED_FLOWS"
+    return 1
+}
+
+# ============================================================================
+# JSON emission
+# ============================================================================
+jesc() {
+    local s="${1-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    printf '%s' "$s"
+}
+jint() { [[ "${1-}" =~ ^-?[0-9]+$ ]] && printf '%s' "$1" || printf '0'; }
+jstr() { printf '"%s"' "$(jesc "${1-}")"; }
+
+emit_json() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] || return 0
+    (( ALL_MODE == 1 )) && { emit_json_all; return 0; }
+    local out row
+    local -a c
+    out='{"tool":"sniffz"'
+    out+=',"timestamp":'"$(jstr "$TIMESTAMP")"
+    out+=',"hostname":'"$(jstr "$HOSTNAME_SHORT")"
+    out+=',"mode":'"$(jstr "$MODE")"
+
+    if [[ -n "$SEL_IP" ]]; then
+        out+=',"peer":{"ip":'"$(jstr "$SEL_IP")"
+        out+=',"port":'$(jint "$SEL_PORT")
+        out+=',"local_ip":'"$(jstr "$SEL_LIP")"
+        out+=',"local_port":'$(jint "$SEL_LPORT")
+        out+=',"process":'"$(jstr "$SEL_PROC")"
+        out+=',"service":'"$(jstr "$SEL_SVC")"
+        out+=',"heuristic_score":'$(jint "$SEL_HEUR")
+        out+=',"selection_score":'$(jint "$SEL_SCORE")
+        out+=',"reason":'"$(jstr "$SEL_REASON")"
+        out+=',"local_src":'"$(jstr "$SEL_LOCAL_SRC")"
+        out+=',"local_iface":'"$(jstr "$SEL_LOCAL_DEV")"
+        out+='}'
+    else
+        out+=',"peer":null'
+    fi
+
+    out+=',"candidates":['
+    local first=1
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS=$'\t' read -ra c <<< "$row"
+        (( ${#c[@]} >= 9 )) || continue
+        (( first )) || out+=','
+        first=0
+        out+='{"ip":'"$(jstr "${c[0]}")"',"port":'$(jint "${c[1]}")
+        out+=',"process":'"$(jstr "${c[4]}")"',"service":'"$(jstr "${c[5]}")"
+        out+=',"heuristic_score":'$(jint "${c[6]}")',"score":'$(jint "${c[7]}")
+        out+=',"reason":'"$(jstr "${c[8]}")"'}'
+    done <<< "$SORTED_FLOWS"
+    out+=']'
+    out+=',"hidden_noise_flows":'$(jint "$NOISE_COUNT")
+
+    out+=',"route":{"tool":'"$(jstr "$TR_TOOL")"',"hops":['
+    first=1
+    local i=0
+    while (( i < ${#TR_HOPS[@]} )); do
+        (( first )) || out+=','
+        first=0
+        out+='{"hop":'$(jint "${TR_HOPS[i]}")',"ip":'"$(jstr "${TR_IPS[i]}")"',"rtt_ms":'"$(jstr "${TR_RTTS[i]}")"'}'
+        i=$(( i + 1 ))
+    done
+    out+='],"hop_count":'$(jint "$TR_HOPCOUNT")
+    out+=',"reached":'"$([[ "$TR_REACHED" -eq 1 ]] && printf true || printf false)"
+    out+=',"last_rtt_ms":'"$(jstr "$TR_LAST_RTT")"'}'
+
+    out+=',"geo":{"local":'"$([[ "$GEO_LOCAL" -eq 1 ]] && printf true || printf false)"
+    out+=',"city":'"$(jstr "$GEO_CITY")"',"region":'"$(jstr "$GEO_REGION")"
+    out+=',"region_code":'"$(jstr "$GEO_RCODE")"',"country":'"$(jstr "$GEO_COUNTRY")"
+    out+=',"country_code":'"$(jstr "$GEO_CCODE")"',"org":'"$(jstr "$GEO_ORG")"
+    out+=',"hostname":'"$(jstr "$GEO_HOST")"',"lat":'"$(jstr "$GEO_LAT")"
+    out+=',"lon":'"$(jstr "$GEO_LON")"',"isp":'"$(jstr "$GEO_ISP")"
+    out+=',"asn":'"$(jstr "$GEO_AS")"',"proxy":'"$(jstr "$GEO_PROXY")"
+    out+=',"hosting":'"$(jstr "$GEO_HOSTING")"',"mobile":'"$(jstr "$GEO_MOBILE")"'}'
+
+    out+=',"hints":['
+    first=1
+    local h
+    for h in "${HINTS[@]:-}"; do
+        [[ -n "$h" ]] || continue
+        (( first )) || out+=','
+        first=0
+        out+=$(jstr "$h")
+    done
+    out+=']}'
+
+    out=$(printf '%s' "$out" | tr -d '\000-\010\013\014\016-\037')
+    json_emit "$out"
+    return 0
+}
+
+finish() {
+    local rc="${1:-0}"
+    emit_json
+    exit "$rc"
+}
+
+# ============================================================================
+# Report
+# ============================================================================
+report_candidates() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    local row i=0 color mark more=0 max_rows=8
+    local -a c
+    section "CANDIDATE UDP FLOWS"
+    if [[ -z "$SORTED_FLOWS" ]]; then
+        if (( NOISE_COUNT > 0 )); then
+            info "${NOISE_COUNT} connected UDP flow(s) — every one of them a system service (DNS/DHCP/NTP/mDNS/…), none is a call"
+        else
+            info "no connected UDP sockets right now — nothing to sniff"
+        fi
+        return 0
+    fi
+    # Normal runs show the short list; --list is the full dump.
+    [[ "$LIST_ONLY" -eq 1 ]] && max_rows=100000
+    table_begin "#" "REMOTE ENDPOINT" "SERVICE" "PROCESS" "SCORE"
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS=$'\t' read -ra c <<< "$row"
+        (( ${#c[@]} >= 9 )) || continue
+        i=$(( i + 1 ))
+        if (( i > max_rows )); then more=$(( more + 1 )); continue; fi
+        color=""; mark=""
+        if [[ -n "$SEL_IP" && "${c[0]}" == "$SEL_IP" && "${c[1]}" == "$SEL_PORT" ]]; then
+            color="$C_GREEN"; mark="◀"
+        fi
+        table_row "${mark}${i}" "${color}${c[0]}:${c[1]}${C_RESET}" \
+                  "${c[5]}" "${c[4]}" "${color}${c[7]}${C_RESET}"
+    done <<< "$SORTED_FLOWS"
+    table_end
+    (( more > 0 )) && info "${more} more flow(s) not shown — ./sniffz --list dumps every one"
+    (( NOISE_COUNT > 0 )) && info "${NOISE_COUNT} system-service flow(s) hidden (DNS/DHCP/NTP/mDNS/…)"
+    info "UDP only — ./sniffz --all lists every TCP connection too, each with its city/state/country"
+    [[ -n "$WATCH_NOTE" ]] && info "$WATCH_NOTE"
+    return 0
+}
+
+report_peer() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    section "SELECTED PEER"
+    if [[ "$MODE" == "explicit" ]]; then
+        ok "${C_BOLD}$(peer_display)${C_RESET} — ${SEL_SVC}  ${C_DIM}(given on the command line)${C_RESET}"
+    else
+        ok "${C_BOLD}$(peer_display)${C_RESET} — ${SEL_SVC}  ${C_DIM}(score ${SEL_SCORE})${C_RESET}"
+    fi
+    info "why: ${SEL_REASON}"
+    if [[ -n "$SEL_LIP" ]]; then
+        local side="${SEL_LIP}:${SEL_LPORT}"
+        [[ -n "$SEL_LOCAL_DEV" ]] && side="$side via ${SEL_LOCAL_DEV}"
+        info "your side: ${side}"
+    fi
+    return 0
+}
+
+report_route() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    section "ROUTE TO PEER  (${TR_TOOL:-no traceroute})"
+    if (( TR_HOPCOUNT == 0 )); then
+        info "no hops returned — the peer may be on-link or firewalled"
+        return 0
+    fi
+    table_begin "HOP" "ADDRESS" "RTT (ms)"
+    local i=0 color
+    while (( i < TR_HOPCOUNT )); do
+        color=""
+        if (( i == TR_HOPCOUNT - 1 )) && (( TR_REACHED == 1 )); then color="$C_GREEN"; fi
+        table_row "$(( i + 1 ))" "${color}${TR_IPS[i]}${C_RESET}" "${color}${TR_RTTS[i]}${C_RESET}"
+        i=$(( i + 1 ))
+    done
+    table_end
+    if (( TR_REACHED == 1 )); then
+        ok "destination answered — ${TR_HOPCOUNT} hop(s), last RTT ${TR_LAST_RTT} ms"
+    else
+        warnf "network_issue" \
+              "traceroute stopped after ${TR_HOPCOUNT} hop(s) without reaching ${SEL_IP}" \
+              "the far end or an intermediate router filters ICMP — geo is still valid"
+    fi
+    return 0
+}
+
+report_geo() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    section "WHO IS ON THE OTHER END"
+    printf "  %-12s %s\n" "Endpoint" "${C_BOLD}$(peer_display)${C_RESET} ${C_DIM}(${SEL_SVC})${C_RESET}"
+    printf "  %-12s %s\n" "Process"  "${SEL_PROC}"
+    if [[ -n "$SEL_LOCAL_SRC" ]]; then
+        printf "  %-12s %s\n" "Your side" "${SEL_LOCAL_SRC}${SEL_LOCAL_DEV:+ via $SEL_LOCAL_DEV}"
+    fi
+
+    if (( GEO_LOCAL == 1 )); then
+        printf "  %-12s %s\n" "Location" "${C_YELLOW}local network${C_RESET} — same LAN as you, not over the internet"
+        printf "  %-12s %s\n" "IP"       "${SEL_IP}"
+        return 0
+    fi
+
+    local loc=""
+    [[ -n "$GEO_CITY"   && "$GEO_CITY"   != "?" ]] && loc="$GEO_CITY"
+    [[ -n "$GEO_RCODE"  && "$GEO_RCODE"  != "?" && -n "$loc" ]] && loc="$loc, $GEO_RCODE"
+    [[ -n "$GEO_COUNTRY" && "$GEO_COUNTRY" != "?" ]] && loc="${loc:+$loc, }$GEO_COUNTRY"
+    [[ -z "$loc" ]] && loc="unknown — lookup failed or offline"
+    printf "  %-12s %s\n" "Location"  "${C_BOLD}${loc}${C_RESET}"
+    printf "  %-12s %s\n" "Network"   "${GEO_ORG:-unknown}${GEO_AS:+ · $GEO_AS}"
+    [[ -n "$GEO_ISP" && "$GEO_ISP" != "$GEO_ORG" ]] && printf "  %-12s %s\n" "ISP" "$GEO_ISP"
+    [[ -n "$GEO_HOST" && "$GEO_HOST" != "—" && "$GEO_HOST" != "?" ]] && \
+        printf "  %-12s %s\n" "rDNS" "$GEO_HOST"
+    if [[ -n "$GEO_LAT" && -n "$GEO_LON" ]]; then
+        printf "  %-12s %s\n" "Coords" "${GEO_LAT}, ${GEO_LON} ${C_DIM}(city-level, not a street address)${C_RESET}"
+    fi
+
+    # ---- what the flags mean --------------------------------------------
+    local relay=0
+    case "$SEL_SVC" in
+        "STUN/TURN relay") relay=1 ;;
+    esac
+    if (( relay == 1 )); then
+        warnf "network_issue" \
+              "this flow is a STUN/TURN relay — you are talking to the relay, not to ${SEL_IP}'s owner" \
+              "WebRTC hides the peer's real IP on purpose; the location above is the relay's"
+    fi
+    if [[ "$GEO_HOSTING" == "true" ]]; then
+        warnf "network_issue" \
+              "${SEL_IP} belongs to a datacenter/hosting network — almost certainly a relay or a server" \
+              "expect the location to be the provider's region, not the caller's"
+    fi
+    if [[ "$GEO_PROXY" == "true" ]]; then
+        warnf "network_issue" \
+              "${SEL_IP} is a known VPN/proxy/TOR exit — this is the exit node's location" \
+              "the caller is deliberately hiding behind it"
+    fi
+    if [[ "$GEO_MOBILE" == "true" ]]; then
+        info "far end is on a mobile carrier network (CGNAT — city may be the carrier's PoP)"
+    fi
+
+    HINTS+=("IP geolocation is city-level at best, and often lands on the ISP's city rather than the caller's address.")
+    HINTS+=("A traceroute ends at the last hop that answered — usually their ISP's edge, not their machine.")
+    if (( relay == 1 )) || [[ "$GEO_HOSTING" == "true" ]] || [[ "$GEO_PROXY" == "true" ]]; then
+        HINTS+=("Everything above describes the relay/VPN exit you are connected to, not the person.")
+    fi
+    return 0
+}
+
+report_hints() {
+    [[ "${JSON_OUT:-0}" -eq 1 ]] && return 0
+    (( ${#HINTS[@]} > 0 )) || return 0
+    section "READ THIS BEFORE YOU BELIEVE IT"
+    local h
+    for h in "${HINTS[@]}"; do
+        printf "  ${C_DIM}• %s${C_RESET}\n" "$h"
+    done
+    return 0
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+    if ! command -v ss >/dev/null 2>&1; then
+        critf "missing_tool" "ss (iproute2) is not installed — cannot enumerate sockets" \
+              "install it: sudo apt install iproute2"
+        finish 2
+    fi
+
+    # ---------- all-connections mode (--all) ------------------------------
+    # An explicit --ip is more specific than --all, so it wins.
+    if (( ALL_MODE == 1 )) && [[ -z "$PEER_IP" ]]; then
+        run_all
+        return 0
+    fi
+
+    # ---------- explicit address mode ------------------------------------
+    if [[ -n "$PEER_IP" ]]; then
+        MODE="explicit"
+        SELECT_THRESHOLD=0
+        SEL_IP="$PEER_IP"; SEL_PORT="${PEER_PORT:-0}"
+        if [[ "$SEL_PORT" =~ ^[0-9]+$ ]] && (( SEL_PORT > 0 )); then
+            SEL_SVC="$(service_guess "$SEL_PORT")"
+        else
+            SEL_PORT=0
+            SEL_SVC="port not specified"
+        fi
+        SEL_HEUR=0; SEL_SCORE=0
+        SEL_REASON="given on the command line (--ip)"
+        info "analyzing ${SEL_IP} as requested"
+    else
+        # ---------- optional packet capture --------------------------------
+        if (( SNIFF_SECS > 0 )); then
+            if sniff_rank "$SNIFF_SECS"; then
+                MODE="capture"
+                SELECT_THRESHOLD=100000
+            else
+                MODE="heuristic"
+                SELECT_THRESHOLD="$MIN_SCORE"
+            fi
+        else
+            SELECT_THRESHOLD="$MIN_SCORE"
+        fi
+
+        # ---------- watch + score ------------------------------------------
+        if (( WATCH_SECS > 0 )) && [[ "$MODE" != "capture" && "$LIST_ONLY" -eq 0 ]]; then
+            watch_flows "$WATCH_SECS"
+            WATCH_NOTE="watched the socket table for ${WATCH_SECS}s (liveness + receive-queue activity)"
+        fi
+        build_flows
+
+        if [[ "$LIST_ONLY" -eq 1 ]]; then
+            report_candidates
+            if [[ -z "$SORTED_FLOWS" ]]; then finish 1; fi
+            finish 0
+        fi
+
+        if ! pick_peer; then
+            report_candidates
+            if [[ -z "$SORTED_FLOWS" ]]; then
+                if (( NOISE_COUNT > 0 )); then
+                    warnf "network_issue" \
+                          "all ${NOISE_COUNT} connected UDP flow(s) are system services (DNS/DHCP/NTP/…) — no call is in progress" \
+                          "join the call first, then run ./sniffz again"
+                else
+                    warnf "network_issue" \
+                          "no UDP sockets at all — no call is in progress on this machine" \
+                          "join the call first, then run ./sniffz again"
+                fi
+            else
+                warnf "network_issue" \
+                      "no flow looks like call media — the call may use a relay, TCP, or has not started" \
+                      "try ./sniffz --sniff 10 (with sudo) to rank flows by real traffic"
+            fi
+            info "looking for everything instead (browser, downloads, chats)? ./sniffz --all"
+            suggest_tool networkz "full connection & interface review of this host"
+            suggest_tool portz    "listening services that could be carrying the call"
+            emit_next_steps
+            finish 1
+        fi
+    fi
+
+    local_route "$SEL_IP"
+    [[ "$MODE" == "explicit" ]] || report_candidates
+    report_peer
+
+    # ---------- traceroute -------------------------------------------------
+    if (( DO_TRACE == 1 )); then
+        if ! run_traceroute "$SEL_IP"; then
+            [[ "${JSON_OUT:-0}" -eq 1 ]] || info "no traceroute tool available (install traceroute or mtr)"
+        else
+            report_route
+        fi
+    fi
+
+    # ---------- geolocation ------------------------------------------------
+    if (( DO_GEO == 1 )); then
+        geo_base "$SEL_IP" || true
+        (( GEO_LOCAL == 1 )) || geo_detail "$SEL_IP" || true
+        report_geo
+    fi
+
+    report_hints
+
+    suggest_tool whoisz    "deep WHOIS/RDAP registration record for peer $(peer_display)"
+    suggest_tool networkz  "full network review of this host"
+    emit_next_steps
+
+    if [[ "${JSON_OUT:-0}" -eq 1 ]]; then
+        printf '  sniffz: peer %s\n' "$(peer_display)" >&2
+    fi
+    finish 0
+}
+
+main

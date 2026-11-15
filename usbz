@@ -606,7 +606,13 @@ if compgen -G "/dev/hidraw*" >/dev/null; then
         perms=$(stat -c '%a' "$hr" 2>/dev/null)
         owner=$(stat -c '%U' "$hr" 2>/dev/null)
         # hidraw should typically be 0600 root:root — anything more open is a finding.
-        if [[ "$perms" =~ ^[0-6][[:digit]][0-9]$ ]] && (( (8#$perms & 066) != 0 )); then
+        # Validate the shape first so the octal arithmetic below cannot choke on
+        # garbage. The class must be [[:digit:]] (a real POSIX class) — it used
+        # to read [[:digit]], which is not a class at all and made bash report
+        # "invalid regular expression ... Unmatched [" on every hidraw device.
+        # The first digit is [0-7] because it is octal: 755 is a valid mode
+        # and was previously skipped.
+        if [[ "$perms" =~ ^[0-7]{3,4}$ ]] && (( (8#$perms & 066) != 0 )); then
             crit "$hr perms=$perms owner=$owner — world/group-readable HID device (keystroke sniff risk)"
         fi
     done

@@ -1,0 +1,2087 @@
+#!/usr/bin/env bash
+
+# shellcheck source=.helpz_log.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
+# ============================================================================
+# bootablez - Bootable USB creator & stick status checker (with safety rails)
+# ----------------------------------------------------------------------------
+# A guided wizard for the three things that actually matter when you make a
+# bootable stick — find the drive (df + lsblk), unmount everything on it, then
+# dd the image with live progress and a stats summary — wrapped in checks that
+# refuse to write to anything which looks like your system disk.
+#
+# Run with no arguments and it reports FIRST: what is mounted, which disks it
+# would touch and why not, which .iso files are lying around (current
+# directory, then --scan DIR, then ~/Downloads), and whether each stick
+# already holds a bootable image — then it offers a MENU instead of expecting
+# you to remember flags: write, verify byte-for-byte, print the commands to
+# run yourself, rescan, or quit.
+#
+# It also catches the classic dd footgun: writing to a PARTITION (/dev/sdb1)
+# instead of the whole disk (/dev/sdb). A partition is usually smaller than
+# the ISO (dd dies with "No space left on device") and its partition table is
+# never replaced, so the stick will not boot. A partition passed here is
+# normalised to its parent disk, loudly, before anything is erased.
+#
+# The write shows a two-line live panel — bar, bytes, dd's rate, our average,
+# elapsed, ETA — redrawn over itself and left on screen when dd exits, then
+# finishes by flushing the STICK's own write cache (sync only flushes the
+# host's) and proving nothing is mounted or holding it before printing a
+# green SAFE TO UNPLUG box.
+#
+# When a stick already looks bootable it also says HOW TO BOOT IT for this
+# machine: the one-time boot menu key (Dell F12, HP F9, Lenovo F12 … read
+# from /sys/class/dmi/id/sys_vendor), UEFI vs Legacy mode, the Secure Boot
+# caveat for Arch, and what to try if the stick never appears.
+#
+# Safety rails — every one of these is fatal unless noted:
+#   * never writes to the disk holding /, /boot, /home or /var
+#   * never writes to a non-removable disk (internal SATA/NVMe) without --force
+#   * never writes to an optical drive, or to a loop/ram device — even with --force
+#   * never writes to a spinning hard disk — non-USB targets only. The kernel
+#     marks every USB stick rotational by default (a real 28.9 GB stick reads
+#     rotational=1), so USB media is judged by size instead
+#   * refuses drive-sized targets (> 200 GB) without --force: a "256 GB USB"
+#     is far more often somebody's external SSD/HDD full of data
+#   * refuses targets smaller than the ISO, and LVM/crypt/RAID targets
+#   * refuses if the ISO itself lives on the target (it would erase its source)
+#   * you must type the exact device path before anything happens (--yes skips)
+#
+# Usage:
+#   ./bootablez                            # report, then a menu: write / verify / show commands
+#   ./bootablez --status                   # check everything, write nothing
+#   ./bootablez --list                     # list candidate drives, write nothing
+#   ./bootablez --scan ~/Downloads         # where to look for .iso files
+#   ./bootablez --iso x.iso --device /dev/sdX --yes --verify
+#   ./bootablez --json                     # machine-readable summary
+#
+# A bare run reports first: what is mounted, which disks it would touch,
+# which .iso files are lying around (current directory, then --scan DIR,
+# then ~/Downloads) and whether each stick already holds a bootable image —
+# then it offers to write one. Nothing is written without that offer being
+# accepted and the device path being typed back.
+#
+# Requires: lsblk, dd, findmnt, sync
+# Optional: cmp (--verify), eject, sudo (for the unmount + write)
+# ============================================================================
+
+set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# ---------- Configuration ----------
+ISO=""
+TARGET=""
+LIST_ONLY=0
+DRY_RUN=0
+ASSUME_YES=0
+FORCE=0
+VERIFY=0
+VERIFY_FULL=0
+NO_EJECT=0
+JSON_OUT=0
+NO_COLOR=${NO_COLOR:-0}
+AI_VERDICT="${AI_VERDICT:-0}"
+SCRIPT_VERSION="1.0.0"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+HOSTNAME_SHORT=$(hostname -s 2>/dev/null || echo "host")
+
+# Populated by the flow below
+ISO_SIZE=0
+ISO_LABEL=""
+ISO9660=0
+TARGET_SIZE=0
+BYTES_WRITTEN=0
+WRITE_DURATION=0
+AVG_BPS=0
+VERIFIED=0
+UNMOUNTED=0
+NORMALIZED_FROM=""
+DEVICES_JSON="[]"
+declare -a CAND=()
+declare -a MOUNTED_SRC=()
+declare -a MOUNTED_MNT=()
+declare -a SWAP_SRC=()
+_WRITE_INTERRUPTED=0
+
+# Status/discovery mode: bare `bootablez` inspects and advises, it does not
+# write. --status forces that even when an image and target are supplied.
+STATUS_ONLY=0
+SCAN_DIR=""
+# Anything at or above this is drive-sized rather than stick-sized. A "256 GB
+# USB" is far more often an external SSD/HDD full of somebody's data than a
+# flash stick, so it is refused unless --force says otherwise.
+MAX_STICK_BYTES="${BOOTABLEZ_MAX_SIZE:-200000000000}"
+
+# Images discovered by the scan (parallel arrays)
+declare -a ISO_LIST=()
+declare -a ISO_LIST_DIR=()
+declare -a ISO_LIST_SIZE=()
+declare -a ISO_LIST_LABEL=()
+IMAGES_JSON="[]"
+
+# Per-device status, filled by usb_status()
+ST_LEVEL="ok"
+ST_VERDICT=""
+ST_ISO_LABEL=""
+declare -a ST_NOTES=()
+declare -a ST_PARTS=()
+STICK_JSON="[]"
+# boot_instructions prints at most once per run
+BOOT_SHOWN=0
+# set by build_device_list: a USB-attached disk exists (even if unusable)
+USB_SEEN=0
+
+# ---------- Args ----------
+ARGS=("$@")
+i=0
+while [[ $i -lt $# ]]; do
+  arg="${ARGS[$i]}"
+  case "$arg" in
+    --iso=*)      ISO="${arg#--iso=}" ;;
+    --iso)        i=$((i+1)); ISO="${ARGS[$i]:-}" ;;
+    --device=*)   TARGET="${arg#--device=}" ;;
+    --device|-d)  i=$((i+1)); TARGET="${ARGS[$i]:-}" ;;
+    --list)       LIST_ONLY=1 ;;
+    --status)     STATUS_ONLY=1 ;;
+    --scan=*)     SCAN_DIR="${arg#--scan=}" ;;
+    --scan)       i=$((i+1)); SCAN_DIR="${ARGS[$i]:-}" ;;
+    --dry-run)    DRY_RUN=1 ;;
+    --yes|-y)     ASSUME_YES=1 ;;
+    --force)      FORCE=1 ;;
+    --verify)     VERIFY=1 ;;
+    --verify-full) VERIFY=1; VERIFY_FULL=1 ;;
+    --no-eject)   NO_EJECT=1 ;;
+    --no-color)   NO_COLOR=1 ;;
+    --json)
+        JSON_OUT=1
+        # JSON mode: the human report goes to stderr, stdout carries only the
+        # JSON object. fd 4 is opened HERE — before any output — and is this
+        # tool's own real stdout.
+        exec 4>&1 1>&2
+        _JSON_FD4=1
+        ;;
+    --ai)         AI_VERDICT=1 ;;
+    --no-ai)      AI_VERDICT=0 ;;
+    -h|--help)
+      cat << 'HELPEOF'
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║          bootablez — Bootable USB Creator                       ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION
+  Walks you through making a bootable USB stick: find the drive, pick the
+  ISO, unmount everything on the target, then dd it with live progress,
+  a speed/ETA readout and a final stats table. Refuses to touch any disk
+  that looks like your system.
+
+USAGE
+  ./bootablez                            Report first, then a menu of what to do
+  ./bootablez --status                   Check everything; write nothing
+  ./bootablez --list                     List candidate drives, write nothing
+  ./bootablez --scan ~/Downloads         Where to look for .iso files
+  ./bootablez --dry-run --iso x.iso --device /dev/sdX
+                                         Show the plan, write nothing
+  ./bootablez --iso x.iso --device /dev/sdX --yes --verify
+                                         Non-interactive, verify afterwards
+  ./bootablez --json                     Machine-readable summary
+
+WHAT A BARE RUN GIVES YOU
+  · df, plus every disk and whether bootablez would touch it (and why not)
+  · .iso/.img in the current directory, then --scan DIR, then ~/Downloads
+  · each stick: capacity, partition layout, whether it carries an image and
+    whether it has an EFI system partition → BOOTABLE / QUESTIONABLE / EMPTY
+  · whether the stick's partition table matches a discovered image — checked
+    without sudo (sfdisk on the file vs lsblk on the device)
+  · when a stick already looks bootable: HOW TO BOOT IT — the one-time boot
+    menu key for YOUR brand (read from DMI: Dell F12, HP F9, Lenovo F12 …),
+    whether you are in UEFI or Legacy mode, the Secure Boot caveat for Arch,
+    and what to try if the stick does not appear in the menu at all
+  · next steps, then a menu — no flags to remember:
+
+      1) Write an image to /dev/sdX   guided: pick image → pick stick → confirm
+      2) Verify a stick byte-for-byte compare against an image, writes nothing
+      3) Show me the commands          print them so you can run them yourself
+      4) Look again                    rescan drives and images
+      5) Quit
+
+  "Show me the commands" prints every command in order with your real paths
+  filled in (df, umount, dd, sync, cmp, eject) so you can paste them one at
+  a time instead of handing sudo to a script.
+
+WHEN A WRITE FINISHES
+  · a two-line live panel — progress bar, bytes, dd's own rate, our average,
+    elapsed and ETA — drawn over itself and left on screen afterwards
+  · sync, then blockdev --flushbufs: `sync` only flushes the HOST's buffers,
+    while the stick's controller can still be holding the data you care about
+  · udevadm settle, then eject
+  · checks nothing is still mounted and that no process still holds it open,
+    then prints a green SAFE TO UNPLUG box — or says what is blocking it
+
+OPTIONS
+  --iso=PATH        The image to write (or pass it as the only argument)
+  --device=DEV      Target disk, e.g. /dev/sdb (bare "sdb" also works)
+  --status          Inspect and advise only — never write
+  --list            List candidate drives and exit
+  --scan=DIR        Extra directory to search for .iso files
+  --dry-run         Run every safety check and print the plan; write nothing
+  --yes, -y         Skip the type-the-device confirmation (scripts)
+  --force           Allow a non-removable or drive-sized target
+  --verify          Quick check: head + middle + tail of the image against
+                    the stick — catches a truncated or wrong write in seconds
+  --verify-full     Compare every byte — slower, shows elapsed while it runs
+  --no-eject        Do not eject the stick when finished
+  --no-color        Disable colors
+  --json            Output a JSON summary (human report moves to stderr)
+  -h, --help        Show this help
+  BOOTABLEZ_MAX_SIZE=BYTES (env)
+                    Override the 200 GB "drive, not a stick" threshold
+
+SAFETY RAILS (fatal unless noted)
+  Never writes to the disk that holds /, /boot, /home or /var
+  Never writes to an internal disk without --force
+  Never writes to an optical, loop or ram device — even with --force
+  Never writes to a spinning hard disk (non-USB targets only: the kernel
+    marks USB sticks rotational by default, so USB is judged by size)
+  Refuses drive-sized targets (> 200 GB) without --force
+  Refuses targets smaller than the ISO, and LVM/crypt/RAID targets
+  Refuses if the ISO itself lives on the target
+  Requires you to type the exact device path (--yes skips that)
+
+MANUAL EQUIVALENT (what this runs for you)
+  1. df -h                                    # find your stick's /dev/sdX
+  2. sudo umount /dev/sdX*                    # disconnect everything on it
+  3. sudo dd bs=4M if=image.iso of=/dev/sdX status=progress oflag=direct
+
+  of= MUST be the whole disk (/dev/sdb), never a partition (/dev/sdb1):
+  a partition is smaller than the ISO → "No space left on device", and the
+  partition table is never replaced → the stick will not boot.
+
+ALTERNATIVE COMMANDS
+  lsblk -o NAME,SIZE,TRAN,MODEL     Block devices with transport
+  df -h                             What is mounted right now
+  isoinfo -d image.iso              ISO volume label (needs genisoimage)
+  sudo eject /dev/sdX               Release the stick when done
+
+WARNING → FIX
+  dd: No space left on device   →  you aimed at a partition: use /dev/sdb, not /dev/sdb1
+  Permission denied             →  sudo ./bootablez   (root is needed for dd)
+  Device is busy                →  sudo umount /dev/sdX*  then retry
+  Stick will not boot           →  re-run with --verify, and check the ISO's sha256sum
+
+HELPEOF
+      exit 0 ;;
+    -*) echo "bootablez: unknown option $arg (try --help)" >&2; exit 64 ;;
+    *)
+      if [[ -n "$ISO" ]]; then
+        echo "bootablez: unexpected argument '$arg' (try --help)" >&2; exit 64
+      fi
+      ISO="$arg" ;;
+  esac
+  i=$((i+1))
+done
+
+# ---------- shared library ----------
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+[[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; C_MAGENTA=$'\033[35m'; }
+if [[ "${AI_VERDICT}" == "1" ]]; then
+    # shellcheck source=lib/ai.sh
+    source "$SCRIPT_DIR/lib/ai.sh" 2>/dev/null || true
+fi
+init_colors
+
+# Interactivity: stdin must be a terminal. Reading /dev/tty instead would be
+# wrong — the suite's self-test runs every tool with </dev/tty available but
+# stdin closed, and a wizard that hangs there hangs the whole test run.
+INTERACTIVE=0
+[[ -t 0 ]] && INTERACTIVE=1
+# The live progress bar needs stdout to be a terminal (and must stay off in
+# JSON mode, where stdout is reserved for the JSON object).
+FANCY=0
+[[ -t 1 && "$JSON_OUT" -eq 0 ]] && FANCY=1
+
+# ---------- Banner ----------
+if [[ "$JSON_OUT" -eq 0 ]]; then
+    BOX_W=61
+    B_TOP="╔$(printf '═%.0s' $(seq 1 $BOX_W))╗"
+    B_BOT="╚$(printf '═%.0s' $(seq 1 $BOX_W))╝"
+    # printf pads by BYTES, and — · are multi-byte: pad by character count
+    # with ${#t} (UTF-8 locale) or the right-hand ║ drifts left.
+    printf "${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$B_TOP"
+    for _bl in "BOOTABLEZ — Bootable USB Creator" \
+               "df · pick ISO · unmount · dd · live progress · stats" \
+               ""; do
+        _bp=$(( BOX_W - 1 - ${#_bl} ))
+        (( _bp < 0 )) && _bp=0
+        printf "${C_BOLD}${C_MAGENTA}║${C_RESET} %s%*s${C_BOLD}${C_MAGENTA}║${C_RESET}\n" \
+            "$_bl" "$_bp" ""
+    done
+    printf "${C_BOLD}${C_MAGENTA}%s${C_RESET}\n" "$B_BOT"
+    printf "${C_DIM}  v%s — %s on %s${C_RESET}\n\n" "$SCRIPT_VERSION" "$TIMESTAMP" "$HOSTNAME_SHORT"
+fi
+
+# ---------- required tools ----------
+for _t in lsblk dd findmnt; do
+    if ! command -v "$_t" >/dev/null 2>&1; then
+        critf "missing_tool" "$_t is not installed (bootablez cannot work without it)" \
+            "install it: 'sudo apt install $( [[ $_t == lsblk ]] && echo util-linux || echo coreutils )'"
+        if [[ "$JSON_OUT" -eq 1 ]]; then
+            add_json_field "status" "aborted"
+            emit_verdict
+        fi
+        exit 1
+    fi
+done
+
+# ============================================================================
+# helpers
+# ============================================================================
+
+# fmt_dur <seconds> → 0:04 / 12:30 / 1:02:03
+fmt_dur() {
+    local s="${1:-0}"
+    [[ "$s" =~ ^[0-9]+$ ]] || { printf '—'; return 0; }
+    if (( s < 3600 )); then printf '%d:%02d' $((s/60)) $((s%60))
+    else printf '%d:%02d:%02d' $((s/3600)) $((s/60%60)) $((s%60)); fi
+}
+
+# field <lsblk-P-line> <KEY> → value
+# lsblk -P emits KEY="value" pairs. The key must be anchored to the start of
+# the line or to whitespace: a bare NAME= also matches the NAME= inside
+# PARTTYPENAME=, which made a partition come back as "Microsoft basic data"
+# instead of sdb1.
+field() {
+    printf '%s' "$1" \
+        | grep -oE "(^|[[:space:]])$2=\"[^\"]*\"" \
+        | head -1 \
+        | sed -E 's/^[[:space:]]*//; s/^[^=]*="//; s/"$//'
+}
+
+# lsblk1 <args…> → first line of lsblk, whitespace-trimmed. lsblk right-aligns
+# numeric columns, so a zero-size device arrives as "    0" — untrimmed that
+# fails the ^[0-9]+$ test and reports "cannot read the size" instead of the
+# real problem.
+lsblk1() { lsblk "$@" 2>/dev/null | head -1 | tr -d '[:space:]'; }
+
+# disk_of <dev> → whole-disk name that owns it (sdb1 → sdb; walks the chain)
+disk_of() {
+    local cur="${1##*/}" pk depth=0
+    while (( depth < 8 )); do
+        pk=$(lsblk1 -dn -o PKNAME "/dev/$cur")
+        [[ -z "$pk" ]] && break
+        cur="$pk"
+        depth=$((depth+1))
+    done
+    printf '%s' "$cur"
+}
+
+# disk_mountpoints <dev> → comma-joined mountpoints of the disk and its children
+disk_mountpoints() {
+    lsblk -ln -o MOUNTPOINT "$1" 2>/dev/null | awk 'NF' | paste -sd, -
+}
+
+# rotational_of <dev> → 1 for a spinning disk. A flash stick is never
+# rotational, so this is the cheapest "obviously not a USB stick" test there
+# is, and it needs no sudo.
+rotational_of() {
+    local f="/sys/block/${1##*/}/queue/rotational"
+    # guard first: a failed input redirection is reported by bash BEFORE the
+    # command's own 2>/dev/null applies, and would leak a ": line N:" error
+    [[ -r "$f" ]] || return 0
+    tr -d '[:space:]' < "$f"
+}
+
+# volume_label <file> → the ISO9660 volume ID, or empty if it is not an image
+# (sector 16 starts with a descriptor type byte, "CD001" follows at 32769,
+# the 32-byte volume ID sits 40 bytes into the descriptor).
+volume_label() {
+    local f="$1"
+    [[ -r "$f" ]] || return 0
+    [[ "$(dd if="$f" bs=1 skip=32769 count=5 2>/dev/null)" == "CD001" ]] || return 0
+    dd if="$f" bs=1 skip=32808 count=32 2>/dev/null | tr -d '\000' | sed 's/[[:space:]]*$//'
+}
+
+# scan_isos → fill ISO_LIST / _DIR / _SIZE / _LABEL with images to choose from.
+# Current directory first (that is where images land), then --scan DIR, then
+# ~/Downloads as a clearly-labelled fallback so a bare `bootablez` still has
+# something to offer.
+scan_isos() {
+    ISO_LIST=(); ISO_LIST_DIR=(); ISO_LIST_SIZE=(); ISO_LIST_LABEL=()
+    local -a dirs=()
+    dirs+=("$(pwd)")
+    [[ -n "$SCAN_DIR" && "$SCAN_DIR" != "$(pwd)" ]] && dirs+=("$SCAN_DIR")
+    local d f
+    for d in "${dirs[@]}"; do
+        [[ -d "$d" ]] || continue
+        _scan_dir "$d"
+        (( ${#ISO_LIST[@]} >= 12 )) && return 0
+    done
+    if (( ${#ISO_LIST[@]} == 0 )) && [[ -d "$HOME/Downloads" && "$HOME/Downloads" != "$(pwd)" ]]; then
+        _scan_dir "$HOME/Downloads"
+    fi
+
+    # machine-readable copy for --json
+    IMAGES_JSON="["
+    local first=1 i=0
+    while (( i < ${#ISO_LIST[@]} )); do
+        [[ $first -eq 1 ]] || IMAGES_JSON+=","
+        first=0
+        IMAGES_JSON+=$(printf '{"path":"%s","size":%s,"label":"%s"}' \
+            "${ISO_LIST[$i]}" "${ISO_LIST_SIZE[$i]:-0}" "${ISO_LIST_LABEL[$i]//\"/}")
+        i=$((i+1))
+    done
+    IMAGES_JSON+="]"
+}
+
+_scan_dir() {
+    local d="$1" f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        (( ${#ISO_LIST[@]} >= 12 )) && return 0
+        ISO_LIST+=("$f")
+        ISO_LIST_DIR+=("$d")
+        ISO_LIST_SIZE+=("$(stat -c %s -- "$f" 2>/dev/null || echo 0)")
+        ISO_LIST_LABEL+=("$(volume_label "$f")")
+    done < <(find "$d" -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) 2>/dev/null | sort)
+}
+
+# layouts_match <iso> <dev> → 0 the partition tables agree, 1 they differ,
+# 2 cannot tell (no sfdisk, or either side unreadable).
+# Reads the image file (unprivileged) and the device's partition geometry
+# (lsblk, also unprivileged) — no sudo needed to say "this stick really does
+# hold that image".
+layouts_match() {
+    local iso="$1" dev="$2" dump isec dsec a b
+    command -v sfdisk >/dev/null 2>&1 || return 2
+    dump=$(sfdisk -d "$iso" 2>/dev/null)
+    [[ -n "$dump" ]] || return 2
+
+    # Both sides are normalised to BYTES, because they speak different
+    # units: sfdisk reports sectors of the image's own sector size, while
+    # lsblk -b reports bytes and lsblk START is in the device's sectors.
+    # Comparing them raw made every stick look "truncated".
+    isec=$(printf '%s\n' "$dump" | sed -n 's/^sector-size:[ ]*\([0-9][0-9]*\).*/\1/p')
+    [[ "$isec" =~ ^[0-9]+$ ]] || isec=512
+    a=$(printf '%s\n' "$dump" \
+        | sed -n 's/.*: start=[ ]*\([0-9][0-9]*\), size=[ ]*\([0-9][0-9]*\).*/\1 \2/p' \
+        | awk -v s="$isec" '{print ($1*s)","($2*s)}')
+
+    dsec=$(lsblk1 -dn -o LOG-SEC "$dev")
+    [[ "$dsec" =~ ^[0-9]+$ ]] || dsec=512
+    b=$(lsblk -lnb -o START,SIZE "$dev" 2>/dev/null \
+        | awk -v s="$dsec" 'NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print ($1*s)","$2}')
+
+    [[ -n "$a" && -n "$b" ]] || return 2
+    [[ "$a" == "$b" ]] && return 0
+    return 1
+}
+
+# match_image <dev> → echo the discovered image whose ISO9660 label is on the
+# stick, or nothing. A label match plus a matching layout is strong evidence
+# the stick holds that exact image.
+match_image() {
+    local dev="$1" line iso_label="" i
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$(field "$line" TYPE)" == "part" ]] || continue
+        [[ "$(field "$line" FSTYPE)" == "iso9660" ]] || continue
+        iso_label=$(field "$line" LABEL)
+        break
+    done < <(lsblk -nP -o NAME,FSTYPE,LABEL,TYPE "$dev" 2>/dev/null)
+    [[ -n "$iso_label" ]] || return 0
+    i=0
+    while (( i < ${#ISO_LIST[@]} )); do
+        if [[ "${ISO_LIST_LABEL[$i]}" == "$iso_label" ]]; then
+            printf '%s' "${ISO_LIST[$i]}"
+            return 0
+        fi
+        i=$((i+1))
+    done
+    return 0
+}
+
+# rec <n> <text> — numbered recommendation line (used by status and post-write)
+rec() { printf "  ${C_CYAN}#%d${C_RESET} → %s\n" "$1" "$2"; }
+
+# usb_status <dev> → ST_LEVEL (ok|warn|bad), ST_VERDICT, ST_NOTES, ST_PARTS
+# Read-only and unprivileged: lsblk probes the partition filesystems and
+# labels, /sys supplies capacity and the rotational flag.
+usb_status() {
+    ST_LEVEL="ok"; ST_VERDICT=""; ST_NOTES=(); ST_PARTS=(); ST_ISO_LABEL=""
+    local dev="$1" size nparts line
+    size=$(lsblk1 -dbno SIZE "$dev")
+
+    if [[ -z "$size" || "$size" -eq 0 ]]; then
+        ST_LEVEL="bad"
+        ST_VERDICT="BROKEN — reports 0 B capacity"
+        ST_NOTES+=("unplug it and plug it back in; if it stays at 0 B the stick is dying, or it is a fake-capacity device")
+        return 0
+    fi
+
+    nparts=$(lsblk -ln -o TYPE "$dev" 2>/dev/null | awk '$1=="part"' | wc -l)
+    nparts=${nparts// /}
+    if (( nparts == 0 )); then
+        ST_LEVEL="warn"
+        ST_VERDICT="EMPTY — no partition table, nothing has been written yet"
+        return 0
+    fi
+
+    local has_iso=0 has_esp=0 seen_fs=0 name fs label ptype
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$(field "$line" TYPE)" == "part" ]] || continue
+        name=$(field "$line" NAME);  fs=$(field "$line" FSTYPE)
+        label=$(field "$line" LABEL); ptype=$(field "$line" PARTTYPENAME)
+        ST_PARTS+=("$name${fs:+ $fs}${label:+ \"$label\"}${ptype:+ ($ptype)}")
+        [[ -n "$fs" ]] && seen_fs=1
+        if [[ "$fs" == "iso9660" ]]; then has_iso=1; ST_ISO_LABEL="$label"; fi
+        # Match EFI anywhere in the type name. GPT images (Ubuntu) report
+        # "EFI System", but MBR/isohybrid images (Arch) report
+        # "EFI (FAT-12/16/32)" — an equality test here made a perfectly good
+        # Arch stick read QUESTIONABLE with "no EFI system partition".
+        [[ "$ptype" == *EFI* ]] && has_esp=1
+    # -nP: --pairs is mutually exclusive with --list, so "-ln -P" fails
+    # outright and silently yields zero rows
+    done < <(lsblk -nP -o NAME,FSTYPE,LABEL,TYPE,PARTTYPENAME "$dev" 2>/dev/null)
+
+    if (( seen_fs == 0 )); then
+        ST_LEVEL="warn"
+        ST_VERDICT="PARTITIONED — cannot read the filesystem types"
+        ST_NOTES+=("lsblk could not probe the partitions; re-run with sudo for a full status")
+        return 0
+    fi
+
+    if (( has_iso && has_esp )); then
+        ST_VERDICT="BOOTABLE — installer image present, with an EFI system partition"
+    elif (( has_iso )); then
+        ST_LEVEL="warn"
+        ST_VERDICT="QUESTIONABLE — image present but no EFI system partition (BIOS-only boot?)"
+    elif (( has_esp )); then
+        ST_LEVEL="warn"
+        ST_VERDICT="NOT AN INSTALLER — a formatted drive (EFI partition, no image)"
+    else
+        ST_LEVEL="warn"
+        ST_VERDICT="UNKNOWN — partitioned, but no recognizable image on it"
+    fi
+    [[ -n "$ST_ISO_LABEL" ]] && ST_NOTES+=("carries an image labelled \"$ST_ISO_LABEL\"")
+    return 0
+}
+
+# status_report — one block per usable stick: what is on it, whether that
+# makes it bootable, and which discovered image (if any) it matches.
+status_report() {
+    section "STICK STATUS"
+    STICK_JSON="["
+    if (( ${#CAND[@]} == 0 )); then
+        # Distinguish "nothing plugged in" from "plugged in but unusable" —
+        # right after an eject the node is still there but reads 0 B, and
+        # telling the user to plug something in when lsblk clearly shows the
+        # device is just confusing.
+        if (( USB_SEEN )); then
+            info "a USB disk is attached, but bootablez will not use it right now"
+            printf "  ${C_DIM}if it reads 0 B: unplug it and plug it back in — ejecting puts it in that state too${C_RESET}\n"
+        else
+            info "no removable disk is plugged in right now"
+            printf "  ${C_DIM}plug your stick in and re-run — or see every disk with --list${C_RESET}\n"
+        fi
+        STICK_JSON+="]"
+        return 0
+    fi
+
+    local dev first=1
+    for dev in "${CAND[@]}"; do
+        usb_status "$dev"
+        local size tran mnt mark col held lay p
+        size=$(humansize "$(lsblk1 -dbno SIZE "$dev")")
+        tran=$(lsblk1 -dn -o TRAN "$dev"); tran=${tran:-—}
+        mnt=$(disk_mountpoints "$dev")
+        mark="✓"; col="$C_GREEN"
+        case "$ST_LEVEL" in
+            warn) mark="!"; col="$C_YELLOW" ;;
+            bad)  mark="✗"; col="$C_RED" ;;
+        esac
+
+        printf "\n  ${C_BOLD}%s${C_RESET}  %s · %s%s\n" "$dev" "$size" "$tran" "${mnt:+ · mounted $mnt}"
+        printf "    %s%s%s %s\n" "$col" "$mark" "$C_RESET" "$ST_VERDICT"
+
+        held=$(match_image "$dev")
+        if [[ -n "$held" ]]; then
+            layouts_match "$held" "$dev"; lay=$?
+            case $lay in
+                0) printf "    ${C_GREEN}✓${C_RESET} structure matches ${C_BOLD}%s${C_RESET} — the partition tables agree\n" \
+                       "$(basename "$held")" ;;
+                1) printf "    ${C_YELLOW}!${C_RESET} label matches %s but the partition tables differ — possibly truncated\n" \
+                       "$(basename "$held")" ;;
+                *) printf "    ${C_DIM}·${C_RESET} holds %s (structure not checked: sfdisk missing)\n" \
+                       "$(basename "$held")" ;;
+            esac
+        elif [[ -n "${ISO_LABEL:-}" ]]; then
+            printf "    ${C_DIM}·${C_RESET} does not hold the image you named (label differs from \"%s\")\n" "$ISO_LABEL"
+        fi
+
+        for p in "${ST_PARTS[@]}"; do
+            printf "      ${C_DIM}·${C_RESET} %s\n" "$p"
+        done
+        for p in "${ST_NOTES[@]}"; do
+            printf "      ${C_DIM}↳${C_RESET} %s\n" "$p"
+        done
+
+        [[ $first -eq 1 ]] || STICK_JSON+=","
+        first=0
+        STICK_JSON+=$(printf '{"device":"%s","level":"%s","verdict":"%s","holds":"%s"}' \
+            "$dev" "$ST_LEVEL" "${ST_VERDICT//\"/}" "${held:-}")
+    done
+    STICK_JSON+="]"
+    printf "\n"
+    return 0
+}
+
+# boot_instructions — how to actually boot the thing, tailored to THIS box.
+# The DMI vendor says which F-key this brand uses for its one-time boot menu,
+# /sys/firmware/efi says whether we are in UEFI mode (which changes what to
+# look for), and the image identity says whether Secure Boot will get in the
+# way. All of it reads from sysfs — no root, and no "F12/F8/ESC" guessing.
+boot_instructions() {
+    (( ${BOOT_SHOWN:-0} )) && return 0
+    BOOT_SHOWN=1
+    local img="${1:-}" model="${2:-}"
+
+    local vendor="" product=""
+    [[ -r /sys/class/dmi/id/sys_vendor ]] && vendor=$(tr -d '\n' < /sys/class/dmi/id/sys_vendor)
+    [[ -r /sys/class/dmi/id/product_name ]] && product=$(tr -d '\n' < /sys/class/dmi/id/product_name)
+    vendor=$(printf '%s' "$vendor" | sed 's/[[:space:]]*$//')
+    product=$(printf '%s' "$product" | sed 's/[[:space:]]*$//')
+
+    # one-time boot menu key and setup key, by brand
+    local bootkey="F12, F11, F10, F8 or Esc" setupkey="F2 or Del"
+    case "${vendor,,}" in
+        *dell*)             bootkey="F12"; setupkey="F2" ;;
+        *hewlett*|*hp*)     bootkey="F9";  setupkey="F10  (or Esc, then F10)" ;;
+        *lenovo*)           bootkey="F12  (or the Novo button)"; setupkey="F1 or Fn+F2" ;;
+        *acer*)             bootkey="F12"; setupkey="F2" ;;
+        *asus*)             bootkey="Esc, then F8"; setupkey="F2 or Del" ;;
+        *toshiba*)          bootkey="F12"; setupkey="F2" ;;
+        *sony*)             bootkey="F11 or Esc"; setupkey="F2" ;;
+        *samsung*)          bootkey="F2 or Esc"; setupkey="F2" ;;
+        *micro-star*|*msi*) bootkey="F11"; setupkey="Del" ;;
+        *gigabyte*)         bootkey="F12"; setupkey="Del" ;;
+        *apple*)            bootkey="hold Option (⌥) while booting"; setupkey="" ;;
+        *microsoft*)        bootkey="hold Volume Down while booting"; setupkey="" ;;
+        *huawei*)           bootkey="F12"; setupkey="F2" ;;
+    esac
+
+    local uefi="Legacy/CSM"
+    [[ -d /sys/firmware/efi ]] && uefi="UEFI"
+
+    section "HOW TO BOOT IT"
+    printf "  ${C_DIM}machine${C_RESET}  %s%s ${C_DIM}· %s mode${C_RESET}\n" \
+        "$vendor" "${product:+ $product}" "$uefi"
+    printf "\n"
+    printf "  ${C_BOLD}1.${C_RESET} Reboot and tap ${C_BOLD}${C_YELLOW}%s${C_RESET} repeatedly\n" "$bootkey"
+    printf "     ${C_DIM}that is the one-time boot menu — not the setup key${C_RESET}\n"
+    if [[ "$uefi" == "UEFI" ]]; then
+        printf "  ${C_BOLD}2.${C_RESET} Pick the entry for your stick"
+        [[ -n "$model" ]] && printf " ${C_DIM}— usually \"%s\" or \"UEFI: %s\"${C_RESET}" "$model" "$model"
+        printf "\n"
+    else
+        printf "  ${C_BOLD}2.${C_RESET} Pick the plain device name\n"
+        printf "     ${C_DIM}this boot is Legacy/CSM, so UEFI: entries will not appear${C_RESET}\n"
+    fi
+    if [[ -n "$setupkey" ]]; then
+        printf "  ${C_BOLD}3.${C_RESET} Missed it? Setup key is ${C_BOLD}%s${C_RESET} ${C_DIM}→ Boot Order, put the USB first${C_RESET}\n" "$setupkey"
+    fi
+
+    # Arch's installer is not signed for Secure Boot by default
+    if [[ "${img,,}" == *arch* ]]; then
+        printf "  ${C_YELLOW}!${C_RESET} Arch's installer is not signed for Secure Boot — if it is rejected\n"
+        printf "    ${C_DIM}(\"Access denied\", or it silently refuses to start), disable Secure Boot in setup${C_RESET}\n"
+    fi
+
+    printf "\n  ${C_DIM}if the stick does not appear at all:${C_RESET}\n"
+    printf "    ${C_DIM}· try a USB 2 port — some firmwares ignore USB 3 during boot${C_RESET}\n"
+    printf "    ${C_DIM}· turn off Windows Fast Startup (it hibernates and locks the disk)${C_RESET}\n"
+    printf "    ${C_DIM}· check UEFI vs Legacy/CSM in setup — the stick may show in only one${C_RESET}\n"
+    printf "\n"
+    return 0
+}
+
+# next_steps — what the status just said, in plain language
+next_steps() {
+    section "NEXT STEPS"
+    local n=0 dev i boot_dev="" boot_img="" boot_model=""
+
+    if (( ${#CAND[@]} == 0 )); then
+        n=$((n+1)); rec $n "Plug in your USB stick, then run ./bootablez again"
+    fi
+    for dev in "${CAND[@]}"; do
+        usb_status "$dev"
+        if [[ "$ST_LEVEL" == "bad" ]]; then
+            n=$((n+1)); rec $n "Unplug $dev and plug it back in — it reports 0 B capacity"
+        elif [[ "$ST_VERDICT" == BOOTABLE* ]]; then
+            n=$((n+1)); rec $n "$dev already looks bootable — the keys for THIS machine are below"
+            # remember it: the tailored instructions print after the list, so
+            # they do not interrupt the numbered recommendations
+            boot_dev="$dev"
+            boot_img="${ST_ISO_LABEL:-}"
+            boot_model="$(lsblk1 -dn -o MODEL "$dev")"
+        elif [[ "$ST_VERDICT" == EMPTY* ]]; then
+            n=$((n+1)); rec $n "$dev is blank — run ./bootablez to write an image to it"
+        elif [[ "$ST_VERDICT" == UNKNOWN* || "$ST_VERDICT" == "NOT AN INSTALLER"* ]]; then
+            # a plain formatted stick (FAT32, no image) — not an error, just
+            # an empty canvas, and the reason the user came here
+            n=$((n+1)); rec $n "$dev has no image on it — ready to be written"
+        fi
+    done
+
+    if (( ${#ISO_LIST[@]} == 0 )); then
+        n=$((n+1)); rec $n "No .iso in $(pwd) — drop one here, or scan another place: ./bootablez --scan ~/Downloads"
+    else
+        n=$((n+1))
+        local names=""
+        i=0
+        while (( i < ${#ISO_LIST[@]} && i < 3 )); do
+            names+="${names:+, }$(basename "${ISO_LIST[$i]}")"
+            i=$((i+1))
+        done
+        (( ${#ISO_LIST[@]} > 3 )) && names+=", …"
+        rec $n "${#ISO_LIST[@]} image(s) found: $names"
+    fi
+
+    if (( ${#ISO_LIST[@]} > 0 && ${#CAND[@]} > 0 )); then
+        n=$((n+1)); rec $n "Write one: ./bootablez --iso \"${ISO_LIST[0]}\" --device ${CAND[0]}"
+        # only worth saying when no plan has been given yet — otherwise the
+        # command above is exactly what this run is already doing
+        if [[ -z "$ISO" && -z "$TARGET" ]]; then
+            n=$((n+1))
+            if (( INTERACTIVE )); then
+                rec $n "…or answer the prompt below and bootablez will walk you through it"
+            else
+                rec $n "…or run ./bootablez with no arguments and answer the two questions"
+            fi
+        fi
+        n=$((n+1)); rec $n "Byte-verify a stick you already made: ./bootablez --status --verify --iso \"${ISO_LIST[0]}\" --device ${CAND[0]}"
+    fi
+    # a stick that is already bootable deserves more than "F12/F8/ESC": give
+    # the key, the firmware mode and the Secure Boot caveat for THIS machine
+    [[ -n "$boot_dev" ]] && boot_instructions "$boot_img" "$boot_model"
+
+    printf "  ${C_DIM}rails: never a system disk · never a partition · never an internal spinning disk · drives over 200 GB need --force · type the device to confirm${C_RESET}\n"
+    return 0
+}
+
+# critical_disks → newline list of whole disks that hold /, /boot, /home, /var
+critical_disks() {
+    local mp src
+    for mp in / /boot /boot/efi /home /var /usr /usr/local; do
+        src=$(findmnt -no SOURCE --target "$mp" 2>/dev/null | head -1)
+        [[ -z "$src" ]] && continue
+        src="${src%%\[*}"                 # btrfs appends [/subvol]
+        [[ -b "$src" ]] || continue
+        printf '%s\n' "$(disk_of "$src")"
+    done | sort -u
+}
+
+# collect_mounts / collect_swaps → what currently sits on $TARGET
+collect_mounts() {
+    MOUNTED_SRC=(); MOUNTED_MNT=()
+    local tname="${TARGET##*/}" src mnt rest
+    [[ -n "$tname" ]] || return 0
+    while read -r src mnt rest; do
+        case "$src" in
+            /dev/"$tname"*) ;;
+            *) continue ;;
+        esac
+        [[ "$(disk_of "$src")" == "$tname" ]] || continue
+        # /proc/mounts octal-escapes spaces (and tabs/newlines) so a mount
+        # point called "Ubuntu 26.10 amd64" arrives as …\04026.10\040…
+        mnt="${mnt//\\040/ }"
+        mnt="${mnt//\\011/	}"
+        mnt="${mnt//\\012/	}"
+        MOUNTED_SRC+=("$src")
+        MOUNTED_MNT+=("$mnt")
+    done < /proc/mounts
+}
+
+collect_swaps() {
+    SWAP_SRC=()
+    local tname="${TARGET##*/}" s
+    [[ -n "$tname" ]] || return 0
+    command -v swapon >/dev/null 2>&1 || return 0
+    while IFS= read -r s; do
+        [[ -z "$s" ]] && continue
+        case "$s" in
+            /dev/"$tname"*) ;;
+            *) continue ;;
+        esac
+        [[ "$(disk_of "$s")" == "$tname" ]] || continue
+        SWAP_SRC+=("$s")
+    done < <(swapon --show=NAME --noheadings 2>/dev/null)
+}
+
+# check_iso <path> → 0 and fills ISO/ISO_SIZE/ISO_LABEL/ISO9660, or 1 + a warning
+check_iso() {
+    local path="$1"
+    [[ -n "$path" ]] || { warn "no image path given"; return 1; }
+    # category forced to "general": message inference would tag "not found"
+    # as missing_tool and print an apt-install hint for a bad file path
+    [[ -e "$path" ]] || { warnf "general" "image not found: $path" \
+        "give the full path, or drag the file onto this terminal"; return 1; }
+    [[ -f "$path" ]] || { warnf "general" "not a regular file: $path" \
+        "point at the .iso itself, not a directory"; return 1; }
+    [[ -r "$path" ]] || { warnf "general" "not readable: $path" \
+        "fix it: sudo chown \$USER \"$path\""; return 1; }
+
+    ISO=$(readlink -f -- "$path" 2>/dev/null)
+    [[ -n "$ISO" ]] || ISO="$path"
+    ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+    if [[ ! "$ISO_SIZE" =~ ^[0-9]+$ ]] || (( ISO_SIZE == 0 )); then
+        warn "cannot read the size of $ISO (empty file?)"
+        return 1
+    fi
+
+    # ISO9660: sector 16 (byte 32768) holds the volume descriptor — a type
+    # code byte FIRST (0x01 = primary), then "CD001" at 32769, then the
+    # 32-byte volume ID at 32808.
+    ISO9660=0
+    ISO_LABEL=""
+    if [[ "$(dd if="$ISO" bs=1 skip=32769 count=5 2>/dev/null)" == "CD001" ]]; then
+        ISO9660=1
+        ISO_LABEL=$(volume_label "$ISO")
+    else
+        warn "does not look like an ISO9660 image — fine for a raw .img, wrong for anything else"
+    fi
+    return 0
+}
+
+# ---------- device inventory ----------
+build_device_list() {
+    CAND=()
+    local line name type rmv size tran model mnt reason
+    local crit; crit=$(critical_disks)
+    local -a dev=() sz=() tr=() mt=() md=() rs=()
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name=$(field "$line" NAME); type=$(field "$line" TYPE)
+        rmv=$(field "$line" RM);   size=$(field "$line" SIZE)
+        tran=$(field "$line" TRAN); model=$(field "$line" MODEL)
+        # only disks and optical drives are worth showing; the 40-odd loop
+        # devices snap leaves behind are pure noise
+        [[ "$type" == "disk" || "$type" == "rom" ]] || continue
+        mnt=$(disk_mountpoints "/dev/$name")
+
+        # system disks are never offered, even with --force: check_target
+        # refuses them too, so listing them would only invite a mistake
+        local usable=0 is_usb=0 is_big=0 rot
+        [[ "$rmv" == "1" || "$tran" == "usb" ]] && is_usb=1
+        if [[ "${size:-0}" =~ ^[0-9]+$ ]] && (( size > MAX_STICK_BYTES )); then is_big=1; fi
+        rot=$(rotational_of "/dev/$name")
+        # only a USB-attached disk counts as "a stick might be plugged in"
+        if [[ "$type" == "disk" ]] && (( is_usb )); then USB_SEEN=1; fi
+
+        reason="yes"
+        if printf '%s\n' "$crit" | grep -qx "$name"; then
+            usable=0; reason="no · system disk"
+        elif [[ "$type" == "rom" ]]; then
+            usable=0; reason="no · optical drive"
+        elif [[ "$rot" == "1" && "$is_usb" -eq 0 ]]; then
+            # rotational is only trusted for non-USB targets: the kernel marks
+            # every USB stick rotational by default (a real 28.9 GB stick
+            # reads rotational=1), so applying it to USB media would refuse
+            # exactly the devices this tool exists for. USB is judged by size.
+            usable=0; reason="no · spinning disk"
+        elif [[ ! "${size:-0}" =~ ^[0-9]+$ || "${size:-0}" -eq 0 ]]; then
+            # seen after a pile of failed dd runs — needs an unplug/replug
+            usable=0; reason="no · 0 B capacity (re-plug)"
+        elif (( is_big )); then
+            # 256 GB of "USB" is far more often somebody's external SSD/HDD
+            if (( FORCE )); then usable=1; reason="yes (--force)"
+            elif (( is_usb )); then usable=0; reason="no · $(humansize "$size") — looks like a drive (--force)"
+            else usable=0; reason="no · internal, $(humansize "$size") (--force)"
+            fi
+        elif (( ! is_usb )); then
+            if (( FORCE )); then usable=1; reason="yes (--force)"
+            else usable=0; reason="no · internal (--force)"
+            fi
+        else
+            # USB-attached, stick-sized, has capacity: the normal case.
+            # Without this, usable stays 0 and the happy path is never added
+            # to CAND — the table would say "yes" while the count says none.
+            usable=1; reason="yes"
+        fi
+
+        (( usable )) && CAND+=("/dev/$name")
+        dev+=("/dev/$name"); sz+=("${size:-0}"); tr+=("${tran:-—}")
+        mt+=("$mnt"); md+=("$model"); rs+=("$reason")
+    done < <(lsblk -dn -P -b -o NAME,TYPE,RM,SIZE,TRAN,MODEL 2>/dev/null)
+
+    # human table
+    if [[ "$JSON_OUT" -eq 0 ]]; then
+        table_begin "DEVICE" "SIZE" "TRAN" "MOUNTED" "MODEL" "USABLE"
+        local n=0
+        while (( n < ${#dev[@]} )); do
+            local usable="${rs[$n]}"
+            if [[ "$usable" == "yes" ]]; then
+                usable="${C_GREEN}yes${C_RESET}"
+            else
+                usable="${C_DIM}${usable}${C_RESET}"
+            fi
+            table_row "${dev[$n]}" "$(humansize "${sz[$n]:-0}")" "${tr[$n]}" \
+                      "$(trunc "${mt[$n]:-—}" 26)" "$(trunc "${md[$n]:-?}" 26)" "$usable"
+            n=$((n+1))
+        done
+        table_end
+    fi
+
+    # machine-readable copy
+    DEVICES_JSON="["
+    local first=1 jn=0
+    while (( jn < ${#dev[@]} )); do
+        [[ $first -eq 1 ]] || DEVICES_JSON+=","
+        first=0
+        DEVICES_JSON+=$(printf '{"device":"%s","size":%s,"transport":"%s","mountpoint":"%s","model":"%s","usable":"%s"}' \
+            "${dev[$jn]}" "${sz[$jn]:-0}" "${tr[$jn]}" \
+            "${mt[$jn]//\"/}" "${md[$jn]//\"/}" "${rs[$jn]}")
+        jn=$((jn+1))
+    done
+    DEVICES_JSON+="]"
+
+    if [[ "$JSON_OUT" -eq 0 && ${#CAND[@]} -eq 0 ]]; then
+        printf "\n  ${C_YELLOW}!${C_RESET} no removable/USB disk found — plug in your stick and re-run\n"
+        printf "  ${C_DIM}(internal disks are deliberately not offered; --force overrides that)${C_RESET}\n"
+    fi
+}
+
+# ---------- safety ----------
+refuse() {   # refuse <message> [fix] — fatal, nothing written, exit 2
+    critf "device_issue" "$1" "${2:-}"
+    printf "\n  ${C_RED}${C_BOLD}REFUSED${C_RESET} — nothing was written.\n"
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        add_json_field "status" "refused"
+        emit_verdict
+    fi
+    exit 2
+}
+
+usage_abort() {   # usage_abort <message> — missing input / not interactive, exit 64
+    printf "  ${C_RED}✗${C_RESET} %s\n" "$1"
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        add_json_field "status" "aborted"
+        add_json_field "error" "$1"
+        emit_verdict
+    fi
+    exit 64
+}
+
+user_abort() {   # the human said no
+    printf "\n  ${C_YELLOW}✗${C_RESET} %s — nothing was written.\n" "${1:-aborted by the user}"
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        add_json_field "status" "aborted"
+        emit_verdict
+    fi
+    exit 1
+}
+
+# normalise: bare names → /dev/…, partitions → their whole disk
+normalize_target() {
+    [[ "$TARGET" == /dev/* ]] || TARGET="/dev/$TARGET"
+    [[ -b "$TARGET" ]] || refuse "$TARGET is not a block device" \
+        "plug the stick in and find it with: ./bootablez --list   (or lsblk)"
+
+    local pk parent
+    pk=$(lsblk1 -dn -o PKNAME "$TARGET")
+    if [[ -n "$pk" ]]; then
+        parent="/dev/$pk"
+        local psize ptype
+        psize=$(lsblk1 -dbno SIZE "$TARGET")
+        ptype=$(lsblk1 -dn -o TYPE "$TARGET")
+        printf "  ${C_YELLOW}!${C_RESET} %s is a %s partition (%s) — bootablez writes to the WHOLE DISK\n" \
+            "$TARGET" "$ptype" "$(humansize "${psize:-0}")"
+        printf "  ${C_YELLOW}↳${C_RESET} %s is only %s; your ISO may be bigger — that is exactly why\n" \
+            "$TARGET" "$(humansize "${psize:-0}")"
+        printf "     ${C_BOLD}dd says \"No space left on device\"${C_RESET}. Switching to %s (%s).\n" \
+            "$parent" "$(humansize "$(lsblk1 -dbno SIZE "$parent")")"
+        NORMALIZED_FROM="$TARGET"
+        TARGET="$parent"
+    fi
+}
+
+check_target() {
+    local tname="${TARGET##*/}" dtype rmv tran is_usb=0
+    dtype=$(lsblk1 -dn -o TYPE "$TARGET")
+    rmv=$(lsblk1 -dn -o RM "$TARGET")
+    tran=$(lsblk1 -dn -o TRAN "$TARGET")
+    [[ "$rmv" == "1" || "$tran" == "usb" ]] && is_usb=1
+
+    # 1. device class ------------------------------------------------------
+    # loop/ram are refused even with --force: they back files that live on
+    # your disk (snap images, initrds), so "unmount + dd" would corrupt one.
+    case "$dtype" in
+        rom)
+            refuse "$TARGET is an optical drive — there is nothing to flash there" \
+                "pick your USB stick instead: ./bootablez --list" ;;
+        loop|ram|zram)
+            refuse "$TARGET is a $dtype device, not a USB stick" \
+                "loop/ram devices are backed by files on your disk — bootablez only writes to physical removable media" ;;
+        disk) : ;;
+        *)
+            refuse "$TARGET has type '$dtype' (LVM/crypt/RAID targets are refused)" \
+                "choose the raw disk, not a mapped volume: ./bootablez --list" ;;
+    esac
+
+    # 2. never the system disk --------------------------------------------
+    local crit; crit=$(critical_disks)
+    if printf '%s\n' "$crit" | grep -qx "$tname"; then
+        refuse "$TARGET is the disk that holds / (or /boot, /home, /var)" \
+            "writing it would destroy this operating system — pick your USB stick"
+    fi
+
+    # 3. mapped volumes on top of it --------------------------------------
+    local ct
+    ct=$(lsblk -no TYPE "$TARGET" 2>/dev/null | sort -u | tr '\n' ' ')
+    case " $ct " in
+        *" crypt "*|*" lvm "*|*" raid"*|*" md "*)
+            refuse "$TARGET carries LVM/crypt/RAID volumes ($ct)" \
+                "unlock or flatten them first, or pick the physical stick" ;;
+    esac
+
+    # 3b. a spinning disk is never a flash stick — but this is only trusted
+    # for NON-USB targets. The kernel defaults queue/rotational=1 for USB
+    # mass-storage devices that do not report a rotation rate, so every cheap
+    # flash stick reads as rotational (your 28.9 GB stick does). Applying the
+    # rule to USB media would refuse exactly the devices this tool exists
+    # for, so USB targets are judged by the size rail below instead.
+    local rot
+    rot=$(rotational_of "$TARGET")
+    if [[ "$rot" == "1" && "$is_usb" -eq 0 ]]; then
+        refuse "$TARGET is a spinning hard disk — flash sticks are never rotational" \
+            "bootablez does not write images to drives; if you truly mean it: sudo dd bs=4M if=\"$ISO\" of=\"$TARGET\" status=progress"
+    fi
+
+    # 4. it has to fit, and it has to be stick-sized -----------------------
+    TARGET_SIZE=$(lsblk1 -dbno SIZE "$TARGET")
+    [[ "$TARGET_SIZE" =~ ^[0-9]+$ ]] || refuse "cannot read the size of $TARGET" \
+        "re-plug the stick and run: ./bootablez --list"
+    if (( TARGET_SIZE == 0 )); then
+        # A stick that reports 0 B after a pile of failed dd runs is in a
+        # bad state (or is a fake-capacity device). Writing to it is futile.
+        refuse "$TARGET reports zero capacity — the kernel sees it, but it has no usable space" \
+            "unplug it, plug it back in, then re-check: ./bootablez --list   (a dying stick also does this)"
+    fi
+    if (( TARGET_SIZE < ISO_SIZE )); then
+        refuse "$TARGET is too small: $(humansize "$TARGET_SIZE") < image $(humansize "$ISO_SIZE")" \
+            "you are probably aiming at a partition or a smaller stick — ./bootablez --list"
+    fi
+    if (( TARGET_SIZE > MAX_STICK_BYTES )); then
+        if (( FORCE )); then
+            info "--force: $(humansize "$TARGET_SIZE") target — drive-sized, not stick-sized"
+        else
+            refuse "$TARGET is $(humansize "$TARGET_SIZE") — that is drive territory, not a USB stick" \
+                "a target this big is usually an external SSD/HDD full of data; if it really is a big flash stick: --force"
+        fi
+    fi
+
+    # 5. the image must not live on the target ----------------------------
+    local isosrc
+    isosrc=$(findmnt -no SOURCE --target "$(dirname -- "$ISO")" 2>/dev/null | head -1)
+    isosrc="${isosrc%%\[*}"
+    if [[ -n "$isosrc" && -b "$isosrc" ]] && [[ "$(disk_of "$isosrc")" == "$tname" ]]; then
+        refuse "the image is stored ON $TARGET — writing it would destroy the file being read" \
+            "move it elsewhere first: mv '$ISO' ~/Downloads/"
+    fi
+
+    # 6. removable? --------------------------------------------------------
+    # is_usb was computed at the top of this function, alongside dtype.
+    if (( ! is_usb )); then
+        if (( FORCE )); then
+            info "--force: writing to a non-removable disk (transport=${tran:-none})"
+        else
+            refuse "$TARGET does not look like a USB stick (transport=${tran:-none}, removable=$rmv)" \
+                "internal disks are never the target — if this really is external media: --force"
+        fi
+    fi
+
+    # 7. what is mounted on it right now ----------------------------------
+    collect_mounts
+    collect_swaps
+    if (( ${#MOUNTED_SRC[@]} > 0 )); then
+        info "${#MOUNTED_SRC[@]} mounted filesystem(s) will be unmounted first:"
+        local n=0
+        while (( n < ${#MOUNTED_SRC[@]} )); do
+            printf "    ${C_DIM}·${C_RESET} %s on %s\n" "${MOUNTED_SRC[$n]}" "${MOUNTED_MNT[$n]}"
+            n=$((n+1))
+        done
+    fi
+    if (( ${#SWAP_SRC[@]} > 0 )); then
+        info "swap on the target will be switched off: ${SWAP_SRC[*]}"
+    fi
+    return 0
+}
+
+confirm_target() {
+    section "STEP 3 · CONFIRM"
+    local tname="${TARGET##*/}" w=58 pad
+    local l1="EVERYTHING ON $TARGET WILL BE ERASED"
+    local l2="$(humansize "$TARGET_SIZE") disk · $(humansize "$ISO_SIZE") image · partition table replaced"
+    local l3="type $TARGET to continue"
+    local top="╔$(printf '═%.0s' $(seq 1 $w))╗"
+    local bot="╚$(printf '═%.0s' $(seq 1 $w))╝"
+    printf "  ${C_BOLD}${C_RED}%s${C_RESET}\n" "$top"
+    local t
+    for t in "$l1" "" "$l2" "" "$l3"; do
+        pad=$(( w - 2 - ${#t} ))
+        (( pad < 0 )) && pad=0
+        if [[ -z "$t" ]]; then
+            printf "  ${C_BOLD}${C_RED}║${C_RESET}%*s${C_BOLD}${C_RED}║${C_RESET}\n" "$w" ""
+        else
+            printf "  ${C_BOLD}${C_RED}║${C_RESET} %s%*s ${C_BOLD}${C_RED}║${C_RESET}\n" "$t" "$pad" ""
+        fi
+    done
+    printf "  ${C_BOLD}${C_RED}%s${C_RESET}\n\n" "$bot"
+
+    if (( DRY_RUN )); then
+        info "dry run — nothing will be erased, so no confirmation needed"
+        return 0
+    fi
+    if (( ASSUME_YES )); then
+        info "confirmation skipped (--yes)"
+        return 0
+    fi
+    if (( ! INTERACTIVE )); then
+        refuse "refusing to write without confirmation (no terminal attached)" \
+            "add --yes when you are certain: ./bootablez --iso … --device $TARGET --yes"
+    fi
+    printf "  Type ${C_BOLD}${C_RED}%s${C_RESET} to continue: " "$TARGET"
+    local ans=""
+    IFS= read -r ans || ans=""
+    if [[ "$ans" != "$TARGET" ]]; then
+        user_abort "confirmation did not match"
+    fi
+    printf "\n"
+}
+
+ensure_sudo() {
+    (( DRY_RUN )) && return 0
+    [[ $EUID -eq 0 ]] && return 0
+    if (( INTERACTIVE )); then
+        printf "  ${C_DIM}root is needed to unmount and to write the device — your password next${C_RESET}\n"
+        sudo -v || refuse "sudo authentication failed" \
+            "re-run it yourself: sudo ./bootablez --iso … --device $TARGET"
+    else
+        sudo -n true 2>/dev/null || refuse "sudo needs a password and this is not a terminal" \
+            "run 'sudo -v' first, or: sudo ./bootablez --iso … --device $TARGET --yes"
+    fi
+}
+
+sudo_run() {
+    if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi
+}
+
+# ---------- unmount ----------
+unmount_target() {
+    section "STEP 4 · UNMOUNT"
+    collect_mounts
+    collect_swaps
+    local n=0 src mnt rc
+    UNMOUNTED=0
+    while (( n < ${#MOUNTED_SRC[@]} )); do
+        src="${MOUNTED_SRC[$n]}"; mnt="${MOUNTED_MNT[$n]}"
+        printf "  ${C_DIM}umount${C_RESET} %s ${C_DIM}(%s)${C_RESET} … " "$src" "$mnt"
+        if sudo_run umount "$src" 2>/dev/null; then
+            printf "${C_GREEN}ok${C_RESET}\n"
+            UNMOUNTED=$((UNMOUNTED+1))
+        elif sudo_run umount -l "$src" 2>/dev/null; then
+            printf "${C_YELLOW}lazy${C_RESET}\n"
+            UNMOUNTED=$((UNMOUNTED+1))
+        else
+            printf "${C_RED}FAILED${C_RESET}\n"
+        fi
+        n=$((n+1))
+    done
+    n=0
+    while (( n < ${#SWAP_SRC[@]} )); do
+        printf "  ${C_DIM}swapoff${C_RESET} %s … " "${SWAP_SRC[$n]}"
+        if sudo_run swapoff "${SWAP_SRC[$n]}" 2>/dev/null; then
+            printf "${C_GREEN}ok${C_RESET}\n"
+            UNMOUNTED=$((UNMOUNTED+1))
+        else
+            printf "${C_RED}FAILED${C_RESET}\n"
+        fi
+        n=$((n+1))
+    done
+
+    # nothing may be left mounted, or dd will write under a live filesystem
+    collect_mounts
+    if (( ${#MOUNTED_SRC[@]} > 0 )); then
+        refuse "$TARGET is still mounted (${MOUNTED_SRC[*]})" \
+            "close the file manager and any terminal using it, then retry"
+    fi
+    if (( UNMOUNTED == 0 )); then
+        ok "nothing was mounted on $TARGET"
+    else
+        ok "$UNMOUNTED filesystem(s)/swap released — the disk is idle"
+    fi
+}
+
+# ---------- dd with a live progress panel ----------
+# dd writes its progress to stderr as \r-separated records roughly once a
+# second:  "1224736768 bytes (1.2 GB, 1.1 GiB) copied, 3.00275 s, 408 MB/s"
+#
+# TWO lines, and it does not erase itself. The old single line was cleared
+# with \r\033[K the moment dd exited, so a finished write left no trace at
+# all — and a \r-updated line does not survive copy-paste even while it is
+# on screen. RP_LINES records how tall the frame is so the next one moves
+# back up over it instead of scrolling past, and the LAST frame stays put.
+RP_LINES=0
+
+render_progress() {
+    local errlog="$1" total="$2" t0="$3"
+    local line bytes pct elapsed avg eta inst bl l1 l2
+    line=$(tr '\r' '\n' < "$errlog" 2>/dev/null | grep -E '^[0-9]+ bytes .* copied' | tail -1)
+    [[ -z "$line" ]] && return 0
+    bytes=${line%% *}
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+    (( total > 0 )) || return 0
+    pct=$(( bytes * 100 / total ))
+    (( pct > 100 )) && pct=100
+    elapsed=$(( $(date +%s) - t0 ))
+    (( elapsed < 1 )) && elapsed=1
+    avg=$(( bytes / elapsed ))
+    (( avg < 1 )) && avg=1
+    eta=$(( (total - bytes) / avg ))
+    # dd's own trailing rate is the near-instant one; ours is the average.
+    # Extract ONLY the rate token: when dd fails it appends its error with no
+    # preceding newline, so the raw tail can read
+    # "332 MB/sdd: IO error: Disk quota exceeded" and would be shown verbatim.
+    inst=$(printf '%s' "$line" | grep -oE '[0-9.]+ (k|M|G|T)?i?B/s' | tail -1)
+
+    bl=$(bar "$pct" 24)
+    # bar() already ends in " NN%", so the percentage is not repeated here
+    l1=$(printf '  %s   %s / %s' "$bl" "$(humansize "$bytes")" "$(humansize "$total")")
+    l2=$(printf '  %s%s%s · avg %s/s · elapsed %s · ETA %s' \
+        "$C_BOLD" "${inst:-…}" "$C_RESET" \
+        "$(humansize "$avg")" "$(fmt_dur "$elapsed")" "$(fmt_dur "$eta")")
+
+    # ONE write for the cursor move and both lines: the poller is killed the
+    # moment dd exits, and dying between printfs would leave a half-frame —
+    # a cursor moved up with nothing redrawn, which shifts the whole panel
+    # down a line for every frame that follows.
+    if (( RP_LINES > 0 )); then
+        printf '\033[%dA\r\033[K%s\n\r\033[K%s\n' "$RP_LINES" "$l1" "$l2"
+    else
+        printf '\r\033[K%s\n\r\033[K%s\n' "$l1" "$l2"
+    fi
+    RP_LINES=2
+}
+
+run_dd() {
+    section "STEP 5 · WRITE"
+    local full_cmd="dd bs=4M if=\"$ISO\" of=\"$TARGET\" status=progress oflag=direct conv=fsync"
+    info "command: ${C_BOLD}$full_cmd${C_RESET}"
+
+    if (( DRY_RUN )); then
+        printf "\n  ${C_YELLOW}${C_BOLD}DRY RUN${C_RESET} — nothing was written. It would run:\n"
+        local m
+        for m in "${MOUNTED_SRC[@]}"; do printf "    ${C_DIM}sudo umount %s${C_RESET}\n" "$m"; done
+        for m in "${SWAP_SRC[@]}"; do printf "    ${C_DIM}sudo swapoff %s${C_RESET}\n" "$m"; done
+        printf "    ${C_BOLD}sudo %s${C_RESET}\n" "$full_cmd"
+        printf "    ${C_DIM}sync${C_RESET}\n"
+        (( VERIFY )) && printf "    ${C_DIM}sudo cmp -n %s \"%s\" %s${C_RESET}\n" "$ISO_SIZE" "$ISO" "$TARGET"
+        (( NO_EJECT )) || printf "    ${C_DIM}sudo eject %s${C_RESET}\n" "$TARGET"
+        return 0
+    fi
+
+    local errlog pollpid="" t0 rc=0 attempt have_progress=0
+    errlog=$(mktemp)
+    t0=$(date +%s)
+    _WRITE_INTERRUPTED=0
+    dd --help 2>&1 | grep -qi progress && have_progress=1
+
+    for attempt in 0 1; do
+        local -a args=(bs=4M "if=$ISO" "of=$TARGET" conv=fsync)
+        (( have_progress )) && args+=(status=progress)
+        (( attempt == 0 )) && args+=(oflag=direct)
+
+        if [[ "$JSON_OUT" -eq 1 ]]; then
+            sudo_run dd "${args[@]}" 2>"$errlog"; rc=$?
+            break
+        fi
+
+        if (( FANCY && have_progress )); then
+            # The poller owns ALL frame drawing, including the last one.
+            # RP_LINES lives in its process — a final frame drawn by THIS
+            # shell would not know how far to move back up, and would leave a
+            # stale frame stacked above the real one (observed: F1 UP F2 UP
+            # F3 UP F4 UP F5 F6). So ask it for one last frame and wait,
+            # rather than killing it mid-draw.
+            local done_flag="$errlog.done"
+            rm -f "$done_flag"
+            RP_LINES=0
+            ( while :; do
+                render_progress "$errlog" "$ISO_SIZE" "$t0"
+                [[ -f "$done_flag" ]] && exit 0
+                sleep 0.4
+              done ) & pollpid=$!
+            trap '_WRITE_INTERRUPTED=1' INT TERM
+            sudo_run dd "${args[@]}" 2>"$errlog"; rc=$?
+            trap - INT TERM
+            touch "$done_flag"
+            # bounded wait: never hang the tool if the poller misbehaves
+            local _w=0
+            while [[ -n "$pollpid" ]] && kill -0 "$pollpid" 2>/dev/null && (( _w < 30 )); do
+                sleep 0.1; _w=$((_w+1))
+            done
+            kill "$pollpid" 2>/dev/null; wait "$pollpid" 2>/dev/null || true
+            pollpid=""
+            rm -f "$done_flag"
+            # The final frame stays on screen — the old code cleared it with
+            # \r\033[K here, throwing away the only record of the write.
+            printf '\n'
+        elif (( have_progress )); then
+            # no terminal to paint on (piped / redirected): \r would just
+            # scribble, so emit a plain status line every few seconds —
+            # `bootablez | tee log` still shows progress
+            ( while :; do
+                _pl=$(tr '\r' '\n' < "$errlog" 2>/dev/null | grep -E '^[0-9]+ bytes .* copied' | tail -1)
+                [[ -n "$_pl" ]] && printf '  %s\n' "$_pl"
+                sleep 5
+              done ) & pollpid=$!
+            sudo_run dd "${args[@]}" 2>"$errlog"; rc=$?
+            kill "$pollpid" 2>/dev/null; wait "$pollpid" 2>/dev/null || true
+            # only the counters — the periodic lines already showed the rest
+            tr '\r' '\n' < "$errlog" | grep -E '^[0-9]+ records (in|out)' | sed 's/^/  /'
+        else
+            sudo_run dd "${args[@]}" 2>"$errlog"; rc=$?
+            # dd without progress support: its own report is all there is
+            tr '\r' '\n' < "$errlog" | grep -vE '^$' | sed 's/^/  /'
+        fi
+
+        (( rc == 0 )) && break
+        # oflag=direct is rejected by some controllers and some filesystems.
+        # The wording differs: uutils coreutils (what this machine runs) says
+        # "Invalid input", GNU dd says "Invalid argument", some kernels say
+        # "Operation not supported". Match them all — otherwise the fallback
+        # never fires and the write simply fails.
+        grep -qiE 'invalid argument|invalid input|not supported' "$errlog" 2>/dev/null || break
+        (( attempt == 0 )) || break
+        printf "  ${C_YELLOW}!${C_RESET} oflag=direct was rejected — retrying with buffered writes\n"
+        : > "$errlog"
+    done
+
+    WRITE_DURATION=$(( $(date +%s) - t0 ))
+    rm -f "$errlog" 2>/dev/null
+
+    if (( _WRITE_INTERRUPTED )); then
+        critf "disk_io_errors" "write interrupted — $TARGET holds a partial image" \
+            "re-run bootablez; the stick is unusable until a write completes"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        critf "disk_io_errors" "dd failed on $TARGET (exit $rc)" \
+            "check the device: 'sudo dmesg | tail -20' — a bad stick or a wrong target is usual cause"
+        return 1
+    fi
+
+    BYTES_WRITTEN=$ISO_SIZE
+    local dur=$WRITE_DURATION
+    (( dur < 1 )) && dur=1
+    AVG_BPS=$(( BYTES_WRITTEN / dur ))
+    return 0
+}
+
+# quick_verify — compare the head, middle and tail of the image against the
+# device instead of every byte. Truncation (what a failed write leaves
+# behind, e.g. "No space left on device") always shows at the tail; the head
+# carries the partition table and the image signature; the middle catches a
+# mid-write stall. Reads 24 MB instead of 1.3 GB — seconds, not minutes.
+quick_verify() {
+    local iso="$1" dev="$2" chunk=8388608 o name bad=0
+    local total="$ISO_SIZE"
+    VERIFIED=0
+
+    # small images: three 8 MB windows would overlap — shrink them
+    (( total > chunk * 6 )) || chunk=$(( total / 6 ))
+    (( chunk < 4096 )) && chunk=4096
+    (( chunk > total )) && chunk=$total
+
+    local -a probes=(0)
+    (( total > chunk * 2 )) && probes+=($(( total / 2 - chunk / 2 )))
+    probes+=($(( total - chunk )))
+
+    section "VERIFY · QUICK"
+    printf "  ${C_DIM}head + middle + tail, %s each, out of %s${C_RESET}\n" \
+        "$(humansize "$chunk")" "$(humansize "$total")"
+
+    for o in "${probes[@]}"; do
+        name="at $(humansize "$o")"
+        if sudo_run cmp -n "$chunk" -i "$o:$o" "$iso" "$dev" >/dev/null 2>&1; then
+            printf "    ${C_GREEN}✓${C_RESET} %-16s matches\n" "$name"
+        else
+            printf "    ${C_RED}✗${C_RESET} %-16s does NOT match\n" "$name"
+            bad=1
+        fi
+    done
+
+    if (( bad )); then
+        critf "disk_io_errors" "$dev does not match $(basename "$iso") — quick verify failed" \
+            "re-run bootablez to rewrite it, or inspect every byte with --verify-full"
+        return 1
+    fi
+    ok "head, middle and tail all match — the image landed in one piece"
+    VERIFIED=1
+    return 0
+}
+
+# full_verify — every byte. Slow on a USB stick, so it shows elapsed time
+# instead of sitting silent for half a minute.
+full_verify() {
+    local iso="$1" dev="$2" t0 vspin="" rc
+    VERIFIED=0
+    section "BYTE VERIFY · FULL"
+    printf "  ${C_DIM}comparing every byte of %s against %s …${C_RESET}\n" \
+        "$(humansize "$ISO_SIZE")" "$dev"
+    t0=$(date +%s)
+    if (( FANCY )); then
+        ( while :; do
+            printf "\r  ${C_DIM}verifying … %ss elapsed${C_RESET}" $(( $(date +%s) - t0 ))
+            sleep 1
+          done ) & vspin=$!
+    fi
+    if sudo_run cmp -n "$ISO_SIZE" "$iso" "$dev" >/dev/null 2>&1; then rc=0; else rc=1; fi
+    if [[ -n "$vspin" ]]; then
+        kill "$vspin" 2>/dev/null; wait "$vspin" 2>/dev/null || true
+        printf '\r\033[K'
+    fi
+    if (( rc == 0 )); then
+        ok "$dev really does hold $(basename "$iso") — byte for byte"
+        VERIFIED=1
+        return 0
+    fi
+    critf "disk_io_errors" "$dev does NOT match $(basename "$iso")" \
+        "it is stale, truncated, or holds a different image — re-run bootablez to rewrite it"
+    return 1
+}
+
+# safe_to_unplug — prove the stick is quiet and flushed, then say so in
+# words you can act on. "It's probably fine" is not good enough for yanking
+# a stick out of a socket: the data that vanishes is the data still sitting
+# in the controller's write cache.
+safe_to_unplug() {
+    local problems=0
+
+    # 1. nothing still mounted on it. An image stick is auto-mounted the
+    #    moment it is written (/run/media/…/ARCH_202611), so refusing here
+    #    without trying would make the check useless for exactly the sticks
+    #    this tool creates. Release them, but only with a plain umount — if
+    #    that fails something is genuinely using it, and lying would be
+    #    worse than saying so.
+    collect_mounts
+    if (( ${#MOUNTED_SRC[@]} > 0 )); then
+        info "${#MOUNTED_SRC[@]} filesystem(s) still mounted — releasing them"
+        local m
+        for m in "${MOUNTED_SRC[@]}"; do
+            printf "  ${C_DIM}umount${C_RESET} %s … " "$m"
+            if sudo_run umount "$m" 2>/dev/null; then
+                printf "${C_GREEN}ok${C_RESET}\n"
+            else
+                printf "${C_RED}busy${C_RESET}\n"
+            fi
+        done
+        collect_mounts
+        if (( ${#MOUNTED_SRC[@]} > 0 )); then
+            warn "$TARGET is still mounted: ${MOUNTED_SRC[*]}"
+            printf "  ${C_DIM}↳${C_RESET} something is using it — close that window or cd out of it, then re-run\n"
+            problems=1
+        fi
+    fi
+
+    # 2. nobody has it or its partitions open — a file manager that
+    #    auto-mounted it, or a shell sitting inside it
+    local parts=() p holders=""
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && parts+=("/dev/$p")
+    done < <(lsblk -ln -o NAME "$TARGET" 2>/dev/null | tail -n +2)
+    if command -v fuser >/dev/null 2>&1 && (( ${#parts[@]} > 0 )); then
+        holders=$(fuser "$TARGET" "${parts[@]}" 2>/dev/null | tr -s '[:space:]' ' ')
+        if [[ -n "${holders// /}" ]]; then
+            warn "$TARGET is still held open by:${holders}"
+            printf "  ${C_DIM}↳${C_RESET} close whatever has it open (file manager, editor, or cd out of it)\n"
+            problems=1
+        fi
+    fi
+
+    # 3. flush the DEVICE's own write cache. `sync` only flushes the host's
+    #    buffers — the stick's controller can still be holding data.
+    if sudo_run blockdev --flushbufs "$TARGET" 2>/dev/null; then
+        ok "device write cache flushed (blockdev --flushbufs)"
+    else
+        info "blockdev --flushbufs unavailable — sync already flushed the host buffers"
+    fi
+
+    # 4. let udev settle so the node and its partitions are consistent
+    command -v udevadm >/dev/null 2>&1 && sudo_run udevadm settle 2>/dev/null
+
+    # 5. eject when asked — the definitive "parked" state
+    if (( NO_EJECT )); then
+        info "eject skipped (--no-eject)"
+    elif command -v eject >/dev/null 2>&1; then
+        if sudo_run eject "$TARGET" 2>/dev/null; then
+            ok "ejected $TARGET"
+        else
+            warn "could not eject $TARGET — the flush and unmount checks still passed"
+        fi
+    else
+        info "eject not installed — relying on the checks above"
+    fi
+
+    printf "\n"
+    if (( problems )); then
+        printf "  ${C_YELLOW}${C_BOLD}NOT READY TO UNPLUG${C_RESET} — deal with the warnings above first\n"
+        return 1
+    fi
+    # printf pads by BYTES and this text has multi-byte glyphs (✓ ·), so the
+    # width is computed from the character count instead — otherwise the
+    # right-hand ║ drifts left, exactly as it once did in the banner.
+    local w=52 t pad
+    local top="╔$(printf '═%.0s' $(seq 1 $w))╗"
+    local bot="╚$(printf '═%.0s' $(seq 1 $w))╝"
+    printf "  ${C_GREEN}${C_BOLD}%s${C_RESET}\n" "$top"
+    for t in "✓ SAFE TO UNPLUG  $TARGET" "flushed · unmounted · nothing holding it"; do
+        pad=$(( w - 2 - ${#t} ))
+        (( pad < 0 )) && pad=0
+        printf "  ${C_GREEN}${C_BOLD}║${C_RESET} %s%*s ${C_GREEN}${C_BOLD}║${C_RESET}\n" "$t" "$pad" ""
+    done
+    printf "  ${C_GREEN}${C_BOLD}%s${C_RESET}\n" "$bot"
+    return 0
+}
+
+verify_write() {
+    section "STEP 6 · SYNC · VERIFY · EJECT"
+    if (( DRY_RUN )); then
+        info "dry run — stopping before any write"
+        return 0
+    fi
+    sync
+    ok "buffers flushed to $TARGET"
+
+    if (( VERIFY_FULL )); then
+        full_verify "$ISO" "$TARGET"
+    elif (( VERIFY )); then
+        quick_verify "$ISO" "$TARGET"
+    else
+        info "verification skipped — --verify checks head/middle/tail, --verify-full checks every byte"
+    fi
+
+    safe_to_unplug
+}
+
+stats_section() {
+    section "STATS"
+    local avg="$AVG_BPS"
+    local verified_txt="${C_DIM}no — add --verify${C_RESET}"
+    (( VERIFIED )) && verified_txt="${C_GREEN}yes — byte-for-byte${C_RESET}"
+    local norm="${C_DIM}—${C_RESET}"
+    [[ -n "$NORMALIZED_FROM" ]] && norm="$NORMALIZED_FROM → $TARGET"
+    local result="NOT WRITTEN"
+    (( DRY_RUN )) && result="DRY RUN — nothing written"
+    (( BYTES_WRITTEN > 0 )) && result="OK — image written"
+
+    table_begin "WHAT" "VALUE"
+    table_row "image" "$(basename "$ISO")  ($(humansize "$ISO_SIZE")$( [[ -n "$ISO_LABEL" ]] && printf ', %s' "$ISO_LABEL" ))"
+    table_row "target" "$TARGET  ($(humansize "$TARGET_SIZE"))"
+    table_row "bytes written" "$(humansize "$BYTES_WRITTEN")"
+    table_row "duration" "$(fmt_dur "$WRITE_DURATION")  (${WRITE_DURATION}s)"
+    table_row "average speed" "$(humansize "$avg")/s"
+    table_row "unmounted" "$UNMOUNTED filesystem(s)/swap"
+    table_row "verified" "$verified_txt"
+    [[ -n "$NORMALIZED_FROM" ]] && table_row "partition fix" "$norm"
+    table_row "result" "$result"
+    table_end
+}
+
+# report — everything that can be said without writing anything: what is
+# mounted, which disks bootablez would touch and why not, which images are
+# lying around, and what each stick currently holds. Every builder resets its
+# own state, so this is safe to call again for a rescan.
+report() {
+    section "DRIVES ON THIS MACHINE"
+    info "what is mounted right now (df):"
+    emit "%s\n" "$(df -h 2>/dev/null | awk 'NR==1 || $1 ~ /^\/dev\//')"
+    printf "\n"
+    info "every disk this machine can see, and whether bootablez would touch it:"
+    build_device_list
+    add_json_field "devices" "$DEVICES_JSON" 1
+    add_json_field "candidates" "${#CAND[@]}" 1
+    if [[ "$JSON_OUT" -eq 0 ]]; then
+        printf "  ${C_DIM}a partition (/dev/sdb1) is never the target — always the whole disk (/dev/sdb)${C_RESET}\n"
+    fi
+
+    if (( LIST_ONLY )); then
+        add_json_field "status" "listed"
+        if [[ "$JSON_OUT" -eq 0 ]]; then
+            printf "\n  ${C_DIM}%d usable target(s): %s${C_RESET}\n" "${#CAND[@]}" "${CAND[*]:-none}"
+            printf "  ${C_DIM}next: ./bootablez --iso /path/to/image.iso --device <one-of-above>${C_RESET}\n"
+        fi
+        emit_verdict
+    fi
+
+    scan_isos
+    [[ -n "$ISO" && -r "$ISO" ]] && ISO_LABEL=$(volume_label "$ISO")
+    add_json_field "images" "$IMAGES_JSON" 1
+
+    if [[ -z "$ISO" ]]; then
+        section "IMAGES FOUND"
+        if (( ${#ISO_LIST[@]} == 0 )); then
+            info "no .iso or .img in $(pwd)"
+            printf "  ${C_DIM}drop one in this directory, pass --iso PATH, or scan elsewhere: --scan ~/Downloads${C_RESET}\n"
+        else
+            local i=1 n dir where
+            while (( i <= ${#ISO_LIST[@]} )); do
+                n=$((i-1))
+                dir="${ISO_LIST_DIR[$n]}"
+                if [[ "$dir" == "$(pwd)" ]]; then where="(here)"; else where="($dir)"; fi
+                printf "  ${C_BOLD}%d)${C_RESET} %-46s %8s  %s %s\n" "$i" \
+                    "$(basename "${ISO_LIST[$n]}")" \
+                    "$(humansize "${ISO_LIST_SIZE[$n]:-0}")" \
+                    "${ISO_LIST_LABEL[$n]:-not ISO9660}" "$where"
+                i=$((i+1))
+            done
+            printf "  ${C_DIM}pick one by number in a moment${C_RESET}\n"
+        fi
+        printf "\n"
+    fi
+
+    status_report
+    add_json_field "sticks" "$STICK_JSON" 1
+    next_steps
+}
+
+# pick_image — ask for an image: row number, name fragment ("arch"), a path,
+# or a drag-and-drop. Returns 0 with ISO set, 1 if the user gives up.
+pick_image() {
+    # Repeat the options right here: IMAGES FOUND is several sections up by
+    # the time the user gets to this prompt, and choosing between two images
+    # should not mean scrolling back.
+    if (( ${#ISO_LIST[@]} > 0 )); then
+        printf "  ${C_DIM}images found:${C_RESET}\n"
+        local i=1 n
+        while (( i <= ${#ISO_LIST[@]} )); do
+            n=$((i-1))
+            printf "    ${C_BOLD}%d)${C_RESET} %-46s %8s  %s\n" "$i" \
+                "$(basename "${ISO_LIST[$n]}")" \
+                "$(humansize "${ISO_LIST_SIZE[$n]:-0}")" \
+                "${ISO_LIST_LABEL[$n]:-not ISO9660}"
+            i=$((i+1))
+        done
+    fi
+
+    local tries=0 _in _f
+    local -a _matches
+    while (( tries < 4 )); do
+        printf "  ${C_BOLD}${C_CYAN}Image${C_RESET} ${C_DIM}(number, name fragment like \"arch\", a path, or drag & drop)${C_RESET}: "
+        _in=""
+        IFS= read -r _in || { printf "\n"; return 1; }
+        _in="${_in#\"}"; _in="${_in%\"}"; _in="${_in//\\ / }"
+        [[ -z "$_in" ]] && return 1
+
+        if [[ "$_in" =~ ^[0-9]+$ ]]; then
+            if (( _in >= 1 && _in <= ${#ISO_LIST[@]} )); then
+                _in="${ISO_LIST[$((_in-1))]}"
+            else
+                printf "  ${C_YELLOW}!${C_RESET} no image numbered %s — there are %d\n" "$_in" "${#ISO_LIST[@]}"
+                tries=$((tries+1)); continue
+            fi
+        elif [[ "$_in" != */* ]]; then
+            # not a number and not a path: treat it as a name fragment, so
+            # "arch" picks the Arch ISO without anybody counting rows
+            _matches=()
+            for _f in "${ISO_LIST[@]}"; do
+                [[ "${_f,,}" == *"${_in,,}"* ]] && _matches+=("$_f")
+            done
+            if (( ${#_matches[@]} == 1 )); then
+                printf "  ${C_DIM}matched: %s${C_RESET}\n" "$(basename "${_matches[0]}")"
+                _in="${_matches[0]}"
+            elif (( ${#_matches[@]} > 1 )); then
+                printf "  ${C_YELLOW}!${C_RESET} \"%s\" matches %d images — use a number instead:\n" \
+                    "$_in" "${#_matches[@]}"
+                for _f in "${_matches[@]}"; do printf "      ${C_DIM}·${C_RESET} %s\n" "$(basename "$_f")"; done
+                tries=$((tries+1)); continue
+            fi
+            # no fragment match: fall through and let check_iso report it
+        fi
+        if check_iso "$_in"; then return 0; fi
+        tries=$((tries+1))
+    done
+    return 1
+}
+
+# pick_target — ask which disk. Returns 0 with TARGET set, 1 otherwise.
+pick_target() {
+    if (( ${#CAND[@]} == 0 )); then
+        # a stick may be plugged in and still be unusable — say which case
+        # this is instead of always blaming the cable
+        if (( USB_SEEN )); then
+            printf "  ${C_RED}✗${C_RESET} a USB disk is attached but bootablez will not use it — see the USABLE column above\n"
+        else
+            printf "  ${C_RED}✗${C_RESET} no USB disk attached — plug your stick in and re-run\n"
+        fi
+        return 1
+    fi
+    local _i=1 _c _in _idx
+    for _c in "${CAND[@]}"; do
+        printf "  ${C_BOLD}%d)${C_RESET} %-14s %8s  %s\n" "$_i" "$_c" \
+            "$(humansize "$(lsblk1 -dbno SIZE "$_c")")" \
+            "$(trunc "$(disk_mountpoints "$_c")" 40)"
+        _i=$((_i+1))
+    done
+    printf "  Target ${C_DIM}(number or /dev path)${C_RESET}: "
+    _in=""
+    IFS= read -r _in || { printf "\n"; return 1; }
+    if [[ "$_in" =~ ^[0-9]+$ ]]; then
+        _idx=$((_in-1))
+        if (( _idx < 0 || _idx >= ${#CAND[@]} )); then
+            printf "  ${C_YELLOW}!${C_RESET} no such row: %s\n" "$_in"
+            return 1
+        fi
+        TARGET="${CAND[$_idx]}"
+    elif [[ -n "$_in" ]]; then
+        TARGET="$_in"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# run_byte_verify — the "did this stick really get flashed?" audit. Reads and
+# writes nothing beyond the comparison itself; needs root only to read the
+# raw device. Shared by --status --verify and the menu.
+run_byte_verify() {
+    check_iso "$ISO" || { warn "cannot use that image (see above)"; return 1; }
+    normalize_target
+    check_target
+    ensure_sudo
+
+    if (( VERIFY_FULL )); then
+        full_verify "$ISO" "$TARGET"
+    else
+        quick_verify "$ISO" "$TARGET"
+    fi
+
+    if (( VERIFIED )); then
+        add_json_field "status" "verified"
+        add_json_field "verified" "true" 1
+    else
+        add_json_field "status" "mismatch"
+        add_json_field "verified" "false" 1
+    fi
+    # Answer the question that made them run this: can I pull it out now?
+    # (The write path does this too; an audit of an existing stick should
+    # finish with the same flush + hold check and the same verdict.)
+    safe_to_unplug
+    return 0
+}
+
+# show_commands — the "just tell me what to type" answer. Prints every
+# command in order with this machine's real paths filled in, so the user can
+# run them one at a time instead of handing sudo to a script.
+show_commands() {
+    section "RUN IT YOURSELF"
+    local img="$ISO" dev="$TARGET"
+
+    if [[ -z "$img" ]]; then
+        if (( ${#ISO_LIST[@]} == 0 )); then
+            info "no image found here, so there is nothing to print commands for"
+            printf "  ${C_DIM}drop an .iso in $(pwd), or pass --iso PATH${C_RESET}\n"
+            return 0
+        elif (( ${#ISO_LIST[@]} == 1 )); then
+            img="${ISO_LIST[0]}"
+        else
+            printf "  ${C_DIM}which image?${C_RESET}\n"
+            pick_image || return 0
+            img="$ISO"
+        fi
+    fi
+    check_iso "$img" || return 0
+    img="$ISO"
+
+    if [[ -z "$dev" ]]; then
+        if (( ${#CAND[@]} == 1 )); then
+            dev="${CAND[0]}"
+        elif (( ${#CAND[@]} > 1 )); then
+            printf "  ${C_DIM}which stick?${C_RESET}\n"
+            pick_target || return 0
+            dev="$TARGET"
+        fi
+    fi
+    if [[ -n "$dev" ]]; then
+        # normalise a partition input and run the rails, so the recipe can
+        # never print an unsafe target (this exits on a refusal, like always)
+        TARGET="$dev"
+        normalize_target
+        check_target
+        dev="$TARGET"
+        collect_mounts
+    else
+        # nothing attached: still worth printing the recipe, but never with
+        # an empty of= — use the placeholder everybody recognises
+        dev="/dev/sdX"
+        MOUNTED_SRC=()
+        printf "  ${C_DIM}no stick attached — printing with %s as a placeholder${C_RESET}\n" "$dev"
+    fi
+
+    printf "\n  ${C_BOLD}Copy and paste, one line at a time:${C_RESET}\n\n"
+
+    printf "    ${C_DIM}# 1 — find your drive${C_RESET}\n"
+    printf "    ${C_BOLD}df -h${C_RESET}\n"
+    printf "    ${C_BOLD}lsblk -o NAME,SIZE,TRAN,MODEL,TYPE${C_RESET}\n\n"
+
+    printf "    ${C_DIM}# 2 — disconnect everything on it${C_RESET}\n"
+    if (( ${#MOUNTED_SRC[@]} > 0 )); then
+        local m
+        for m in "${MOUNTED_SRC[@]}"; do
+            printf "    ${C_BOLD}sudo umount %s${C_RESET}\n" "$m"
+        done
+    else
+        printf "    ${C_BOLD}sudo umount %s* 2>/dev/null${C_RESET}   ${C_DIM}# nothing mounted — harmless${C_RESET}\n" "$dev"
+    fi
+    printf "\n"
+
+    printf "    ${C_DIM}# 3 — write the image (%s → %s)${C_RESET}\n" "$(basename "$img")" "$dev"
+    printf "    ${C_BOLD}sudo dd bs=4M if=\"%s\" of=%s status=progress oflag=direct conv=fsync${C_RESET}\n\n" "$img" "$dev"
+
+    printf "    ${C_DIM}# 4 — flush to the device${C_RESET}\n"
+    printf "    ${C_BOLD}sync${C_RESET}\n\n"
+
+    printf "    ${C_DIM}# 5 — check it landed (${C_RESET}%s${C_DIM})${C_RESET}\n" "$(humansize "$ISO_SIZE")"
+    printf "    ${C_BOLD}sudo cmp -n %s \"%s\" %s${C_RESET}\n\n" "$ISO_SIZE" "$img" "$dev"
+
+    printf "    ${C_DIM}# 6 — release the stick${C_RESET}\n"
+    printf "    ${C_BOLD}sudo eject %s${C_RESET}\n\n" "$dev"
+
+    printf "  ${C_YELLOW}·${C_RESET} of= must be the WHOLE disk (%s), never a partition (%s1)\n" "$dev" "$dev"
+    printf "  ${C_YELLOW}·${C_RESET} a partition is smaller than the image → dd says \"No space left on device\"\n"
+    printf "  ${C_DIM}· or pick 1 in the menu and let bootablez do all of this for you${C_RESET}\n"
+    return 0
+}
+
+# do_menu_verify — menu action 2: settle on an image and a stick, then audit
+# them. Prompts only when there is more than one to choose from.
+do_menu_verify() {
+    local saved_iso="$ISO" saved_target="$TARGET"
+    if [[ -z "$ISO" ]]; then
+        if (( ${#ISO_LIST[@]} == 0 )); then
+            printf "  ${C_YELLOW}!${C_RESET} no image found to verify against — drop one in $(pwd)\n"
+            return 0
+        elif (( ${#ISO_LIST[@]} == 1 )); then
+            ISO="${ISO_LIST[0]}"
+            info "verifying against the only image found: $(basename "$ISO")"
+        else
+            printf "  ${C_DIM}which image?${C_RESET}\n"
+            pick_image || { ISO="$saved_iso"; return 0; }
+        fi
+    fi
+    if [[ -z "$TARGET" ]]; then
+        if (( ${#CAND[@]} == 0 )); then
+            printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in first\n"
+            ISO="$saved_iso"; return 0
+        elif (( ${#CAND[@]} == 1 )); then
+            TARGET="${CAND[0]}"
+            info "verifying the only stick found: $TARGET"
+        else
+            printf "  ${C_DIM}which stick?${C_RESET}\n"
+            pick_target || { ISO="$saved_iso"; TARGET="$saved_target"; return 0; }
+        fi
+    fi
+    run_byte_verify
+    # ISO and TARGET stay set on purpose: if the user then picks "write",
+    # they have already chosen both, and the confirm box still shows exactly
+    # what would be erased.
+    return 0
+}
+
+# menu_loop — after the report, let the user choose instead of making them
+# remember flags. Returns when they pick "write" (the wizard continues
+# below); every other choice is handled here and loops back.
+menu_loop() {
+    local choice
+    while :; do
+        printf "\n  ${C_BOLD}${C_CYAN}WHAT DO YOU WANT TO DO?${C_RESET}\n\n"
+        if (( ${#CAND[@]} > 0 )); then
+            printf "    ${C_BOLD}1${C_RESET}) Write an image to %-12s ${C_DIM}guided: pick image → pick stick → confirm${C_RESET}\n" "${CAND[0]}"
+        else
+            printf "    ${C_BOLD}1${C_RESET}) Write an image to a stick    ${C_DIM}(plug one in first)${C_RESET}\n"
+        fi
+        printf "    ${C_BOLD}2${C_RESET}) Verify a stick byte-for-byte ${C_DIM}compare against an image, writes nothing${C_RESET}\n"
+        printf "    ${C_BOLD}3${C_RESET}) Show me the commands         ${C_DIM}print them so you can run them yourself${C_RESET}\n"
+        printf "    ${C_BOLD}4${C_RESET}) Look again                   ${C_DIM}rescan drives and images${C_RESET}\n"
+        printf "    ${C_BOLD}5${C_RESET}) Quit\n\n"
+        printf "  Choice [1-5]: "
+        choice=""
+        IFS= read -r choice || choice=""
+        printf "\n"
+        case "$choice" in
+            1)
+                # do not lead with an image prompt if there is nowhere to
+                # write it — say so and stay in the menu
+                if (( ${#CAND[@]} == 0 )); then
+                    if (( USB_SEEN )); then
+                        printf "  ${C_YELLOW}!${C_RESET} a USB disk is attached but not usable right now — see the USABLE column above\n"
+                        printf "  ${C_DIM}reads 0 B? unplug it and plug it back in, then pick 4 to rescan${C_RESET}\n"
+                    else
+                        printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in, then pick 4 to rescan\n"
+                    fi
+                else
+                    return 0
+                fi
+                ;;
+            2) do_menu_verify ;;
+            3) show_commands ;;
+            4) report ;;
+            5|q|Q|"")
+                printf "  ${C_DIM}nothing was written — run bootablez again whenever you are ready${C_RESET}\n"
+                add_json_field "status" "status"
+                emit_verdict ;;
+            *) printf "  ${C_YELLOW}!${C_RESET} pick 1-5\n" ;;
+        esac
+    done
+}
+
+# ============================================================================
+# main
+# ============================================================================
+
+report
+
+# ---------- status-only exits ---------------------------------------------
+# --status --verify is the "did this stick really get flashed?" audit: it
+# byte-compares an existing stick against an image without writing anything.
+if (( STATUS_ONLY )); then
+    if (( VERIFY )); then
+        # sensible defaults: with exactly one image and one stick, just use them
+        if [[ -z "$ISO" && ${#ISO_LIST[@]} -eq 1 ]]; then
+            ISO="${ISO_LIST[0]}"
+            info "verifying against the only image found: $(basename "$ISO")"
+        fi
+        if [[ -z "$TARGET" && ${#CAND[@]} -eq 1 ]]; then
+            TARGET="${CAND[0]}"
+            info "verifying the only stick found: $TARGET"
+        fi
+        if [[ -z "$ISO" || -z "$TARGET" ]]; then
+            usage_abort "--verify needs an image and a target: ./bootablez --status --verify --iso <img> --device <dev>"
+        fi
+        run_byte_verify
+        emit_verdict
+    fi
+    add_json_field "status" "status"
+    emit_verdict
+fi
+
+# A bare `bootablez` is a report first: then it asks what you want to do,
+# rather than expecting you to remember flags. Every choice except "write"
+# is handled inside menu_loop; picking 1 returns here so the wizard runs.
+if [[ -z "$ISO" && -z "$TARGET" ]]; then
+    if (( ! INTERACTIVE )) || (( JSON_OUT == 1 )); then
+        # nothing was asked for and there is no terminal to ask in: the
+        # report above is the answer
+        add_json_field "status" "status"
+        emit_verdict
+    fi
+    menu_loop
+fi
+
+# ---------- STEP 1: the image ---------------------------------------------
+section "STEP 1 · CHOOSE THE IMAGE"
+if [[ -z "$ISO" ]]; then
+    if (( ! INTERACTIVE )); then
+        usage_abort "no image given — pass one: ./bootablez --iso /path/to/image.iso"
+    fi
+    pick_image || usage_abort "could not settle on an image"
+else
+    check_iso "$ISO" || usage_abort "cannot use that image (see above)"
+fi
+if (( ISO9660 )); then
+    ok "image: ${C_BOLD}$(basename "$ISO")${C_RESET} — $(humansize "$ISO_SIZE")${ISO_LABEL:+ · label \"$ISO_LABEL\"}"
+else
+    info "image: $(basename "$ISO") — $(humansize "$ISO_SIZE")"
+fi
+add_json_field "iso" "$ISO"
+add_json_field "iso_size" "$ISO_SIZE" 1
+
+# ---------- STEP 2: the target ----------
+section "STEP 2 · CHOOSE THE TARGET"
+if [[ -z "$TARGET" ]]; then
+    if (( ! INTERACTIVE )); then
+        usage_abort "no target given — pass one: --device /dev/sdX   (list them with --list)"
+    fi
+    # pick_target prints the reason when there is nothing usable to pick
+    pick_target || usage_abort "no target chosen"
+fi
+normalize_target
+check_target
+printf "  ${C_GREEN}✓${C_RESET} target checks passed: ${C_BOLD}%s${C_RESET} (%s, fits %s image with %s to spare)\n" \
+    "$TARGET" "$(humansize "$TARGET_SIZE")" "$(humansize "$ISO_SIZE")" \
+    "$(humansize "$(( TARGET_SIZE - ISO_SIZE ))")"
+add_json_field "device" "$TARGET"
+add_json_field "device_size" "$TARGET_SIZE" 1
+[[ -n "$NORMALIZED_FROM" ]] && add_json_field "normalized_from" "$NORMALIZED_FROM"
+
+# ---------- STEP 4: confirm ----------
+confirm_target
+
+# ---------- STEP 4: unmount ----------
+ensure_sudo
+if (( DRY_RUN )); then
+    # print the header anyway, or the step numbering jumps 3 → 5
+    section "STEP 4 · UNMOUNT"
+    info "dry run — skipping the unmount (see the plan below)"
+else
+    unmount_target
+fi
+
+# ---------- STEP 6/7: write, then sync/verify/eject ----------
+if run_dd; then
+    verify_write
+else
+    printf "\n  ${C_RED}${C_BOLD}WRITE FAILED${C_RESET} — $TARGET is not a usable bootable stick right now.\n"
+fi
+
+stats_section
+
+section "RECOMMENDATIONS"
+if (( BYTES_WRITTEN > 0 )); then
+    rec 1 "Reboot now — the exact keys for THIS machine are below"
+    rec 2 "It is now a full installer — keep it, or wipe it back with: sudo mkfs.vfat -F32 $TARGET"
+    rec 3 "Cheap sticks fail mid-write: always re-run with --verify after a suspicious copy"
+    rec 4 "Never aim dd at a partition: of=/dev/sdb, not of=/dev/sdb1"
+    boot_instructions "$(basename "$ISO")" "$(lsblk1 -dn -o MODEL "$TARGET")"
+elif (( DRY_RUN )); then
+    rec 1 "Dry run complete — nothing was written, which is the point of --dry-run"
+    rec 2 "To do it for real: re-run the same command without --dry-run"
+    rec 3 "Never aim dd at a partition: of=/dev/sdb, not of=/dev/sdb1"
+else
+    rec 1 "Nothing was written — fix the problem above and run ./bootablez again"
+    rec 2 "List the drives this machine offers: ./bootablez --list"
+    rec 3 "Never aim dd at a partition: of=/dev/sdb, not of=/dev/sdb1"
+fi
+
+add_json_field "bytes_written" "$BYTES_WRITTEN" 1
+add_json_field "duration_s" "$WRITE_DURATION" 1
+add_json_field "avg_bps" "$AVG_BPS" 1
+add_json_field "verified" "$([[ $VERIFIED -eq 1 ]] && echo true || echo false)" 1
+add_json_field "unmounted" "$UNMOUNTED" 1
+if (( DRY_RUN )); then
+    add_json_field "status" "dry-run"
+elif (( BYTES_WRITTEN > 0 )); then
+    add_json_field "status" "ok"
+else
+    add_json_field "status" "failed"
+fi
+
+if [[ "${AI_VERDICT}" == "1" ]]; then
+    ai_emit_verdict "summary" \
+        "bootablez: image=${ISO:-none} target=${TARGET:-none} bytes=$BYTES_WRITTEN duration=${WRITE_DURATION}s verified=$VERIFIED" \
+        2>/dev/null || true
+fi
+
+emit_verdict

@@ -515,6 +515,9 @@ SYMPTOM_INDEX=(
   "Leaked credentials or passwords|secretz|password credential secret leaked token api-key"
   "What hardware do I have|specz|hardware specs motherboard bios"
   "A device or driver is missing|driverz usbz pciz|driver device-not-working usb pci firmware"
+  "Make a bootable USB stick|bootablez|boot usb iso image flash write dd rufus etcher installer-stick"
+  "Is my USB stick bootable|bootablez|bootable check verify status is-it-bootable stick already-flashed"
+  "dd says No space left on device|bootablez|dd no-space partition too-small sdb1 write-failed"
   "Kernel problems / boot fails|kernelz bootz crashz|kernel boot grub panic wont-start"
   "Something crashed|crashz debugz logz|crash core-dump segfault killed"
   "A service will not start|bootz logz demonz|service failed-unit systemd"
@@ -536,6 +539,8 @@ SYMPTOM_INDEX=(
   "Install the suite on my PATH|installz|install path completion symlink"
   "Test the suite itself|testz|test self-test regression check-the-suite"
   "Make a chart from my data|chartz|chart graph plot visuali bar"
+  "Search the web from the terminal|searchz|search web query google bing duckduckgo engine url find lookup"
+  "Look someone up / find their profiles or contact info|searchz|person name facebook linkedin instagram twitter github phone address email osint"
   "Compare two tool runs|timingz|compare timing benchmark diff"
   "Study my notes or the register|spiritz|register notes theme"
 )
@@ -546,30 +551,34 @@ symptom_search() {
     q="$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')"
     [[ -z "$q" ]] && return 1
 
-    local entry desc rest tools kw tool hit=0
+    local entry desc rest tools kw tool hit=0 em
     local -a matched=()
 
     # Each entry is  description|tool1 tool2|keyword keyword ...
+    # em = "this entry matched" (reset every loop); hit = "anything matched"
+    # at all, which the fallback below and the return value depend on. The two
+    # must be separate or the first match locks the rest of the index out.
     for entry in "${SYMPTOM_INDEX[@]}"; do
         desc="${entry%%|*}"
         rest="${entry#*|}"
         tools="${rest%%|*}"
         local keywords="${rest#*|}"
+        em=0
 
         # 1) the query names a tool from this entry
         for tool in $tools; do
             if [[ "$q" == *"$tool"* ]]; then
-                hit=1
+                em=1; hit=1
                 matched+=("$tools")
                 break
             fi
         done
-        (( hit )) && continue
+        (( em )) && continue
 
         # 2) the query contains one of this entry's keywords
         for kw in $keywords; do
             if [[ "$q" == *"$kw"* ]]; then
-                hit=1
+                em=1; hit=1
                 matched+=("$tools")
                 break
             fi
@@ -591,9 +600,13 @@ symptom_search() {
 
     printf "  ${C_BOLD}${C_CYAN}Possible tools for ${C_RESET}${C_BOLD}%s${C_RESET}${C_CYAN}:${C_RESET}\n" "$query"
     local t d
+    # Several entries can now name the same tool — print each tool once.
+    local -A seen_tool=()
     for t in "${matched[@]}"; do
         for tool in $t; do
             [[ -x "$SCRIPT_DIR/$tool" ]] || continue
+            [[ -n "${seen_tool[$tool]:-}" ]] && continue
+            seen_tool[$tool]=1
             d=$(describe_line "$tool")
             printf "    ${C_GREEN}→${C_RESET} %s\n" "$d"
         done

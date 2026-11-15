@@ -171,7 +171,16 @@ fi
 
 # ---------- Verify psql is available and we can connect ----------
 if ! command -v psql >/dev/null 2>&1; then
-  echo "psql not found in PATH"
+  # --json must still produce an object here, or consumers piping
+  # `sqlz --json | jq` get nothing and the suite's self-test fails.
+  if [[ $JSON_OUT -eq 1 ]]; then
+    [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
+    printf '{"timestamp":"%s","hostname":"%s","status":"missing_psql","error":"psql not found in PATH","critical":1,"warnings":0}\n' \
+      "$TIMESTAMP" "$HOSTNAME_SHORT"
+    exec 1>&2
+  else
+    printf "\033[31m\033[1m✗\033[0m \033[31mpsql not found in PATH\033[0m — install it: sudo apt install postgresql-client\n" >&2
+  fi
   exit 2
 fi
 
