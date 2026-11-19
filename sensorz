@@ -9,14 +9,17 @@
 #
 #   * /sys/class/hwmon      — coretemp, acpitz, PCH, motherboard chips
 #   * /sys/class/thermal    — thermal zones + trip points
-#   * thermal_throttle      — Intel package/core throttle counters
+#   * thermal_throttle      — Intel package AND per-core throttle counters
 #   * /sys/class/powercap   — RAPL package/core/uncore/dram power + limits
+#   * /proc/<pid>/stat      — every process's CPU time (--attrib)
 #   * SMART                 — drive temperatures (smartctl, needs root)
 #   * nvidia-smi            — GPU temperature/utilisation
 #
 # Every reading is judged against the trip point THE FIRMWARE reports
-# (temp*_crit, thermal_zone trip points), never a hardcoded number — so a
-# threshold that moves with a BIOS update still reads correctly.
+# (temp*_max = the throttle/alarm point, thermal_zone trip points), never
+# a hardcoded number — so a threshold that moves with a BIOS update still
+# reads correctly. temp*_crit is kept separately as the SHUTDOWN point;
+# confusing the two makes an over-temp CPU look like it has headroom.
 #
 # The headline metric is the throttle ratio: what fraction of wall-clock
 # uptime the CPU has spent thermally limited. A machine can look "fine"
@@ -25,6 +28,7 @@
 # Usage:
 #   ./sensorz                     # full sweep
 #   ./sensorz --cpu               # thermals + throttle + power only
+#   ./sensorz --attrib 60         # sample 60s: WHAT is causing the throttle
 #   ./sensorz --json              # machine-readable summary
 #   ./sensorz --no-color          # plain output
 #   ./sensorz --watch 5           # re-sample every 5s (Ctrl+C to stop)
@@ -50,6 +54,7 @@ WATCH_INTERVAL=0
 NO_COLOR=0
 JSON_OUT=0
 CPU_ONLY=0
+ATTRIB_SECS=""      # set by --attrib N; runs the attribution mode instead of a sweep
 START_TS=$(date +%s)
 SCRIPT_VERSION="1.0.0"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
@@ -66,6 +71,18 @@ while [[ $i -lt $# ]]; do
     case "$arg" in
         --watch=*)  WATCH_INTERVAL="${arg#--watch=}" ;;
         --watch)    i=$((i+1)); WATCH_INTERVAL="${ARGS[$i]:-5}" ;;
+        --attrib=*) ATTRIB_SECS="${arg#--attrib=}" ;;
+        --attrib)
+            # Optional value: consume the next token only if it is a number,
+            # so `sensorz --attrib --json` still parses as --json.
+            i=$((i+1))
+            if [[ "${ARGS[$i]:-}" =~ ^[0-9]+$ ]]; then
+                ATTRIB_SECS="${ARGS[$i]}"
+            else
+                ATTRIB_SECS=60
+                i=$((i-1))
+            fi
+            ;;
         --cpu)      CPU_ONLY=1 ;;
         --no-color) NO_COLOR=1 ;;
         --json)
@@ -83,10 +100,10 @@ while [[ $i -lt $# ]]; do
 
 DESCRIPTION
   Reads every sensor the kernel exposes — CPU/package thermals, per-core
-  temperatures, thermal zones, the Intel thermal-throttle counters, RAPL
-  power domains, drive temperatures and GPU state — and judges each
-  against the trip point reported by the firmware rather than a
-  hardcoded number.
+  temperatures, thermal zones, the Intel thermal-throttle counters (both
+  package and per-core), RAPL power domains, drive temperatures and GPU
+  state — and judges each against the trip point reported by the firmware
+  rather than a hardcoded number.
 
   The headline number is the THROTTLE RATIO: what percentage of wall
   clock the CPU has spent thermally limited. A box sitting at a
@@ -96,19 +113,45 @@ DESCRIPTION
 USAGE
   ./sensorz                 full sweep
   ./sensorz --cpu           thermals + throttle + power only
+  ./sensorz --attrib 60     sample for 60s and attribute the throttling
   ./sensorz --json          machine-readable summary on stdout
   ./sensorz --no-color      plain output
   ./sensorz --watch 5       re-sample every 5 seconds
   ./sensorz -h, --help      this text
 
 READING THE OUTPUT
-  trip point   the firmware's own limit (temp*_crit / thermal_zone trips)
-  headroom     trip minus current — below 10 C means you are close
-  throttle%    share of uptime spent thermally limited (cumulative)
+  alarm point     temp*_max — the firmware's own warning threshold (86 C
+                    on coretemp, `sensors` "high"). Crossing it warns.
+  critical point  temp*_crit — Tjmax (100 C, `sensors` "crit"). THIS is
+                    where the silicon actually throttles, then shuts down.
+                    Measured on this host rather than assumed: a package
+                    at 89 C produced ZERO throttle events while 93-97 C
+                    produced ~73/s — the per-core sensors reach Tjmax
+                    first and the package figure trails them.
+  headroom        alarm point minus current — negative means OVER
+  ambient         the acpitz board sensor; package−ambient is the delta
+                    that separates a cooler problem (>50 C) from a case
+                    airflow problem (<20 C)
+  throttle%       share of uptime spent thermally limited (cumulative)
+  per-core        which cores are eating the throttle events; logical
+                    CPUs sharing a physical core report identical counts
 
-  FANS are reported only if the board exposes fan*_input; many desktop
-  boards expose none, which this tool reports as "not exposed" rather
-  than pretending everything is fine.
+ATTRIBUTION (--attrib N)
+  Samples the throttle counters, package temperature and every process's
+  CPU time once per second for N seconds, then joins them on the same
+  second:
+    · seconds that throttled — temp + events/s + who was CPU-hot right
+      then, so the blame is temporal and not just "these both happened"
+    · CPU burned during the window — ranked per process, as cpu-seconds
+      and % of one core
+  A process is only named against a second if its own CPU delta in that
+  second was positive. Default window is 60s (min 10, max 3600).
+
+  FANS are reported as RPM AND % of the firmware's nominal max, because
+  a fan already at 100% of max is the firmware demanding everything it
+  has — a bare RPM number reads as healthy when it is not. Many OEM
+  boards expose no fan sensor at all, which this tool reports honestly
+  rather than pretending everything is fine.
 
 EXIT CODES
   0  healthy    1  warnings    2  critical
@@ -128,9 +171,22 @@ fi
 
 # ---------- Collectors ----------
 
-# Every hwmon chip's temperature inputs, as "chip|label|millidegC|crit_mC"
+# Every hwmon chip's temperature inputs, as
+#   "chip|label|millidegC|max_mC|crit_mC"
+#
+# TWO thresholds, because they mean different things and conflating them
+# is how a hot box gets reported as healthy:
+#   *_max  the firmware's ALARM point — on coretemp this is 86 C and
+#          `sensors` prints it as "high". THIS is where throttling starts.
+#   *_crit the SHUTDOWN point — 100 C here, printed as "crit".
+#
+# The old code kept only *_crit (preferring it over *_max), so every
+# sensor was measured against SHUTDOWN: a package at 93 C was reported
+# as "headroom 7C of 100C", which reads as comfortable while it is seven
+# degrees from thermal shutdown AND already past its 86 C alarm point.
+# Keeping both lets the report name which of the two it is near. Keep both, alarm on max, escalate on crit.
 collect_hwmon_temps() {
-    local h name lbl f mv crit
+    local h name lbl f mv mx cr
     for h in /sys/class/hwmon/hwmon*; do
         [[ -d "$h" ]] || continue
         name=$(cat "$h/name" 2>/dev/null || echo "hwmon")
@@ -141,10 +197,23 @@ collect_hwmon_temps() {
             (( mv <= 0 )) && continue
             # label: temp1_label if present, else the index
             lbl=$(cat "${f%_input}_label" 2>/dev/null || basename "${f%_input}")
-            crit=$(cat "${f%_input}_crit" 2>/dev/null || cat "${f%_input}_max" 2>/dev/null || echo "")
-            printf '%s|%s|%s|%s\n' "$name" "$lbl" "$mv" "$crit"
+            mx=$(cat "${f%_input}_max" 2>/dev/null || echo "")
+            cr=$(cat "${f%_input}_crit" 2>/dev/null || echo "")
+            printf '%s|%s|%s|%s|%s\n' "$name" "$lbl" "$mv" "$mx" "$cr"
         done
     done
+}
+
+# The package temperature alone, in whole C — "" when not exposed.
+# Hoisted out of do_sample() so --attrib can sample it every second
+# without re-reading every sensor on the board.
+pkg_temp_c() {
+    local v
+    v=$(awk -F'|' '$2 ~ /ackage/ {print int($3/1000); exit}' <<<"$(collect_hwmon_temps)")
+    if [[ -z "$v" ]]; then
+        v=$(awk -F'|' '$1=="x86_pkg_temp" {print int($2/1000); exit}' <<<"$(collect_thermal_zones)")
+    fi
+    printf '%s' "$v"
 }
 
 # Thermal zones as "type|millidegC|tripC" (invalid/unset trips dropped)
@@ -231,9 +300,15 @@ collect_gpu() {
     printf '%s\n' "$out"
 }
 
-# Fans from hwmon: "chip|label|rpm"
+# Fans from hwmon: "chip|label|rpm|max_rpm"
+#
+# max_rpm matters more than the RPM itself. A fan sitting at 4800 RPM
+# against a nominal max of 3899 is not "fast" — it is the firmware
+# DEMANDING maximum cooling and still losing, which is the single most
+# useful thing a fan reading can tell you. Without max, "4847 RPM" reads
+# as healthy.
 collect_fans() {
-    local h name f lbl rpm
+    local h name f lbl rpm fmax
     for h in /sys/class/hwmon/hwmon*; do
         [[ -d "$h" ]] || continue
         name=$(cat "$h/name" 2>/dev/null || echo "hwmon")
@@ -242,9 +317,32 @@ collect_fans() {
             rpm=$(cat "$f" 2>/dev/null) || continue
             [[ "$rpm" =~ ^[0-9]+$ ]] || continue
             lbl=$(cat "${f%_input}_label" 2>/dev/null || basename "${f%_input}")
-            printf '%s|%s|%s\n' "$name" "$lbl" "$rpm"
+            fmax=$(cat "${f%_input}_max" 2>/dev/null || echo 0)
+            [[ "$fmax" =~ ^[0-9]+$ ]] || fmax=0
+            printf '%s|%s|%s|%s\n' "$name" "$lbl" "$rpm" "$fmax"
         done
     done
+}
+
+# Per-core throttle counters: "cpuN|count" — sorted hottest-first.
+#
+# sensorz historically read ONLY package_throttle_count, which says that
+# throttling happened but never where. The per-core counters split it:
+# on this box cpu2/cpu10 sit at ~415k while cpu3/cpu11 sit at ~198k, a
+# 2x spread that points at the cores doing the real work (and, via the
+# sibling pairing, confirms which logical CPUs share a physical core).
+collect_core_throttle() {
+    local c n
+    for c in /sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count; do
+        [[ -f "$c" ]] || continue
+        n=$(cat "$c" 2>/dev/null) || continue
+        [[ "$n" =~ ^[0-9]+$ ]] || continue
+        # $c = .../cpuN/thermal_throttle/core_throttle_count, so the cpu
+        # name is TWO directories up. Taking one directory up yields
+        # "thermal_throttle" for every row — the table printed sixteen
+        # identical labels and no way to tell which core was hot.
+        printf '%s|%s\n' "$(basename "$(dirname "$(dirname "$c")")")" "$n"
+    done | sort -t'|' -k2 -rn
 }
 
 # ---------- Reporting ----------
@@ -253,8 +351,24 @@ CRIT_LIST=()
 # top-level (not local): `declare` inside a function would scope it local
 declare -A _SEEN_TEMP=()
 
-check_temp() {   # check_temp <label> <c> <trip_c>
-    local lbl="$1" t="$2" trip="${3:-0}"
+# check_temp <label> <c> <alarm_trip_c> [critical_c]
+#
+# Two thresholds, because they are NOT interchangeable:
+#   trip  temp*_max  — the firmware's ALARM point (86 C on coretemp,
+#                      `sensors` "high"). Crossing it means the board is
+#                      complaining; it is a warning, not a throttle.
+#   crit  temp*_crit — Tjmax (100 C here, `sensors` "crit"). Past this
+#                      the silicon throttles, then shuts down.
+#
+# Measured on this host rather than assumed: a package touching 89 C
+# produced ZERO throttle events, while 93-97 C produced ~73/s — because
+# the per-CORE sensors reach Tjmax first and the package figure trails
+# them. So raising a CRITICAL at the alarm point and calling it
+# "throttling" overstates the problem. The throttle counter in the
+# THERMAL THROTTLING section is the ground truth for whether throttling
+# is actually happening; temperature tells you how close you are.
+check_temp() {
+    local lbl="$1" t="$2" trip="${3:-0}" crit="${4:-0}"
     [[ -z "$t" || "$t" == "-" ]] && return 0
     [[ "$t" =~ ^[0-9]+$ ]] || return 0
     # Deduplicate: the package is reported once by the summary line and once
@@ -263,12 +377,20 @@ check_temp() {   # check_temp <label> <c> <trip_c>
     local key="${lbl}|${t}"
     [[ -n "${_SEEN_TEMP[$key]:-}" ]] && return 0
     _SEEN_TEMP[$key]=1
+    # Critical first: at/over Tjmax nothing lesser matters.
+    if (( crit > 0 && t >= crit )); then
+        critf "Thermal" "$lbl at ${t}C — AT/OVER the ${crit}C critical point (Tjmax: throttles, then shuts down)" \
+            "cooling cannot reject the heat: fans, dust, paste, mount pressure"
+        CRIT_LIST+=("$lbl ${t}C ≥ critical ${crit}C")
+        return 0
+    fi
     if (( trip > 0 )); then
         if (( t >= trip )); then
-            critf "Thermal" "$lbl at ${t}C — at/over the ${trip}C trip point"
-            CRIT_LIST+=("$lbl ${t}C ≥ ${trip}C")
+            warnf "Thermal" "$lbl at ${t}C — past the ${trip}C alarm point (${crit:-?}C is critical)" \
+                "watch it; the counter below says whether it is throttling yet"
+            WARN_LIST+=("$lbl ${t}C > alarm ${trip}C")
         elif (( t >= trip - 10 )); then
-            warnf "Thermal" "$lbl at ${t}C — only $((trip - t))C below the ${trip}C trip point"
+            warnf "Thermal" "$lbl at ${t}C — only $((trip - t))C below the ${trip}C alarm point"
             WARN_LIST+=("$lbl ${t}C (headroom $((trip - t))C)")
         fi
     else
@@ -281,6 +403,22 @@ check_temp() {   # check_temp <label> <c> <trip_c>
             WARN_LIST+=("$lbl ${t}C")
         fi
     fi
+}
+
+# Alarm on the package summary line ONLY when the per-sensor table cannot
+# do it for us. The table calls check_temp() for every hwmon chip —
+# including the package — under the label "coretemp/Package id 0", while
+# the summary line used "package". Two different strings meant two
+# different dedup keys, so ONE physical reading raised TWO criticals.
+# When hwmon exposes a package row the table owns the alarm; when it does
+# not (package read from a thermal zone instead) this line is the only
+# chance to catch it.
+check_temp_pkg() {
+    local t="$1" trip="$2" crit="$3" rows="$4"
+    if [[ -n "$(awk -F'|' '$2 ~ /ackage/ {print 1; exit}' <<<"$rows")" ]]; then
+        return 0
+    fi
+    check_temp "package" "$t" "$trip" "$crit"
 }
 
 # ---------- Main ----------
@@ -303,8 +441,12 @@ do_sample() {
     hwmon_rows=$(collect_hwmon_temps)
     zone_rows=$(collect_thermal_zones)
 
-    # pick trip points from coretemp/whatever reports crit
-    pkg_trip=$(awk -F'|' '$1=="coretemp" && $4!="" {print $4/1000; exit}' <<<"$hwmon_rows")
+    # Trip points come from coretemp's own *_max (the ALARM/throttle
+    # point, 86 C here) — not *_crit (shutdown, 100 C). See the note in
+    # collect_hwmon_temps() for why the distinction matters.
+    pkg_trip=$(awk -F'|' '$1=="coretemp" && $4 ~ /^[0-9]+$/ {print int($4/1000); exit}' <<<"$hwmon_rows")
+    local pkg_crit=""
+    pkg_crit=$(awk -F'|' '$1=="coretemp" && $5 ~ /^[0-9]+$/ {print int($5/1000); exit}' <<<"$hwmon_rows")
 
     local pkg_c=""
     pkg_c=$(awk -F'|' '$2 ~ /ackage/ {print int($3/1000); exit}' <<<"$hwmon_rows")
@@ -312,15 +454,45 @@ do_sample() {
         pkg_c=$(awk -F'|' '$1=="x86_pkg_temp" {print int($2/1000); exit}' <<<"$zone_rows")
     fi
 
+    # Chassis ambient — the acpitz motherboard sensor. This one reading
+    # settles the "is it the case?" question: if the air entering the
+    # board is 27 C while the package is 95 C, the case is ventilating
+    # fine and the problem is local to the cooler. A delta under ~20 C
+    # would instead implicate airflow.
+    local amb_c=""
+    amb_c=$(awk -F'|' '$1=="acpitz" {print int($3/1000); exit}' <<<"$hwmon_rows")
+
     if [[ -n "$pkg_c" ]]; then
         local head=""
-        (( pkg_trip > 0 )) && head="  headroom $((pkg_trip - pkg_c))C of ${pkg_trip}C"
+        if (( pkg_trip > 0 )); then
+            if (( pkg_crit > 0 && pkg_c >= pkg_crit )); then
+                head="  ${C_RED}AT/CRITICAL — ≥ ${pkg_crit}C Tjmax${C_RESET}"
+            elif (( pkg_c >= pkg_trip )); then
+                # Never print a negative "headroom" — that is how measuring
+                # against the wrong threshold made an over-temp CPU look
+                # comfortable in the first place.
+                head="  ${C_YELLOW}past ${pkg_trip}C alarm by $((pkg_c - pkg_trip))C${C_RESET} (critical ${pkg_crit:-?}C)"
+            else
+                head="  headroom $((pkg_trip - pkg_c))C to ${pkg_trip}C alarm"
+            fi
+        fi
         local pct=0
         (( pkg_trip > 0 )) && pct=$(( pkg_c * 100 / pkg_trip ))
         emit "  ${C_BOLD}package%s${C_RESET} %b%s C%s\n" "${C_DIM} (${HOSTNAME_SHORT})${C_RESET}" "$(temp_color "$pkg_c")" "$pkg_c" "$head"
-        chart_gauge "$pct" "vs trip point" 24
-        check_temp "package" "$pkg_c" "$pkg_trip"
-        JSON_FIELDS+=("\"cpu_package_c\":$pkg_c" "\"cpu_trip_c\":${pkg_trip:-0}")
+        (( pkg_trip > 0 )) && chart_gauge "$pct" "vs ${pkg_trip}C alarm" 24
+        if [[ -n "$amb_c" ]]; then
+            local delta=$(( pkg_c - amb_c ))
+            emit "  ${C_DIM}ambient %sC  →  package−ambient delta %s%sC%s${C_RESET}\n" \
+                "$amb_c" "$(temp_color "$(( delta > 60 ? 90 : 30 ))")" "$delta" "$C_RESET"
+            if (( delta > 50 )); then
+                emit "  ${C_DIM}delta %sC with cool ambient ⇒ cooler-side problem (paste/mount/fins), not case airflow${C_RESET}\n" "$delta"
+            elif (( delta <= 20 )); then
+                emit "  ${C_DIM}delta only %sC ⇒ the cooler is pulling heat out; look at intake airflow instead${C_RESET}\n" "$delta"
+            fi
+        fi
+        check_temp_pkg "$pkg_c" "$pkg_trip" "$pkg_crit" "$hwmon_rows"
+        JSON_FIELDS+=("\"cpu_package_c\":$pkg_c" "\"cpu_trip_c\":${pkg_trip:-0}" "\"cpu_crit_c\":${pkg_crit:-0}")
+        [[ -n "$amb_c" ]] && JSON_FIELDS+=("\"ambient_c\":$amb_c")
     else
         warn "no CPU package temperature exposed"
         WARN_LIST+=("no CPU package temp")
@@ -332,11 +504,11 @@ do_sample() {
     # glue every row onto a single line. That broke the table renderer (one
     # giant row) and the spread calc (27..27). Append the newline explicitly.
     local rows="" n=0
-    while IFS='|' read -r chip lbl mv crit; do
+    while IFS='|' read -r chip lbl mv mx cr; do
         [[ -z "$mv" ]] && continue
         local c=$((mv / 1000))
-        rows+="$(printf '%s\t%s\t%s' "$chip/$lbl" "$c" "${crit:-}")"$'\n'
-        check_temp "$chip/$lbl" "$c" "$(( ${crit:-0} / 1000 ))"
+        rows+="$(printf '%s\t%s\t%s' "$chip/$lbl" "$c" "$(( ${mx:-0} / 1000 ))")"$'\n'
+        check_temp "$chip/$lbl" "$c" "$(( ${mx:-0} / 1000 ))" "$(( ${cr:-0} / 1000 ))"
         n=$((n+1))
     done <<<"$hwmon_rows"
 
@@ -346,8 +518,13 @@ do_sample() {
             [[ -z "$a" ]] && continue          # skip the trailing blank line
             local tc trip_c=""
             tc=$(temp_color "$b")
-            # sysfs reports trips in millidegC (100000) — show C, not raw
-            [[ -n "$c" && "$c" =~ ^[0-9]+$ ]] && trip_c="$(( c / 1000 ))"
+            # The collector already converted millidegC → whole C when it
+            # built the row, so this must NOT divide by 1000 again (it
+            # did, printing 0 for every sensor). A sensor with no _max
+            # reports 0 — that means "no trip point", i.e. a dash, not 0.
+            if [[ "$c" =~ ^[0-9]+$ ]] && (( c > 0 )); then
+                trip_c="$c"
+            fi
             table_row "$a" "${tc}${b}${C_RESET}" "${trip_c:-—}"
         done <<<"$rows"
         table_end
@@ -423,6 +600,41 @@ do_sample() {
         info "no thermal_throttle counters exposed (non-Intel or not present)"
     fi
 
+    # Per-core split — WHERE the throttling lands, not just THAT it did.
+    local core_thr
+    core_thr=$(collect_core_throttle)
+    if [[ -n "$core_thr" ]]; then
+        local ct_rows="" ct_total=0 ct_n=0 ct_hi="" ct_lo=""
+        while IFS='|' read -r cname cval; do
+            [[ -z "$cval" ]] && continue
+            ct_rows+="$(printf '%s\t%s' "$cname" "$cval")"$'\n'
+            ct_total=$((ct_total + cval)); ct_n=$((ct_n+1))
+            [[ -z "$ct_hi" ]] && ct_hi="$cval"
+            ct_lo="$cval"
+        done <<<"$core_thr"
+
+        emit "\n  ${C_BOLD}per-core throttle${C_RESET} ${C_DIM}(cumulative, hottest first)${C_RESET}\n"
+        table_begin "core" "events" "share"
+        while IFS=$'\t' read -r cn cv; do
+            [[ -z "$cn" ]] && continue
+            local share=0
+            (( ct_total > 0 )) && share=$(( cv * 100 / ct_total ))
+            table_row "$cn" "$cv" "${share}%"
+        done <<<"$ct_rows"
+        table_end
+
+        if [[ -n "$ct_hi" && -n "$ct_lo" && "$ct_lo" -gt 0 ]]; then
+            # One decimal — integer division turned a real 1.8x spread
+            # into a useless "1x".
+            local spread
+            spread=$(awk -v h="$ct_hi" -v l="$ct_lo" 'BEGIN{printf "%.1f", h/l}')
+            emit "  ${C_DIM}spread: ${ct_hi} (hottest) vs ${ct_lo} (coolest) — ${spread}x${C_RESET}\n"
+            emit "  ${C_DIM}logical CPUs share a physical core, so identical pairs are one core; a real${C_RESET}\n"
+            emit "  ${C_DIM}spread means the work is concentrated — check what runs on the hottest cores${C_RESET}\n"
+            JSON_FIELDS+=("\"core_throttle_total\":$ct_total" "\"core_throttle_spread_x\":$spread")
+        fi
+    fi
+
     # ---------- power ----------
     section "POWER (RAPL)"
     local pw
@@ -496,17 +708,36 @@ do_sample() {
             info "visual check required: open the case and confirm every fan spins"
             info "this is common on OEM desktop boards; it does NOT mean fans are fine"
         else
-            while IFS='|' read -r chip lbl rpm; do
+            while IFS='|' read -r chip lbl rpm fmax; do
                 fan_any=1
+                # % of the firmware's nominal max. Two failure shapes that
+                # a bare RPM number hides:
+                #   rpm == 0            → stalled
+                #   rpm >= 100% of max  → firmware demanding everything it
+                #                         has and still losing to the heat
+                local fpct=-1
+                (( fmax > 0 )) && fpct=$(( rpm * 100 / fmax ))
                 if (( rpm == 0 )); then
                     crit "Fan" "$chip/$lbl is reporting 0 RPM (stalled)"
                     CRIT_LIST+=("$chip/$lbl stalled")
                 elif (( rpm < 300 )); then
                     warn "Fan" "$chip/$lbl at ${rpm} RPM (very slow)"
                     WARN_LIST+=("$chip/$lbl ${rpm}rpm")
+                elif (( fpct >= 100 )); then
+                    warn "Fan" "$chip/$lbl at ${rpm} RPM — at/over its nominal max (${fmax}); firmware is demanding full cooling"
+                    WARN_LIST+=("$chip/$lbl at max (${rpm}/${fmax}rpm)")
+                    emit "  %-24s ${C_YELLOW}%s RPM${C_RESET} ${C_DIM}(%s%% of nominal max %s — maxed out)${C_RESET}\n" \
+                        "$chip/$lbl" "$rpm" "$fpct" "$fmax"
+                elif (( fpct >= 85 )); then
+                    emit "  %-24s ${C_YELLOW}%s RPM${C_RESET} ${C_DIM}(%s%% of max %s)${C_RESET}\n" \
+                        "$chip/$lbl" "$rpm" "$fpct" "$fmax"
+                elif (( fpct >= 0 )); then
+                    emit "  %-24s ${C_GREEN}%s RPM${C_RESET} ${C_DIM}(%s%% of max %s)${C_RESET}\n" \
+                        "$chip/$lbl" "$rpm" "$fpct" "$fmax"
                 else
                     emit "  %-24s ${C_GREEN}%s RPM${C_RESET}\n" "$chip/$lbl" "$rpm"
                 fi
+                (( fpct >= 0 )) && JSON_FIELDS+=("\"fan_$(printf '%s' "$chip$lbl" | tr -c 'a-zA-Z0-9' '_')_rpm\":$rpm")
             done <<<"$fans"
             (( fan_any == 0 )) && info "no fan sensors exposed"
         fi
@@ -532,8 +763,266 @@ do_sample() {
     fi
 }
 
-# ---------- Watch mode ----------
-if (( WATCH_INTERVAL > 0 )); then
+# ---------- Attribution ----------
+# --attrib <secs>  →  "it is throttling; WHAT was running while it did?"
+#
+# Two independent measurements are taken once per second and joined on the
+# same second, so the blame is temporal rather than coincidental:
+#
+#   per-second   throttle counter delta + package temperature
+#                → WHEN it throttled, how hot, for how long
+#   per-process  utime+stime delta from /proc/<pid>/stat
+#                → WHO burned the CPU-seconds in that same second
+#
+# A process is only listed against a second if its own CPU delta in that
+# second was positive. Reading the process table costs one open() per
+# process per second (bash's $(<file) forks nothing), so a 60s window
+# with ~400 processes is ~24k reads — a few percent of one core.
+#
+# Reads utime+stime for every process into the array named by $1.
+# Prints nothing. Uses nameref so the caller keeps ownership of the map.
+_attr_read_cpu() {
+    local -n _dst="$1"
+    local f line pid rest
+    local -a a
+    _dst=()
+    for f in /proc/[0-9]*/stat; do
+        [[ -r "$f" ]] || continue
+        line=$(<"$f") 2>/dev/null || continue
+        pid=${line%% *}
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        # Everything after the LAST ')' — comm is the only field that
+        # contains parens (and the kernel escapes them as \)), so the
+        # final ')' is unambiguously the end of the comm field.
+        rest=${line##*)}
+        read -r -a a <<< "$rest"
+        # rest starts at field 3 (state): ... a[11]=utime, a[12]=stime
+        _dst[$pid]=$(( ${a[11]:-0} + ${a[12]:-0} ))
+    done
+}
+
+# Resolve "pid:pct pid:pct" into "comm:pct comm:pct" for display.
+# The sampler records PIDs (reading /proc once per second is cheap;
+# forking `cat` per process per second is not), so names are resolved
+# once, here, for only the handful of PIDs that survived to the report.
+_attr_label() {
+    local spec="$1" out="" tok pid cn
+    for tok in $spec; do
+        pid=${tok%%:*}
+        cn=$(cat "/proc/$pid/comm" 2>/dev/null || echo "$pid")
+        out+="$cn:${tok#*:} "
+    done
+    printf '%s' "${out% }"
+}
+
+do_attrib() {
+    local secs="${1:-60}"
+    [[ "$secs" =~ ^[0-9]+$ ]] || secs=60
+    (( secs < 10 )) && secs=10
+    (( secs > 3600 )) && secs=3600
+
+    local hz
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+
+    # The alarm point (temp*_max) and the critical point (temp*_crit).
+    # See check_temp() for why these are tracked separately: a package at
+    # 89 C over the alarm point still produced zero throttle events.
+    local trip crit_t
+    trip=$(awk -F'|' '$1=="coretemp" && $4 ~ /^[0-9]+$/ {print int($4/1000); exit}' \
+        <<<"$(collect_hwmon_temps)")
+    crit_t=$(awk -F'|' '$1=="coretemp" && $5 ~ /^[0-9]+$/ {print int($5/1000); exit}' \
+        <<<"$(collect_hwmon_temps)")
+    [[ "$trip" =~ ^[0-9]+$ ]] || trip=0
+    [[ "$crit_t" =~ ^[0-9]+$ ]] || crit_t=0
+
+    section "THROTTLE ATTRIBUTION"
+    info "sampling ${secs}s at 1 Hz — throttle counters, package temp, every process's CPU"
+    (( trip > 0 )) && info "alarm point for this CPU: ${trip}C (critical ${crit_t:-?}C)"
+
+    local -A cur=() prev=() tot=()
+    local -A s_rate=() s_temp=() s_top=()
+    _attr_read_cpu cur
+    local k
+    for k in "${!cur[@]}"; do prev[$k]=${cur[$k]}; done
+
+    local t0 thr0
+    t0=$(date +%s)
+    thr0=$(collect_throttle | cut -d'|' -f1)
+    [[ "$thr0" =~ ^[0-9]+$ ]] || thr0=0
+
+    local n=0 evtotal=0 over=0 overc=0 tmin=999 tmax=0 tsum=0
+    local i=0
+    while (( i < secs )); do
+        sleep 1
+        local thr1 temp1 rate
+        thr1=$(collect_throttle | cut -d'|' -f1)
+        # Fall back to the previous reading only when the counter is
+        # unreadable — NOT unconditionally. (An earlier version assigned
+        # $thr0 on both sides of the test, so the "new" value was always
+        # thrown away and every window reported zero events.)
+        [[ "$thr1" =~ ^[0-9]+$ ]] || thr1=$thr0
+        rate=$(( thr1 - thr0 )); thr0=$thr1
+        (( rate < 0 )) && rate=0
+        evtotal=$(( evtotal + rate ))
+
+        temp1=$(pkg_temp_c)
+        if [[ "$temp1" =~ ^[0-9]+$ ]]; then
+            (( temp1 < tmin )) && tmin=$temp1
+            (( temp1 > tmax )) && tmax=$temp1
+            tsum=$(( tsum + temp1 ))
+            # Both thresholds are tracked: over-alarm is a trend, over-
+            # critical is the real thing. Collapsing them into one number
+            # is what made "89C, zero events" look identical to
+            # "97C, 73 events/s".
+            (( trip > 0 && temp1 >= trip )) && over=$(( over + 1 ))
+            (( crit_t > 0 && temp1 >= crit_t )) && overc=$(( overc + 1 ))
+        fi
+        n=$(( n + 1 ))
+
+        # per-process delta for THIS second
+        _attr_read_cpu cur
+        local -a cand=()
+        for k in "${!cur[@]}"; do
+            [[ -n "${prev[$k]:-}" ]] || continue
+            local d=$(( cur[$k] - prev[$k] ))
+            (( d > 0 )) || continue
+            tot[$k]=$(( ${tot[$k]:-0} + d ))
+            cand+=( "$d $k" )
+        done
+        if (( ${#cand[@]} > 0 )); then
+            # top 3 for this second, as "pid:pct-of-one-core"
+            s_top[$i]=$(printf '%s\n' "${cand[@]}" | sort -rn | head -3 |
+                awk -v hz="$hz" '{printf "%s:%d%% ", $2, ($1*100)/hz}')
+        fi
+        s_rate[$i]=$rate
+        s_temp[$i]=$temp1
+
+        prev=()
+        for k in "${!cur[@]}"; do prev[$k]=${cur[$k]}; done
+        i=$(( i + 1 ))
+    done
+
+    local elapsed=$(( $(date +%s) - t0 ))
+    (( elapsed < 1 )) && elapsed=1
+    (( n < 1 )) && n=1
+    local avg=$(( tsum / n )) over_pct=$(( over * 100 / n )) overc_pct=$(( overc * 100 / n ))
+    # Rate over WALL CLOCK, not sample count: each iteration costs the
+    # 1s sleep plus the /proc sweep, so 25 samples can span 31s — dividing
+    # by n would overstate events per second by ~20%.
+    local rate_avg=$(( evtotal / elapsed ))
+    (( tmin > 999 )) && tmin=0
+
+    emit "\n"
+    kpi "window"        "${elapsed}s, ${n} samples @ 1Hz"
+    kpi "throttle"      "+${evtotal} events during window (${rate_avg}/s)" \
+        "$(awk -v p="$rate_avg" 'BEGIN{print (p>0?"'"$C_RED"'":"'"$C_GREEN"'")}')"
+    kpi "package temp"  "${tmin}C .. ${tmax}C  (avg ${avg}C)"
+    # BOTH thresholds, kept apart: over-alarm is "trending badly", over-
+    # critical is "the silicon is throttling right now".
+    (( trip > 0 )) && kpi "over ${trip}C alarm" "${over}/${n}s  (${over_pct}% of window)" \
+        "$(awk -v p="$over_pct" 'BEGIN{print (p>0?"'"$C_YELLOW"'":"'"$C_GREEN"'")}')"
+    (( crit_t > 0 )) && kpi "over ${crit_t}C critical" "${overc}/${n}s  (${overc_pct}% of window)" \
+        "$(awk -v p="$overc_pct" 'BEGIN{print (p>0?"'"$C_RED"'":"'"$C_GREEN"'")}')"
+    (( crit_t > 0 )) && chart_gauge "$overc_pct" "time ≥ ${crit_t}C" 24
+    JSON_FIELDS+=("\"attrib_window_s\":$elapsed" "\"attrib_events\":$evtotal" \
+                  "\"attrib_temp_min\":$tmin" "\"attrib_temp_max\":$tmax" \
+                  "\"attrib_temp_avg\":$avg" "\"attrib_over_alarm_pct\":$over_pct" \
+                  "\"attrib_over_crit_pct\":$overc_pct")
+
+    # ---- hottest seconds: where the throttle actually fired ----
+    local -a order=()
+    for k in "${!s_rate[@]}"; do
+        (( ${s_rate[$k]:-0} > 0 )) && order+=( "$k" )
+    done
+    if (( ${#order[@]} > 0 )); then
+        emit "\n  ${C_BOLD}seconds that throttled${C_RESET} ${C_DIM}(worst first, up to 8)${C_RESET}\n"
+        local sorted
+        sorted=$(for k in "${order[@]}"; do printf '%s %s %s\n' "${s_rate[$k]}" "$k" "${s_temp[$k]:--}"; done |
+            sort -rn | head -8)
+        table_begin "at" "temp" "ev/s" "top CPU consumers that second"
+        while read -r r k tp; do
+            [[ -z "$k" ]] && continue
+            local disp=""
+            # Red only past CRITICAL (Tjmax); past the alarm point is
+            # yellow. The old version reddened everything over the alarm,
+            # which flattened "warming up" and "throttling right now"
+            # into one colour.
+            if (( tp >= 0 && crit_t > 0 && tp >= crit_t )); then
+                disp="${C_RED}${tp}C${C_RESET}"
+            elif (( tp >= 0 && trip > 0 && tp >= trip )); then
+                disp="${C_YELLOW}${tp}C${C_RESET}"
+            else
+                disp="$(temp_color "$tp")${tp}C${C_RESET}"
+            fi
+            table_row "+$((k+1))s" "$disp" "$r" "$(_attr_label "${s_top[$k]:-}")"
+        done <<< "$sorted"
+        table_end
+    else
+        info "no throttle events fired during the window — nothing to attribute"
+    fi
+
+    # ---- window-level: who burned the CPU while it was hot ----
+    local -a ranked=()
+    for k in "${!tot[@]}"; do
+        (( ${tot[$k]:-0} > 0 )) && ranked+=( "${tot[$k]} $k" )
+    done
+    if (( ${#ranked[@]} > 0 )); then
+        emit "\n  ${C_BOLD}CPU burned during the window${C_RESET} ${C_DIM}(jiffies → %% of one core)${C_RESET}\n"
+        table_begin "pid" "cpu-s" "%core" "command"
+        local top_rows
+        top_rows=$(printf '%s\n' "${ranked[@]}" | sort -rn | head -10)
+        while read -r jf pid; do
+            [[ -z "$pid" ]] && continue
+            local cn
+            cn=$(cat "/proc/$pid/comm" 2>/dev/null || echo "(gone)")
+            local cs
+            cs=$(awk -v j="$jf" -v hz="$hz" 'BEGIN{printf "%.1f", j/hz}')
+            local pc
+            pc=$(awk -v j="$jf" -v hz="$hz" -v e="$elapsed" 'BEGIN{printf "%.0f", (j/hz)*100/e}')
+            table_row "$pid" "$cs" "${pc}%" "$cn"
+            JSON_FIELDS+=("\"attrib_pid_${pid}_pct\":$pc")
+        done <<< "$top_rows"
+        table_end
+        # emit() is a printf wrapper — literal % must be %% or printf
+        # eats it as a conversion specifier and mangles the line.
+        emit "  ${C_DIM}%%core = share of one core for the whole window; 100%% = one core fully busy${C_RESET}\n"
+        emit "  ${C_DIM}the processes above were running in the same seconds the counters moved${C_RESET}\n"
+    fi
+
+    # ---- verdict for this mode ----
+    # The counter decides whether throttling happened; temperature alone
+    # only says how close it was. Three distinct outcomes, because
+    # "no events but 40% of the window over the alarm" is a genuinely
+    # different (and useful) finding from "no events, never got warm".
+    if (( evtotal > 0 )); then
+        warnf "Thermal" "CPU throttled ${evtotal}x in ${elapsed}s (${rate_avg}/s); ${over_pct}% over ${trip}C alarm, ${overc_pct}% over ${crit_t:-?}C critical" \
+            "the consumer table above names what was running in those seconds"
+        WARN_LIST+=("throttled ${evtotal}x in ${elapsed}s")
+    elif (( over > 0 )); then
+        warnf "Thermal" "no throttle events, but ${over}/${n}s sat past the ${trip}C alarm point (peak ${tmax}C)" \
+            "not throttling yet — this is the early-warning signal, act before it crosses ${crit_t:-?}C"
+        WARN_LIST+=("over ${trip}C alarm ${over}/${n}s")
+    else
+        ok "no throttle events, never past the ${trip:-alarm}C alarm point in ${elapsed}s"
+    fi
+    # Only a peak past CRITICAL earns a critical — a peak over the alarm
+    # point is already reported above as a warning.
+    if (( crit_t > 0 && tmax >= crit_t )); then
+        CRIT_LIST+=("peak ${tmax}C ≥ critical ${crit_t}C")
+        critf "Thermal" "package peaked at ${tmax}C — at/over the ${crit_t}C critical point" \
+            "cooler cannot reject the heat: fans, dust, paste, mount pressure"
+    fi
+}
+
+# ---------- Dispatch ----------
+# --attrib is a focused mode: it samples for N seconds and answers "what
+# was running while it throttled", then goes straight to the shared
+# verdict below. It deliberately does NOT also run do_sample() — the
+# attribution window already reports temperature, throttle rate and trip
+# point, and a second full sweep would print the same numbers twice.
+if [[ -n "$ATTRIB_SECS" ]]; then
+    do_attrib "$ATTRIB_SECS"
+elif (( WATCH_INTERVAL > 0 )); then
     while true; do
         clear 2>/dev/null || true
         emit "%s sensorz %s  v%s — sampling every %ss  (Ctrl+C to stop)\n\n" \
@@ -542,9 +1031,9 @@ if (( WATCH_INTERVAL > 0 )); then
         do_sample
         sleep "$WATCH_INTERVAL"
     done
+else
+    do_sample
 fi
-
-do_sample
 
 # ---------- Verdict ----------
 # NOTE: emit_verdict() prints its own "VERDICT" header — printing one here
