@@ -220,6 +220,26 @@ sql() {
   "${PSQL[@]}" -c "$1" 2>/dev/null
 }
 
+# ---------- Does THIS server have that setting? ----------
+# SHOW on a setting the server does not have is an ERROR, and a
+# read-only diagnostic that writes errors into the server's log every
+# time it runs is a diagnostic that costs the DBA something. The
+# settings moved between major versions: `log_connections` was a
+# boolean until 17 and became a string (receipt/authentication/...)
+# in 18, and `log_failed_attempts` — which this suite labelled
+# "(PG14+)" — has never existed in PostgreSQL at all (checked
+# against 15, 18 and 19). Guessing a version number is how that
+# label went stale. Ask the server what it actually has.
+#
+# The answer is fetched ONCE (pg_settings is a small view) and then
+# matched in bash, so the guard costs one query per run, not one per
+# setting.
+PG_PARAMS=""
+pg_param_exists() {
+  [[ -z "$PG_PARAMS" ]] && PG_PARAMS=$(sql "SELECT string_agg(name, ' ') FROM pg_settings;" 2>/dev/null)
+  [[ " $PG_PARAMS " == *" $1 "* ]]
+}
+
 # ---------- Banner ----------
 if [[ $JSON_OUT -eq 0 ]]; then
   printf "${C_BOLD}${C_BLUE}"
@@ -449,10 +469,19 @@ fi
 # ============================================================================
 section "DATABASES"
 
+# The XID AGE is a COUNT OF TRANSACTIONS, not a number of days.
+# `datfrozenxid` is of type `xid`, and PostgreSQL's `age(xid)` returns an
+# integer (the transactions elapsed since the database was frozen) — it
+# is `age(timestamp)` that returns an interval. The old expression here
+# cast the xid to timestamptz (`datfrozenxid::timestamptz`), which is
+# not a valid cast at all, so the server answered
+# "cannot cast type xid to timestamp with time zone" on every run.
+# The wraparound thresholds below are TRANSACTION counts (100M/200M),
+# which is what this column has always meant.
 DB_HEADER=$(sql "SELECT json_build_object(
   'name', datname, 'owner', datdba::regrole, 'size', pg_database_size(datname),
   'conns', (SELECT count(*) FROM pg_stat_activity WHERE datname = d.datname),
-  'age_days', EXTRACT(DAY FROM (now() - datfrozenxid::timestamptz))
+  'xid_age', age(datfrozenxid)
 ) FROM pg_database d WHERE datistemplate = false ORDER BY pg_database_size(datname) DESC;")
 
 DB_COUNT=$(sql "SELECT count(*) FROM pg_database WHERE datistemplate = false;")
@@ -582,6 +611,12 @@ fi
 # ============================================================================
 section "LOCKS & BLOCKING"
 
+# `granted` lives on pg_locks, NOT on pg_stat_activity. The join below
+# aliases pg_stat_activity as `blocked` and pg_locks as `blocked_locks`,
+# and the old predicate read `NOT blocked.granted` — a column that
+# pg_stat_activity does not have, so every run answered
+# "column blocked.granted does not exist". The waiting lock is the one
+# on `blocked_locks`.
 BLOCKERS=$(sql "SELECT count(DISTINCT blocking_locks.pid)
 FROM pg_locks blocking_locks
 JOIN pg_locks blocked_locks ON blocking_locks.locktype = blocked_locks.locktype
@@ -591,7 +626,7 @@ JOIN pg_locks blocked_locks ON blocking_locks.locktype = blocked_locks.locktype
   AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
   AND blocking_locks.pid != blocked_locks.pid
 JOIN pg_stat_activity blocked ON blocked.pid = blocked_locks.pid
-WHERE NOT blocked.granted;")
+WHERE NOT blocked_locks.granted;")
 
 if [[ "${BLOCKERS:-0}" -gt 0 ]]; then
   warn "$BLOCKERS blocking lock chain(s) - queries waiting on others"
@@ -662,7 +697,13 @@ DB_SIZE=$(sql "SELECT pg_database_size(current_database());")
 DB_SIZE_H=$(humansize "$DB_SIZE")
 info "Database size: ${C_BOLD}${C_MAGENTA}$DB_SIZE_H${C_RESET}"
 
-MAX_TBL_SIZE=$(sql "SELECT MAX(pg_total_relation_size(oid)) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null)
+# pg_tables is a VIEW and it exposes no `oid` column — the old query
+# answered "column "oid" does not exist" and returned nothing, so
+# MAX_TBL_SIZE fell back to 1 and every bar below was scaled against 1
+# byte (a 62 GB table drew as a percentage in the billions). The size
+# functions take a regclass, so the qualified name is what they need —
+# the same expression the table listing uses.
+MAX_TBL_SIZE=$(sql "SELECT MAX(pg_total_relation_size(schemaname || '.' || tablename)) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null)
 [[ -z "$MAX_TBL_SIZE" || "$MAX_TBL_SIZE" == "" ]] && MAX_TBL_SIZE=1
 
 subsec "Top $TOP_N tables (with indexes) in public schema"
@@ -820,6 +861,7 @@ CFG_VARS=(
 for entry in "${CFG_VARS[@]}"; do
   varname="${entry%%:*}"
   desc="${entry#*:}"
+  pg_param_exists "$varname" || continue
   val=$(sql "SHOW $varname;" 2>/dev/null)
   [[ -z "$val" ]] && continue
   printf "  ${C_DIM}%-30s${C_RESET} ${C_BOLD}%-15s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
@@ -836,13 +878,14 @@ SEC_VARS=(
     "ssl:SSL/TLS required (off = plaintext passwords on wire)"
     "ssl_min_protocol_version:Minimum TLS version"
     "log_connections:Log successful connections"
-    "log_failed_attempts:Log failed auth (PG14+)"
+    "log_disconnections:Log session terminations"
     "log_statement:Which statements to log"
     "shared_preload_libraries:Loaded modules"
 )
 for entry in "${SEC_VARS[@]}"; do
     varname="${entry%%:*}"
     desc="${entry#*:}"
+    pg_param_exists "$varname" || continue
     val=$(sql "SHOW $varname;" 2>/dev/null)
     [[ -z "$val" ]] && continue
     printf "  ${C_DIM}%-30s${C_RESET} ${C_BOLD}%-18s${C_RESET} ${C_DIM}%s${C_RESET}\n" \
@@ -871,14 +914,44 @@ if [[ "$MIN_PROTO" == "TLSv1" || "$MIN_PROTO" == "TLSv1.1" ]]; then
         "Set ssl_min_protocol_version = 'TLSv1.2' (or 'TLSv1.3')."
 fi
 LOG_CONN=$(sql "SHOW log_connections;" 2>/dev/null)
-if [[ "$LOG_CONN" == "off" ]]; then
+# PG 18 turned log_connections from a boolean into a list of connection
+# aspects (receipt / authentication / authorization / setup_durations);
+# 17 and earlier used on/off. Empty means "nothing is logged" on 18+.
+if [[ "$LOG_CONN" == "off" || -z "$LOG_CONN" ]]; then
     warn "log_connections = off — connection attempts not audited"
     info "  Enable with: log_connections = on"
 fi
-LOG_FAIL=$(sql "SHOW log_failed_attempts;" 2>/dev/null)
-if [[ "$LOG_FAIL" == "off" ]]; then
-    warn "log_failed_attempts = off — auth failures not logged (PG14+)"
-    info "  Enable with: log_failed_attempts = on"
+
+# FAILED AUTHENTICATIONS.
+#
+# There is no `log_failed_attempts` setting. It was never merged into
+# PostgreSQL — checked against 15, 18 and 19 — so this suite's old
+# "(PG14+)" label was wrong, and SHOWing it put
+# "unrecognized configuration parameter" into the server's log on
+# every single run. The parameter is gone rather than re-labelled
+# because a setting that does not exist cannot be audited.
+#
+# What the check was actually after — are failed authentications being
+# logged? — is answered by the LOG, because the server writes a LOG
+# line for a rejected password whatever the settings say.
+AUTH_FAILS=0
+if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
+    info "Failed authentication attempts: not counted — no PostgreSQL log files accessible"
+else
+    for logfile in "${LOG_FILES[@]}"; do
+        if [[ "$logfile" == sudo:* ]]; then
+            real_log="${logfile#sudo:}"
+            AUTH_FAILS=$((AUTH_FAILS + $(sudo -n cat "$real_log" 2>/dev/null | grep -ciE 'authentication failed|no pg_hba.conf entry' || true)))
+        else
+            AUTH_FAILS=$((AUTH_FAILS + $(cat "$logfile" 2>/dev/null | grep -ciE 'authentication failed|no pg_hba.conf entry' || true)))
+        fi
+    done
+    if (( AUTH_FAILS > 0 )); then
+        warn "$AUTH_FAILS failed authentication attempt(s) in the PostgreSQL log"
+        info "  The server logs these itself — no setting is required."
+    else
+        ok "No failed authentication attempts in the PostgreSQL log"
+    fi
 fi
 
 # pg_hba.conf trust auth check (CRITICAL — trust = no password at all)
