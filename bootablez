@@ -51,6 +51,7 @@
 #   ./bootablez                            # report, then a menu: write / verify / show commands
 #   ./bootablez --status                   # check everything, write nothing
 #   ./bootablez --list                     # list candidate drives, write nothing
+#   ./bootablez --history                  # recorded write speeds — the ETA's basis
 #   ./bootablez --scan ~/Downloads         # where to look for .iso files
 #   ./bootablez --iso x.iso --device /dev/sdX --yes --verify
 #   ./bootablez --json                     # machine-readable summary
@@ -72,6 +73,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 ISO=""
 TARGET=""
 LIST_ONLY=0
+HISTORY_ONLY=0
 DRY_RUN=0
 ASSUME_YES=0
 FORCE=0
@@ -93,6 +95,14 @@ TARGET_SIZE=0
 BYTES_WRITTEN=0
 WRITE_DURATION=0
 AVG_BPS=0
+# Real-world write history: every finished write is measured and kept, so
+# the next ETA starts from a number THIS machine produced instead of from
+# nothing. See eta_seconds()/history_stats()/write_history_record().
+WRITE_HISTORY="${BOOTABLEZ_WRITE_HISTORY:-$HOME/.cache/bootablez/writes.tsv}"
+PREDICT_BPS=0      # median B/s from history — seeds the ETA until live data exists
+PREDICT_S=0        # what that predicts for THIS image (shown as the eta check)
+HIST_N=0           # past writes the prediction was taken from
+HIST_SAME=0        # 1 = those writes were to this same model of stick
 VERIFIED=0
 UNMOUNTED=0
 NORMALIZED_FROM=""
@@ -171,6 +181,7 @@ while [[ $i -lt $# ]]; do
     --device=*)   TARGET="${arg#--device=}" ;;
     --device|-d)  i=$((i+1)); TARGET="${ARGS[$i]:-}" ;;
     --list)       LIST_ONLY=1 ;;
+    --history)    HISTORY_ONLY=1 ;;
     --status)     STATUS_ONLY=1 ;;
     --scan=*)     SCAN_DIR="${arg#--scan=}" ;;
     --scan)       i=$((i+1)); SCAN_DIR="${ARGS[$i]:-}" ;;
@@ -287,6 +298,7 @@ OPTIONS
   --device=DEV      Target disk, e.g. /dev/sdb (bare "sdb" also works)
   --status          Inspect and advise only — never write
   --list            List candidate drives and exit
+  --history         Show the recorded write speeds the ETA is built from
   --scan=DIR        Extra directory to search for .iso files
   --macos-list      List the macOS installer media Apple's catalog offers
   --macos-download=VER
@@ -1405,6 +1417,136 @@ unmount_target() {
     fi
 }
 
+# ---------- real-world write history (what the ETA is built from) ----------
+# The live panel cannot know anything during its first seconds: it divides a
+# few megabytes by one second, so the ETA swung from 35 min to 7 min and then
+# landed somewhere else entirely — and the speed measured at the END of a
+# write was thrown away, so the next write started from nothing again.
+#
+# Every finished write is now measured and kept in WRITE_HISTORY, the median
+# of those numbers seeds the next ETA, and the live average takes over once it
+# has 8 s / 64 MB of its own data.
+
+# eta_seconds <bytes> <total> <elapsed> <predicted_bps> → seconds remaining
+eta_seconds() {
+    local bytes="$1" total="$2" elapsed="$3" pred="${4:-0}"
+    (( total > 0 )) || { printf '0'; return 0; }
+    (( bytes > total )) && bytes=$total
+    (( bytes < 0 )) && bytes=0
+    (( elapsed < 1 )) && elapsed=1
+    local avg=$(( bytes / elapsed ))
+    (( avg < 1 )) && avg=1
+    local rate="$avg"
+    # Only while the live average is still BELOW what history says — that is
+    # the cold start, a few megabytes divided by one second. Once the live
+    # number reaches the prediction (or beats it) the history has nothing to
+    # add and must not drag the ETA around; after 8 s / 64 MB it is dropped
+    # entirely, whatever the two of them say.
+    if [[ "$pred" =~ ^[0-9]+$ ]] && (( pred > 0 && avg < pred )); then
+        local we=$(( elapsed * 100 / 8 )) wb=$(( bytes * 100 / 67108864 ))
+        (( we > 100 )) && we=100
+        (( wb > 100 )) && wb=100
+        local w=$we
+        (( wb < w )) && w=$wb
+        rate=$(( (w * avg + (100 - w) * pred) / 100 ))
+        (( rate < 1 )) && rate=1
+    fi
+    local eta=$(( (total - bytes) / rate ))
+    (( eta < 0 )) && eta=0
+    printf '%s' "$eta"
+}
+
+# history_stats <model> — fill HIST_N / HIST_SAME / PREDICT_BPS from the log.
+# Writes to the same model of stick win; with none recorded yet it falls back
+# to every write, because "this machine's USB port does ~20 MB/s" is a far
+# better guess than no guess at all.
+history_stats() {
+    local model="${1:-}" f="$WRITE_HISTORY" all same use
+    HIST_N=0; HIST_SAME=0; PREDICT_BPS=0
+    [[ -r "$f" ]] || return 0
+    all=$(awk -F'\t' '/^#/ || NF < 6 { next } { print $6 }' "$f" 2>/dev/null)
+    [[ -n "$all" ]] || return 0
+    same=$(awk -F'\t' -v m="$model" \
+        '/^#/ || NF < 6 { next } m != "" && $2 == m { print $6 }' "$f" 2>/dev/null)
+    use="$all"
+    if [[ -n "$same" ]]; then use="$same"; HIST_SAME=1; fi
+    HIST_N=$(printf '%s\n' "$use" | grep -c .)
+    # the MEDIAN, not the mean: one dying stick must not skew every ETA after it
+    PREDICT_BPS=$(printf '%s\n' "$use" | sort -n \
+        | awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)] }')
+    [[ "$PREDICT_BPS" =~ ^[0-9]+$ ]] || PREDICT_BPS=0
+    return 0
+}
+
+# write_history_record — append the write that just finished. Tab-separated,
+# bounded: this file IS the real-world data the next ETA is computed from.
+write_history_record() {
+    (( BYTES_WRITTEN > 0 )) || return 0
+    local dur="$WRITE_DURATION" avg="$AVG_BPS" model
+    [[ "$dur" =~ ^[0-9]+$ ]] && (( dur > 0 )) || return 0
+    [[ "$avg" =~ ^[0-9]+$ ]] || return 0
+    model=$(lsblk1 -dn -o MODEL "$TARGET" 2>/dev/null | tr -s '[:space:]' ' ')
+    model="${model# }"; model="${model% }"
+    model="${model:-unknown}"
+    mkdir -p "$(dirname -- "$WRITE_HISTORY")" 2>/dev/null || return 0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date +%s)" "$model" "$TARGET_SIZE" "$BYTES_WRITTEN" "$dur" "$avg" \
+        >> "$WRITE_HISTORY" 2>/dev/null || return 0
+    # bounded: the oldest rows fall off the top
+    local n tmp
+    n=$(grep -vc '^#' "$WRITE_HISTORY" 2>/dev/null || true)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    if (( n > 100 )); then
+        tmp=$(mktemp "${WRITE_HISTORY}.XXXXXX" 2>/dev/null) || return 0
+        { grep '^#' "$WRITE_HISTORY" 2>/dev/null
+          grep -v '^#' "$WRITE_HISTORY" 2>/dev/null | tail -100; } > "$tmp" 2>/dev/null \
+            && mv -f "$tmp" "$WRITE_HISTORY" 2>/dev/null \
+            || rm -f "$tmp" 2>/dev/null
+    fi
+    return 0
+}
+
+# write_history_report — `--history`: what this machine has actually done,
+# newest first, plus the number the next write will open its ETA with.
+write_history_report() {
+    local f="$WRITE_HISTORY" rows
+    printf "  ${C_DIM}log: %s${C_RESET}\n\n" "${f/#$HOME/~}"
+    rows=$(grep -v '^#' "$f" 2>/dev/null | awk -F'\t' 'NF >= 6')
+    if [[ -z "$rows" ]]; then
+        info "no writes recorded yet — the first one becomes the baseline"
+        return 0
+    fi
+    table_begin "WHEN" "STICK" "IMAGE" "TOOK" "SPEED"
+    # a here-string, NOT a pipeline: `printf | while` would run table_row in a
+    # subshell and _TBL_ROWS would be gone by the time table_end looks at it
+    while IFS=$'\t' read -r ts model tgt bytes dur avg; do
+        [[ "$ts" =~ ^[0-9]+$ ]] || continue
+        table_row "$(date -d "@$ts" '+%m-%d %H:%M' 2>/dev/null)" \
+            "$(trunc "$model" 18)" "$(humansize "$bytes")" \
+            "$(fmt_dur "$dur")" "$(humansize "$avg")/s"
+    done <<< "$rows"
+    table_end
+
+    # the machine-wide baseline, then the one that applies to a stick that is
+    # plugged in right now — that is the number the next ETA opens with
+    history_stats ""
+    printf "\n  ${C_DIM}median of %d recorded write(s): %s/s${C_RESET}\n" \
+        "$HIST_N" "$(humansize "$PREDICT_BPS")"
+    if (( ${#CAND[@]} > 0 )); then
+        history_stats "$(lsblk1 -dn -o MODEL "${CAND[0]}" 2>/dev/null | tr -s '[:space:]' ' ')"
+        if (( PREDICT_BPS > 0 )); then
+            if (( HIST_SAME )); then
+                printf "  ${C_DIM}next write to %s starts from its own median: %s/s${C_RESET}\n" \
+                    "${CAND[0]}" "$(humansize "$PREDICT_BPS")"
+            else
+                printf "  ${C_DIM}next write to %s has no history of its own — using this machine's median: %s/s${C_RESET}\n" \
+                    "${CAND[0]}" "$(humansize "$PREDICT_BPS")"
+            fi
+        fi
+    fi
+    return 0
+}
+
 # ---------- dd with a live progress panel ----------
 # dd writes its progress to stderr as \r-separated records roughly once a
 # second:  "1224736768 bytes (1.2 GB, 1.1 GiB) copied, 3.00275 s, 408 MB/s"
@@ -1417,7 +1559,7 @@ unmount_target() {
 RP_LINES=0
 
 render_progress() {
-    local errlog="$1" total="$2" t0="$3"
+    local errlog="$1" total="$2" t0="$3" pred="${4:-0}"
     local line bytes pct elapsed avg eta inst bl l1 l2
     line=$(tr '\r' '\n' < "$errlog" 2>/dev/null | grep -E '^[0-9]+ bytes .* copied' | tail -1)
     [[ -z "$line" ]] && return 0
@@ -1430,7 +1572,7 @@ render_progress() {
     (( elapsed < 1 )) && elapsed=1
     avg=$(( bytes / elapsed ))
     (( avg < 1 )) && avg=1
-    eta=$(( (total - bytes) / avg ))
+    eta=$(eta_seconds "$bytes" "$total" "$elapsed" "$pred")
     # dd's own trailing rate is the near-instant one; ours is the average.
     # Extract ONLY the rate token: when dd fails it appends its error with no
     # preceding newline, so the raw tail can read
@@ -1461,6 +1603,22 @@ run_dd() {
     local full_cmd="dd bs=4M if=\"$ISO\" of=\"$TARGET\" status=progress oflag=direct conv=fsync"
     info "command: ${C_BOLD}$full_cmd${C_RESET}"
 
+    # What the ETA opens with: the speed this machine has actually
+    # measured, not a guess. Recorded again below once this write ends.
+    local model
+    model=$(lsblk1 -dn -o MODEL "$TARGET" 2>/dev/null | tr -s '[:space:]' ' ')
+    model="${model# }"; model="${model% }"
+    history_stats "$model"
+    PREDICT_S=0
+    (( PREDICT_BPS > 0 )) && PREDICT_S=$(( ISO_SIZE / PREDICT_BPS ))
+    if (( HIST_N > 0 )); then
+        local scope="on this machine"
+        (( HIST_SAME )) && scope="to this stick"
+        info "history: $HIST_N past write(s) $scope — median $(humansize "$PREDICT_BPS")/s → this image ≈ $(fmt_dur "$PREDICT_S")"
+    else
+        info "history: no writes recorded yet — this one becomes the baseline"
+    fi
+
     if (( DRY_RUN )); then
         printf "\n  ${C_YELLOW}${C_BOLD}DRY RUN${C_RESET} — nothing was written. It would run:\n"
         local m
@@ -1480,6 +1638,9 @@ run_dd() {
     dd --help 2>&1 | grep -qi progress && have_progress=1
 
     for attempt in 0 1; do
+        # per attempt: a rejected oflag=direct must not age the average
+        # (and with it the ETA) with time in which nothing was written
+        t0=$(date +%s)
         local -a args=(bs=4M "if=$ISO" "of=$TARGET" conv=fsync)
         (( have_progress )) && args+=(status=progress)
         (( attempt == 0 )) && args+=(oflag=direct)
@@ -1500,7 +1661,7 @@ run_dd() {
             rm -f "$done_flag"
             RP_LINES=0
             ( while :; do
-                render_progress "$errlog" "$ISO_SIZE" "$t0"
+                render_progress "$errlog" "$ISO_SIZE" "$t0" "$PREDICT_BPS"
                 [[ -f "$done_flag" ]] && exit 0
                 sleep 0.4
               done ) & pollpid=$!
@@ -1525,7 +1686,16 @@ run_dd() {
             # `bootablez | tee log` still shows progress
             ( while :; do
                 _pl=$(tr '\r' '\n' < "$errlog" 2>/dev/null | grep -E '^[0-9]+ bytes .* copied' | tail -1)
-                [[ -n "$_pl" ]] && printf '  %s\n' "$_pl"
+                if [[ -n "$_pl" ]]; then
+                    _pb=${_pl%% *}
+                    if [[ "$_pb" =~ ^[0-9]+$ ]]; then
+                        _pe=$(( $(date +%s) - t0 ))
+                        printf '  %s · ETA %s\n' "$_pl" \
+                            "$(fmt_dur "$(eta_seconds "$_pb" "$ISO_SIZE" "$_pe" "$PREDICT_BPS")")"
+                    else
+                        printf '  %s\n' "$_pl"
+                    fi
+                fi
                 sleep 5
               done ) & pollpid=$!
             sudo_run dd "${args[@]}" 2>"$errlog"; rc=$?
@@ -1774,6 +1944,18 @@ stats_section() {
     table_row "bytes written" "$(humansize "$BYTES_WRITTEN")"
     table_row "duration" "$(fmt_dur "$WRITE_DURATION")  (${WRITE_DURATION}s)"
     table_row "average speed" "$(humansize "$avg")/s"
+    # did the real-world number hold? this line is what makes the next
+    # prediction worth trusting (or not)
+    if (( PREDICT_S > 0 && WRITE_DURATION > 0 && BYTES_WRITTEN > 0 )); then
+        local pdelta=$(( (WRITE_DURATION - PREDICT_S) * 100 / PREDICT_S )) pverdict
+        if (( pdelta > 3 )); then pverdict="$pdelta% slower than predicted"
+        elif (( pdelta < -3 )); then pverdict="$((-pdelta))% faster than predicted"
+        else pverdict="within 3% of the prediction"; fi
+        table_row "eta check" "$(fmt_dur "$PREDICT_S") predicted from $HIST_N past write(s) · $(fmt_dur "$WRITE_DURATION") actual · $pverdict"
+    fi
+    if (( BYTES_WRITTEN > 0 )); then
+        table_row "recorded" "${WRITE_HISTORY/#$HOME/~} — the next ETA starts from this write"
+    fi
     table_row "unmounted" "$UNMOUNTED filesystem(s)/swap"
     table_row "verified" "$verified_txt"
     [[ -n "$NORMALIZED_FROM" ]] && table_row "partition fix" "$norm"
@@ -1804,6 +1986,18 @@ report() {
             printf "\n  ${C_DIM}%d usable target(s): %s${C_RESET}\n" "${#CAND[@]}" "${CAND[*]:-none}"
             printf "  ${C_DIM}next: ./bootablez --iso /path/to/image.iso --device <one-of-above>${C_RESET}\n"
         fi
+        emit_verdict
+    fi
+
+    # --history: the recorded speeds. Handled here, next to --list, so it
+    # never reaches the image scan or the menu. It exits through emit_verdict
+    # like --list does, so the ETA basis has to be added HERE — the fields at
+    # the end of main are never reached from this path.
+    if (( HISTORY_ONLY )); then
+        write_history_report
+        add_json_field "hist_bps" "$PREDICT_BPS" 1
+        add_json_field "hist_writes" "$HIST_N" 1
+        add_json_field "status" "history"
         emit_verdict
     fi
 
@@ -2457,7 +2651,8 @@ fi
 if [[ -z "$ISO" && -z "$TARGET" ]] \
    && (( ! MACOS_LIST && ! MACOS_DOWNLOAD && ! MACOS_BUILD )) \
    && [[ -z "$DISTRO" ]] \
-   && (( ! DISTRO_LIST && ! WINDOWS_USB && ! WINDOWS_BOOTS )); then
+   && (( ! DISTRO_LIST && ! WINDOWS_USB && ! WINDOWS_BOOTS )) \
+   && (( ! HISTORY_ONLY )); then
     if (( ! INTERACTIVE )) || (( JSON_OUT == 1 )); then
         # nothing was asked for and there is no terminal to ask in: the
         # report above is the answer
@@ -2715,6 +2910,9 @@ else
     printf "\n  ${C_RED}${C_BOLD}WRITE FAILED${C_RESET} — $TARGET is not a usable bootable stick right now.\n"
 fi
 
+# every finished write is a real-world measurement — keep it for the next ETA
+(( BYTES_WRITTEN > 0 )) && write_history_record
+
 stats_section
 
 section "RECOMMENDATIONS"
@@ -2737,6 +2935,8 @@ fi
 add_json_field "bytes_written" "$BYTES_WRITTEN" 1
 add_json_field "duration_s" "$WRITE_DURATION" 1
 add_json_field "avg_bps" "$AVG_BPS" 1
+add_json_field "hist_bps" "$PREDICT_BPS" 1
+add_json_field "hist_predicted_s" "$PREDICT_S" 1
 add_json_field "verified" "$([[ $VERIFIED -eq 1 ]] && echo true || echo false)" 1
 add_json_field "unmounted" "$UNMOUNTED" 1
 if (( DRY_RUN )); then
