@@ -2360,13 +2360,29 @@ do_windows_usb() {
         done
         sudo_run ls -la "$mnt_usb/sources/" | head -8
     else
-        warn "no install.wim found in the ISO — the payload may not have been copied"
-        # say what IS there, so the next run's output answers the question
-        printf "  ${C_DIM}contents of the ISO mount:${C_RESET}\n"
-        sudo_run ls -la "$mnt_iso" 2>/dev/null | head -12 >&2 || true
-        printf "  ${C_DIM}contents of the destination:${C_RESET}\n"
-        sudo_run ls -la "$mnt_usb/sources" 2>/dev/null | head -12 >&2 || true
-        sudo_run df -h "$mnt_usb" 2>/dev/null >&2 || true
+        # The kernel's UDF driver can mount a Windows ISO and show an empty
+        # root: these ISOs use UDF features it does not fully implement.
+        # The file itself is intact (its checksum matched), so read it with
+        # a userspace extractor instead.
+        warn "the kernel mounted the ISO but it shows no payload — extracting with 7-Zip instead"
+        sudo_run umount "$mnt_iso" 2>/dev/null || true
+        if ! command -v 7z >/dev/null 2>&1 && ! command -v 7zzs >/dev/null 2>&1; then
+            info "installing 7zip"
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y 7zip 2>/dev/null || apt-get install -y p7zip-full 2>/dev/null || true
+        fi
+        local sz7
+        sz7=$(command -v 7zzs || command -v 7z || true)
+        [[ -n "$sz7" ]] || { warn "no 7-Zip available (apt install 7zip)"; return 1; }
+        if ! "$sz7" x -y -o"$mnt_usb" "$iso" >/dev/null 2>&1; then
+            warn "7-Zip could not read the ISO either"
+            return 1
+        fi
+        if [[ ! -f "$mnt_usb/sources/install.wim" ]]; then
+            warn "7-Zip extracted the ISO but sources/install.wim is still missing"
+            sudo_run ls -la "$mnt_usb" 2>/dev/null | head -12 >&2 || true
+            return 1
+        fi
     fi
 
     echo "--- syncing and releasing"
