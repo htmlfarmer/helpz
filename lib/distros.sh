@@ -275,6 +275,24 @@ distro_download() {
     base=$(basename "$iso_url")
     out="$dir/$base"
 
+    # the size check happens BEFORE the download: five gigabytes of an image
+    # that will not fit on the stick is five gigabytes wasted
+    if [[ -n "${DISTRO_TARGET_BYTES:-}" ]]; then
+        local isize
+        isize=$(distro_image_size "$iso_url")
+        if [[ "$isize" =~ ^[0-9]+$ ]] && (( isize > 0 && isize > DISTRO_TARGET_BYTES )); then
+            warn "$name's image is $(humansize "$isize") but the stick is only $(humansize "$DISTRO_TARGET_BYTES")" >&2
+            warn "  it will not fit — a bigger stick (8 GB or more) is the way" >&2
+            case "$name" in
+                windows11|windows10)
+                    warn "  or keep this stick and use the boot set instead:" >&2
+                    warn "  ./bootablez --windows-boots <the .iso> --device $DEV --yes" >&2
+                    ;;
+            esac
+            return 1
+        fi
+    fi
+
     if [[ -s "$out" ]]; then
         info "have $base — checking it against the published checksum" >&2
         if distro_verify "$out" "$sum_url"; then
@@ -326,6 +344,24 @@ distro_brief() {
     printf "  ${C_DIM}refuses automated clients. --distro windows11 prints the page,${C_RESET}\n"
     printf "  ${C_DIM}the language to pick and the published hash to verify against.${C_RESET}\n"
     printf "\n"
+}
+
+# distro_image_size <url> → the size in bytes, or 0 if unknown
+distro_image_size() {
+    local url="$1"
+    [[ "$url" == "MANUAL" ]] && { printf '0'; return 0; }
+    curl -sIL "$url" 2>/dev/null | tr -d '\r' \
+        | awk 'tolower($1)=="content-length:"{print $2; exit}' | tail -1
+}
+
+# distro_fits <url> <target-bytes> → 0 when the image fits on the target
+distro_fits() {
+    local url="$1" target="$2" size
+    size=$(distro_image_size "$url")
+    [[ "$size" =~ ^[0-9]+$ ]] || return 0
+    (( size == 0 )) && return 0
+    (( target >= size )) && return 0
+    return 1
 }
 
 # distro_list → what each supported distribution currently offers

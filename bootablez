@@ -141,6 +141,10 @@ MACOS_VER=""
 # the distribution to fetch an installer ISO for, and the flag that lists them
 DISTRO=""
 DISTRO_LIST=0
+# --windows-boots=ISO → put the Windows boot SET on a stick too small for
+# the whole installer ISO
+WINDOWS_BOOTS=0
+WINDOWS_BOOTS_ISO=""
 # where the macOS media was fetched, and the assembled image
 MACOS_MEDIA_DIR=""
 MACOS_IMG=""
@@ -177,6 +181,8 @@ while [[ $i -lt $# ]]; do
     --distro=*)   DISTRO="${arg#--distro=}" ;;
     --distro)     i=$((i+1)); DISTRO="${ARGS[$i]:-}" ;;
     --distro-list) DISTRO_LIST=1 ;;
+    --windows-boots=*) WINDOWS_BOOTS=1; WINDOWS_BOOTS_ISO="${arg#--windows-boots=}" ;;
+    --windows-boots) i=$((i+1)); WINDOWS_BOOTS=1; WINDOWS_BOOTS_ISO="${ARGS[$i]:-}" ;;
     --yes|-y)     ASSUME_YES=1 ;;
     --force)      FORCE=1 ;;
     --verify)     VERIFY=1 ;;
@@ -220,6 +226,8 @@ USAGE
   ./bootablez --macos-build 10.13        Assemble a bootable offline macOS image
   ./bootablez --distro ubuntu            Fetch a distro's installer ISO and write it
   ./bootablez --distro-list              Which distro images are on offer
+  ./bootablez --windows-boots Windows.iso --device /dev/sdX
+                                         Boot set only — for a small stick
   ./bootablez --json                     Machine-readable summary
 
 LINUX DISTRIBUTIONS
@@ -283,6 +291,10 @@ OPTIONS
   --distro=NAME    Fetch that distribution's installer ISO (verified against
                     the distribution's published checksum) and write it
   --distro-list    List the installer images the supported distributions offer
+  --windows-boots=ISO
+                    Put the Windows BOOT SET on a stick too small for the
+                    whole installer ISO — about 600 MB of firmware files,
+                    enough to boot into Windows Setup
   --dry-run         Run every safety check and print the plan; write nothing
   --yes, -y         Skip the type-the-device confirmation (scripts)
   --force           Allow a non-removable or drive-sized target
@@ -2077,6 +2089,9 @@ do_menu_distro() {
         (( found )) || { printf "  ${C_YELLOW}!${C_RESET} no such distribution\n"; return 0; }
     fi
     printf "  ${C_DIM}fetching the %s image — it is checked against the published checksum${C_RESET}\n" "$name"
+    # if there is only one stick attached, check the image against it before
+    # downloading: an image that cannot fit is not worth the bandwidth
+    (( ${#CAND[@]} == 1 )) && DISTRO_TARGET_BYTES=$(lsblk -dn -b -o SIZE "${CAND[0]}" 2>/dev/null || echo 0)
     DISTRO_ISO=$(distro_download "$name") || return 0
     ISO="$DISTRO_ISO"
     ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
@@ -2177,6 +2192,62 @@ menu_loop() {
     done
 }
 
+# ---------- Windows boot set -----------------------------------------------
+# A Windows installer ISO does not fit on a small stick (Windows 10 is 5.2 GB,
+# Windows 11 is 7.7 GB) but the BOOT SET does — about 500 MB of firmware
+# files. With those, the machine boots into Windows Setup and the OS itself
+# comes from the target's own disk, a network share, or the internet.
+do_windows_boot_set() {
+    local iso="$1" target="$2" part
+    local mnt_iso=/mnt/bootablez-win-iso mnt_usb=/mnt/bootablez-win-usb
+    [[ -f "$iso" ]] || { warn "no such file: $iso"; return 1; }
+    command -v mkfs.vfat >/dev/null 2>&1 || { warn "needs mkfs.vfat (apt install dosfstools)"; return 1; }
+
+    echo "--- partitioning $target (MBR + FAT32)"
+    sudo_run wipefs -a "$target" >/dev/null 2>&1 || true
+    printf 'label: dos\nunit: sectors\n\nstart=2048, type=0xef, bootable\n' \
+        | sudo_run sfdisk --quiet "$target" || { warn "could not partition $target"; return 1; }
+    part=$(lsblk -nr -o NAME "$target" | sed -n '2p')
+    part="/dev/$part"
+    [[ -b "$part" ]] || { warn "could not find the new partition on $target"; return 1; }
+    echo "    partition: $part"
+
+    echo "--- formatting FAT32"
+    sudo_run mkfs.vfat -F 32 -n "WININST" "$part" || { warn "mkfs.vfat failed"; return 1; }
+
+    echo "--- reading the boot files out of the ISO"
+    sudo_run mkdir -p "$mnt_iso" "$mnt_usb" || return 1
+    sudo_run mount -o loop,ro "$iso" "$mnt_iso" || { warn "could not mount the ISO"; return 1; }
+    sudo_run mount "$part" "$mnt_usb" || { sudo_run umount "$mnt_iso"; warn "could not mount $part"; return 1; }
+
+    # the names on a Windows ISO come out in whatever case the filesystem
+    # carries — match them case-insensitively instead of guessing
+    local rel dest f
+    while IFS='|' read -r rel dest; do
+        [[ -n "$rel" ]] || continue
+        f=$(sudo_run find "$mnt_iso" -ipath "*/$rel" -print -quit 2>/dev/null | head -1)
+        [[ -n "$f" ]] || { printf "    ${C_DIM}(not found: %s)${C_RESET}\n" "$rel"; continue; }
+        sudo_run mkdir -p "$(dirname "$mnt_usb/$dest")" 2>/dev/null || true
+        if sudo_run cp -f "$f" "$mnt_usb/$dest"; then
+            printf "    ${C_GREEN}+${C_RESET} %s\n" "$dest"
+        fi
+    done <<'EOF'
+bootmgr|bootmgr
+boot/BCD|boot/BCD
+sources/boot.wim|sources/boot.wim
+sources/install.boot|sources/install.boot
+efi/boot/bootx64.efi|efi/boot/bootx64.efi
+efi/microsoft/boot/bootmgfw.efi|efi/microsoft/boot/bootmgfw.efi
+EOF
+
+    echo "--- syncing and releasing"
+    sudo_run sync
+    sudo_run umount "$mnt_usb"
+    sudo_run umount "$mnt_iso"
+    sudo_run rmdir "$mnt_iso" "$mnt_usb" 2>/dev/null || true
+    return 0
+}
+
 # ============================================================================
 # main
 # ============================================================================
@@ -2204,6 +2275,13 @@ if [[ -n "$DISTRO" || "$DISTRO_LIST" == "1" ]]; then
         *) usage_abort "unknown distribution: $DISTRO  (try --distro-list)" ;;
     esac
     section "DISTRO · $DISTRO"
+    # if we already know the stick, check the image against it BEFORE the
+    # download: five gigabytes of an image that cannot fit is wasted
+    if [[ -n "$TARGET" ]] && [[ -b "$TARGET" ]]; then
+        DISTRO_TARGET_BYTES=$(lsblk -dn -b -o SIZE "$TARGET" 2>/dev/null || echo 0)
+    elif (( ${#CAND[@]} == 1 )); then
+        DISTRO_TARGET_BYTES=$(lsblk -dn -b -o SIZE "${CAND[0]}" 2>/dev/null || echo 0)
+    fi
     DISTRO_ISO=$(distro_download "$DISTRO") || usage_abort "could not fetch the $DISTRO installer"
     ISO="$DISTRO_ISO"
     ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
@@ -2215,6 +2293,41 @@ if [[ -n "$DISTRO" || "$DISTRO_LIST" == "1" ]]; then
         add_json_field "status" "distro-image"
         emit_verdict
     fi
+fi
+
+# ---------- Windows boot set -----------------------------------------------
+# A Windows installer ISO does not fit on a small stick (Windows 10 is 5.2 GB,
+# Windows 11 is 7.7 GB) but the BOOT SET does — about 600 MB of firmware
+# files. With those on the stick the machine boots into Windows Setup, and
+# the OS itself comes from the target's own disk, a network share, or the
+# internet.
+if (( WINDOWS_BOOTS )); then
+    [[ -n "$WINDOWS_BOOTS_ISO" ]] || usage_abort "--windows-boots needs the ISO: --windows-boots /path/to/Windows.iso"
+    [[ -n "$TARGET" ]] || usage_abort "--windows-boots needs a target: --device /dev/sdX"
+    section "WINDOWS BOOT SET"
+    normalize_target
+    # the safety rails run against the BOOT SET's size, not the whole ISO's:
+    # a target smaller than the ISO is the whole point here
+    local saved_iso="$ISO" saved_size="$ISO_SIZE"
+    ISO="$WINDOWS_BOOTS_ISO"
+    ISO_SIZE=629145600
+    check_target
+    ISO="$saved_iso"; ISO_SIZE="$saved_size"
+    confirm_target
+    ensure_sudo
+    if do_windows_boot_set "$WINDOWS_BOOTS_ISO" "$TARGET"; then
+        ok "the Windows boot set is on $TARGET"
+        printf "\n  ${C_DIM}the stick now boots Windows Setup. The OS itself comes from:${C_RESET}\n"
+        printf "    ${C_DIM}· the ISO on the TARGET machine's own disk${C_RESET}\n"
+        printf "    ${C_DIM}· a network share — Setup asks where the installation files are${C_RESET}\n"
+        printf "    ${C_DIM}· the internet, via Windows Update${C_RESET}\n"
+        printf "\n  ${C_DIM}verify the ISO you download on that machine against the published hash:${C_RESET}\n"
+        printf "    ${C_DIM}ef7312733a9f5d7d51cfa04ac497671995674ca5e1058d5164d6028f0938d668${C_RESET}\n"
+    else
+        printf "\n  ${C_RED}✗${C_RESET} the boot set could not be written\n"
+    fi
+    add_json_field "status" "windows-boot-set"
+    emit_verdict
 fi
 
 # ---------- macOS installer media -------------------------------------------
