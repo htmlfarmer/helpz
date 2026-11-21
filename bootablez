@@ -794,6 +794,19 @@ boot_instructions() {
         printf "  ${C_BOLD}3.${C_RESET} Missed it? Setup key is ${C_BOLD}%s${C_RESET} ${C_DIM}→ Boot Order, put the USB first${C_RESET}\n" "$setupkey"
     fi
 
+    # The key itself never changes between keyboards — but whether it WORKS
+    # often does: on laptops and on Apple hardware the F-keys are media keys
+    # first, which is the usual reason "I tapped F12 and nothing happened".
+    printf "\n  ${C_BOLD}keyboards${C_RESET}\n"
+    printf "    ${C_DIM}· the key above is the same on a PC/Windows keyboard and an Apple keyboard${C_RESET}\n"
+    printf "    ${C_DIM}· F-keys doing brightness/volume instead? hold ${C_BOLD}Fn${C_RESET}${C_DIM} with it (FnLock off)${C_RESET}\n"
+    case "${vendor,,}" in
+        *apple*)
+            printf "    ${C_DIM}· on a Mac keyboard that is ${C_BOLD}Option (⌥)${C_RESET}${C_DIM} — ${C_BOLD}Alt${C_RESET}${C_DIM} on a PC keyboard${C_RESET}\n"
+            printf "    ${C_DIM}· Apple Silicon Macs cannot boot x86 USB media at all${C_RESET}\n"
+            ;;
+    esac
+
     # Arch's installer is not signed for Secure Boot by default
     if [[ "${img,,}" == *arch* ]]; then
         printf "  ${C_YELLOW}!${C_RESET} Arch's installer is not signed for Secure Boot — if it is rejected\n"
@@ -804,6 +817,7 @@ boot_instructions() {
     printf "    ${C_DIM}· try a USB 2 port — some firmwares ignore USB 3 during boot${C_RESET}\n"
     printf "    ${C_DIM}· turn off Windows Fast Startup (it hibernates and locks the disk)${C_RESET}\n"
     printf "    ${C_DIM}· check UEFI vs Legacy/CSM in setup — the stick may show in only one${C_RESET}\n"
+    printf "    ${C_DIM}· already sitting in Linux? efibootmgr -v shows what the firmware kept${C_RESET}\n"
     printf "\n"
     return 0
 }
