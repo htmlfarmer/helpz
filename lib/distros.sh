@@ -388,3 +388,22 @@ distro_list() {
         printf '  %-12s %-46s %s\n' "$name" "$(basename "$iso_url")" "$(humansize "${size:-0}")"
     done
 }
+
+# windows_boot_help → how to start a Windows USB, and the fix for the error
+# everybody hits when a Windows installer USB was not made on Windows
+windows_boot_help() {
+    printf "  ${C_BOLD}Boot it:${C_RESET} one-time boot-menu key — F12 Dell, F9 HP, F11 Lenovo\n"
+    printf "\n"
+    printf "  ${C_YELLOW}!${C_RESET} ${C_BOLD}use a USB 2.0 port — the black ones, not the blue USB 3 ones.${C_RESET}\n"
+    printf "    ${C_DIM}Windows Setup has no xHCI driver for hardware this old, so a USB 3 port${C_RESET}\n"
+    printf "    ${C_DIM}makes it ask for a driver. That dialog — \"A required CD/DVD drive${C_RESET}\n"
+    printf "    ${C_DIM}device driver is missing\" (or \"A media driver your computer needs${C_RESET}\n"
+    printf "    ${C_DIM}is missing\") means the media is unreadable, not that a video driver${C_RESET}\n"
+    printf "    ${C_DIM}is missing: Windows Setup runs on a basic display adapter and installs${C_RESET}\n"
+    printf "    the GPU driver after the copy step.\n"
+    printf "  ${C_DIM}If it appears anyway: click Browse → the stick's sources/ folder.${C_RESET}\n"
+    printf "  ${C_DIM}If it persists, the split .swm files are the likely cause — the stick${C_RESET}\n"
+    printf "    ${C_DIM}needs one install.wim on NTFS instead (Microsoft's Media Creation Tool,${C_RESET}\n"
+    printf "    ${C_DIM}or Rufus in NTFS mode), which sidesteps the 4 GB FAT32 limit.${C_RESET}\n"
+    printf "  ${C_DIM}On a Mac (Intel) hold Option (⌥) — Alt on a PC keyboard — at boot.${C_RESET}\n"
+}

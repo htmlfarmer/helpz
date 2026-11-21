@@ -478,7 +478,11 @@ rotational_of() {
 volume_label() {
     local f="$1"
     [[ -r "$f" ]] || return 0
-    [[ "$(dd if="$f" bs=1 skip=32769 count=5 2>/dev/null)" == "CD001" ]] || return 0
+    # tr strips the NULs BEFORE bash captures the substitution: a non-ISO file
+    # has arbitrary bytes at 32769, and bash warns "ignored null byte in
+    # input" for every NUL it has to drop — a shell warning on stderr from a
+    # function that is only supposed to answer "is this an ISO?".
+    [[ "$(dd if="$f" bs=1 skip=32769 count=5 2>/dev/null | tr -d '\000')" == "CD001" ]] || return 0
     dd if="$f" bs=1 skip=32808 count=32 2>/dev/null | tr -d '\000' | sed 's/[[:space:]]*$//'
 }
 
@@ -2430,7 +2434,16 @@ fi
 # A bare `bootablez` is a report first: then it asks what you want to do,
 # rather than expecting you to remember flags. Every choice except "write"
 # is handled inside menu_loop; picking 1 returns here so the wizard runs.
-if [[ -z "$ISO" && -z "$TARGET" ]]; then
+#
+# Only a run that asked for NOTHING specific is a bare run. Flags such as
+# --macos-list, --macos-build, --distro-list or --windows-usb deliberately
+# set no image and no target — exactly like a bare run does — so without
+# this guard the menu swallowed them and emit_verdict exited before their
+# own code was ever reached (the macOS route was unreachable from a flag).
+if [[ -z "$ISO" && -z "$TARGET" ]] \
+   && (( ! MACOS_LIST && ! MACOS_DOWNLOAD && ! MACOS_BUILD )) \
+   && [[ -z "$DISTRO" ]] \
+   && (( ! DISTRO_LIST && ! WINDOWS_USB && ! WINDOWS_BOOTS )); then
     if (( ! INTERACTIVE )) || (( JSON_OUT == 1 )); then
         # nothing was asked for and there is no terminal to ask in: the
         # report above is the answer
@@ -2517,10 +2530,10 @@ if (( WINDOWS_BOOTS )); then
     unmount_target
     if do_windows_boot_set "$WINDOWS_BOOTS_ISO" "$TARGET"; then
         ok "the Windows boot set is on $TARGET"
-        printf "\n  ${C_DIM}the stick now boots Windows Setup. The OS itself comes from:${C_RESET}\n"
-        printf "    ${C_DIM}· the ISO on the TARGET machine's own disk${C_RESET}\n"
-        printf "    ${C_DIM}· a network share — Setup asks where the installation files are${C_RESET}\n"
-        printf "    ${C_DIM}· the internet, via Windows Update${C_RESET}\n"
+        printf "\n"
+        declare -F windows_boot_help >/dev/null 2>&1 && windows_boot_help
+        printf "\n  ${C_DIM}the OS itself comes from the ISO on the TARGET machine's disk,${C_RESET}\n"
+        printf "  ${C_DIM}a network share, or the internet — the stick only starts Setup.${C_RESET}\n"
         printf "\n  ${C_DIM}verify the ISO you download on that machine against the published hash:${C_RESET}\n"
         printf "    ${C_DIM}ef7312733a9f5d7d51cfa04ac497671995674ca5e1058d5164d6028f0938d668${C_RESET}\n"
     else
@@ -2568,9 +2581,9 @@ if (( WINDOWS_USB )); then
     unmount_target
     if do_windows_usb "$WINDOWS_USB_ISO" "$TARGET"; then
         ok "the Windows USB is on $TARGET"
-        printf "\n  ${C_DIM}Boot it: one-time boot-menu key on a PC (F12 Dell, F9 HP, F11 Lenovo),${C_RESET}\n"
-        printf "  ${C_DIM}or Option (⌥) — Alt on a PC keyboard — on an Intel Mac.${C_RESET}\n"
-        printf "  ${C_DIM}Windows 10 22H2 is the newest version most pre-2018 hardware supports;${C_RESET}\n"
+        printf "\n"
+        declare -F windows_boot_help >/dev/null 2>&1 && windows_boot_help
+        printf "\n  ${C_DIM}Windows 10 22H2 is the newest version most pre-2018 hardware supports;${C_RESET}\n"
         printf "  ${C_DIM}Windows 11 from 24H2 on wants TPM 2.0 and Secure Boot.${C_RESET}\n"
     else
         printf "\n  ${C_RED}✗${C_RESET} the Windows USB could not be built\n"
@@ -2595,7 +2608,7 @@ if (( MACOS_LIST || MACOS_DOWNLOAD || MACOS_BUILD )); then
         MACOS_MEDIA_DIR=$(macos_download "$MACOS_VER") || usage_abort "could not fetch the macOS $MACOS_VER media"
         MACOS_IMG="$MACOS_MEDIA_DIR/macos-$MACOS_VER.img"
         info "assembling a bootable macOS $MACOS_VER image (recovery system + payload in one HFS+ volume)"
-        macos_build "$MACOS_DIR" "$MACOS_IMG" || usage_abort "could not assemble the macOS image"
+        macos_build "$MACOS_MEDIA_DIR" "$MACOS_IMG" || usage_abort "could not assemble the macOS image"
         ISO="$MACOS_IMG"
         ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
         IMAGE_KIND="macos"
