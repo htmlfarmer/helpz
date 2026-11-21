@@ -2350,7 +2350,7 @@ do_windows_usb() {
     [[ -f "$wim" ]] || { warn "sources/install.wim is missing after the extraction"; return 1; }
 
     echo "--- splitting install.wim so it fits FAT32"
-    if ! sudo_run wimlib-imagex split "$wim" "$work/sources/install.swm" 4000M; then
+    if ! sudo_run wimlib-imagex split "$wim" "$work/sources/install.swm" 4000; then
         warn "wimlib could not split the payload"
         rm -rf "$work"
         return 1
