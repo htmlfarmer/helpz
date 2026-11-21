@@ -35,7 +35,7 @@
 #   6-9) hour, 24h (default), 7d, 30d ...
 #   7) Custom journalctl time string
 #
-# Exits 0 if healthy, 1 warnings found, 2 critical issues found.
+# Exits 0 if healthy, 1 warning, 2 critical issues.
 # Works with or without sudo (graceful degradation).
 # ============================================================================
 
@@ -81,7 +81,10 @@ while [[ $i -lt $# ]]; do
     --no-color)  NO_COLOR=1 ;;
         --json)
             JSON_OUT=1
-            shift
+            # NO `shift` here: this parser is index-based over ARGS and the
+            # loop runs `while [[ $i -lt $# ]]`. Shifting shrank $#, so the
+            # loop stopped early and every option AFTER --json was silently
+            # dropped — `logz --json --last=5m` scanned 24 hours instead of 5.
             # JSON mode: the human report goes to stderr, stdout carries only
             # the JSON object. fd 4 is opened HERE — before any output — and is
             # this tool's own real stdout. It is never inherited from a parent
@@ -220,6 +223,26 @@ if [[ $SINCE_SET -eq 0 && $JSON_OUT -eq 0 ]]; then
   # Non-interactive AND no --since: SINCE stays at default "24 hours ago"
 fi
 
+# ---------- Resolve the window into journalctl flags ----------
+# Menu option 10 ("Since boot") sets SINCE="". Every call site guarded its
+# flag with `[[ -n "$SINCE" ]] && ... --since "$SINCE"`, so an empty window
+# meant NO time filter at all — and journalctl with no --since reads EVERY
+# boot in the journal (46 boots here, back to 2026-04-28). That is why a
+# "Since boot" scan reported Oct 27 OOM kills, Apr..Sep SSH failures, 17k
+# errors and openclaw/ollama failures that all predate this boot.
+#
+# An empty window must become -b (the boot you are running now). Use
+# `journalctl -b -1` if you ever need the PREVIOUS boot instead.
+if [[ -n "$SINCE" ]]; then
+  JOURNAL_WIN=(--since "$SINCE")
+  JOURNAL_FIX="--since '$SINCE'"
+  WIN_LABEL="$SINCE"
+else
+  JOURNAL_WIN=(-b)
+  JOURNAL_FIX="-b"
+  WIN_LABEL="since boot (this boot only)"
+fi
+
 # If JSON mode is enabled, suppress all stdout during data collection
 if [[ $JSON_OUT -eq 1 ]]; then
     [[ -n "${_JSON_FD4:-}" ]] && exec 1>&4
@@ -265,8 +288,7 @@ count_journal() {
   else
     local cmd=()
     [[ -n "$SUDO" ]] && cmd+=("$SUDO")
-    cmd+=(journalctl --no-pager -q)
-    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
+    cmd+=(journalctl --no-pager -q "${JOURNAL_WIN[@]}")
     "${cmd[@]}" 2>/dev/null | grep -ciE "$pattern" | head -1
   fi
 }
@@ -278,8 +300,7 @@ run_journal() {
   else
     local cmd=()
     [[ -n "$SUDO" ]] && cmd+=("$SUDO")
-    cmd+=(journalctl --no-pager -q)
-    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
+    cmd+=(journalctl --no-pager -q "${JOURNAL_WIN[@]}")
     "${cmd[@]}" 2>/dev/null
   fi
 }
@@ -292,7 +313,19 @@ run_journal() {
 # probes) and were the #1 recurring message. Real failed logins log a
 # different message ("pam_unix(sudo:auth): authentication failure") which is
 # NOT filtered — SECTION 3 counts those separately.
-SUDO_NOISE='a password is required ; '
+#
+# The same probes also leave a pair of PAM lines at ERR and CRIT priority
+# when sudo is run with no terminal (testz runs every tool with </dev/null):
+#
+#   pam_unix(sudo:auth): conversation failed              <- err
+#   pam_unix(sudo:auth): auth could not identify password <- crit
+#
+# Both mean "no password could be obtained at all", i.e. nothing was even
+# attempted — they are infrastructure noise, not an auth failure. A mistyped
+# interactive password logs "authentication failure; ..." instead, which
+# stays visible. Left unfiltered these made a healthy box read
+# "CRITICAL: 2 critical ... Action needed" whenever a tool had probed sudo.
+SUDO_NOISE='a password is required ; |pam_unix\(sudo:auth\): conversation failed|pam_unix\(sudo:auth\): auth could not identify password'
 
 # Every windowed journalctl query goes through here: same flags, same filter,
 # in one place. journalctl indents the continuation lines of a multi-line
@@ -300,8 +333,8 @@ SUDO_NOISE='a password is required ; '
 # only lines that OPEN an entry (timestamp at column 0; continuation lines
 # are indented and journal headers start with "--").
 journal_window() {
-  ${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q "$@" 2>/dev/null \
-    | grep -va "$SUDO_NOISE" || true
+  ${SUDO:+$SUDO }journalctl "${JOURNAL_WIN[@]}" --no-pager -q "$@" 2>/dev/null \
+    | grep -vaE "$SUDO_NOISE" || true
 }
 
 # journal_count <priority-spec>  -> number of ENTRIES, e.g. "warning..warning"
@@ -398,7 +431,7 @@ fi
 if [[ -n "$SINCE" ]]; then
   info "Time window: $SINCE"
 else
-  info "Time window: since boot"
+  info "Time window: since boot (current boot only, journalctl -b)"
 fi
 
 # ---------- Journal cache (AFTER the privilege check, see above) ----------
@@ -414,9 +447,12 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
     trap "rm -f '$JOURNAL_CACHE' 2>/dev/null" EXIT
     cmd=()
     [[ -n "$SUDO" ]] && cmd+=("$SUDO")
-    cmd+=(journalctl --no-pager -q)
-    [[ -n "$SINCE" ]] && cmd+=(--since "$SINCE")
-    "${cmd[@]}" > "$JOURNAL_CACHE" 2>/dev/null || true
+    cmd+=(journalctl --no-pager -q "${JOURNAL_WIN[@]}")
+    # Filter while caching, not only in journal_window(): count_journal() and
+    # run_journal() read this file directly, so leaving the cache raw kept the
+    # suite's own sudo-probe noise in the TOP RECURRING table and in every
+    # count that goes through the cache.
+    "${cmd[@]}" 2>/dev/null | grep -vaE "$SUDO_NOISE" > "$JOURNAL_CACHE" || true
 fi
 
 # ============================================================================
@@ -426,7 +462,7 @@ fi
 # getting worse?" before the reader has to wade through the detail.
 if [[ $JSON_OUT -eq 0 ]]; then
   section "AT A GLANCE"
-  printf "  ${C_DIM}window:${C_RESET} %s → now   ${C_DIM}host:${C_RESET} %s\n" "${SINCE:-since boot}" "$HOSTNAME_SHORT"
+  printf "  ${C_DIM}window:${C_RESET} %s → now   ${C_DIM}host:${C_RESET} %s\n" "$WIN_LABEL" "$HOSTNAME_SHORT"
   printf "\n"
 
   if [[ $HAVE_JOURNALCTL -eq 1 && ( -n "$SUDO" || $EUID -eq 0 ) ]]; then
@@ -435,7 +471,7 @@ if [[ $JSON_OUT -eq 0 ]]; then
     # "the journal is completely quiet" over 370 real errors), and a bare
     # "-p warning" means "warning AND MORE SEVERE" — it included _jc and
     # double-counted every problem into the warning segment of the bar.
-    _jc=$(journal_count "emerg..err")          # problems: emerg..err
+    _jc=$(journal_count "emerg..err")          # errors: emerg..err
     _jw=$(journal_count "warning..warning")    # warnings only
     _jn=$(journal_count "notice..info")        # notice + info
     [[ "$_jc" =~ ^[0-9]+$ ]] || _jc=0
@@ -460,7 +496,11 @@ if [[ $JSON_OUT -eq 0 ]]; then
       (( _n2 > 0 )) && _bar+="${C_YELLOW}$(chart_repeat "$_g_mid" "$_n2")${C_RESET}"
       (( _n3 > 0 )) && _bar+="${C_DIM}$(chart_repeat "$_g_light" "$_n3")${C_RESET}"
       printf "  ${C_BOLD}mix${C_RESET}       %b\n" "$_bar"
-      printf "  ${C_DIM}%s %d problem%s   %s %d warning%s   %s %d info${C_RESET}\n" \
+      # The legend says "error", not "problem": this row and the trend row
+      # count journal PRIORITY (emerg..err), while the VERDICT below counts
+      # findings. Calling both "problems" is what made "1 problem" up here
+      # disagree with "2 critical" at the bottom of the same report.
+      printf "  ${C_DIM}%s %d error%s   %s %d warning%s   %s %d info${C_RESET}\n" \
         "$_g_full" "$_jc" "$( [[ $_jc -eq 1 ]] && echo "" || echo "s" )" \
         "$_g_mid"  "$_jw" "$( [[ $_jw -eq 1 ]] && echo "" || echo "s" )" \
         "$_g_light" "$_jn"
@@ -480,7 +520,7 @@ if [[ $JSON_OUT -eq 0 ]]; then
     _tnow=$(date +%s)
     if [[ "$_t0" =~ ^[0-9]+$ ]] && (( _tnow - _t0 > 120 )); then
       _span=$(( _tnow - _t0 ))
-      # Same bucket the mix bar calls "problems" (emerg..err) — the old
+      # Same bucket the mix bar calls "errors" (emerg..err) — the old
       # "warning..alert" range silently meant something else — and only
       # timestamped lines count: continuation lines have no timestamp, and
       # coercing their first word to a number dumped them all in slice 0.
@@ -489,7 +529,19 @@ if [[ $JSON_OUT -eq 0 ]]; then
             $1 ~ /^@?[0-9]+/ { b=int(($1-s)/(sp/12+1)); if(b<0)b=0; if(b>11)b=11; c[b]++ }
             END{ for(i=0;i<12;i++) printf "%d%s", c[i]+0, (i<11?" ":"") }')
       if [[ -n "$_spark" ]]; then
-        printf "  ${C_BOLD}trend${C_RESET}     %s  ${C_DIM}problems per 1/12 of the window${C_RESET}\n" "$(chart_spark "$_spark")"
+        # chart_spark prints TWO lines (the spark, then a min/max/avg/last
+        # row). Wrapping it in a command substitution inside a one-line
+        # printf glued row 2 onto this line's caption, so it read
+        # "last 1  problems per 1/12 of the window". Split the rows first.
+        _spark_out=$(chart_spark "$_spark")
+        if [[ "$_spark_out" == *$'\n'* ]]; then
+          _spark_line="${_spark_out%%$'\n'*}"
+          printf "  ${C_BOLD}trend${C_RESET}     %s  ${C_DIM}errors per 1/12 of the window${C_RESET}\n" \
+            "${_spark_line#  }"
+          printf "%s\n" "${_spark_out#*$'\n'}"
+        else
+          printf "  ${C_BOLD}trend${C_RESET}     %s  ${C_DIM}errors per 1/12 of the window${C_RESET}\n" "$_spark_out"
+        fi
       fi
     fi
   else
@@ -518,11 +570,38 @@ else
     case "$PRIO" in
       emerg|alert|crit|err)
         if (( COUNT > 0 )); then
-          crit "$COUNT ${PRIO} messages"
-          # Show what they actually are - the count alone is not actionable.
+          ERR_LINES=""
           if [[ "$PRIO" == "err" ]]; then
-            ERR_LINES=$(journal_window -p err..err | tail -6)
-            [[ -n "$ERR_LINES" ]] && printf '%s\n' "$ERR_LINES" \
+            ERR_ALL=$(journal_window -p err..err)
+            ERR_LINES=$(printf '%s\n' "$ERR_ALL" | grep -a '^[^ -]' | tail -6)
+            # Packages ship udev rules naming groups that do not exist; udevvd
+            # logs the rule at err priority and ignores it, so nothing failed.
+            # When EVERY err in the window is one of those, calling it critical
+            # is what made a healthy box read "Action needed". Only entry-
+            # opening lines are counted (continuation lines are indented and
+            # do not match the pattern), which is also how journal_count()
+            # derives COUNT above.
+            ERR_BENIGN='Failed to resolve (group|user)|Unknown group|Unknown user'
+            ERR_REAL=$(printf '%s\n' "$ERR_ALL" | grep -a '^[^ -]' | grep -cviE "$ERR_BENIGN")
+            [[ "$ERR_REAL" =~ ^[0-9]+$ ]] || ERR_REAL=$COUNT
+          elif [[ "$PRIO" == "crit" ]]; then
+            # Sample crit entries too. Only err used to print its lines, so a
+            # crit bucket showed a bare "2 crit messages" — an unexplained
+            # CRITICAL the reader had no way to identify.
+            ERR_LINES=$(journal_window -p crit..crit | grep -a '^[^ -]' | tail -6)
+            ERR_REAL=$COUNT
+          else
+            ERR_REAL=$COUNT
+          fi
+          if (( ERR_REAL > 0 )); then
+            crit "$COUNT ${PRIO} messages"
+          else
+            warnf log_health "$COUNT ${PRIO} messages — known-benign (udev rules naming groups/users that do not exist)" \
+              "udev skips those rules; the fix ships with the package that owns it (dpkg -S /usr/lib/udev/rules.d/<file>)."
+          fi
+          # Show what they actually are - the count alone is not actionable.
+          if [[ -n "$ERR_LINES" ]]; then
+            printf '%s\n' "$ERR_LINES" \
               | awk -v d="$C_DIM" -v r="$C_RESET" '
                   # Keep the timestamp: two failures of the same unit at
                   # different times are two events, not one line pasted
@@ -606,7 +685,7 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
           if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " $0; next }
           sub(/^[ \t]+/, ""); print "        " $0
         }'
-    printf "      ${C_GREEN}fix:${C_RESET} sudo journalctl -k --since '$SINCE' | grep -iE 'oom|killed process'\n"
+    printf "      ${C_GREEN}fix:${C_RESET} sudo journalctl -k %s | grep -iE 'oom|killed process'\n" "$JOURNAL_FIX"
   else
     ok "No OOM kills"
   fi
@@ -651,10 +730,17 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # "1 hardware/memory errors - check DIMMs and CPU", and the sample grep below
   # doesn't know that pattern either — so the panel printed a count with no
   # lines under it and sent the reader to grep dmesg for MCEs that weren't there.
-  MCE=$(count_journal "machine check exception|mce:|edac.*error")
+  #
+  # And now scoped to kernel lines: `edac.*error` also matches file PATHS
+  # ("…/drivers/edac/skx_edac.mod … finished with error"), so a desktop
+  # indexer crawling a kernel source tree produced 19 "hardware/memory
+  # errors - check DIMMs and CPU" criticals. Kernel MCE/EDAC reports always
+  # come from the kernel facility; a Tracker warning never does.
+  MCE_PAT='kernel:.*(machine check exception|mce:|edac.*error)'
+  MCE=$(count_journal "$MCE_PAT")
   if (( MCE > 0 )); then
     crit "$MCE hardware/memory errors - check DIMMs and CPU"
-    run_journal | grep -iE "machine check exception|mce:|edac.*error" \
+    run_journal | grep -iE "$MCE_PAT" \
       | tail -3 \
       | awk '{
           # Keep the timestamp. Stripping it made four lines from ONE kill
@@ -698,7 +784,7 @@ if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   SSH_FAIL=$(count_journal "sshd.*authentication failure;|sshd.*failed password")
   if (( SSH_FAIL > 0 )); then
     crit "$SSH_FAIL SSH authentication failures - possible brute force"
-    _sf=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
+    _sf=$(${SUDO:+$SUDO }journalctl "${JOURNAL_WIN[@]}" --no-pager -q 2>/dev/null \
           | grep -iE "sshd.*(authentication failure;|failed password)" | tail -3)
     [[ -n "$_sf" ]] && printf '%s\n' "$_sf" | awk -v d="$C_DIM" -v r="$C_RESET" '{ if ($0 ~ /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:/) { print "    " d "|" r " " $0; next } sub(/^[ \t]+/,""); print "    " d "|" r "   " $0 }'
     printf "      ${C_GREEN}fix:${C_RESET} sudo sshauditz        ${C_DIM}(full SSH audit)${C_RESET}\n"
@@ -735,13 +821,32 @@ if [[ -r /var/log/auth.log || -n "$SUDO" ]]; then
   [[ -n "$AUTH_LOG_ALL" ]] && AUTH_LOG_FAILS=$(printf '%s\n' "$AUTH_LOG_ALL" | wc -l)
   [[ "$AUTH_LOG_FAILS" =~ ^[0-9]+$ ]] || AUTH_LOG_FAILS=0
   if (( AUTH_LOG_FAILS > 0 )); then
-    warn "$AUTH_LOG_FAILS failed-login attempts in auth.log ${C_DIM}(whole file, not just this window)${C_RESET}"
     # Show them - a count of "failures" is scarier and less useful than the
     # actual lines, which say whether it was you or someone else.
     AUTH_LINES=$(printf '%s\n' "$AUTH_LOG_ALL" | tail -4)
+    # Remote (SSH-style) failures vs a mistyped local console password. The
+    # old output always ended with "harden SSH" even when the only entry was
+    # a gdm login typo on tty1.
+    AUTH_REMOTE=0
+    printf '%s\n' "$AUTH_LOG_ALL" | grep -qE "Failed password for|Invalid user" && AUTH_REMOTE=1
+    # Category is explicit: infer_category() used to see "failed" inside
+    # "failed-login" and file this under failed_service (lib/common.sh now
+    # claims these phrasings for auth_issue before failed_service can).
+    if (( AUTH_REMOTE == 1 )); then
+      warnf auth_issue "$AUTH_LOG_FAILS failed-login attempts in auth.log ${C_DIM}(whole file, not just this window)${C_RESET}" \
+        "Remote attempts: sudo grep -iE 'Failed password for|Invalid user' /var/log/auth.log | tail -20 — if the IPs are not yours, harden SSH: ./sshauditz"
+    else
+      warnf auth_issue "$AUTH_LOG_FAILS failed-login attempts in auth.log ${C_DIM}(whole file, not just this window)${C_RESET}" \
+        "No remote failures in the file — local/console logins (a mistyped password), nothing remote to harden."
+    fi
     [[ -n "$AUTH_LINES" ]] && printf '%s\n' "$AUTH_LINES" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "    " d "|" r " " $0}'
-    printf "      ${C_GREEN}fix:${C_RESET} sudo grep -iE 'Failed password for|Invalid user' /var/log/auth.log | tail -20\n"
-    printf "      ${C_DIM}if the source IPs are not yours, harden SSH: see ./sshauditz${C_RESET}\n"
+    if (( AUTH_REMOTE == 1 )); then
+      printf "      ${C_GREEN}fix:${C_RESET} sudo grep -iE 'Failed password for|Invalid user' /var/log/auth.log | tail -20\n"
+      printf "      ${C_DIM}if the source IPs are not yours, harden SSH: see ./sshauditz${C_RESET}\n"
+    else
+      printf "      ${C_DIM}no 'Failed password for' / 'Invalid user' entries — these are local console logins,${C_RESET}\n"
+      printf "      ${C_DIM}not remote attempts: a mistyped password at the login screen, nothing to harden.${C_RESET}\n"
+    fi
   else
     ok "No failed logins in auth.log"
   fi
@@ -776,7 +881,13 @@ if [[ $HAVE_SYSTEMCTL -eq 1 ]]; then
       [[ -n "$local_result" ]] && printf " ${C_DIM}— %s${C_RESET}" "$local_result"
       [[ -n "$local_status" && "$local_status" != "n/a" ]] && printf " ${C_DIM}(since %s)${C_RESET}" "$local_status"
       printf "\n"
-      # The actual error output of the unit
+      # The actual error output of the unit.
+      #
+      # Deliberately NOT windowed with JOURNAL_WIN: the unit list above comes
+      # from `systemctl --failed`, which is CURRENT state, not a time window.
+      # A unit that failed before the window still needs to show why it
+      # failed — applying --since here printed "no log lines left" for every
+      # failure older than the selected window.
       if [[ -n "$SUDO" ]] || [[ $EUID -eq 0 ]]; then
         _uline=$(${SUDO:+$SUDO }journalctl -u "$unit" -n 6 --no-pager -q 2>/dev/null \
                  | grep -viE "^-- (Boot|Journal|Logs)|^$" | tail -4)
@@ -842,6 +953,19 @@ $_sl"
           { sub(/^[ \t]+/, ""); print "        " $0 }')
     if [[ -n "$_recent" ]]; then
       printf '%s\n' "$_recent" | head -10
+      # run-<pid>-<rand>.service is a transient unit created by `systemd-run`:
+      # it fails whenever the command it wrapped exits non-zero, and it is gone
+      # after a reboot. Saying so stops a one-off `systemd-run` typo from
+      # reading like an installed service that crashed. Only entry-opening
+      # lines are considered — the indented continuation lines ("Failed with
+      # result 'exit-code'.") never carry the unit name.
+      _installed=$(printf '%s\n' "$_recent" \
+        | grep -a '^[[:space:]]*[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:' \
+        | grep -avc 'run-p[0-9]' || true)
+      if [[ "${_installed:-1}" == "0" ]]; then
+        info "those are transient systemd-run units (run-<pid>-*) — the command they wrapped"
+        info "exited non-zero; they are not installed services and vanish at reboot"
+      fi
     else
       ok "No service crashes or restarts in this window"
     fi
@@ -855,39 +979,117 @@ fi
 # ============================================================================
 section "DISK & FILESYSTEM EVENTS"
 DISK_DETAIL=""
+DISK_HARD=0
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   # Disk errors
   # "sd.*error" on its own also matches "sshd: ... error", so the device
   # names are matched explicitly instead.
-  DISK_ERR=$(count_journal "i/o error|buffer i/o|medium error|ata[0-9]+.*(failed|error)|critical medium|blk_update_request|nvme[0-9]+n[0-9]+.*(error|timeout|reset|abort)|pcie bus error")
+  DISK_PAT="i/o error|buffer i/o|medium error|ata[0-9]+.*(failed|error)|critical medium|blk_update_request|nvme[0-9]+n[0-9]+.*(error|timeout|reset|abort)|pcie bus error"
+  # Not every DISK_PAT hit is a disk problem. fwupd probing the optical
+  # drive logs ".../ata4/.../sr0: failed to subclass open: failed to open
+  # /dev/sr0: No medium found", and `ata[0-9]+.*(failed|error)` matched the
+  # "ata4" in that path plus the word "failed" — so an empty DVD tray was
+  # counted as a non-correctable disk error and drove the "back up now"
+  # verdict. Optical drives (srN) and fwupd's own probe log are excluded.
+  DISK_NOISE='fwupd|FuEngine|/dev/sr[0-9]|\bsr[0-9]+\b'
+  # ONE scan feeds the count, the sample, the device list and the correctable
+  # split. Counting them separately is what let the split disagree with the
+  # total: DISK_ERR used to count ENTRIES (grep -ca '^[^-]') while DISK_CORR
+  # counted LINES, so a multi-line entry inflated the total and DISK_HARD
+  # (= ERR - CORR) came out non-zero on a box with no hard errors at all.
+  # Both are line counts over the same buffer now, so HARD can only be
+  # lines that genuinely lack the word "correctable".
+  DISK_ALL=$(run_journal | grep -iE "$DISK_PAT" | grep -vaE "$DISK_NOISE" || true)
+  DISK_ERR=$(printf '%s\n' "$DISK_ALL" | grep -c .)
+  [[ "$DISK_ERR" =~ ^[0-9]+$ ]] || DISK_ERR=0
   if (( DISK_ERR > 0 )); then
+    DISK_CORR=$(printf '%s\n' "$DISK_ALL" | grep -ci "correctable")
+    [[ "$DISK_CORR" =~ ^[0-9]+$ ]] || DISK_CORR=0
+    (( DISK_CORR > DISK_ERR )) && DISK_CORR=$DISK_ERR
+    DISK_HARD=$(( DISK_ERR - DISK_CORR ))
+    (( DISK_HARD < 0 )) && DISK_HARD=0
     # Pull the real error lines and the devices involved - "3 disk I/O
     # errors" on its own tells the reader nothing about what to do.
-    DISK_LINES=$(${SUDO:+$SUDO }journalctl ${SINCE:+--since "$SINCE"} --no-pager -q 2>/dev/null \
-                 | grep -iE "i/o error|buffer i/o|medium error|ata[0-9]+.*(failed|error)|critical medium|blk_update_request|nvme[0-9]+n[0-9]+.*(error|timeout|reset|abort)|pcie bus error" \
-                 | head -8)
-    DISK_DEVS=$(printf '%s\n' "$DISK_LINES" \
+    DISK_LINES=$(printf '%s\n' "$DISK_ALL" | head -8)
+    DISK_DEVS=$(printf '%s\n' "$DISK_ALL" \
                 | grep -oE '\b(nvme[0-9]+n[0-9]+|sd[a-z]|hd[a-z]|vd[a-z]|mmcblk[0-9]+)\b' \
                 | sort -u | tr '\n' ' ')
-    # Correctable PCIe bus errors are usually link noise, not a dying disk.
-    DISK_CORR=$(printf '%s\n' "$DISK_LINES" | grep -ci "correctable")
-    DISK_HARD=$(( DISK_ERR - DISK_CORR ))
-    if [[ -n "$DISK_DEVS" ]]; then
-      crit "$DISK_ERR disk I/O errors on ${DISK_DEVS% }:"
+    # An AER report names the PCI address (0000:02:00.0), never the block
+    # device — which is why this section never printed its `smartctl` fix: it
+    # could not name a device. Map the BDF through sysfs to what sits behind
+    # it: /sys/bus/pci/devices/<bdf>/nvme/nvme0/nvme0n1 -> nvme0n1.
+    DISK_BDFS=$(printf '%s\n' "$DISK_ALL" \
+                | grep -oE '\b[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]\b' \
+                | sort -u)
+    for _bdf in $DISK_BDFS; do
+      for _ctl in /sys/bus/pci/devices/"$_bdf"/nvme/nvme*; do
+        [[ -e "$_ctl" ]] || continue
+        _ns_found=0
+        for _ns in "$_ctl"/nvme*n*; do
+          [[ -d "$_ns" ]] || continue
+          DISK_DEVS+="$(basename "$_ns") "
+          _ns_found=1
+        done
+        (( _ns_found == 0 )) && DISK_DEVS+="$(basename "$_ctl") "
+      done
+    done
+    DISK_DEVS=$(printf '%s' "$DISK_DEVS" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ')
+
+    # Severity follows what the errors actually are. Every correctable PCIe
+    # event means the link retransmitted and moved on — no I/O failed — so it
+    # is a warning; a single non-correctable one means the drive is suspect.
+    # (Calling all of them critical is what made this verdict read
+    # "Action needed" on a box whose own note said "not a dying disk".)
+    if (( DISK_HARD > 0 )); then
+      if [[ -n "$DISK_DEVS" ]]; then
+        critf disk_health "$DISK_ERR disk I/O errors on ${DISK_DEVS% } (${DISK_CORR} of them correctable):" \
+          "Back up first, then: sudo smartctl -a /dev/${DISK_DEVS%% *}"
+      else
+        critf disk_health "$DISK_ERR disk I/O errors (${DISK_CORR} of them correctable):" \
+          "Back up first, then: sudo smartctl -a /dev/nvme0"
+      fi
+    elif [[ -n "$DISK_DEVS" ]]; then
+      warnf device_issue "$DISK_CORR PCIe correctable bus errors on ${DISK_DEVS% } — link retransmits, no I/O failed:" \
+        "Usually link noise: reseat the drive, update BIOS/SSD firmware, test pcie_aspm=off. Track the rate: grep -c severity=Correctable /var/log/kern.log"
     else
-      crit "$DISK_ERR disk I/O errors:"
+      warnf device_issue "$DISK_CORR PCIe correctable bus errors — link retransmits, no I/O failed:" \
+        "Usually link noise: reseat the drive, update BIOS/SSD firmware, test pcie_aspm=off. Track the rate: grep -c severity=Correctable /var/log/kern.log"
     fi
     [[ -n "$DISK_LINES" ]] && printf '%s\n' "$DISK_LINES" | awk -v d="$C_DIM" -v r="$C_RESET" '{print "    " d "|" r " " $0}'
     for _dev in ${DISK_DEVS}; do
       printf "      ${C_GREEN}fix:${C_RESET} sudo smartctl -a /dev/%s      ${C_DIM}(health, wear, error log)${C_RESET}\n" "$_dev"
       if [[ "$_dev" == nvme* ]]; then
-        printf "      ${C_GREEN}fix:${C_RESET} sudo nvme smart-log /dev/%s     ${C_DIM}(nvme-specific)${C_RESET}\n" "${_dev%n*}"
+        # ${_dev%%n[0-9]*}: nvme0n1 -> nvme0, and a bare controller name
+        # (nvme0) stays nvme0 — the old ${_dev%n*} stripped everything from
+        # the first "n", turning "nvme0" into an empty "/dev/".
+        printf "      ${C_GREEN}fix:${C_RESET} sudo nvme smart-log /dev/%s     ${C_DIM}(nvme-specific)${C_RESET}\n" "${_dev%%n[0-9]*}"
       fi
     done
-    printf "      ${C_GREEN}fix:${C_RESET} sudo dmesg | grep -iE '%s'\n" "$( [[ -n "$DISK_DEVS" ]] && echo "${DISK_DEVS% }" || echo 'nvme|sd[a-z]' )"
-    if (( DISK_CORR > 0 )) && (( DISK_HARD <= 0 )); then
-      printf "      ${C_YELLOW}note:${C_RESET} %d of them are PCIe 'Correctable' bus errors — usually link noise,\n" "$DISK_CORR"
-      printf "            ${C_YELLOW}not${C_RESET} a dying disk. Check SMART anyway; if it keeps growing, reseat the drive/PCIe slot.\n"
+    # AER counters are the ground truth and need no root: a drive that is
+    # genuinely failing moves these into NONFATAL/FATAL, link noise does not.
+    for _bdf in $DISK_BDFS; do
+      _ce=$(awk '/^TOTAL_ERR_COR/{print $2}' "/sys/bus/pci/devices/$_bdf/aer_dev_correctable" 2>/dev/null)
+      [[ -z "$_ce" ]] && continue
+      _nf=$(awk '/^TOTAL_ERR_NONFATAL/{print $2}' "/sys/bus/pci/devices/$_bdf/aer_dev_nonfatal" 2>/dev/null)
+      _fa=$(awk '/^TOTAL_ERR_FATAL/{print $2}' "/sys/bus/pci/devices/$_bdf/aer_dev_fatal" 2>/dev/null)
+      printf "      ${C_DIM}AER counters on %s — %s correctable · %s nonfatal · %s fatal ${C_DIM}(since boot)${C_RESET}\n" \
+        "$_bdf" "$_ce" "${_nf:-0}" "${_fa:-0}"
+    done
+    # Match on the PCI address when we have it: `grep -iE 'nvme0'` misses the
+    # very lines being reported ("nvme 0000:02:00.0: PCIe Bus Error").
+    if [[ -n "$DISK_BDFS" ]]; then
+      _dmesg_pat=$(printf '%s\n' "$DISK_BDFS" | paste -sd'|')
+    elif [[ -n "$DISK_DEVS" ]]; then
+      _dmesg_pat="${DISK_DEVS% }"
+    else
+      _dmesg_pat='nvme|sd[a-z]'
+    fi
+    printf "      ${C_GREEN}fix:${C_RESET} sudo dmesg | grep -iE '%s'\n" "$_dmesg_pat"
+    printf "      ${C_GREEN}fix:${C_RESET} grep -c severity=Correctable /var/log/kern.log   ${C_DIM}(track the rate over days)${C_RESET}\n"
+    if (( DISK_CORR > 0 )) && (( DISK_HARD == 0 )); then
+      printf "      ${C_YELLOW}note:${C_RESET} all %d are PCIe 'Correctable' bus errors — the link retransmitted and\n" "$DISK_CORR"
+      printf "            moved on: no I/O failed and no data was lost. Check SMART anyway; if the count\n"
+      printf "            keeps climbing, reseat the drive/PCIe slot.\n"
     else
       printf "      ${C_YELLOW}note:${C_RESET} %d non-correctable error(s) — treat the drive as suspect: back up now.\n" "$DISK_HARD"
     fi
@@ -1067,7 +1269,7 @@ fi
 # ============================================================================
 # SECTION 9: Top recurring messages (dedup + frequency)
 # ============================================================================
-section "TOP RECURRING MESSAGES (window: $SINCE)"
+section "TOP RECURRING MESSAGES (window: $WIN_LABEL)"
 RECURRING_ROWS=""
 if [[ $HAVE_JOURNALCTL -eq 1 ]]; then
   info "Top $TOP_N unique messages by frequency, full text (errors + warnings only)"
@@ -1239,7 +1441,11 @@ REC_FILE=$(mktemp)
   fi
   if [[ -n "$DISK_DETAIL" ]]; then
     for _dev in $DISK_DETAIL; do
-      echo "• ${_dev} reported I/O errors — check its health:"
+      if (( ${DISK_HARD:-0} > 0 )); then
+        echo "• ${_dev} reported I/O errors — check its health:"
+      else
+        echo "• ${_dev} is behind a noisy PCIe link (correctable errors only) — confirm it is healthy:"
+      fi
       echo "    ${C_BOLD}sudo smartctl -a /dev/${_dev}${C_RESET}"
     done
     echo "  ${C_DIM}correctable PCIe bus errors are usually noise; uncorrectable ones mean back up now${C_RESET}"
@@ -1254,7 +1460,7 @@ REC_FILE=$(mktemp)
     echo "  ${C_DIM}lists which message produced them and how often. Fix the top one first.${C_RESET}"
   fi
   if (( CRITICAL > 0 )); then
-    echo "• The CRITICAL lines are the ones to act on: ${C_BOLD}journalctl -p err --since '$SINCE'${C_RESET}"
+    echo "• The CRITICAL lines are the ones to act on: ${C_BOLD}journalctl -p err ${JOURNAL_FIX}${C_RESET}"
   fi
   echo "• Follow live errors as they happen: ${C_BOLD}journalctl -p err -f${C_RESET}"
   echo "• Full history in a pager: ${C_BOLD}journalctl --since '7 days ago' | less${C_RESET}"
@@ -1280,11 +1486,11 @@ if [[ $JSON_OUT -eq 0 ]]; then
   printf "\n${C_BOLD}${C_BLUE}━━━ VERDICT ━━━${C_RESET}\n"
 
   if (( CRITICAL > 0 )); then
-    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings found\n" "$CRITICAL" "$WARNINGS"
+    printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warning%s found\n" "$CRITICAL" "$WARNINGS" "$( [[ $WARNINGS -eq 1 ]] && echo "" || echo "s" )"
     printf "  ${C_RED}Action needed - see recommendations${C_RESET}\n"
     EXIT_CODE=2
   elif (( WARNINGS > 0 )); then
-    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+    printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warning%s, no critical issues\n" "$WARNINGS" "$( [[ $WARNINGS -eq 1 ]] && echo "" || echo "s" )"
     printf "  ${C_YELLOW}System usable but review warnings above${C_RESET}\n"
     EXIT_CODE=1
   else
@@ -1296,8 +1502,14 @@ if [[ $JSON_OUT -eq 0 ]]; then
   printf "\n${C_DIM}Scan completed in ${DURATION}s at $(date '+%H:%M:%S')${C_RESET}\n\n"
   chart_findings
 
-  # Display one-liner explanations for any critical/warning issues logged
-  show_verdict_one_liners
+  # Display one-liner explanations for any critical/warning issues logged.
+  # These are the common.sh emitters, which read CRITICAL_ISSUES/WARN_ENTRIES
+  # — the arrays crit()/warn() fill. show_verdict_one_liners() reads
+  # VLOG_CRITICAL/VLOG_WARNINGS instead, which only log_verdict_crit() fills
+  # and logz never calls, so this report shipped with no explanations at all
+  # while announcing "2 critical".
+  emit_critical_one_liners
+  emit_warning_one_liners
 else
   exec 1>&3
   exec 3>&-
@@ -1315,7 +1527,7 @@ else
 {
   "timestamp": "$TIMESTAMP",
   "hostname": "$HOSTNAME_SHORT",
-  "since": "$SINCE",
+  "since": "$WIN_LABEL",
   "critical": $CRITICAL,
   "warnings": $WARNINGS,
   "verdict": "$VERDICT",
@@ -1329,7 +1541,7 @@ if declare -f run_comparison_finalize >/dev/null 2>&1; then run_comparison_final
 
 # ---------- AI verdict (opt-in via --ai) ----------
 if [[ "${AI_VERDICT:-}" == "1" ]]; then
-    _LOG_SUMMARY="since=$SINCE critical=$CRITICAL warnings=$WARNINGS verdict=$VERDICT duration=${DURATION}s"
+    _LOG_SUMMARY="since=$WIN_LABEL critical=$CRITICAL warnings=$WARNINGS verdict=$VERDICT duration=${DURATION}s"
     ai_emit_verdict "top_issue" "$_LOG_SUMMARY" 2>/dev/null || true
 fi
 

@@ -386,6 +386,11 @@ FINDING_CATEGORY_HINTS=(
   'device_issue:\busb\b|\bpci\b|firmware'
   'gpu_issue:\bgpu\b|\bvram\b|nvidia|nvtop'
   'kernel_issue:\bkernel\b|\bgrub\b|\binitramfs\b|\bpanic\b|\boops\b'
+  # BEFORE failed_service: its "\bfailed\b" matches the word "failed" in
+  # "failed-login attempts", which filed a mistyped gdm password under the
+  # failed-SERVICES bucket of the findings chart. Only auth phrasings are
+  # claimed here, so a genuinely failed "sshd.service" still lands below.
+  'auth_issue:failed[- ]login|failed password|authentication failure|invalid user|pam_unix'
   'failed_service:\bservice\b|\bunit\b|systemd|\bfailed\b'
   'scheduled_task:\bcron\b|schedule|\btimer\b|anacron'
   'process_issue:process|zombie|\bthread\b|\bhang\b|locked|stuck'
@@ -1119,10 +1124,10 @@ emit_verdict() {
     else
         section "VERDICT"
         if (( CRITICAL > 0 )); then
-            printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warnings\n" "$CRITICAL" "$WARNINGS"
+            printf "  ${C_RED}${C_BOLD}CRITICAL${C_RESET}: %d critical, %d warning%s found\n" "$CRITICAL" "$WARNINGS" "$( [[ $WARNINGS -eq 1 ]] && echo "" || echo "s" )"
             exit_code=2
         elif (( WARNINGS > 0 )); then
-            printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warnings, no critical issues\n" "$WARNINGS"
+            printf "  ${C_YELLOW}${C_BOLD}WARNING${C_RESET}: %d warning%s, no critical issues\n" "$WARNINGS" "$( [[ $WARNINGS -eq 1 ]] && echo "" || echo "s" )"
             exit_code=1
         else
             printf "  ${C_GREEN}${C_BOLD}HEALTHY${C_RESET}: no issues detected\n"
