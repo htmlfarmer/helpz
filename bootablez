@@ -2304,15 +2304,26 @@ fi
 if (( WINDOWS_BOOTS )); then
     [[ -n "$WINDOWS_BOOTS_ISO" ]] || usage_abort "--windows-boots needs the ISO: --windows-boots /path/to/Windows.iso"
     [[ -n "$TARGET" ]] || usage_abort "--windows-boots needs a target: --device /dev/sdX"
+    # a directory is fine: take the only .iso in it
+    if [[ -d "$WINDOWS_BOOTS_ISO" ]]; then
+        WBOOTS_FOUND=$(find "$WINDOWS_BOOTS_ISO" -maxdepth 2 -iname '*.iso' -print -quit 2>/dev/null)
+        [[ -n "$WBOOTS_FOUND" ]] && WINDOWS_BOOTS_ISO="$WBOOTS_FOUND"
+    fi
     section "WINDOWS BOOT SET"
     normalize_target
     # the safety rails run against the BOOT SET's size, not the whole ISO's:
     # a target smaller than the ISO is the whole point here
-    local saved_iso="$ISO" saved_size="$ISO_SIZE"
     ISO="$WINDOWS_BOOTS_ISO"
     ISO_SIZE=629145600
     check_target
-    ISO="$saved_iso"; ISO_SIZE="$saved_size"
+    if (( DRY_RUN )); then
+        info "dry run — nothing was written. It would:"
+        printf "    ${C_DIM}partition %s (MBR + one FAT32 partition)${C_RESET}\n" "$TARGET"
+        printf "    ${C_DIM}mount %s read-only and copy the boot set out of it${C_RESET}\n" "$WINDOWS_BOOTS_ISO"
+        printf "    ${C_DIM}bootmgr, boot/BCD, sources/boot.wim, sources/install.boot, efi/boot/bootx64.efi${C_RESET}\n"
+        add_json_field "status" "dry-run"
+        emit_verdict
+    fi
     confirm_target
     ensure_sudo
     if do_windows_boot_set "$WINDOWS_BOOTS_ISO" "$TARGET"; then
