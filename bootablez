@@ -2046,6 +2046,86 @@ do_menu_verify() {
     return 0
 }
 
+# do_menu_distro — menu action: fetch a Linux/Windows installer and write it
+do_menu_distro() {
+    local pick name i=1
+    printf "  ${C_BOLD}which installer?${C_RESET}\n"
+    for name in "${DISTRO_NAMES[@]}"; do
+        printf "    ${C_BOLD}%d${C_RESET}) %-12s ${C_DIM}%s${C_RESET}\n" "$i" "$name" "$(distro_label "$name")"
+        i=$((i+1))
+    done
+    printf "\n  ${C_DIM}number, or a name${C_RESET} [1-%d]: " "${#DISTRO_NAMES[@]}"
+    pick=""
+    IFS= read -r pick || pick=""
+    printf "\n"
+    [[ -n "$pick" ]] || return 0
+    if [[ "$pick" =~ ^[0-9]+$ ]]; then
+        (( pick >= 1 && pick <= ${#DISTRO_NAMES[@]} )) || { printf "  ${C_YELLOW}!${C_RESET} no such number\n"; return 0; }
+        name="${DISTRO_NAMES[$((pick-1))]}"
+    else
+        name="${pick,,}"
+        case "$name" in
+            mint) name="linuxmint" ;;
+            arch) name="archlinux" ;;
+            win11) name="windows11" ;;
+            win10) name="windows10" ;;
+        esac
+        local found=0 n
+        for n in "${DISTRO_NAMES[@]}"; do
+            [[ "$n" == "$name" ]] && { name="$n"; found=1; break; }
+        done
+        (( found )) || { printf "  ${C_YELLOW}!${C_RESET} no such distribution\n"; return 0; }
+    fi
+    printf "  ${C_DIM}fetching the %s image — it is checked against the published checksum${C_RESET}\n" "$name"
+    DISTRO_ISO=$(distro_download "$name") || return 0
+    ISO="$DISTRO_ISO"
+    ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+    return 0
+}
+
+# do_menu_macos — menu action: fetch Apple's macOS installer and write it
+do_menu_macos() {
+    local pick ver size build i=1
+    printf "  ${C_DIM}reading Apple's catalog…${C_RESET}\n"
+    local versions
+    versions=$(macos_versions_best)
+    if [[ -z "$versions" ]]; then
+        printf "  ${C_YELLOW}!${C_RESET} could not reach Apple's catalog — try --macos-list\n"
+        return 0
+    fi
+    printf "  ${C_BOLD}which macOS?${C_RESET}\n"
+    while IFS=$'\t' read -r ver size build full; do
+        [[ -n "$ver" ]] || continue
+        printf "    ${C_BOLD}%d${C_RESET}) %-8s ${C_DIM}%s payload · build %s${C_RESET}\n" "$i" "$ver" "$(humansize "$size")" "$build"
+        i=$((i+1))
+    done <<< "$versions"
+    printf "\n  ${C_DIM}number${C_RESET} [1-%d]: " "$((i-1))"
+    pick=""
+    IFS= read -r pick || pick=""
+    printf "\n"
+    [[ "$pick" =~ ^[0-9]+$ ]] || { printf "  ${C_YELLOW}!${C_RESET} pick a number\n"; return 0; }
+    i=1
+    while IFS=$'\t' read -r ver size build full; do
+        [[ -n "$ver" ]] || continue
+        if (( i == pick )); then
+            printf "  ${C_DIM}fetching macOS %s (%s) — recovery system, payload and diagnostics${C_RESET}\n" "$ver" "$full"
+            MACOS_MEDIA_DIR=$(macos_download "$ver") || return 0
+            MACOS_IMG="$MACOS_MEDIA_DIR/macos-$ver.img"
+            info "assembling the bootable image (this takes a while — the HFS+ write is slow)"
+            macos_build "$MACOS_MEDIA_DIR" "$MACOS_IMG" || {
+                printf "  ${C_YELLOW}!${C_RESET} could not assemble the image — see the message above\n"
+                return 0
+            }
+            ISO="$MACOS_IMG"
+            ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+            IMAGE_KIND="macos"
+            return 0
+        fi
+        i=$((i+1))
+    done <<< "$versions"
+    return 0
+}
+
 # menu_loop — after the report, let the user choose instead of making them
 # remember flags. Returns when they pick "write" (the wizard continues
 # below); every other choice is handled here and loops back.
@@ -2058,11 +2138,13 @@ menu_loop() {
         else
             printf "    ${C_BOLD}1${C_RESET}) Write an image to a stick    ${C_DIM}(plug one in first)${C_RESET}\n"
         fi
-        printf "    ${C_BOLD}2${C_RESET}) Verify a stick byte-for-byte ${C_DIM}compare against an image, writes nothing${C_RESET}\n"
-        printf "    ${C_BOLD}3${C_RESET}) Show me the commands         ${C_DIM}print them so you can run them yourself${C_RESET}\n"
-        printf "    ${C_BOLD}4${C_RESET}) Look again                   ${C_DIM}rescan drives and images${C_RESET}\n"
-        printf "    ${C_BOLD}5${C_RESET}) Quit\n\n"
-        printf "  Choice [1-5]: "
+        printf "    ${C_BOLD}2${C_RESET}) Fetch a Linux/Windows installer ${C_DIM}download + verify, then write it${C_RESET}\n"
+        printf "    ${C_BOLD}3${C_RESET}) Fetch a macOS installer        ${C_DIM}Apple's catalog → bootable image → write it${C_RESET}\n"
+        printf "    ${C_BOLD}4${C_RESET}) Verify a stick byte-for-byte ${C_DIM}compare against an image, writes nothing${C_RESET}\n"
+        printf "    ${C_BOLD}5${C_RESET}) Show me the commands         ${C_DIM}print them so you can run them yourself${C_RESET}\n"
+        printf "    ${C_BOLD}6${C_RESET}) Look again                   ${C_DIM}rescan drives and images${C_RESET}\n"
+        printf "    ${C_BOLD}7${C_RESET}) Quit\n\n"
+        printf "  Choice [1-7]: "
         choice=""
         IFS= read -r choice || choice=""
         printf "\n"
@@ -2073,22 +2155,24 @@ menu_loop() {
                 if (( ${#CAND[@]} == 0 )); then
                     if (( USB_SEEN )); then
                         printf "  ${C_YELLOW}!${C_RESET} a USB disk is attached but not usable right now — see the USABLE column above\n"
-                        printf "  ${C_DIM}reads 0 B? unplug it and plug it back in, then pick 4 to rescan${C_RESET}\n"
+                        printf "  ${C_DIM}reads 0 B? unplug it and plug it back in, then pick 6 to rescan${C_RESET}\n"
                     else
-                        printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in, then pick 4 to rescan\n"
+                        printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in, then pick 6 to rescan\n"
                     fi
                 else
                     return 0
                 fi
                 ;;
-            2) do_menu_verify ;;
-            3) show_commands ;;
-            4) report ;;
-            5|q|Q|"")
+            2) do_menu_distro; [[ -n "$ISO" ]] && return 0 ;;
+            3) do_menu_macos;   [[ -n "$ISO" ]] && return 0 ;;
+            4) do_menu_verify ;;
+            5) show_commands ;;
+            6) report ;;
+            7|q|Q|"")
                 printf "  ${C_DIM}nothing was written — run bootablez again whenever you are ready${C_RESET}\n"
                 add_json_field "status" "status"
                 emit_verdict ;;
-            *) printf "  ${C_YELLOW}!${C_RESET} pick 1-5\n" ;;
+            *) printf "  ${C_YELLOW}!${C_RESET} pick 1-7\n" ;;
         esac
     done
 }

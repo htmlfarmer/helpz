@@ -75,7 +75,7 @@ _distro_ubuntu() {
     [[ -n "$iso" ]] || return 1
     sums=$(distro_links "$base/$rel/" | grep -E '^SHA256SUMS$' | head -1)
     [[ -n "$sums" ]] || return 1
-    printf '%s/%s\t%s/%s\n' "$base" "$iso" "$base/$rel" "$sums"
+    printf '%s/%s/%s\t%s/%s\n' "$base" "$rel" "$iso" "$base/$rel" "$sums"
 }
 
 _distro_debian() {
@@ -286,7 +286,12 @@ distro_download() {
     fi
 
     info "downloading $base" >&2
-    distro_fetch "$iso_url" "$out" >&2 || { warn "could not fetch $base" >&2; return 1; }
+    distro_fetch "$iso_url" "$out" >&2 || {
+        rm -f "$out"
+        warn "could not fetch $base" >&2
+        warn "  $iso_url" >&2
+        return 1
+    }
     distro_verify "$out" "$sum_url"
     local vrc=$?
     if (( vrc == 2 )); then

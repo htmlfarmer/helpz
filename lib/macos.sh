@@ -528,41 +528,62 @@ for path in sys.argv[1:]:
 PY
 }
 
-# macos_version <installinfo.plist> → the marketing version, e.g. 10.13
+# macos_version <installinfo.plist> → the full version, e.g. 10.13.6.0.0.1544783150
 macos_version() {
     macos_have_python || return 1
     python3 - "$1" <<'PY' 2>/dev/null
 import plistlib, sys
 with open(sys.argv[1], 'rb') as f:
     p = plistlib.loads(f.read())
-v = (p.get('System Image Info') or {}).get('version', '')
-parts = v.split('.')
-print('.'.join(parts[:2]) if len(parts) >= 2 else v)
+print((p.get('System Image Info') or {}).get('version', ''))
 PY
 }
 
-# macos_list → the macOS versions Apple's catalog offers, with sizes
-macos_list() {
-    local row id info_url base_url esd_url dir tmp ver
+# macos_versions → TSV: version, size, build, full-version
+# Apple's catalog lists every BUILD of every version; the same version shows
+# up several times. The full version string sorts them: the newest build of a
+# version is the one with the highest trailing number.
+macos_versions() {
+    local row id info_url base_url esd_url dir tmp ver esd_size
     local -a catalogs
-    macos_have_python || { warn "macos: needs python3 to read Apple's catalog"; return 1; }
-    macos_have_curl || { warn "macos: needs curl or wget"; return 1; }
+    macos_have_python || return 1
+    macos_have_curl || return 1
     mapfile -t catalogs < <(macos_fetch_catalog) || true
-    [[ ${#catalogs[@]} -gt 0 ]] || { warn "macos: cannot reach Apple's catalog"; return 1; }
+    [[ ${#catalogs[@]} -gt 0 ]] || return 1
     dir=$(macos_dir); mkdir -p "$dir"
-    printf '  %-9s %-9s %s\n' "VERSION" "SIZE" "BUILD"
     while IFS=$'\t' read -r id info_url base_url esd_url; do
         [[ -n "$info_url" ]] || continue
         tmp="$dir/.info-$id.plist"
         macos_fetch "$info_url" "$tmp" || continue
         ver=$(macos_version "$tmp")
         [[ -n "$ver" ]] || { rm -f "$tmp"; continue; }
-        local esd_size=0
+        # the marketing version is the first two components: 10.13.6.0.0.x → 10.13
+        local short="${ver%%.*}" rest="${ver#*.}"
+        short="$short.${rest%%.*}"
         esd_size=$(curl -sI "$esd_url" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2; exit}')
-        printf '  %-9s %-9s %s\n' "$ver" \
-            "$(humansize "${esd_size:-0}")" "$id"
+        printf '%s\t%s\t%s\t%s\n' "$short" "${esd_size:-0}" "$id" "$ver"
         rm -f "$tmp"
     done < <(macos_products "${catalogs[@]}")
+}
+
+# macos_versions_best → the same list, one line per macOS version: the newest
+# build of each. Apple's catalog lists every build, and the same version
+# appears several times.
+macos_versions_best() {
+    macos_versions | awk -F'\t' '
+        { if (!($1 in seen)) { seen[$1]=1; order[++n]=$1 }
+          if (best[$1] == "" || best[$1] < $4) { best[$1]=$4; line[$1]=$0 } }
+        END { for (i=1; i<=n; i++) print line[order[i]] }'
+}
+
+# macos_list → the macOS versions Apple's catalog offers, with sizes
+macos_list() {
+    local ver size build full
+    printf '  %-9s %-9s %s\n' "VERSION" "SIZE" "BUILD"
+    while IFS=$'\t' read -r ver size build full; do
+        [[ -n "$ver" ]] || continue
+        printf '  %-9s %-9s %s\n' "$ver" "$(humansize "$size")" "$build"
+    done < <(macos_versions_best)
 }
 
 # macos_download <version> → fetch the media into the cache; echoes the dir
@@ -575,20 +596,23 @@ macos_download() {
     [[ ${#catalogs[@]} -gt 0 ]] || { warn "macos: cannot reach Apple's catalog"; return 1; }
     dir=$(macos_dir); mkdir -p "$dir"
 
-    # find the product whose InstallInfo.plist says the version we want
-    local found_id="" found_info="" found_base="" found_esd=""
+    # find the product for the version we want: the NEWEST build of it
+    local found_id="" found_info="" found_base="" found_esd="" found_full=""
     while IFS=$'\t' read -r id info_url base_url esd_url; do
         [[ -n "$info_url" ]] || continue
         tmp="$dir/.info-$id.plist"
         macos_fetch "$info_url" "$tmp" || continue
         ver=$(macos_version "$tmp")
         if [[ "$ver" == "$want" || "$ver" == "$want."* ]]; then
-            found_id="$id"; found_info="$info_url"; found_base="$base_url"; found_esd="$esd_url"
-            rm -f "$tmp"; break
+            if [[ -z "$found_full" || "$found_full" < "$ver" ]]; then
+                found_id="$id"; found_info="$info_url"; found_base="$base_url"
+                found_esd="$esd_url"; found_full="$ver"
+            fi
         fi
         rm -f "$tmp"
     done < <(macos_products "${catalogs[@]}")
-    [[ -n "$found_id" ]] || { warn "macos: Apple's catalog does not offer macOS $want"; return 1; }
+    [[ -n "$found_id" ]] || { warn "macos: Apple's catalog does not offer macOS $want" >&2; return 1; }
+    info "macOS $found_full (build $found_id)" >&2
 
     local out="$dir/$want"
     mkdir -p "$out"
