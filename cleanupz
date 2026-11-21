@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# cleanupz — remove openclaw-gateway remnants + reclaim log space.
+#
+#   ./cleanupz --dry-run    show what would happen, change nothing
+#   ./cleanupz              do it (one sudo prompt, then cached ~15 min)
+#   ./cleanupz --no-openclaw    logs only
+#   ./cleanupz --no-logs        openclaw only
+#   ./cleanupz --json           machine-readable report (implies --dry-run)
+#
+# Everything deleted is backed up first to ~/.cleanupz-backup/<timestamp>/.
+#
+# Deliberately NOT touched:
+#   ~/.vscode-oss/extensions/kade.kade-*/assets/providers/openclaw.svg
+#       one of 789 provider icons in an extension icon set — removing it
+#       breaks the extension's UI. It is an AI-provider logo, not the gateway.
+#   ~/.config/VSCodium/.../kade.kade/cache/*.json
+#       cached model catalogs; "OpenClaw" appears only in model prose.
+#   ~/.local/share/opencode/     this session tool's own logs.
+#   ~/.cache, ~/Downloads, ~/.local, ~/ai, ~/Videos, ...
+#       not logs and not openclaw — see the note at the end of a run.
+
+set -uo pipefail
+
+DRY=0
+JSON=0
+DO_OPENCLAW=1
+DO_LOGS=1
+for arg in "$@"; do
+  case "$arg" in
+    -n|--dry-run) DRY=1 ;;
+    --json)
+      # Machine-readable report: implies --dry-run so a self-test or a
+      # script can ask cleanupz what it WOULD do — no sudo, no prompts,
+      # no deletions. Human output moves to stderr; the object goes to fd4.
+      if (( JSON == 0 )); then JSON=1; DRY=1; exec 4>&1 1>&2; fi ;;
+    --no-openclaw) DO_OPENCLAW=0 ;;
+    --no-logs) DO_LOGS=0 ;;
+    -h|--help) # print the header comment block only: skip the shebang, then
+               # emit lines while they start with '#' and stop at the first
+               # that doesn't (a fixed line range overruns into real code).
+               awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+               exit 0 ;;
+    *) printf 'cleanupz: unknown option: %s (try --help)\n' "$arg" >&2; exit 64 ;;
+  esac
+done
+
+# ---------- look & feel ----------
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[1m'
+  C_D=$'\033[2m'; C_0=$'\033[0m'
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_0=""
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_Y" "$C_0" "$*"; }
+die()  { printf '\n%scleanupz:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+section() { printf '\n%s  ━━━ %s ━━━%s\n' "$C_B" "$*" "$C_0"; }
+
+# run <cmd...> — echoes instead of executing in dry-run.
+run() {
+  if (( DRY )); then
+    printf '  %s$ %s%s\n' "$C_D" "$*" "$C_0"
+    return 0
+  fi
+  "$@"
+}
+
+# size of a path, human readable ("unknown" if missing).
+# NOT `du | cut || printf`: under `set -o pipefail` du still prints a total
+# but exits non-zero when it hits an unreadable subdir (e.g. /var/cache/apt
+# as a normal user), so the fallback fired and appended a second line "0".
+hsize() {
+  local out
+  out="$(du -sh "$1" 2>/dev/null | cut -f1 | head -1)"
+  printf '%s' "${out:-unknown}"
+}
+
+# the size figure inside `journalctl --disk-usage`, e.g. "3.9G".
+# The raw line is "Archived and active journals take up 3.9G in the file
+# system." — `$NF` on that is the word "system." not the size.
+jsize() {
+  local out
+  out="$(journalctl --disk-usage 2>/dev/null \
+         | grep -oiE '[0-9]+(\.[0-9]+)?[KMGT]' | tail -1)"
+  printf '%s' "${out:-unknown}"
+}
+
+# ---------- who are we / which home? ----------
+REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+REAL_HOME="${HOME:-/home/$REAL_USER}"
+if (( EUID == 0 )) && [[ -n ${SUDO_USER:-} ]]; then
+  REAL_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  [[ -d $REAL_HOME ]] || die "cannot resolve home for $SUDO_USER"
+fi
+
+TS="$(date '+%Y%m%d-%H%M%S')"
+BACKUP="$REAL_HOME/.cleanupz-backup/$TS"
+BACKED=0
+
+# backup <file...> — copies into $BACKUP, preserving relative name.
+backup() {
+  local f
+  for f in "$@"; do
+    [[ -e $f ]] || continue
+    if (( DRY )); then
+      printf '  %s$ backup %s%s\n' "$C_D" "$f" "$C_0"
+      continue
+    fi
+    mkdir -p "$BACKUP" 2>/dev/null || { warn "backup dir not writable: $BACKUP"; continue; }
+    cp -a "$f" "$BACKUP/" 2>/dev/null && BACKED=1
+  done
+}
+
+# As root we must not write into root's own copies of the user's files.
+# ucmd <cmd...> runs a command as the real user when we are root.
+ucmd() {
+  if (( EUID == 0 )) && [[ -n ${SUDO_USER:-} ]]; then
+    run sudo -u "$REAL_USER" -- "$@"
+  else
+    run "$@"
+  fi
+}
+
+printf '%s  CLEANUPZ — openclaw removal + log space reclaim%s\n' "$C_B" "$C_0"
+printf '  %suser:%s %s   %shome:%s %s\n' "$C_D" "$C_0" "$REAL_USER" "$C_D" "$C_0" "$REAL_HOME"
+(( DRY )) && printf '  %sDRY RUN — nothing will be changed%s\n' "$C_Y" "$C_0"
+
+# ---------- before ----------
+section "BEFORE"
+BEFORE_DF="$(df -h "$REAL_HOME" | awk 'NR==2{print $4" free ("$5" used)"}')"
+BEFORE_JOURNAL="$(jsize)"
+say "  journal:      ${BEFORE_JOURNAL:-unknown}"
+say "  home free:    $BEFORE_DF"
+(( DO_LOGS )) && say "  apt cache:    $(hsize /var/cache/apt)"
+
+# ---------- sudo (one prompt; skipped for dry runs and logs-only user work) ----------
+NEED_SUDO=0
+(( DO_LOGS )) && NEED_SUDO=1
+if (( NEED_SUDO && ! DRY && EUID != 0 )); then
+  section "PRIVILEGE"
+  # sudo reads the password from /dev/tty, NOT stdin — so `sudo -v` with no
+  # terminal available blocks forever instead of failing. Probe the cached
+  # ticket first, only prompt when a terminal exists, else fail fast.
+  if sudo -n true 2>/dev/null; then
+    ok "sudo ticket already cached"
+  elif [[ -t 0 && -t 2 ]]; then
+    printf '  the journal, apt cache and rotated logs need root\n'
+    printf '  → authenticating with sudo (one prompt, then cached ~15 min)\n'
+    if sudo -v; then
+      ok "sudo credentials accepted"
+    else
+      printf '\n%scleanupz:%s sudo authentication failed — nothing was changed.\n' "$C_R" "$C_0" >&2
+      exit 1
+    fi
+  else
+    printf '\n%scleanupz:%s root is needed for the log cleanup, but there is no\n' "$C_R" "$C_0" >&2
+    printf 'terminal to prompt on and no cached sudo ticket. Nothing was changed.\n' >&2
+    printf '  run this interactively, or cache a ticket first: sudo -v\n' >&2
+    exit 1
+  fi
+fi
+
+# ============================================================================
+# PART 1 — openclaw-gateway remnants (user-owned)
+# ============================================================================
+if (( DO_OPENCLAW )); then
+  section "OPENCLAW-GATEWAY REMNANTS"
+
+  # --- 1a. is anything still running? (informational; never kills) ---
+  if command -v systemctl >/dev/null 2>&1; then
+    _sys=$(systemctl list-unit-files --no-pager 2>/dev/null | grep -ci openclaw || true)
+    _usr=$(systemctl --user list-unit-files --no-pager 2>/dev/null | grep -ci openclaw || true)
+  else
+    _sys=0; _usr=0
+  fi
+  # pgrep -f matches our own command line containing the literal word, so
+  # filter out shells/greps or we always "find" ourselves.
+  _proc=$(pgrep -af openclaw 2>/dev/null \
+          | grep -vE 'pgrep|grep|cleanupz|bash -c' | grep -c . || true)
+  if [[ ${_sys:-0} -eq 0 && ${_usr:-0} -eq 0 && ${_proc:-0} -eq 0 ]]; then
+    ok "no openclaw units, timers, sockets or processes — service already gone"
+  else
+    warn "still present: ${_sys} system units, ${_usr} user units, ${_proc} processes"
+    say "  ${C_D}inspect with: systemctl --failed | grep -i openclaw${C_0}"
+  fi
+
+  # --- 1b. ~/.openclaw, configs, binaries ---
+  for _p in "$REAL_HOME/.openclaw" "$REAL_HOME/.config/openclaw" \
+            "$REAL_HOME/.openclaw.json" "$REAL_HOME/openclaw.json"; do
+    if [[ -e $_p ]]; then
+      backup "$_p"
+      run rm -rf "$_p" && ok "removed $_p"
+    fi
+  done
+  _bins=0
+  for _d in "$REAL_HOME/.local/bin" "$REAL_HOME/.npm-global/bin" /usr/local/bin; do
+    [[ -e "$_d/openclaw" || -e "$_d/openclaw-gateway" ]] || continue
+    backup "$_d/openclaw" "$_d/openclaw-gateway"
+    run rm -f "$_d/openclaw" "$_d/openclaw-gateway"
+    _bins=$((_bins+1))
+  done
+  (( _bins )) && ok "removed $_bins openclaw binary/links from PATH"
+
+  # --- 1c. the note file (~/security/ dir itself is KEPT: logz writes there) ---
+  _note="$REAL_HOME/security/openclaw.txt"
+  if [[ -e $_note ]]; then
+    backup "$_note"
+    run rm -f "$_note" && ok "removed ~/security/openclaw.txt (directory kept for logz)"
+  fi
+
+  # --- 1d. bash_history ---
+  _hist="$REAL_HOME/.bash_history"
+  if [[ -f $_hist ]]; then
+    _hits=$(grep -c -i openclaw "$_hist" 2>/dev/null || true)
+    if [[ ${_hits:-0} -gt 0 ]]; then
+      backup "$_hist"
+      if (( DRY )); then
+        printf '  %s$ strip %s openclaw lines from .bash_history%s\n' "$C_D" "$_hits" "$C_0"
+      else
+        if ucmd grep -v -i openclaw "$_hist" > "$_hist.tmp" 2>/dev/null; then
+          mv "$_hist.tmp" "$_hist"
+          chown "$REAL_USER":"$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")" "$_hist" 2>/dev/null || true
+          ok "stripped $_hits openclaw lines from .bash_history"
+          warn "if your current shell rewrites history on exit, re-run cleanupz from a fresh shell"
+        else
+          rm -f "$_hist.tmp"
+          warn "could not edit .bash_history"
+        fi
+      fi
+    else
+      ok ".bash_history already clean"
+    fi
+  fi
+
+  # --- 1e. Firefox visited-site record (any profile) ---
+  _ff=$(find "$REAL_HOME/snap/firefox/common/.mozilla/firefox" \
+            "$REAL_HOME/.mozilla/firefox" \
+            -maxdepth 3 -type d -name 'https+++docs.openclaw.ai' 2>/dev/null)
+  if [[ -n $_ff ]]; then
+    printf '%s\n' "$_ff" | while read -r d; do backup "$d"; done
+    # shellcheck disable=SC2086
+    run rm -rf $_ff && ok "removed Firefox record for docs.openclaw.ai"
+  fi
+
+  # --- 1f. npm registry cache entries for the openclaw package ---
+  _npmidx="$REAL_HOME/.npm/_cacache/index-v5"
+  if [[ -d $_npmidx ]] && command -v grep >/dev/null 2>&1; then
+    _npmhits=$(grep -rl 'registry\.npmjs\.org/openclaw' "$_npmidx" 2>/dev/null | head -50)
+    if [[ -n $_npmhits ]]; then
+      printf '%s\n' "$_npmhits" | while read -r f; do backup "$f"; done
+      printf '%s\n' "$_npmhits" | while read -r f; do run rm -f "$f"; done
+      ok "removed $(printf '%s\n' "$_npmhits" | grep -c .) npm cache index entries"
+      say "  ${C_D}orphaned content blobs: run 'npm cache verify' to reclaim (~357M cache)${C_0}"
+    else
+      ok "npm cache has no openclaw entries"
+    fi
+  fi
+
+  # --- 1g. pip cache (only if it names openclaw) ---
+  if command -v pip >/dev/null 2>&1; then
+    pip cache list 2>/dev/null | grep -qi openclaw && {
+      run pip cache remove openclaw >/dev/null 2>&1 && ok "removed openclaw from pip cache"
+    } || true
+  fi
+
+  # --- final sweep report (never deletes: extension icons, model catalogs, session logs) ---
+  _left=$(find "$REAL_HOME" -maxdepth 4 -iname '*openclaw*' \
+            -not -path '*/.cache/*' -not -path '*/.local/share/opencode/*' \
+            -not -path '*/.vscode-oss/*' -not -path '*/snap/*' 2>/dev/null | head -10)
+  if [[ -z $_left ]]; then
+    ok "sweep: no openclaw files remain outside skipped locations"
+  else
+    say "  ${C_D}remaining (informational, not deleted):${C_0}"
+    printf '%s\n' "$_left" | sed 's/^/    /'
+  fi
+fi
+
+# ============================================================================
+# PART 2 — log cleanup
+# ============================================================================
+if (( DO_LOGS )); then
+  section "LOG CLEANUP"
+
+  # --- 2a. journald size cap (prevents regrowth to the 10%-of-disk default) ---
+  _jconf=/etc/systemd/journald.conf.d/50-size.conf
+  if [[ -d /etc/systemd/journald.conf.d && -f $_jconf ]] \
+     && grep -q 'SystemMaxUse=500M' "$_jconf" 2>/dev/null; then
+    ok "journal cap already set (SystemMaxUse=500M)"
+  elif (( DRY )); then
+    printf '  %s$ write %s (SystemMaxUse=500M, SystemMaxFileSize=50M)%s\n' "$C_D" "$_jconf" "$C_0"
+  else
+    if sudo mkdir -p /etc/systemd/journald.conf.d \
+       && printf '[Journal]\nSystemMaxUse=500M\nSystemMaxFileSize=50M\n' | sudo tee "$_jconf" >/dev/null; then
+      ok "journal cap set: SystemMaxUse=500M ($_jconf)"
+    else
+      warn "could not write $_jconf"
+    fi
+  fi
+
+  # --- 2b. vacuum: 7 days first (drops the openclaw era), then enforce 500M ---
+  #
+  # --rotate is REQUIRED, not cosmetic. Per journalctl(1), --vacuum-time=
+  # "removes ARCHIVED journal files older than the specified timespan" and
+  # "will not remove active journal files". An active file's old entries are
+  # therefore invisible to a plain vacuum: system.journal rotates on its own
+  # (it fills fast), but user-1000.journal fills slowly, never rotated, and
+  # held one continuous span from Oct 27 with 75k entries older than the
+  # window — untouched by a bare --vacuum-time.
+  #   --rotate marks active files archived and starts fresh ones, after which
+  #   the vacuum can actually remove the old ones. journalctl combines them
+  #   in one command: rotate first, vacuum immediately after.
+  #
+  # --directory scopes BOTH journals in that dir. Without it a root vacuum
+  # covers only the system journal — asher's user journal (root:systemd-journal,
+  # ACL user:asher:r--) is out of scope entirely.
+  JDIR="/var/log/journal"
+  if (( DRY )); then
+    printf '  %s$ sudo journalctl --directory=%s --rotate --vacuum-time=7d%s\n' "$C_D" "$JDIR" "$C_0"
+    printf '  %s$ sudo journalctl --directory=%s --vacuum-size=500M%s\n' "$C_D" "$JDIR" "$C_0"
+    _est="$(jsize)"
+    say "  ${C_D}current: ${_est} → target 500M${C_0}"
+  else
+    _before_j="$(jsize)"
+    # rotate+vacuum in one pass, then a size pass to enforce the cap.
+    # --no-pager + tail keeps the multi-line "Vacuuming done" chatter to 2 lines.
+    sudo journalctl --directory="$JDIR" --rotate --vacuum-time=7d --no-pager 2>&1 | tail -2 | sed 's/^/    /'
+    sudo journalctl --directory="$JDIR" --vacuum-size=500M --no-pager 2>&1 | tail -2 | sed 's/^/    /'
+    # reread config so the cap actually applies from now on
+    sudo systemctl restart systemd-journald 2>/dev/null || true
+    _after_j="$(jsize)"
+    ok "journal: ${_before_j:-?} → ${_after_j:-?} (rotated + kept 7 days, capped 500M)"
+    # Prove the window actually held across BOTH journals. Counting entries
+    # before the cutoff catches the case where a vacuum silently skipped an
+    # active file — which is exactly how the first version of this script
+    # reported success while leaving 75k old entries on disk.
+    _stale=$(journalctl --directory="$JDIR" --no-pager -q \
+             --until '7 days ago' 2>/dev/null | grep -c '^[A-Z]')
+    # Reporting only "0 older than the window" is NOT sufficient — that check
+    # passes even if the vacuum deleted far more than it should have. It
+    # proves no old entries remain, not that in-window entries survived.
+    #
+    # Observed here (verified by before/after file spans, not inferred):
+    #   before: user-1000.journal = ONE active file, Oct 27 -> Nov 14 23:30
+    #   after:  user scope oldest  = Nov 15 02:31
+    # So the whole file went, including its in-window Nov 10-14 half (window
+    # floor is Nov 8). Vacuum acts on whole files: --rotate makes the active
+    # file an archive, and the archive is then judged as a unit — it cannot
+    # keep the recent part of an otherwise-old file. System scope kept
+    # Nov 10 only because it rotates on its own, into younger files.
+    #
+    # Not recoverable (the file is deleted) and not a bug in this script's
+    # flags — but it IS why "0 stale entries" alone would have reported
+    # success over a real coverage loss. Report the actual span per scope.
+    _sys_old=$(journalctl --system --no-pager -q -o short 2>/dev/null | head -1 | cut -c1-16)
+    _usr_old=$(journalctl --user   --no-pager -q -o short 2>/dev/null | head -1 | cut -c1-16)
+    _all_old=$(journalctl --directory="$JDIR" --no-pager -q -o short 2>/dev/null | head -1 | cut -c1-16)
+    if [[ ${_stale:-0} -eq 0 ]]; then
+      ok "0 entries older than the window remain"
+    else
+      warn "$_stale entries older than 7 days remain — the window did not fully apply"
+      say "  ${C_D}re-run: sudo journalctl --directory=$JDIR --rotate --vacuum-time=7d${C_0}"
+    fi
+    say "  ${C_D}coverage (oldest entry kept) — journal granularity is per-FILE,${C_0}"
+    say "  ${C_D}so a file is kept or dropped whole; in-window data inside an${C_0}"
+    say "  ${C_D}otherwise-old file goes with it:${C_0}"
+    say "  ${C_D}  all:    ${_all_old:-n/a}${C_0}"
+    say "  ${C_D}  system: ${_sys_old:-n/a}${C_0}"
+    say "  ${C_D}  user:   ${_usr_old:-n/a}${C_0}"
+    say "  ${C_D}note: ~17% of old journal was openclaw crash-loop noise${C_0}"
+  fi
+
+  # --- 2c. apt cache ---
+  if (( DRY )); then
+    printf '  %s$ sudo apt clean   (currently %s)%s\n' "$C_D" "$(hsize /var/cache/apt)" "$C_0"
+  else
+    _b="$(hsize /var/cache/apt)"
+    if sudo apt-get clean -qq 2>/dev/null; then
+      ok "apt cache: $_b → $(hsize /var/cache/apt)"
+    else
+      warn "apt clean failed"
+    fi
+  fi
+
+  # --- 2d. rotated logs only. Live syslog/kern.log carry no .N suffix, so
+  #        these globs cannot match them. ---
+  _rots=()
+  for f in /var/log/syslog.[0-9] /var/log/syslog.[0-9].gz \
+           /var/log/kern.log.[0-9] /var/log/kern.log.[0-9].gz; do
+    [[ -e $f ]] && _rots+=("$f")
+  done
+  if (( ${#_rots[@]} == 0 )); then
+    ok "no rotated logs to remove (live syslog/kern.log kept)"
+  else
+    _rot_sz=0
+    for f in "${_rots[@]}"; do
+      _rot_sz=$((_rot_sz + $(stat -c%s "$f" 2>/dev/null || echo 0)))
+    done
+    if (( DRY )); then
+      printf '  %s$ sudo rm -f %s rotated logs (%s)%s\n' \
+        "$C_D" "${#_rots[@]}" "$(awk -v b="$_rot_sz" 'BEGIN{printf "%.1fM", b/1048576}')" "$C_0"
+      printf '    %s\n' "${_rots[@]}"
+    else
+      sudo rm -f "${_rots[@]}" && ok "removed ${#_rots[@]} rotated logs ($(awk -v b="$_rot_sz" 'BEGIN{printf "%.1fM", b/1048576}'))"
+      say "  ${C_D}kept: /var/log/syslog and /var/log/kern.log (live)${C_0}"
+    fi
+  fi
+
+  # --- 2e. helpz security-logs reset to their headers (append-only files) ---
+  for f in errors.txt warnings.txt; do
+    _lf="$REAL_HOME/.security-logs/$f"
+    [[ -f $_lf ]] || continue
+    _sz=$(stat -c%s "$_lf" 2>/dev/null || echo 0)
+    if (( _sz <= 400 )); then
+      ok "$f already at header"
+      continue
+    fi
+    backup "$_lf"
+    if (( DRY )); then
+      printf '  %s$ reset ~/.security-logs/%s (%s → header)%s\n' "$C_D" "$f" "$(awk -v b="$_sz" 'BEGIN{printf "%.0fK", b/1024}')" "$C_0"
+    else
+      case "$f" in
+        errors.txt)   _hdr='# Security Suite Errors Log — appended, never overwritten\n# Format: [TIMESTAMP] [SCRIPT] [CATEGORY] message — FIX: one-liner\n\n' ;;
+        warnings.txt) _hdr='# Security Suite Warnings Log — appended, never overwritten\n# Format: [TIMESTAMP] [SCRIPT] [CATEGORY] message — SUGGESTION: one-liner\n\n' ;;
+      esac
+      printf "$_hdr" > "$_lf" && ok "reset ~/.security-logs/$f to header"
+    fi
+  done
+  # incidents.txt holds no incidents — only ever its header. Leave it alone.
+fi
+
+# ============================================================================
+# AFTER
+# ============================================================================
+section "AFTER"
+if (( DRY )); then
+  say "  ${C_Y}dry run — nothing changed. Re-run without --dry-run to apply.${C_0}"
+else
+  AFT_JOURNAL="$(jsize)"
+  AFT_DF="$(df -h "$REAL_HOME" | awk 'NR==2{print $4" free ("$5" used)"}')"
+  say "  journal:   ${BEFORE_JOURNAL:-?} → ${AFT_JOURNAL:-?}"
+  say "  home free: $BEFORE_DF → $AFT_DF"
+  (( DO_LOGS )) && say "  apt cache: now $(hsize /var/cache/apt)"
+  if (( BACKED )); then
+    printf '\n  %sbackups:%s %s\n' "$C_D" "$C_0" "$BACKUP"
+    printf '  %s(delete that dir when you are happy with the result)%s\n' "$C_D" "$C_0"
+  fi
+  printf '\n  %s✓%s cleanupz complete\n' "$C_G" "$C_0"
+fi
+
+# Space that is NOT logs and NOT openclaw — left alone on purpose.
+if (( DO_LOGS )); then
+  printf '\n%s  not touched (not logs, not openclaw) — the real space:%s\n' "$C_D" "$C_0"
+  for d in "$REAL_HOME/.cache" "$REAL_HOME/Downloads" "$REAL_HOME/.local" \
+           "$REAL_HOME/ai" "$REAL_HOME/linux-build" "$REAL_HOME/kernel-build"; do
+    [[ -d $d ]] && printf '    %-40s %s\n' "${d/#$REAL_HOME/~}" "$(hsize "$d")"
+  done
+fi
+
+# ---------- JSON report (only in --json mode; fd4 is real stdout) ----------
+if (( JSON )); then
+  jq_esc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+  printf '{"tool":"cleanupz","dry_run":true,"openclaw":%s,"logs":%s,"journal_before":"%s","home_free_before":"%s","backup":"%s","files_backed_up":%s,"status":"dry-run"}\n' \
+    "$([[ $DO_OPENCLAW -eq 1 ]] && echo true || echo false)" \
+    "$([[ $DO_LOGS -eq 1 ]] && echo true || echo false)" \
+    "$(jq_esc "${BEFORE_JOURNAL:-unknown}")" \
+    "$(jq_esc "${BEFORE_DF:-unknown}")" \
+    "$(jq_esc "${BACKUP:-}")" \
+    "$([[ $BACKED -eq 1 ]] && echo true || echo false)" >&4
+fi
+exit 0

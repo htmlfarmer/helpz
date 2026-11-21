@@ -542,7 +542,7 @@ path_status() {
 # nobody would ever have guessed that name.
 SYMPTOM_INDEX=(
   "Computer is slow or sluggish|topz speedz slowz|slow sluggish freezing laggy hangs speed"
-  "Disk is full / no space|diskz filez|disk full no space storage cleanup"
+  "Disk is full / no space|diskz filez cleanupz|disk full no space storage cleanup reclaim logs openclaw"
   "Running out of memory|memoryz|ram memory oom out-of-memory"
   "CPU is hot or throttling|cpuz powerz|hot overheat thermal throttl cpu-temp"
   "Something is eating the network|networkz topz|traffic bandwidth network ping latency"
