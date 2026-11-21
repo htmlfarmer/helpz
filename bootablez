@@ -2318,6 +2318,108 @@ do_windows_usb() {
     echo "    partition: $part"
     sudo_run mkfs.vfat -F 32 -n "WINUSB" "$part" || { warn "mkfs.vfat failed"; return 1; }
 
+    # The payload is 4.59 GB — over FAT32's 4 GB file limit — so it cannot be
+    # extracted straight onto the stick. Extract to the local disk, split it
+    # there, then copy the (now small) pieces onto the FAT32 volume.
+    sudo_run mkdir -p "$mnt_usb" || { warn "cannot create the mount point"; return 1; }
+    sudo_run mount "$part" "$mnt_usb" || { warn "could not mount $part"; return 1; }
+    local work="$ISO.windows-usb-work"
+    rm -rf "$work"
+    mkdir -p "$work" || { warn "cannot create a work directory next to the ISO"; return 1; }
+    local sz7
+    sz7=$(command -v 7zzs || command -v 7z || true)
+    if [[ -z "$sz7" ]]; then
+        info "installing 7zip"
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y 7zip 2>/dev/null || apt-get install -y p7zip-full 2>/dev/null || true
+        sz7=$(command -v 7zzs || command -v 7z || true)
+    fi
+    [[ -n "$sz7" ]] || { warn "no 7-Zip available (apt install 7zip)"; return 1; }
+
+    echo "--- extracting the ISO (a few minutes)"
+    if ! "$sz7" x -y -o"$work" "$iso" >/dev/null 2>&1; then
+        warn "7-Zip could not extract the ISO"
+        rm -rf "$work"
+        return 1
+    fi
+    local wim="$work/sources/install.wim"
+    [[ -f "$wim" ]] || { warn "sources/install.wim is missing after the extraction"; return 1; }
+
+    echo "--- splitting install.wim so it fits FAT32"
+    if ! sudo_run wimlib-imagex split "$wim" "$work/sources/install.swm" 4000M; then
+        warn "wimlib could not split the payload"
+        rm -rf "$work"
+        return 1
+    fi
+    sudo_run rm -f "$wim"
+    # wimlib names the parts however it likes; Windows Setup only accepts
+    # install.swm, install2.swm, install3.swm ... so rename them in order
+    local n=2 p first=1
+    local -a parts=()
+    mapfile -t parts < <(sudo_run find "$work/sources" -maxdepth 1 -name 'install*.swm' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2)
+    for p in "${parts[@]}"; do
+        [[ -f "$p" ]] || continue
+        if (( first )); then
+            [[ "$(basename "$p")" == "install.swm" ]] || sudo_run mv "$p" "$work/sources/install.swm"
+            first=0
+        else
+            sudo_run mv "$p" "$work/sources/install${n}.swm" 2>/dev/null && n=$((n+1))
+        fi
+    done
+
+    echo "--- copying the installer files onto the stick"
+    sudo_run cp -rT --no-preserve=xattr,ownership "$work/." "$mnt_usb/" || {
+        warn "the copy onto the stick failed"
+        rm -rf "$work"
+        return 1
+    }
+    sudo_run df -h "$mnt_usb" >&2 || true
+    sudo_run ls -la "$mnt_usb/sources/" 2>/dev/null | head -6 >&2 || true
+    rm -rf "$work"
+
+    echo "--- syncing and releasing"
+    sudo_run sync
+    sudo_run umount "$mnt_usb"
+    sudo_run umount "$mnt_iso"
+    sudo_run rmdir "$mnt_iso" "$mnt_usb" 2>/dev/null || true
+    return 0
+}
+
+# ---------- Windows USB, the way a real Windows USB is built ---------------
+# The Windows installer ISOs have no El Torito boot record, so dd-ing one to
+# a stick gives a stick that will not boot. The only layout that works is
+# what Microsoft's Media Creation Tool builds: one FAT32 partition with the
+# ISO's contents copied in — bootmgr, boot/BCD, sources/boot.wim, the EFI
+# loader — and the payload (install.wim) split so it fits FAT32's 4 GB file
+# limit.
+do_windows_usb() {
+    local iso="$1" target="$2" part mnt_iso=/mnt/bootablez-wusb mnt_usb=/mnt/bootablez-wusb
+    [[ -f "$iso" ]] || { warn "no such file: $iso"; return 1; }
+    command -v mkfs.vfat >/dev/null 2>&1 || { warn "needs mkfs.vfat (apt install dosfstools)"; return 1; }
+    command -v wimlib-imagex >/dev/null 2>&1 || {
+        # Debian/Ubuntu package the wimlib tools as "wimtools"; wimlib is
+        # the upstream name (Fedora/Arch), so try both
+        info "installing the wimlib tools (they split install.wim so it fits FAT32)"
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y wimtools 2>/dev/null || apt-get install -y wimlib 2>/dev/null || {
+            warn "could not install the wimlib tools"
+            warn "  sudo apt install wimtools      (Debian/Ubuntu)"
+            warn "  sudo pacman -S wimlib          (Arch)"
+            warn "  sudo dnf install wimlib        (Fedora)"
+            return 1
+        }
+    }
+    command -v wimlib-imagex >/dev/null 2>&1 || { warn "wimlib-imagex is still missing"; return 1; }
+
+    echo "--- wiping $target and laying out one FAT32 partition"
+    sudo_run wipefs -a "$target" >/dev/null 2>&1 || true
+    printf 'label: dos\nunit: sectors\n\nstart=2048, type=0x0c, bootable\n' | sudo_run sfdisk --quiet "$target" || { warn "sfdisk failed"; return 1; }
+    part=$(lsblk -nr -o NAME "$target" | sed -n '2p')
+    part="/dev/$part"
+    [[ -b "$part" ]] || { warn "no partition appeared on $target"; return 1; }
+    echo "    partition: $part"
+    sudo_run mkfs.vfat -F 32 -n "WINUSB" "$part" || { warn "mkfs.vfat failed"; return 1; }
+
     echo "--- mounting the ISO"
     sudo_run mkdir -p "$mnt_iso" "$mnt_usb" || return 1
     # these ISOs are UDF for content and carry a stub ISO9660 descriptor
