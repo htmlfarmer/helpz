@@ -2320,7 +2320,17 @@ do_windows_usb() {
 
     echo "--- mounting the ISO"
     sudo_run mkdir -p "$mnt_iso" "$mnt_usb" || return 1
-    sudo_run mount -o loop,ro "$iso" "$mnt_iso" || { warn "could not mount the ISO (needs the udf driver)"; return 1; }
+    # these ISOs are UDF for content and carry a stub ISO9660 descriptor
+    # with nothing but README.TXT in it — ask for UDF explicitly, or the
+    # mount succeeds and the payload is simply not there
+    sudo_run mount -o loop,ro -t udf "$iso" "$mnt_iso" 2>/dev/null \
+        || sudo_run mount -o loop,ro "$iso" "$mnt_iso" \
+        || { warn "could not mount the ISO (needs the udf driver)"; return 1; }
+    if ! sudo_run find "$mnt_iso" -iname 'install.wim' -print -quit 2>/dev/null | grep -q .; then
+        warn "the ISO mounted but shows no install.wim — it was not mounted as UDF"
+        sudo_run umount "$mnt_iso" 2>/dev/null || true
+        return 1
+    fi
     sudo_run mount "$part" "$mnt_usb" || { sudo_run umount "$mnt_iso"; warn "could not mount $part"; return 1; }
 
     echo "--- copying the installer files (this takes a few minutes)"
@@ -2329,7 +2339,7 @@ do_windows_usb() {
 
     echo "--- splitting install.wim so it fits FAT32"
     local wim
-    wim=$(sudo_run find "$mnt_iso" -maxdepth 2 -iname 'install.wim' -print -quit 2>/dev/null | head -1)
+    wim=$(sudo_run find "$mnt_iso" -iname 'install.wim' -print -quit 2>/dev/null | head -1)
     if [[ -n "$wim" ]]; then
         sudo_run wimlib-imagex split "$wim" "$mnt_usb/sources/install.swm" 4000M || {
             warn "wimlib could not split the payload"
