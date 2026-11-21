@@ -2146,6 +2146,33 @@ do_menu_macos() {
     return 0
 }
 
+# do_menu_windows — menu action: build a Windows installer stick
+do_menu_windows() {
+    printf "  ${C_BOLD}what kind of Windows stick?${C_RESET}\n"
+    printf "    ${C_BOLD}1${C_RESET}) full installer  ${C_DIM}FAT32 with the payload split — needs an 8 GB+ stick${C_RESET}\n"
+    printf "    ${C_BOLD}2${C_RESET}) boot set only    ${C_DIM}about 600 MB — for a small stick; the install comes from the ISO elsewhere${C_RESET}\n"
+    printf "\n  Choice [1-2]: "
+    local pick=""
+    IFS= read -r pick || pick=""
+    printf "\n"
+    case "$pick" in
+        1) WINDOWS_USB=1 ;;
+        2) WINDOWS_BOOTS=1 ;;
+        *) printf "  ${C_YELLOW}!${C_RESET} pick 1 or 2\n"; return 0 ;;
+    esac
+    if (( ${#CAND[@]} == 0 )); then
+        printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in, then pick 8 to rescan\n"
+        WINDOWS_USB=0; WINDOWS_BOOTS=0
+        return 0
+    elif (( ${#CAND[@]} == 1 )); then
+        TARGET="${CAND[0]}"
+        info "using the only stick attached: $TARGET"
+    else
+        pick_target || { WINDOWS_USB=0; WINDOWS_BOOTS=0; return 0; }
+    fi
+    return 0
+}
+
 # menu_loop — after the report, let the user choose instead of making them
 # remember flags. Returns when they pick "write" (the wizard continues
 # below); every other choice is handled here and loops back.
@@ -2160,11 +2187,12 @@ menu_loop() {
         fi
         printf "    ${C_BOLD}2${C_RESET}) Fetch a Linux/Windows installer ${C_DIM}download + verify, then write it${C_RESET}\n"
         printf "    ${C_BOLD}3${C_RESET}) Fetch a macOS installer        ${C_DIM}Apple's catalog → bootable image → write it${C_RESET}\n"
-        printf "    ${C_BOLD}4${C_RESET}) Verify a stick byte-for-byte ${C_DIM}compare against an image, writes nothing${C_RESET}\n"
-        printf "    ${C_BOLD}5${C_RESET}) Show me the commands         ${C_DIM}print them so you can run them yourself${C_RESET}\n"
-        printf "    ${C_BOLD}6${C_RESET}) Look again                   ${C_DIM}rescan drives and images${C_RESET}\n"
-        printf "    ${C_BOLD}7${C_RESET}) Quit\n\n"
-        printf "  Choice [1-7]: "
+        printf "    ${C_BOLD}4${C_RESET}) Build a Windows installer stick ${C_DIM}full installer or boot-set only${C_RESET}\n"
+        printf "    ${C_BOLD}5${C_RESET}) Verify a stick byte-for-byte ${C_DIM}compare against an image, writes nothing${C_RESET}\n"
+        printf "    ${C_BOLD}6${C_RESET}) Show me the commands         ${C_DIM}print them so you can run them yourself${C_RESET}\n"
+        printf "    ${C_BOLD}7${C_RESET}) Look again                   ${C_DIM}rescan drives and images${C_RESET}\n"
+        printf "    ${C_BOLD}8${C_RESET}) Quit\n\n"
+        printf "  Choice [1-8]: "
         choice=""
         IFS= read -r choice || choice=""
         printf "\n"
@@ -2175,9 +2203,9 @@ menu_loop() {
                 if (( ${#CAND[@]} == 0 )); then
                     if (( USB_SEEN )); then
                         printf "  ${C_YELLOW}!${C_RESET} a USB disk is attached but not usable right now — see the USABLE column above\n"
-                        printf "  ${C_DIM}reads 0 B? unplug it and plug it back in, then pick 6 to rescan${C_RESET}\n"
+                        printf "  ${C_DIM}reads 0 B? unplug it and plug it back in, then pick 7 to rescan${C_RESET}\n"
                     else
-                        printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in, then pick 6 to rescan\n"
+                        printf "  ${C_YELLOW}!${C_RESET} no usable stick attached — plug one in, then pick 7 to rescan\n"
                     fi
                 else
                     return 0
@@ -2185,14 +2213,16 @@ menu_loop() {
                 ;;
             2) do_menu_distro; [[ -n "$ISO" ]] && return 0 ;;
             3) do_menu_macos;   [[ -n "$ISO" ]] && return 0 ;;
-            4) do_menu_verify ;;
-            5) show_commands ;;
-            6) report ;;
-            7|q|Q|"")
+            4) do_menu_windows
+               if (( WINDOWS_USB )) || (( WINDOWS_BOOTS )); then return 0; fi ;;
+            5) do_menu_verify ;;
+            6) show_commands ;;
+            7) report ;;
+            8|q|Q|"")
                 printf "  ${C_DIM}nothing was written — run bootablez again whenever you are ready${C_RESET}\n"
                 add_json_field "status" "status"
                 emit_verdict ;;
-            *) printf "  ${C_YELLOW}!${C_RESET} pick 1-7\n" ;;
+            *) printf "  ${C_YELLOW}!${C_RESET} pick 1-8\n" ;;
         esac
     done
 }
@@ -2326,6 +2356,43 @@ do_windows_usb() {
 # ============================================================================
 
 report
+
+# ---------- status-only exits ---------------------------------------------
+# --status --verify is the "did this stick really get flashed?" audit: it
+# byte-compares an existing stick against an image without writing anything.
+if (( STATUS_ONLY )); then
+    if (( VERIFY )); then
+        # sensible defaults: with exactly one image and one stick, just use them
+        if [[ -z "$ISO" && ${#ISO_LIST[@]} -eq 1 ]]; then
+            ISO="${ISO_LIST[0]}"
+            info "verifying against the only image found: $(basename "$ISO")"
+        fi
+        if [[ -z "$TARGET" && ${#CAND[@]} -eq 1 ]]; then
+            TARGET="${CAND[0]}"
+            info "verifying the only stick found: $TARGET"
+        fi
+        if [[ -z "$ISO" || -z "$TARGET" ]]; then
+            usage_abort "--verify needs an image and a target: ./bootablez --status --verify --iso <img> --device <dev>"
+        fi
+        run_byte_verify
+        emit_verdict
+    fi
+    add_json_field "status" "status"
+    emit_verdict
+fi
+
+# A bare `bootablez` is a report first: then it asks what you want to do,
+# rather than expecting you to remember flags. Every choice except "write"
+# is handled inside menu_loop; picking 1 returns here so the wizard runs.
+if [[ -z "$ISO" && -z "$TARGET" ]]; then
+    if (( ! INTERACTIVE )) || (( JSON_OUT == 1 )); then
+        # nothing was asked for and there is no terminal to ask in: the
+        # report above is the answer
+        add_json_field "status" "status"
+        emit_verdict
+    fi
+    menu_loop
+fi
 
 # ---------- distribution ISOs -----------------------------------------------
 # A bootable stick should not start with "go and download an ISO first".
@@ -2512,42 +2579,6 @@ if [[ -z "$ISO" && -z "$TARGET" && -z "$DISTRO" ]] && declare -F distro_brief >/
     distro_brief
 fi
 
-# ---------- status-only exits ---------------------------------------------
-# --status --verify is the "did this stick really get flashed?" audit: it
-# byte-compares an existing stick against an image without writing anything.
-if (( STATUS_ONLY )); then
-    if (( VERIFY )); then
-        # sensible defaults: with exactly one image and one stick, just use them
-        if [[ -z "$ISO" && ${#ISO_LIST[@]} -eq 1 ]]; then
-            ISO="${ISO_LIST[0]}"
-            info "verifying against the only image found: $(basename "$ISO")"
-        fi
-        if [[ -z "$TARGET" && ${#CAND[@]} -eq 1 ]]; then
-            TARGET="${CAND[0]}"
-            info "verifying the only stick found: $TARGET"
-        fi
-        if [[ -z "$ISO" || -z "$TARGET" ]]; then
-            usage_abort "--verify needs an image and a target: ./bootablez --status --verify --iso <img> --device <dev>"
-        fi
-        run_byte_verify
-        emit_verdict
-    fi
-    add_json_field "status" "status"
-    emit_verdict
-fi
-
-# A bare `bootablez` is a report first: then it asks what you want to do,
-# rather than expecting you to remember flags. Every choice except "write"
-# is handled inside menu_loop; picking 1 returns here so the wizard runs.
-if [[ -z "$ISO" && -z "$TARGET" ]]; then
-    if (( ! INTERACTIVE )) || (( JSON_OUT == 1 )); then
-        # nothing was asked for and there is no terminal to ask in: the
-        # report above is the answer
-        add_json_field "status" "status"
-        emit_verdict
-    fi
-    menu_loop
-fi
 
 # ---------- STEP 1: the image ---------------------------------------------
 section "STEP 1 · CHOOSE THE IMAGE"
