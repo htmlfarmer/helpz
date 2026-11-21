@@ -43,15 +43,17 @@ macimg_script() {
     dir=$(macos_dir 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")
     mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
     out="$dir/macimg.py"
-    if ! grep -q 'macimg version: 2' "$out" 2>/dev/null; then
+    if ! grep -q 'macimg version: 4' "$out" 2>/dev/null; then
         cat > "$out" <<'MACIMG_PY_EOF'
-# macimg version: 2
+# macimg version: 4
 """macimg — helper for Apple's macOS installer media, used by bootablez.
 
-Three jobs, all pure stdlib (no dmg2img, no 7-Zip needed):
+Four jobs, all pure stdlib (no dmg2img, no 7-Zip needed):
 
   probe <file>            what is this file?  iso9660 | udif | macos | raw
   dmg2raw <in.dmg> <out>   Apple UDIF (.dmg) -> raw disk image
+  partoff <file>           "<offset> <size>" of the Apple HFS+ partition
+                          (bytes; "0 0" = the file is not a partitioned image)
   pkgextract <pkg> <name> <out>
                           pull one file out of an Apple flat package (.pkg)
 
@@ -431,6 +433,23 @@ def main():
         pkg_extract(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd == 'probe' and len(sys.argv) == 3:
         probe(sys.argv[2])
+    elif cmd == 'partoff' and len(sys.argv) == 3:
+        # prints "<offset> <size>" in bytes for the Apple HFS+ partition, or
+        # "0 0" when the file is not a partitioned image.
+        #
+        # BOTH numbers matter. Apple's BaseSystem images are GPT disk images
+        # whose file runs ~134 MB PAST the partition, and the kernel looks for
+        # the backup volume header at the end of the DEVICE it was handed:
+        # a loop device that overhangs the partition makes it read zeros there
+        # and reject a perfectly good volume with
+        # "invalid secondary volume header". Size the device to the partition
+        # (offset + sizelimit) and the header is where it expects it.
+        for first, last, guid, _name in gpt_map(sys.argv[2]):
+            if guid == APPLE_HFS_GUID:
+                print(first * 512, (last - first + 1) * 512)
+                break
+        else:
+            print(0, 0)
     else:
         print(__doc__)
         return 1
@@ -639,6 +658,9 @@ macos_download() {
         info "unpacking InstallESD.dmg from the package …" >&2
         python3 "$(macimg_script)" pkgextract "$out/InstallESDDmg.pkg" InstallESD.dmg "$out/InstallESD.dmg" \
             >&2 || { warn "macos: could not unpack the payload"; return 1; }
+        # the .pkg is only the container the DMG came in — keeping it cost
+        # several GB of disk for something that will never be read again
+        rm -f "$out/InstallESDDmg.pkg"
     fi
 
     printf '%s' "$out"
@@ -656,15 +678,47 @@ macos_download() {
 macos_build() {
     local src="$1" out="$2"
     macos_have_python || { warn "macos: needs python3"; return 1; }
+    # mkfs.hfsplus comes from hfsprogs — it is small, and asking the user to
+    # leave the flow to install it by hand is how this path used to die.
+    # sudo_run prompts here when root is needed, like the rest of the suite.
+    if ! command -v mkfs.hfsplus >/dev/null 2>&1; then
+        info "macos: installing hfsprogs (mkfs.hfsplus)"
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo_run apt-get update -qq >/dev/null 2>&1 || true
+            sudo_run apt-get install -y hfsprogs >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo_run pacman -S --noconfirm --needed hfsprogs >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo_run dnf install -y hfsprogs >/dev/null 2>&1 || true
+        fi
+        # the package lands in /usr/sbin, which is not in every user's PATH —
+        # without this the tool reports "missing" right after installing it
+        if ! command -v mkfs.hfsplus >/dev/null 2>&1; then
+            local _hp
+            for _hp in /usr/sbin /sbin /usr/local/sbin; do
+                [[ -x "$_hp/mkfs.hfsplus" ]] && { PATH="$PATH:$_hp"; break; }
+            done
+        fi
+    fi
     command -v mkfs.hfsplus >/dev/null 2>&1 || {
         warn "macos: needs hfsprogs for mkfs.hfsplus (sudo apt install hfsprogs)"
         return 1
     }
     command -v sfdisk >/dev/null 2>&1 || { warn "macos: needs sfdisk (util-linux)"; return 1; }
 
-    # 1. the recovery system, unwrapped to a bare HFS+ volume
+    # 1. the recovery system, unwrapped from the .dmg. What comes out is a
+    #    GPT DISK image (Apple ships a whole disk, not a bare volume), so the
+    #    HFS+ volume lives inside the Apple partition — see partoff for where.
     local raw="$src/.recovery.raw"
     [[ -s "$raw" ]] || python3 "$(macimg_script)" dmg2raw "$src/BaseSystem.dmg" "$raw" >&2 || return 1
+    local part_line raw_off=0 raw_lim=0
+    part_line=$(python3 "$(macimg_script)" partoff "$raw" 2>/dev/null | head -1)
+    raw_off="${part_line%% *}"
+    raw_lim="${part_line##* }"
+    [[ "$raw_off" =~ ^[0-9]+$ ]] || raw_off=0
+    [[ "$raw_lim" =~ ^[0-9]+$ ]] || raw_lim=0
+    # a size that does not outgrow the offset cannot be a partition size
+    (( raw_lim <= raw_off )) && raw_lim=0
 
     # 2. a fresh HFS+ volume, big enough for the recovery system AND the payload
     local payload=0 f
@@ -673,6 +727,24 @@ macos_build() {
     done
     local vol="$src/.volume.hfs"
     local vol_bytes=$(( $(stat -c %s -- "$raw" 2>/dev/null || echo 0) + payload + 1073741824 ))
+    # Round up to whole MiB. mkfs.hfsplus sizes the volume in allocation
+    # blocks and writes the backup volume header at the VOLUME's end, while
+    # the kernel looks for it at the end of the DEVICE it was handed — any
+    # slack between the two is the same "invalid secondary volume header"
+    # trap the recovery image just fell into.
+    vol_bytes=$(( (vol_bytes + 1048575) / 1048576 * 1048576 ))
+    # The volume is copied INTO the image, so both exist for a moment — on a
+    # disk that just managed to hold Apple's several-GB media that is the
+    # difference between finishing and dying with "No space left on device"
+    # halfway through a build. Say it before doing the work, and point at
+    # the knob that moves the cache somewhere roomier.
+    local free
+    free=$(df -PB1 -- "$(dirname -- "$out")" 2>/dev/null | awk 'NR==2{print $4}')
+    [[ "$free" =~ ^[0-9]+$ ]] || free=0
+    if (( free > 0 && free < vol_bytes )); then
+        warn "macos: only $(humansize "$free") free next to $(basename "$out") — the build needs at least $(humansize "$vol_bytes")"
+        warn "  move the cache to a roomier disk: BOOTABLEZ_MACOS_DIR=/mnt/data/bootablez ./bootablez --macos-build <version>"
+    fi
     rm -f "$vol"
     truncate -s "$vol_bytes" "$vol"
     mkfs.hfsplus -v "OS X Base System" "$vol" || { warn "macos: mkfs.hfsplus failed"; return 1; }
@@ -681,32 +753,145 @@ macos_build() {
     #    installer looks for it
     local mnt_base="$src/.mnt-base" mnt_out="$src/.mnt-out"
     mkdir -p "$mnt_base" "$mnt_out"
-    sudo_run mount -o loop,ro "$raw" "$mnt_base" || { warn "macos: could not mount the recovery volume"; return 1; }
+    # _abort <message> — let go of the mounts, then give up. The image would
+    # otherwise be laid out, dd-ed and byte-verified while holding nothing
+    # that boots: a silent copy failure is the one failure mode this tool
+    # must never have.
+    _macos_build_abort() {
+        sudo_run umount "$mnt_out" 2>/dev/null
+        sudo_run umount "$mnt_base" 2>/dev/null
+        sudo_run rm -rf "$mnt_base" "$mnt_out"
+        warn "macos: $1"
+        return 1
+    }
+    # A previous failed attempt leaves the image attached to a loop device,
+    # and mount refuses to overlap one ("overlapping loop device exists").
+    # Release any loop still holding this file first — they are read-only and
+    # nothing is mounted on them, or losetup -d would refuse with EBUSY.
+    local stale l
+    stale=$(sudo_run losetup -j "$raw" -O NAME -n 2>/dev/null)
+    for l in $stale; do
+        info "releasing a stale loop device from an earlier attempt: $l"
+        sudo_run losetup -d "$l" 2>/dev/null || true
+    done
+
+    # Mount the recovery volume. The type is named explicitly (blkid sees a
+    # GPT table here and would otherwise have nothing to detect), the offset
+    # points at the Apple HFS+ partition, and the SIZELIMIT is what actually
+    # makes it mount: Apple's image runs ~134 MB past the partition, the
+    # kernel reads the backup volume header at the end of the device it was
+    # handed, and a device that overhangs the volume makes it read zeros and
+    # reject the whole thing with "invalid secondary volume header".
+    local base_opts="loop,ro"
+    (( raw_off > 0 )) && base_opts="$base_opts,offset=$raw_off"
+    (( raw_lim > 0 )) && base_opts="$base_opts,sizelimit=$raw_lim"
+    if ! sudo_run mount -t hfsplus -o "$base_opts" "$raw" "$mnt_base"; then
+        local pttype
+        pttype=$(blkid -p -o value -s PTTYPE "$raw" 2>/dev/null)
+        warn "macos: could not mount the recovery volume (offset ${raw_off} bytes, size ${raw_lim:-whole image}${pttype:+, image is a $pttype table})"
+        warn "  the kernel's reason is in the log: sudo dmesg | tail -5"
+        return 1
+    fi
     sudo_run mount -t hfsplus "$vol" "$mnt_out" || {
         sudo_run umount "$mnt_base"; warn "macos: could not mount the HFS+ volume"; return 1; }
     sudo_run cp -rT --no-preserve=xattr,ownership "$mnt_base/." "$mnt_out/" 2>/dev/null || true
-    local app
-    app=$(sudo_run find "$mnt_out" -maxdepth 1 -name 'Install macOS *.app' 2>/dev/null | head -1)
-    if [[ -n "$app" ]]; then
-        sudo_run mkdir -p "$app/Contents/SharedSupport"
-        sudo_run cp "$src/InstallESD.dmg" "$src/BaseSystem.dmg" \
-              "$src/BaseSystem.chunklist" "$src/InstallInfo.plist" \
-              "$src/AppleDiagnostics.dmg" "$app/Contents/SharedSupport/" 2>/dev/null || true
-    else
-        warn "macos: no 'Install macOS *.app' in the recovery volume — the install would not be offline"
+
+    # did the recovery system actually land? cp's "|| true" above would
+    # otherwise turn a failed copy into a successful-looking build
+    if ! sudo_run find "$mnt_out" -iname boot.efi -print -quit 2>/dev/null | grep -q .; then
+        _macos_build_abort "the recovery system did not land in the volume (no boot.efi) — the stick would not boot"
+        return 1
+    fi
+
+    # 10.13 calls it "Install macOS High Sierra.app", older releases
+    # "Install OS X ….app" — match both, or the payload has nowhere to go
+    local app payload_dst=""
+    app=$(sudo_run find "$mnt_out" -maxdepth 1 \
+            \( -name 'Install macOS *.app' -o -name 'Install OS X *.app' \) -print -quit 2>/dev/null)
+    if [[ -z "$app" ]]; then
+        _macos_build_abort "no installer app in the recovery volume — there would be nothing to run on the Mac"
+        return 1
+    fi
+    sudo_run mkdir -p "$app/Contents/SharedSupport"
+    sudo_run cp "$src/InstallESD.dmg" "$src/BaseSystem.dmg" \
+          "$src/BaseSystem.chunklist" "$src/InstallInfo.plist" \
+          "$src/AppleDiagnostics.dmg" "$app/Contents/SharedSupport/" 2>/dev/null || true
+    payload_dst="$app/Contents/SharedSupport/InstallESD.dmg"
+    # ask root: the copy ran as root and the mode bits are not guaranteed
+    if (( $(sudo_run stat -c %s -- "$payload_dst" 2>/dev/null || echo 0) == 0 )); then
+        _macos_build_abort "the payload (InstallESD.dmg) did not reach SharedSupport — the install could not run"
+        return 1
     fi
     sudo_run umount "$mnt_out"
     sudo_run umount "$mnt_base"
     sudo_run rm -rf "$mnt_base" "$mnt_out"
 
+    # the unwrapped recovery volume has been copied into the new one — it
+    # only served to build it, and it is a gigabyte the disk gets back
+    rm -f "$raw"
+
     # 4. lay the volume into a GPT disk image, as the single Apple HFS+ partition
+    # The payload is inside the volume now too. If the disk cannot hold the
+    # image AND its cached copy of the payload at the same time, the cached
+    # copy is the one to lose — it can always be downloaded again, and the
+    # image cannot be finished any other way.
+    free=$(df -PB1 -- "$(dirname -- "$out")" 2>/dev/null | awk 'NR==2{print $4}')
+    [[ "$free" =~ ^[0-9]+$ ]] || free=0
+    if (( free > 0 && free < vol_bytes )); then
+        info "macos: freeing cache space — the payload now lives inside the image"
+        rm -f "$src/InstallESD.dmg" "$src/InstallESDDmg.pkg"
+    fi
     rm -f "$out"
-    truncate -s "$(( vol_bytes + 1073741824 ))" "$out"
-    printf ',,48465300-0000-11AA-AA11-00306543ECAC\n' | sfdisk --quiet --label=gpt "$out" 2>/dev/null
-    local start
-    start=$(sfdisk -l -o Start "$out" 2>/dev/null | sed -n '2p' | tr -d ' ')
-    [[ "$start" =~ ^[0-9]+$ ]] || { warn "macos: could not lay out the image"; return 1; }
-    dd if="$vol" of="$out" bs=512 seek="$start" conv=notrunc,sparse status=none
+    # The partition must be EXACTLY the volume. sfdisk's "auto" layout sizes
+    # it to fill the disk, and with the disk larger than the volume the
+    # kernel would hunt for the backup volume header past its real end — the
+    # same trap as the recovery image, one layer down. Start at 1 MiB (GPT
+    # needs room for its own tables), size it to the volume, leave 1 MiB for
+    # the backup GPT.
+    local gpt_start=2048                       # sectors → 1 MiB
+    local vol_secs=$(( vol_bytes / 512 ))
+    truncate -s "$(( (gpt_start + vol_secs + 2048) * 512 ))" "$out"
+    printf 'start=%d, size=%d, type=48465300-0000-11AA-AA11-00306543ECAC\n' \
+        "$gpt_start" "$vol_secs" | sfdisk --quiet --label=gpt "$out" 2>/dev/null
+    # Read the table back from `sfdisk -d`, which prints "start=2048, size=…".
+    # `sfdisk -l -o Start` was the wrong tool: it prints a six-line banner and
+    # a "Start" column header BEFORE the value, so `sed -n 2p` picked up
+    # "Units: sectors of 1 * 512 = 512 bytes" and every build died here.
+    local pstart psize
+    pstart=$(sfdisk -d "$out" 2>/dev/null | sed -n 's/^.*: start=[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)
+    psize=$(sfdisk -d "$out" 2>/dev/null | sed -n 's/^.*start=[ ]*[0-9][0-9]*,[ ]*size=[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)
+    if [[ "$pstart" != "$gpt_start" || "$psize" != "$vol_secs" ]]; then
+        warn "macos: could not lay out the image (partition start=${pstart:-none} size=${psize:-none}, wanted $gpt_start/$vol_secs)"
+        return 1
+    fi
+    dd if="$vol" of="$out" bs=512 seek="$gpt_start" conv=notrunc,sparse status=none
+
+    # The last word before this image is called done: BOTH volume headers
+    # must be where every reader looks for them — primary at the partition
+    # start +1024, backup at the partition end −1024. A header missing here
+    # would still dd cleanly, still verify byte-for-byte, and boot nothing.
+    local hdrs sig_p sig_b
+    hdrs=$(python3 - "$out" "$(( gpt_start * 512 ))" "$(( vol_secs * 512 ))" <<'PY'
+import sys
+path, start, size = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path, 'rb') as f:
+    f.seek(start + 1024)
+    primary = f.read(2).hex()
+    f.seek(start + size - 1024)
+    backup = f.read(2).hex()
+print(primary, backup)
+PY
+)
+    read -r sig_p sig_b <<< "$hdrs"
+    case "$sig_p:$sig_b" in
+        482b:482b|4858:4858) ;;      # H+ or HX (case-sensitive HFSX)
+        *)
+            warn "macos: the assembled image is missing a volume header (primary=${sig_p:-?} backup=${sig_b:-?})"
+            return 1 ;;
+    esac
+    # the volume has been laid into the image — the working copy is not
+    # needed any more (a rebuild re-copies it from BaseSystem.dmg)
+    rm -f "$vol"
     return 0
 }
 
@@ -738,4 +923,18 @@ macos_boot_help() {
     printf "  ${C_DIM}  until Secure Boot is lowered in Recovery${C_RESET}\n"
     printf "  ${C_DIM}· ⌘R boots the Mac's OWN recovery instead of the stick — that is${C_RESET}\n"
     printf "  ${C_DIM}  the path to use if the internal disk still has a Recovery HD${C_RESET}\n"
+
+    # The machine in front of you may not be able to boot this stick at all.
+    # Saying "hold Option" on a Dell is how somebody spends an evening
+    # tapping Alt for nothing — name the machine instead.
+    local vendor=""
+    [[ -r /sys/class/dmi/id/sys_vendor ]] && vendor=$(tr -d '\n' < /sys/class/dmi/id/sys_vendor)
+    vendor=$(printf '%s' "$vendor" | sed 's/[[:space:]]*$//')
+    if [[ "${vendor,,}" != *apple* ]]; then
+        printf "\n  ${C_YELLOW}!${C_RESET} this machine is ${C_BOLD}%s${C_RESET} — it will not boot this stick.\n" \
+            "${vendor:-not a Mac}"
+        printf "    ${C_DIM}a macOS installer starts on a Mac only; a PC would need a bootloader${C_RESET}\n"
+        printf "    ${C_DIM}such as OpenCore, which this tool does not build — take the stick${C_RESET}\n"
+        printf "    ${C_DIM}to the Mac and hold the key above there${C_RESET}\n"
+    fi
 }
