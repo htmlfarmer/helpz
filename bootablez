@@ -145,6 +145,9 @@ DISTRO_LIST=0
 # the whole installer ISO
 WINDOWS_BOOTS=0
 WINDOWS_BOOTS_ISO=""
+# --windows-usb=ISO → the whole Windows USB built the way a real one is built
+WINDOWS_USB=0
+WINDOWS_USB_ISO=""
 # where the macOS media was fetched, and the assembled image
 MACOS_MEDIA_DIR=""
 MACOS_IMG=""
@@ -182,7 +185,9 @@ while [[ $i -lt $# ]]; do
     --distro)     i=$((i+1)); DISTRO="${ARGS[$i]:-}" ;;
     --distro-list) DISTRO_LIST=1 ;;
     --windows-boots=*) WINDOWS_BOOTS=1; WINDOWS_BOOTS_ISO="${arg#--windows-boots=}" ;;
-    --windows-boots) i=$((i+1)); WINDOWS_BOOTS=1; WINDOWS_BOOTS_ISO="${ARGS[$i]:-}" ;;
+    --windows-boots) WINDOWS_BOOTS=1 ;;
+    --windows-usb=*) WINDOWS_USB=1; WINDOWS_USB_ISO="${arg#--windows-usb=}" ;;
+    --windows-usb) WINDOWS_USB=1 ;;
     --yes|-y)     ASSUME_YES=1 ;;
     --force)      FORCE=1 ;;
     --verify)     VERIFY=1 ;;
@@ -2248,6 +2253,74 @@ EOF
     return 0
 }
 
+# ---------- Windows USB, the way a real Windows USB is built ---------------
+# The Windows installer ISOs have no El Torito boot record, so dd-ing one to
+# a stick gives a stick that will not boot. The only layout that works is
+# what Microsoft's Media Creation Tool builds: one FAT32 partition with the
+# ISO's contents copied in — bootmgr, boot/BCD, sources/boot.wim, the EFI
+# loader — and the payload (install.wim) split so it fits FAT32's 4 GB file
+# limit.
+do_windows_usb() {
+    local iso="$1" target="$2" part mnt_iso=/mnt/bootablez-wusb mnt_usb=/mnt/bootablez-wusb
+    [[ -f "$iso" ]] || { warn "no such file: $iso"; return 1; }
+    command -v mkfs.vfat >/dev/null 2>&1 || { warn "needs mkfs.vfat (apt install dosfstools)"; return 1; }
+    command -v wimlib-imagex >/dev/null 2>&1 || {
+        info "installing wimlib (it splits install.wim so it fits FAT32)"
+        apt-get install -y wimlib || { warn "could not install wimlib (apt install wimlib)"; return 1; }
+    }
+
+    echo "--- wiping $target and laying out one FAT32 partition"
+    sudo_run wipefs -a "$target" >/dev/null 2>&1 || true
+    printf 'label: dos\nunit: sectors\n\nstart=2048, type=0x0c, bootable\n' | sudo_run sfdisk --quiet "$target" || { warn "sfdisk failed"; return 1; }
+    part=$(lsblk -nr -o NAME "$target" | sed -n '2p')
+    part="/dev/$part"
+    [[ -b "$part" ]] || { warn "no partition appeared on $target"; return 1; }
+    echo "    partition: $part"
+    sudo_run mkfs.vfat -F 32 -n "WINUSB" "$part" || { warn "mkfs.vfat failed"; return 1; }
+
+    echo "--- mounting the ISO"
+    sudo_run mkdir -p "$mnt_iso" "$mnt_usb" || return 1
+    sudo_run mount -o loop,ro "$iso" "$mnt_iso" || { warn "could not mount the ISO (needs the udf driver)"; return 1; }
+    sudo_run mount "$part" "$mnt_usb" || { sudo_run umount "$mnt_iso"; warn "could not mount $part"; return 1; }
+
+    echo "--- copying the installer files (this takes a few minutes)"
+    sudo_run cp -rT --no-preserve=xattr,ownership "$mnt_iso/." "$mnt_usb/" 2>/dev/null || true
+    sudo_run rm -f "$mnt_usb/sources/install.wim" "$mnt_usb/sources/install.esd" 2>/dev/null || true
+
+    echo "--- splitting install.wim so it fits FAT32"
+    local wim
+    wim=$(sudo_run find "$mnt_iso" -maxdepth 2 -iname 'install.wim' -print -quit 2>/dev/null | head -1)
+    if [[ -n "$wim" ]]; then
+        sudo_run wimlib-imagex split "$wim" "$mnt_usb/sources/install.swm" 4000M || {
+            warn "wimlib could not split the payload"
+        }
+        # wimlib names the parts however it likes; Windows Setup only accepts
+        # install.swm, install2.swm, install3.swm … so rename them in order
+        local n=2 p first=1
+        local -a parts=()
+        mapfile -t parts < <(sudo_run find "$mnt_usb/sources" -maxdepth 1 -name 'install*.swm' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2)
+        for p in "${parts[@]}"; do
+            [[ -f "$p" ]] || continue
+            if (( first )); then
+                [[ "$(basename "$p")" == "install.swm" ]] || sudo_run mv "$p" "$mnt_usb/sources/install.swm"
+                first=0
+            else
+                sudo_run mv "$p" "$mnt_usb/sources/install${n}.swm" 2>/dev/null && n=$((n+1))
+            fi
+        done
+        sudo_run ls -la "$mnt_usb/sources/" | head -8
+    else
+        warn "no install.wim found in the ISO — the payload may not have been copied"
+    fi
+
+    echo "--- syncing and releasing"
+    sudo_run sync
+    sudo_run umount "$mnt_usb"
+    sudo_run umount "$mnt_iso"
+    sudo_run rmdir "$mnt_iso" "$mnt_usb" 2>/dev/null || true
+    return 0
+}
+
 # ============================================================================
 # main
 # ============================================================================
@@ -2340,6 +2413,52 @@ if (( WINDOWS_BOOTS )); then
         printf "\n  ${C_RED}✗${C_RESET} the boot set could not be written\n"
     fi
     add_json_field "status" "windows-boot-set"
+    emit_verdict
+fi
+
+# ---------- Windows USB (the real layout) -----------------------------------
+# The Windows installer ISOs have no El Torito boot record, so dd-ing one to
+# a stick gives a stick that will not boot. The layout that does work is the
+# one Microsoft's Media Creation Tool builds: one FAT32 partition with the
+# ISO's contents in it, and install.wim SPLIT so it fits FAT32's 4 GB file
+# limit (install.swm, install2.swm …).
+if (( WINDOWS_USB )); then
+    [[ -n "$TARGET" ]] || usage_abort "--windows-usb needs a target: --device /dev/sdX"
+    if [[ -z "$WINDOWS_USB_ISO" ]]; then
+        # no ISO named: use the cached one from --distro windows10
+        WINDOWS_USB_ISO=$(find "${BOOTABLEZ_ISO_DIR:-$HOME/.cache/bootablez/iso}/windows10" -maxdepth 1 -iname '*.iso' -print -quit 2>/dev/null)
+        [[ -n "$WINDOWS_USB_ISO" ]] && info "using the cached ISO: $(basename "$WINDOWS_USB_ISO")"
+    fi
+    [[ -n "$WINDOWS_USB_ISO" ]] || usage_abort "--windows-usb needs the ISO: --windows-usb /path/to/Windows.iso"
+    if [[ -d "$WINDOWS_USB_ISO" ]]; then
+        WUSB_FOUND=$(find "$WINDOWS_USB_ISO" -maxdepth 2 -iname '*.iso' -print -quit 2>/dev/null)
+        [[ -n "$WUSB_FOUND" ]] && WINDOWS_USB_ISO="$WUSB_FOUND"
+    fi
+    section "WINDOWS USB"
+    normalize_target
+    ISO="$WINDOWS_USB_ISO"
+    ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+    check_target
+    if (( DRY_RUN )); then
+        info "dry run — nothing was written. It would:"
+        printf "    ${C_DIM}wipe %s and lay out one FAT32 partition${C_RESET}\n" "$TARGET"
+        printf "    ${C_DIM}mount the ISO and copy its contents in${C_RESET}\n"
+        printf "    ${C_DIM}split install.wim into install.swm, install2.swm …${C_RESET}\n"
+        add_json_field "status" "dry-run"
+        emit_verdict
+    fi
+    confirm_target
+    ensure_sudo
+    if do_windows_usb "$WINDOWS_USB_ISO" "$TARGET"; then
+        ok "the Windows USB is on $TARGET"
+        printf "\n  ${C_DIM}Boot it: one-time boot-menu key on a PC (F12 Dell, F9 HP, F11 Lenovo),${C_RESET}\n"
+        printf "  ${C_DIM}or Option (⌥) — Alt on a PC keyboard — on an Intel Mac.${C_RESET}\n"
+        printf "  ${C_DIM}Windows 10 22H2 is the newest version most pre-2018 hardware supports;${C_RESET}\n"
+        printf "  ${C_DIM}Windows 11 from 24H2 on wants TPM 2.0 and Secure Boot.${C_RESET}\n"
+    else
+        printf "\n  ${C_RED}✗${C_RESET} the Windows USB could not be built\n"
+    fi
+    add_json_field "status" "windows-usb"
     emit_verdict
 fi
 
