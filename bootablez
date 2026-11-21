@@ -936,7 +936,8 @@ check_iso() {
         # and writing one of those to a stick produces a stick that will NOT
         # boot — the payload inside is compressed. Unwrap it first.
         local kind
-        kind=$(macimg_probe "$ISO")
+        macimg_probe "$ISO"
+        kind="$PROBE_KIND"
         if [[ "$kind" == "udif" ]]; then
             local unwrapped
             unwrapped=$(macimg_unwrap "$ISO") || {
@@ -946,10 +947,19 @@ check_iso() {
             IMAGE_SOURCE="$path"
             ISO="$unwrapped"
             ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
-            kind=$(macimg_probe "$ISO")
+            macimg_probe "$ISO"
+            kind="$PROBE_KIND"
         fi
         if [[ "$kind" == "macos" ]]; then
             IMAGE_KIND="macos"
+            # Apple's own installer disk images ship an EMPTY EFI system
+            # partition — the loader lives in the HFS+ volume instead. If
+            # NEITHER is there, the stick would come up with nothing to
+            # boot, and saying so is the whole point of looking.
+            if [[ "$(printf '%s' "${PROBE_OUT:-}" | sed -n 's/^boot=//p' | head -1)" == "0" ]]; then
+                warn "this macOS image has no EFI loader and no startup file — writing it to a stick will NOT boot"
+                warn "  use the recovery image (BaseSystem.dmg) or --macos-build, which assembles one"
+            fi
         else
             IMAGE_KIND="raw"
             warn "not an ISO9660 image and not a macOS installer either — treated as a raw disk image"
@@ -958,12 +968,18 @@ check_iso() {
     return 0
 }
 
-# macimg_probe <file> → iso9660 | udif | macos | raw
+# macimg_probe <file> → sets PROBE_KIND and PROBE_OUT
+# NOT called in a command substitution: a subshell would swallow the globals.
 macimg_probe() {
-    [[ -f "$(macimg_script)" ]] || { printf 'raw'; return 0; }
-    command -v python3 >/dev/null 2>&1 || { printf 'raw'; return 0; }
-    python3 "$(macimg_script)" probe "$1" 2>/dev/null \
-        | sed -n 's/^kind=//p' | head -1
+    PROBE_OUT=""
+    PROBE_KIND="raw"
+    [[ -f "$(macimg_script)" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    PROBE_OUT=$(python3 "$(macimg_script)" probe "$1" 2>/dev/null)
+    local k
+    k=$(printf '%s' "$PROBE_OUT" | sed -n 's/^kind=//p' | head -1)
+    [[ -n "$k" ]] && PROBE_KIND="$k"
+    return 0
 }
 
 # macimg_unwrap <file.dmg> → path of the raw disk image (cached)

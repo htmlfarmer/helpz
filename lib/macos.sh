@@ -43,8 +43,9 @@ macimg_script() {
     dir=$(macos_dir 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")
     mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
     out="$dir/macimg.py"
-    if [[ ! -s "$out" ]] || (( $(stat -c %s -- "$out" 2>/dev/null || echo 0) < 2000 )); then
+    if ! grep -q 'macimg version: 2' "$out" 2>/dev/null; then
         cat > "$out" <<'MACIMG_PY_EOF'
+# macimg version: 2
 """macimg — helper for Apple's macOS installer media, used by bootablez.
 
 Three jobs, all pure stdlib (no dmg2img, no 7-Zip needed):
@@ -382,6 +383,19 @@ def probe(path):
                                (b'com.apple.recovery.boot', 'recovery folder')):
                 if find_bytes(path, pat) >= 0:
                     detail += f', has {label}'
+            # will it BOOT a Mac? two ways: an EFI system partition carrying
+            # a loader, or the HFS+ volume carrying the startup file
+            # (/System/Library/CoreServices/boot.efi). Apple's own installer
+            # disk images have an EMPTY EFI partition — writing one of those
+            # to a stick gives a stick that does not boot.
+            bootable = 0
+            for p0, p1, guid, _pn in parts:
+                if guid == APPLE_EFI_GUID:
+                    if find_bytes(path, b'.efi', limit=(p1 + 1) * 512) >= 0:
+                        bootable = 1
+            if not bootable and find_bytes(path, b'boot.efi') >= 0:
+                bootable = 1
+            print(f'boot={bootable}')
     print(f'kind={kind}')
     print(f'size={size}')
     print(f'detail={detail}')
