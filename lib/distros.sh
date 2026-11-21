@@ -188,13 +188,16 @@ _distro_windows() {
         [[ -n "$url" && -n "$sum" ]] || { url=""; sum=""; }
     fi
     if [[ -z "$url" ]]; then
-        # the index is unreachable — fall back to the URLs that were verified
-        # by hand, and say so plainly rather than pretend to check anything
+        # the index does not carry every product (Microsoft retired the
+        # Windows 10 evaluation ISOs, so there is no entry for them) —
+        # fall back to the URLs that were verified by hand, with the
+        # published hash where one exists
         case "$name" in
             windows11) url="https://software-static.download.prss.microsoft.com/dbazure/26300.9457.260913-1737.26h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso" ;;
-            windows10) url="https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-ac9d-1f9786c66750/19045.2006.220908-0225.22h2_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso" ;;
+            windows10) url="https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-ac9d-1f9786c66750/19045.2006.220908-0225.22h2_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso"
+                       sum="ef7312733a9f5d7d51cfa04ac497671995674ca5e1058d5164d6028f0938d668" ;;
         esac
-        printf '%s\tms-sha256:\n' "$url"
+        printf '%s\tms-sha256:%s\n' "$url" "$sum"
         return 0
     fi
     printf '%s\tms-sha256:%s\n' "$url" "$sum"
@@ -286,7 +289,7 @@ distro_download() {
             case "$name" in
                 windows11|windows10)
                     warn "  or keep this stick and use the boot set instead:" >&2
-                    warn "  ./bootablez --windows-boots <the .iso> --device $DEV --yes" >&2
+                    warn "  ./bootablez --windows-boots <the .iso> --device ${DISTRO_TARGET_DEVICE:-/dev/sdX} --yes" >&2
                     ;;
             esac
             return 1
@@ -296,6 +299,12 @@ distro_download() {
     if [[ -s "$out" ]]; then
         info "have $base — checking it against the published checksum" >&2
         if distro_verify "$out" "$sum_url"; then
+            ok "$base verified against the published checksum" >&2
+            printf '%s' "$out"
+            return 0
+        fi
+        if [[ "$sum_url" == *sha256:* ]] && [[ -z "${sum_url##*sha256:}" ]]; then
+            warn "no published checksum for this image — it is NOT verified" >&2
             printf '%s' "$out"
             return 0
         fi

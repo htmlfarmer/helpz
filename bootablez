@@ -2279,8 +2279,10 @@ if [[ -n "$DISTRO" || "$DISTRO_LIST" == "1" ]]; then
     # download: five gigabytes of an image that cannot fit is wasted
     if [[ -n "$TARGET" ]] && [[ -b "$TARGET" ]]; then
         DISTRO_TARGET_BYTES=$(lsblk -dn -b -o SIZE "$TARGET" 2>/dev/null || echo 0)
+        DISTRO_TARGET_DEVICE="$TARGET"
     elif (( ${#CAND[@]} == 1 )); then
         DISTRO_TARGET_BYTES=$(lsblk -dn -b -o SIZE "${CAND[0]}" 2>/dev/null || echo 0)
+        DISTRO_TARGET_DEVICE="${CAND[0]}"
     fi
     DISTRO_ISO=$(distro_download "$DISTRO") || usage_abort "could not fetch the $DISTRO installer"
     ISO="$DISTRO_ISO"
