@@ -28,7 +28,7 @@ export PATH="$PWD:$PATH"       # or: ln -s "$PWD" ~/.local/bin/ztools
 | `aiz` | AI server status monitor |
 | `allz` | Security Script Orchestrator |
 | `benchmarkz` | System-wide benchmarks and speed tests using Linux commands. |
-| `bootablez` | Bootable USB creator & stick status checker (with safety rails) |
+| `bootablez` | Bootable USB creator for ISOs, macOS installers & Linux distros |
 | `bootz` | Boot diagnostic |
 | `browserz` | Installed Web Browser & Privacy Audit |
 | `chartz` | Turn any numbers into a text-mode chart |

@@ -3,7 +3,7 @@
 # shellcheck source=.helpz_log.sh
 . "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/.helpz_log.sh"
 # ============================================================================
-# bootablez - Bootable USB creator & stick status checker (with safety rails)
+# bootablez - Bootable USB creator for ISOs, macOS installers & Linux distros
 # ----------------------------------------------------------------------------
 # A guided wizard for the three things that actually matter when you make a
 # bootable stick — find the drive (df + lsblk), unmount everything on it, then
@@ -131,6 +131,28 @@ BOOT_SHOWN=0
 # set by build_device_list: a USB-attached disk exists (even if unusable)
 USB_SEEN=0
 
+# macOS installer media: Apple's .dmg files are UDIF containers, not disk
+# images, and the full offline installer has to be assembled inside an HFS+
+# volume. lib/macos.sh knows how; these flags turn it on.
+MACOS_LIST=0
+MACOS_DOWNLOAD=0
+MACOS_BUILD=0
+MACOS_VER=""
+# the distribution to fetch an installer ISO for, and the flag that lists them
+DISTRO=""
+DISTRO_LIST=0
+# where the macOS media was fetched, and the assembled image
+MACOS_MEDIA_DIR=""
+MACOS_IMG=""
+# the distribution image that was fetched, and the file it landed in
+DISTRO_ISO=""
+# what kind of image we are holding: iso | macos | raw
+IMAGE_KIND=""
+# the file the user pointed at, before a .dmg was unwrapped
+IMAGE_SOURCE=""
+# set when a .dmg was converted, so the report can say so
+CONVERTED=""
+
 # ---------- Args ----------
 ARGS=("$@")
 i=0
@@ -146,6 +168,15 @@ while [[ $i -lt $# ]]; do
     --scan=*)     SCAN_DIR="${arg#--scan=}" ;;
     --scan)       i=$((i+1)); SCAN_DIR="${ARGS[$i]:-}" ;;
     --dry-run)    DRY_RUN=1 ;;
+    --macos-list) MACOS_LIST=1 ;;
+    --macos-download=*) MACOS_DOWNLOAD=1; MACOS_VER="${arg#--macos-download=}" ;;
+    --macos-download) i=$((i+1)); MACOS_DOWNLOAD=1; MACOS_VER="${ARGS[$i]:-}" ;;
+    --macos-build=*) MACOS_BUILD=1; MACOS_VER="${arg#--macos-build=}" ;;
+    --macos-build) i=$((i+1)); MACOS_BUILD=1; MACOS_VER="${ARGS[$i]:-}" ;;
+    --macos)      MACOS_LIST=1 ;;
+    --distro=*)   DISTRO="${arg#--distro=}" ;;
+    --distro)     i=$((i+1)); DISTRO="${ARGS[$i]:-}" ;;
+    --distro-list) DISTRO_LIST=1 ;;
     --yes|-y)     ASSUME_YES=1 ;;
     --force)      FORCE=1 ;;
     --verify)     VERIFY=1 ;;
@@ -184,7 +215,27 @@ USAGE
                                          Show the plan, write nothing
   ./bootablez --iso x.iso --device /dev/sdX --yes --verify
                                          Non-interactive, verify afterwards
+  ./bootablez --macos-list               What macOS installers Apple's catalog offers
+  ./bootablez --macos-download 10.13     Fetch that macOS version's installer media
+  ./bootablez --macos-build 10.13        Assemble a bootable offline macOS image
+  ./bootablez --distro ubuntu            Fetch a distro's installer ISO and write it
+  ./bootablez --distro-list              Which distro images are on offer
   ./bootablez --json                     Machine-readable summary
+
+LINUX DISTRIBUTIONS
+  --distro fetches the distribution's own current image and checks it against
+  the checksum the distribution publishes, so nothing unverified is ever
+  written to a stick. No version is hard-coded: each distribution's index is
+  read and the newest image it offers is used. Supported: ubuntu, debian,
+  archlinux, fedora, linuxmint.
+
+macOS
+  A .dmg is a UDIF container around a disk image, not a disk image — writing
+  one to a stick with dd gives a stick that will not boot. bootablez unwraps
+  it (lib/macimg.py) and tells you the image is a macOS installer.
+  --macos-build goes further: it assembles the recovery system AND the OS
+  payload into one HFS+ volume, which is what makes the install work with
+  no network at all.
 
 WHAT A BARE RUN GIVES YOU
   · df, plus every disk and whether bootablez would touch it (and why not)
@@ -224,6 +275,14 @@ OPTIONS
   --status          Inspect and advise only — never write
   --list            List candidate drives and exit
   --scan=DIR        Extra directory to search for .iso files
+  --macos-list      List the macOS installer media Apple's catalog offers
+  --macos-download=VER
+                    Download that macOS version's installer media
+  --macos-build=VER Assemble a bootable macOS image (recovery + payload) and
+                    write it like any other image
+  --distro=NAME    Fetch that distribution's installer ISO (verified against
+                    the distribution's published checksum) and write it
+  --distro-list    List the installer images the supported distributions offer
   --dry-run         Run every safety check and print the plan; write nothing
   --yes, -y         Skip the type-the-device confirmation (scripts)
   --force           Allow a non-removable or drive-sized target
@@ -284,6 +343,10 @@ done
 # ---------- shared library ----------
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+# shellcheck source=lib/macos.sh
+source "$SCRIPT_DIR/lib/macos.sh" 2>/dev/null || true
+# shellcheck source=lib/distros.sh
+source "$SCRIPT_DIR/lib/distros.sh" 2>/dev/null || true
 [[ -z "${C_RESET:-}" ]] && { C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'; C_CYAN=$'\033[36m'; C_MAGENTA=$'\033[35m'; }
 if [[ "${AI_VERDICT}" == "1" ]]; then
     # shellcheck source=lib/ai.sh
@@ -443,7 +506,7 @@ _scan_dir() {
         ISO_LIST_DIR+=("$d")
         ISO_LIST_SIZE+=("$(stat -c %s -- "$f" 2>/dev/null || echo 0)")
         ISO_LIST_LABEL+=("$(volume_label "$f")")
-    done < <(find "$d" -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) 2>/dev/null | sort)
+    done < <(find "$d" -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' -o -iname '*.dmg' \) 2>/dev/null | sort)
 }
 
 # layouts_match <iso> <dev> → 0 the partition tables agree, 1 they differ,
@@ -509,6 +572,7 @@ rec() { printf "  ${C_CYAN}#%d${C_RESET} → %s\n" "$1" "$2"; }
 # labels, /sys supplies capacity and the rotational flag.
 usb_status() {
     ST_LEVEL="ok"; ST_VERDICT=""; ST_NOTES=(); ST_PARTS=(); ST_ISO_LABEL=""
+    ST_MACOS=0
     local dev="$1" size nparts line
     size=$(lsblk1 -dbno SIZE "$dev")
 
@@ -527,7 +591,7 @@ usb_status() {
         return 0
     fi
 
-    local has_iso=0 has_esp=0 seen_fs=0 name fs label ptype
+    local has_iso=0 has_esp=0 seen_fs=0 name fs label ptype has_macos=0
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         [[ "$(field "$line" TYPE)" == "part" ]] || continue
@@ -541,6 +605,10 @@ usb_status() {
         # "EFI (FAT-12/16/32)" — an equality test here made a perfectly good
         # Arch stick read QUESTIONABLE with "no EFI system partition".
         [[ "$ptype" == *EFI* ]] && has_esp=1
+        # A macOS installer stick is an Apple HFS+ partition, not ISO9660: the
+        # recovery system lives in it. Linux reports the filesystem as
+        # "hfsplus" and the partition type as "Apple HFS".
+        [[ "$fs" == "hfsplus" || "$ptype" == *Apple* || "$ptype" == *HFS* ]] && has_macos=1
     # -nP: --pairs is mutually exclusive with --list, so "-ln -P" fails
     # outright and silently yields zero rows
     done < <(lsblk -nP -o NAME,FSTYPE,LABEL,TYPE,PARTTYPENAME "$dev" 2>/dev/null)
@@ -554,6 +622,9 @@ usb_status() {
 
     if (( has_iso && has_esp )); then
         ST_VERDICT="BOOTABLE — installer image present, with an EFI system partition"
+    elif (( has_macos )); then
+        ST_MACOS=1
+        ST_VERDICT="BOOTABLE — macOS installer (Apple HFS+ volume with the recovery system)"
     elif (( has_iso )); then
         ST_LEVEL="warn"
         ST_VERDICT="QUESTIONABLE — image present but no EFI system partition (BIOS-only boot?)"
@@ -646,6 +717,16 @@ boot_instructions() {
     (( ${BOOT_SHOWN:-0} )) && return 0
     BOOT_SHOWN=1
     local img="${1:-}" model="${2:-}"
+
+    # macOS media boots a Mac, not this PC: the keys are Option on a Mac
+    # keyboard and Alt on a PC one, and Apple Silicon wants the Power button.
+    if [[ "${IMAGE_KIND:-}" == "macos" || "${ST_MACOS:-0}" == "1" ]]; then
+        section "HOW TO BOOT IT (macOS)"
+        if declare -F macos_boot_help >/dev/null 2>&1; then
+            macos_boot_help
+        fi
+        return 0
+    fi
 
     local vendor="" product=""
     [[ -r /sys/class/dmi/id/sys_vendor ]] && vendor=$(tr -d '\n' < /sys/class/dmi/id/sys_vendor)
@@ -845,13 +926,62 @@ check_iso() {
     # 32-byte volume ID at 32808.
     ISO9660=0
     ISO_LABEL=""
-    if [[ "$(dd if="$ISO" bs=1 skip=32769 count=5 2>/dev/null)" == "CD001" ]]; then
+    if [[ "$(dd if="$ISO" bs=1 skip=32769 count=5 2>/dev/null | tr -d '\000')" == "CD001" ]]; then
         ISO9660=1
         ISO_LABEL=$(volume_label "$ISO")
+        IMAGE_KIND="iso"
     else
-        warn "does not look like an ISO9660 image — fine for a raw .img, wrong for anything else"
+        # Not an ISO. Before calling it "just a raw .img", ask what it really
+        # is: Apple's installers are UDIF containers wrapping a disk image,
+        # and writing one of those to a stick produces a stick that will NOT
+        # boot — the payload inside is compressed. Unwrap it first.
+        local kind
+        kind=$(macimg_probe "$ISO")
+        if [[ "$kind" == "udif" ]]; then
+            local unwrapped
+            unwrapped=$(macimg_unwrap "$ISO") || {
+                warn "this .dmg could not be unwrapped — needs python3"
+                return 1
+            }
+            IMAGE_SOURCE="$path"
+            ISO="$unwrapped"
+            ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+            kind=$(macimg_probe "$ISO")
+        fi
+        if [[ "$kind" == "macos" ]]; then
+            IMAGE_KIND="macos"
+        else
+            IMAGE_KIND="raw"
+            warn "not an ISO9660 image and not a macOS installer either — treated as a raw disk image"
+        fi
     fi
     return 0
+}
+
+# macimg_probe <file> → iso9660 | udif | macos | raw
+macimg_probe() {
+    [[ -f "$(macimg_script)" ]] || { printf 'raw'; return 0; }
+    command -v python3 >/dev/null 2>&1 || { printf 'raw'; return 0; }
+    python3 "$(macimg_script)" probe "$1" 2>/dev/null \
+        | sed -n 's/^kind=//p' | head -1
+}
+
+# macimg_unwrap <file.dmg> → path of the raw disk image (cached)
+macimg_unwrap() {
+    [[ -f "$(macimg_script)" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    local cache out
+    cache="${TMPDIR:-/tmp}/bootablez-macos"
+    mkdir -p "$cache" 2>/dev/null || return 1
+    out="$cache/$(basename "$1" .dmg).raw"
+    if [[ ! -s "$out" ]] || (( $(stat -c %s -- "$out" 2>/dev/null || echo 0) < $(stat -c %s -- "$1") )); then
+        # every message goes to stderr: stdout here is the return value, and
+        # a chatty line in it would be taken for the filename
+        info "unwrapping the .dmg — Apple's installers are containers, not disk images" >&2
+        # the converter's progress goes to stderr too
+        python3 "$(macimg_script)" dmg2raw "$1" "$out" >&2 || return 1
+    fi
+    printf '%s' "$out"
 }
 
 # ---------- device inventory ----------
@@ -1953,6 +2083,90 @@ menu_loop() {
 
 report
 
+# ---------- distribution ISOs -----------------------------------------------
+# A bootable stick should not start with "go and download an ISO first".
+# --distro fetches the distribution's own current image and checks it against
+# the checksum the distribution publishes, so nothing unverified is ever
+# written to a stick.
+if [[ -n "$DISTRO" || "$DISTRO_LIST" == "1" ]]; then
+    declare -F distro_download >/dev/null 2>&1 \
+        || usage_abort "this build has no distribution support (lib/distros.sh is missing)"
+
+    if [[ "$DISTRO_LIST" == "1" ]]; then
+        section "LINUX INSTALLER IMAGES"
+        distro_list
+        add_json_field "status" "distro-list"
+        emit_verdict
+    fi
+
+    case "$DISTRO" in
+        ubuntu|debian|archlinux|fedora|linuxmint|mint|windows11|windows10) ;;
+        *) usage_abort "unknown distribution: $DISTRO  (try --distro-list)" ;;
+    esac
+    section "DISTRO · $DISTRO"
+    DISTRO_ISO=$(distro_download "$DISTRO") || usage_abort "could not fetch the $DISTRO installer"
+    ISO="$DISTRO_ISO"
+    ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+    IMAGE_KIND="iso"
+    ok "$DISTRO image ready: $ISO ($(humansize "$ISO_SIZE"))"
+    if [[ -z "$TARGET" ]]; then
+        printf "  ${C_DIM}write it to a stick like any other image:${C_RESET}\n"
+        printf "  ${C_BOLD}./bootablez --distro %s --device /dev/sdX --yes --verify${C_RESET}\n" "$DISTRO"
+        add_json_field "status" "distro-image"
+        emit_verdict
+    fi
+fi
+
+# ---------- macOS installer media -------------------------------------------
+# Apple's installers are not ISO files. A .dmg is a UDIF container wrapping a
+# disk image — writing one straight to a stick gives a stick that will not
+# boot, because the payload inside is compressed. And the FULL offline
+# installer needs the OS payload inside the HFS+ volume, which no dd can do.
+# These flags handle both, using Apple's own catalog as the source of truth.
+if (( MACOS_LIST || MACOS_DOWNLOAD || MACOS_BUILD )); then
+    declare -F macos_list >/dev/null 2>&1 \
+        || usage_abort "this build has no macOS support (lib/macos.sh is missing)"
+
+    if (( MACOS_BUILD )); then
+        [[ -n "$MACOS_VER" ]] || usage_abort "--macos-build needs a version: --macos-build 10.13"
+        section "MACOS · $MACOS_VER"
+        MACOS_MEDIA_DIR=$(macos_download "$MACOS_VER") || usage_abort "could not fetch the macOS $MACOS_VER media"
+        MACOS_IMG="$MACOS_MEDIA_DIR/macos-$MACOS_VER.img"
+        info "assembling a bootable macOS $MACOS_VER image (recovery system + payload in one HFS+ volume)"
+        macos_build "$MACOS_DIR" "$MACOS_IMG" || usage_abort "could not assemble the macOS image"
+        ISO="$MACOS_IMG"
+        ISO_SIZE=$(stat -c %s -- "$ISO" 2>/dev/null || echo 0)
+        IMAGE_KIND="macos"
+        ok "macOS $MACOS_VER image ready: $ISO ($(humansize "$ISO_SIZE"))"
+        printf "  ${C_DIM}write it to a stick like any other image:${C_RESET}\n"
+        printf "  ${C_BOLD}./bootablez --iso %s --device /dev/sdX --yes --verify${C_RESET}\n" "$ISO"
+        if [[ -z "$TARGET" ]]; then
+            add_json_field "status" "macos-image"
+            emit_verdict
+        fi
+    elif (( MACOS_DOWNLOAD )); then
+        [[ -n "$MACOS_VER" ]] || usage_abort "--macos-download needs a version: --macos-download 10.13"
+        section "MACOS · $MACOS_VER"
+        MACOS_MEDIA_DIR=$(macos_download "$MACOS_VER") || usage_abort "could not fetch the macOS $MACOS_VER media"
+        ok "macOS $MACOS_VER media in $MACOS_MEDIA_DIR"
+        add_json_field "status" "macos-downloaded"
+        emit_verdict
+    else
+        section "MACOS INSTALLER MEDIA"
+        macos_list
+        add_json_field "status" "macos-list"
+        emit_verdict
+    fi
+fi
+
+# a bare run says so too, so the macOS route is discoverable without flags
+if [[ -z "$ISO" && -z "$TARGET" ]] && declare -F macos_brief >/dev/null 2>&1; then
+    macos_brief
+fi
+if [[ -z "$ISO" && -z "$TARGET" && -z "$DISTRO" ]] && declare -F distro_brief >/dev/null 2>&1; then
+    distro_brief
+fi
+
 # ---------- status-only exits ---------------------------------------------
 # --status --verify is the "did this stick really get flashed?" audit: it
 # byte-compares an existing stick against an image without writing anything.
@@ -2002,6 +2216,8 @@ else
 fi
 if (( ISO9660 )); then
     ok "image: ${C_BOLD}$(basename "$ISO")${C_RESET} — $(humansize "$ISO_SIZE")${ISO_LABEL:+ · label \"$ISO_LABEL\"}"
+elif [[ "$IMAGE_KIND" == "macos" ]]; then
+    ok "image: ${C_BOLD}$(basename "$ISO")${C_RESET} — $(humansize "$ISO_SIZE")  ${C_CYAN}macOS installer${C_RESET}${IMAGE_SOURCE:+ · unwrapped from $(basename "$IMAGE_SOURCE")}"
 else
     info "image: $(basename "$ISO") — $(humansize "$ISO_SIZE")"
 fi
