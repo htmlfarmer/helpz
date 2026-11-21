@@ -9,3 +9,12 @@ __pycache__/
 *.pcap
 *.pftrace
 *.tmp
+
+# installer images and disk images — never commit these
+*.iso
+*.dmg
+*.img
+*.raw
+*.wim
+*.esd
+*.qcow2
