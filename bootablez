@@ -2295,9 +2295,19 @@ do_windows_usb() {
     [[ -f "$iso" ]] || { warn "no such file: $iso"; return 1; }
     command -v mkfs.vfat >/dev/null 2>&1 || { warn "needs mkfs.vfat (apt install dosfstools)"; return 1; }
     command -v wimlib-imagex >/dev/null 2>&1 || {
-        info "installing wimlib (it splits install.wim so it fits FAT32)"
-        apt-get install -y wimlib || { warn "could not install wimlib (apt install wimlib)"; return 1; }
+        # Debian/Ubuntu package the wimlib tools as "wimtools"; wimlib is
+        # the upstream name (Fedora/Arch), so try both
+        info "installing the wimlib tools (they split install.wim so it fits FAT32)"
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y wimtools 2>/dev/null || apt-get install -y wimlib 2>/dev/null || {
+            warn "could not install the wimlib tools"
+            warn "  sudo apt install wimtools      (Debian/Ubuntu)"
+            warn "  sudo pacman -S wimlib          (Arch)"
+            warn "  sudo dnf install wimlib        (Fedora)"
+            return 1
+        }
     }
+    command -v wimlib-imagex >/dev/null 2>&1 || { warn "wimlib-imagex is still missing"; return 1; }
 
     echo "--- wiping $target and laying out one FAT32 partition"
     sudo_run wipefs -a "$target" >/dev/null 2>&1 || true
