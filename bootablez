@@ -2321,6 +2321,10 @@ do_windows_usb() {
     # The payload is 4.59 GB — over FAT32's 4 GB file limit — so it cannot be
     # extracted straight onto the stick. Extract to the local disk, split it
     # there, then copy the (now small) pieces onto the FAT32 volume.
+    # a previous failed run can leave the ISO mounted at this path, and a
+    # mount point that is already taken fails the build before it starts
+    sudo_run umount "$mnt_usb" 2>/dev/null || true
+    sudo_run umount "$mnt_iso" 2>/dev/null || true
     sudo_run mkdir -p "$mnt_usb" || { warn "cannot create the mount point"; return 1; }
     sudo_run mount "$part" "$mnt_usb" || { warn "could not mount $part"; return 1; }
     local work="$ISO.windows-usb-work"
