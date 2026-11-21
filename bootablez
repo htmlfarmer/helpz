@@ -2361,6 +2361,12 @@ do_windows_usb() {
         sudo_run ls -la "$mnt_usb/sources/" | head -8
     else
         warn "no install.wim found in the ISO — the payload may not have been copied"
+        # say what IS there, so the next run's output answers the question
+        printf "  ${C_DIM}contents of the ISO mount:${C_RESET}\n"
+        sudo_run ls -la "$mnt_iso" 2>/dev/null | head -12 >&2 || true
+        printf "  ${C_DIM}contents of the destination:${C_RESET}\n"
+        sudo_run ls -la "$mnt_usb/sources" 2>/dev/null | head -12 >&2 || true
+        sudo_run df -h "$mnt_usb" 2>/dev/null >&2 || true
     fi
 
     echo "--- syncing and releasing"
